@@ -264,7 +264,7 @@
   ["deftype" "Defines a named type with fields (cljc: represented as a tagged map)."]
   ["derive" "Adds a parent relationship in the (global) hierarchy."]
   ["isa?" "Hierarchy-aware type/tag relation (vectors compare element-wise)."]
-  ;; ── batteries (fs.clj / http.clj / json.clj / process.clj) ──
+  ;; ── batteries (fs.clj / http.clj / json.clj / peg.clj / process.clj) ──
   ["fs/exists?" "Whether the path exists."]
   ["fs/directory?" "Whether the path is a directory."]
   ["fs/regular-file?" "Whether the path is a regular file."]
@@ -286,6 +286,12 @@
   ["http/post" "HTTP POST of a body to a url; returns a channel of the response map."]
   ["json/parse" "Parses a JSON string to Clojure data ((json/parse s) or (json/parse s {:keywords? true}))."]
   ["json/write" "Renders Clojure data as a JSON string."]
+  ["peg/match" "Matches a Janet-style PEG (pattern data, grammar map with :main, or compiled) at start of text; returns the capture vector or nil. (peg/match peg text ?start & args)."]
+  ["peg/compile" "Compiles a PEG pattern once; the result is a fn (m text ?start & args) => captures, accepted anywhere a pattern is."]
+  ["peg/find" "Index of the first position at/after start where the PEG matches, or nil."]
+  ["peg/find-all" "Vector of every position in text where the PEG matches."]
+  ["peg/replace" "Replaces the first PEG match in text with subst: a string, or a fn of (matched-text & captures)."]
+  ["peg/replace-all" "Replaces every PEG match in text with subst (string or fn of (matched-text & captures))."]
   ["process/sh" "Runs a shell command, returns {:exit :out} (stderr folded into :out)."]
   ["process/shell" "Like process/sh but throws ex-info on nonzero exit."]
   ["process/out" "The trimmed stdout of running the command."]

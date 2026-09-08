@@ -39,7 +39,7 @@ PREFIX=/usr/local ./install.sh    # system-wide
 ```
 
 Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
-`process.clj`, …) and vendored libraries (`clojure.set`, `clojure.tools.logging`,
+`process.clj`, `peg.clj`, …) and vendored libraries (`clojure.set`, `clojure.tools.logging`,
 `nextjournal.markdown`, medley, …) resolve through `$PREFIX/share/cljc`, with
 `CLJC_PATH` (colon-separated) for extra roots. An uninstalled `./cljc` also
 works from any directory (its own directory joins the load path). When requires
@@ -126,6 +126,7 @@ same `tests.clj` runs everywhere.
 | **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
 | **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
 | **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
+| **PEGs** | `peg.clj` battery: [Janet's](https://janet-lang.org/docs/peg.html) parsing-expression grammars as plain data — `(peg/match '(* (<- :w+) "=" (number :d+)) "k=7")` ⇒ `["k" 7]`; grammars as maps with `:main`, ordered choice, `any`/`some`/`between`, `if`/`if-not`/`look` (arbitrary lookahead *and* lookbehind), `to`/`thru`, `sub`/`split`, captures with tags (`<-` `group` `replace` `cmt` `accumulate` `number` `backmatch` `->` `unref` …), `find`/`find-all`/`replace`/`replace-all`; codepoint-indexed; verified case-for-case against the Janet binary |
 | **Transducers** | `map`/`filter`/`take`/`mapcat`/… as transducers, `transduce`, `eduction`, `into` with an xform — compose over infinite seqs with `reduced` early-exit |
 | **Concurrency** | stackful **coroutines** (`coro/new`/`resume`/`yield`) under a shared cooperative **fiber scheduler** (Janet `ev/`-style: ready queue, timer wheel, `poll(2)` fd parking). Real **`future`/`promise`** with blocking `deref` (parks in a fiber, drives the loop on main, `(deref x ms tval)` timeouts, failed futures rethrow at deref), fiber-aware `Thread/sleep`, a genuine `clojure.core.async` (`go`/`<!`/`>!`/`alts!`, channels, timeouts), **agents** (`send`/`await`/error modes/`restart-agent`, serial actions on a drain fiber), and **STM refs** (`dosync`/`alter`/`commute`/`ensure` with real conflict-detect-and-retry across fiber yields; in-tx `send`s held until commit; watches on agents/refs) — all on one thread, one scheduler |
 | **Library** | hundreds of core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops, `format`, `sort`/`compare`, `read-string`/`eval`, `Math/*` |
@@ -201,7 +202,8 @@ s7/cload-style: declare C signatures as data, cljc generates glue, compiles a
 cache by content hash; `ffi/defstruct` generates struct accessors. The battery
 shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
 `fs.clj` (babashka.fs-flavored, `list-dir` via real `readdir`), `process.clj`
-(`sh`/`shell`/`out`), `json.clj`, `http.clj`, plus `(sh "cmd")` ⇒ `{:exit :out}`.
+(`sh`/`shell`/`out`), `json.clj`, `http.clj`, `peg.clj` (Janet-style PEGs), plus
+`(sh "cmd")` ⇒ `{:exit :out}`.
 
 ## Standalone binaries
 

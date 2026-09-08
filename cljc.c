@@ -122,7 +122,7 @@ static void cljc_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLJC_VERSION "0.4.2"
+#define CLJC_VERSION "0.5.0"
 #ifndef CLJC_SHAREDIR
 #define CLJC_SHAREDIR "/usr/local/share/cljc"
 #endif
@@ -204,7 +204,14 @@ struct Cljc {
         char *str;
         /* aliases .str — nbytes: buffer length from mk_str; ncp: cached
          * codepoint count (STR_NCP_UNKNOWN until first asked for) */
-        struct { char *data; uint32_t nbytes; uint32_t ncp; } strx;
+        struct { char *data; uint32_t nbytes; uint32_t ncp;
+                 /* cursor cache for non-ASCII codepoint indexing: the byte
+                  * offset of codepoint cur_cp, last looked up. Sequential or
+                  * near-sequential scans (nth/subs in a loop, the peg
+                  * battery) become O(1)/step instead of O(i). clean: every
+                  * multibyte sequence is well-formed (set with ncp), which is
+                  * what makes stepping the cursor BACKWARD exact. */
+                 uint32_t cur_cp, cur_byte; bool clean; } strx;
         struct { Cljc *head; Cljc *tail; } cons;
         /* Persistent vector: 32-way position trie + tail of the last ≤32
          * elements. tail is owned by THIS cell (copied per derived vector);
@@ -816,6 +823,8 @@ static Cljc *mk_str(const char *s, size_t n) {
     v->as.str[n] = '\0';
     v->as.strx.nbytes = (uint32_t)n;
     v->as.strx.ncp = STR_NCP_UNKNOWN;
+    v->as.strx.cur_cp = v->as.strx.cur_byte = 0;
+    v->as.strx.clean = false;
     return v;
 }
 
@@ -853,30 +862,67 @@ static int32_t utf8_next(const char **p) {
 static size_t str_cp_count(Cljc *v) {
     if (v->as.strx.ncp != STR_NCP_UNKNOWN) return v->as.strx.ncp;
     size_t n = 0;
+    bool clean = true;
     const char *p = v->as.str, *end = v->as.str + v->as.strx.nbytes;
-    while (p < end) { utf8_next(&p); n++; }
+    while (p < end) {
+        const char *q = p;
+        utf8_next(&p);
+        /* a non-ASCII byte that decoded alone is a stray/invalid byte */
+        if (p - q == 1 && (unsigned char)*q >= 0x80) clean = false;
+        n++;
+    }
     v->as.strx.ncp = (uint32_t)n;            /* idempotent cache; one thread */
+    v->as.strx.clean = clean;
     return n;
 }
 static bool str_ascii(Cljc *v) { return str_cp_count(v) == v->as.strx.nbytes; }
 
+/* Byte offset of codepoint i (i <= ncp) in a non-ASCII string, moving the
+ * string's cursor there. Starts from whichever of {start, cursor} is nearer;
+ * walks backward from the cursor only when the string is clean UTF-8 (then
+ * skipping continuation bytes lands exactly on the forward-decode boundary;
+ * on dirty input a stray 0x80..0xBF byte would desync, so restart from 0). */
+static size_t str_cp_seek(Cljc *v, size_t i) {
+    const char *s = v->as.str;
+    size_t ccp = v->as.strx.cur_cp, cb = v->as.strx.cur_byte;
+    if (ccp > str_cp_count(v) || cb > v->as.strx.nbytes) ccp = cb = 0;
+    const char *p;
+    if (i >= ccp) {
+        p = s + cb;
+        for (size_t k = i - ccp; k; k--) utf8_next(&p);
+    } else if (v->as.strx.clean && ccp - i < i) {
+        p = s + cb;
+        for (size_t k = ccp - i; k; k--) {
+            do p--; while (p > s && ((unsigned char)*p & 0xC0) == 0x80);
+        }
+    } else {
+        p = s;
+        for (size_t k = i; k; k--) utf8_next(&p);
+    }
+    v->as.strx.cur_cp = (uint32_t)i;
+    v->as.strx.cur_byte = (uint32_t)(p - s);
+    return (size_t)(p - s);
+}
 static size_t str_cp_to_byte(Cljc *v, size_t i) {  /* i <= ncp */
     if (str_ascii(v)) return i;
-    const char *p = v->as.str;
-    while (i--) utf8_next(&p);
-    return (size_t)(p - v->as.str);
+    return str_cp_seek(v, i);
 }
 static int32_t str_cp_at(Cljc *v, size_t i) {      /* i < ncp */
     if (str_ascii(v)) return (unsigned char)v->as.str[i];
-    const char *p = v->as.str;
-    while (i--) utf8_next(&p);
+    const char *p = v->as.str + str_cp_seek(v, i);
     return utf8_next(&p);
 }
 static size_t str_byte_to_cp(Cljc *v, size_t off) {  /* off on a cp boundary */
     if (str_ascii(v)) return off;
     size_t n = 0;
     const char *p = v->as.str;
+    if (v->as.strx.cur_byte <= off) {       /* resume from the cursor */
+        n = v->as.strx.cur_cp;
+        p += v->as.strx.cur_byte;
+    }
     while ((size_t)(p - v->as.str) < off) { utf8_next(&p); n++; }
+    v->as.strx.cur_cp = (uint32_t)n;
+    v->as.strx.cur_byte = (uint32_t)off;
     return n;
 }
 static Cljc *mk_cons(Cljc *h, Cljc *t) {
@@ -7626,7 +7672,8 @@ static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
  * (?=X) (?!X) lookahead, | alternation, * + ? quantifiers with lazy
  * variants (*? +? ??), X{n} X{n,} X{n,m} bounded repeats (n,m ≤ 64,
  * desugared to copies).
- * Not supported: lookbehind. Patterns are plain
+ * Not supported: lookbehind / named groups — any (?<...) is a loud error
+ * rather than a silent non-match. Patterns are plain
  * strings; the #"..." reader literal passes backslashes through raw.
  * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
  * only star is a real loop, guarded against empty-match cycles. */
@@ -7718,6 +7765,10 @@ static RxChain rx_parse_atom(RxC *c) {
             ch.h = ch.t = la;
             return ch;
         }
+        if (c->p[0] == '?' && c->p[1] == '<')
+            cljc_error("regex: (?<...) is not supported (no lookbehind or "
+                       "named groups); use the peg battery for lookbehind-style "
+                       "matching");
         if (c->p[0] == '?' && c->p[1] == ':') { capture = false; c->p += 2; }
         int idx = 0;
         if (capture) {
@@ -8735,6 +8786,8 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
         memcpy(c->as.str, v->as.str, n + 1);
         c->as.strx.nbytes = (uint32_t)n;
         c->as.strx.ncp = STR_NCP_UNKNOWN;
+        c->as.strx.cur_cp = c->as.strx.cur_byte = 0;
+        c->as.strx.clean = false;
     }
     c->meta = m == NIL ? NULL : m;
     return c;
@@ -9680,6 +9733,21 @@ static Cljc *prim_split(CljcEnv *env, Cljc **argv, int nargs) {
 STR_PRED(starts_with, strncmp(s, sub, bl) == 0)
 STR_PRED(ends_with,   bl <= sl && strcmp(s + sl - bl, sub) == 0)
 STR_PRED(includes,    strstr(s, sub) != NULL)
+
+/* (cljc/str-starts-at? s prefix i) → does s have prefix at codepoint index i?
+ * No substring allocation — backs String.startsWith(prefix, toffset) and the
+ * peg battery's literal matcher. Out-of-range i (like Java) is just false. */
+static Cljc *prim_starts_at(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    as_str(argv[0], "str-starts-at?");
+    char *sub = as_str(argv[1], "str-starts-at?");
+    int64_t i = as_int(argv[2], "str-starts-at?");
+    Cljc *sv = argv[0];
+    if (i < 0 || (size_t)i > str_cp_count(sv)) return mk_bool(false);
+    size_t b0 = str_cp_to_byte(sv, (size_t)i), bl = strlen(sub);
+    if (b0 + bl > sv->as.strx.nbytes) return mk_bool(false);
+    return mk_bool(memcmp(sv->as.str + b0, sub, bl) == 0);
+}
 
 /* (str/index-of s sub [from]) → first index at/after from, or nil. */
 /* (str/index-of "..." \c) is valid in Clojure — a char search value. */
@@ -11833,7 +11901,8 @@ static const char *PRELUDE =
     "(def Numbers/reduceBigInt identity)\n"
     /* java.lang.String instance methods over cljc strings */
     "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
-    "(defn .startsWith [s pre] (str/starts-with? (str s) pre))\n"
+    "(defn .startsWith ([s pre] (str/starts-with? (str s) pre))\n"
+    "  ([s pre off] (cljc/str-starts-at? (str s) pre off)))\n"
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
     "(defn .replace [s old new] (clojure.string/replace (str s) old new))\n"  /* String.replace: literal */
     "(defn String/valueOf [x] (str x))\n"
@@ -12893,6 +12962,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "str/trim",         prim_trim);
     cljc_define_native(e, "str/split",        prim_split);
     cljc_define_native(e, "str/starts-with?", prim_starts_with);
+    cljc_define_native(e, "cljc/str-starts-at?", prim_starts_at);
     cljc_define_native(e, "str/ends-with?",   prim_ends_with);
     cljc_define_native(e, "str/includes?",    prim_includes);
     cljc_define_native(e, "cljc/str-nbytes*", prim_str_nbytes);

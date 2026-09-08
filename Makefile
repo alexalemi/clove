@@ -5,7 +5,7 @@ CFLAGS  ?= -O2 -falign-functions=64 -falign-loops=32 -Wall -Wextra -Wno-unused-p
 PREFIX  ?= /usr/local
 DESTDIR ?=
 SHAREDIR = $(PREFIX)/share/cljc
-BATTERIES = docs.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj
+BATTERIES = docs.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj peg.clj
 
 cljc: cljc.c
 	$(CC) $(CFLAGS) -DCLJC_SHAREDIR='"$(SHAREDIR)"' -o $@ $< -lm -ldl

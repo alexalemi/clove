@@ -4,7 +4,7 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test`
 (suite + conformance); `make test-full` adds the `CLJC_GC_STRESS=1` pass.
 
-## Status (as of 2026-09-06, v0.4.2)
+## Status (as of 2026-09-07, v0.5.0)
 
 ~15,400 lines, zero warnings, ~1470 assertions in `tests.clj` + 412-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
@@ -38,6 +38,10 @@ GC-stress on every push; tagged releases publish portable binaries.
   finally runs on normal exit, body throw, and handler throw. Divergence:
   catch is untyped — `(catch Exception e ...)` accepts and ignores the class.
 - **Atoms**: `atom deref reset! swap!` + `@` reader sugar; printed `#atom[v]`.
+- **peg.clj** (2026-09-07): Janet-style PEG battery, semantics diffed against
+  the Janet binary (corpus in tests.clj). Strings gained a codepoint cursor
+  cache (non-ASCII `nth`/`subs` no longer O(i)) and `cljc/str-starts-at?`.
+  Throughput ~0.5 MB/s interpreted; a C core is the lever if that ever bites.
 - **Modes**: interactive REPL (multi-line, paren-balance), `./cljc file.clj`,
   piped stdin (babashka-style: no result echo). Embed API: `cljc_new_env`,
   `cljc_eval_string`, `cljc_define_native`, `cljc_set_stack_base`,

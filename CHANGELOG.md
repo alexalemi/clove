@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 — 2026-09-07
+
+### Added
+- **`peg.clj`** battery: Janet-style Parsing Expression Grammars —
+  `(require '[peg :as peg])`, then `(peg/match '(* (<- :w+) "=" (number :d+)) "k=7")`
+  ⇒ `["k" 7]`. Patterns are plain data (quote them; vectors work like lists),
+  grammars are maps with `:main`, and the whole Janet vocabulary is there:
+  `* + ! any some opt between at-least at-most repeat if if-not look to thru
+  sub split backmatch`, captures `<- group replace cmt constant argument
+  position line column accumulate number drop backref/-> unref nth only-tags
+  error` with tags, and `compile`/`match`/`find`/`find-all`/`replace`/
+  `replace-all`. Semantics were checked case-for-case against the real Janet
+  binary (144-pair corpus, now in `tests.clj`), including the corners the
+  Janet docs get wrong (`if`/`look` keep their captures; a no-progress
+  iteration ends `any`/`some`; `to` drops, `thru` keeps). One deliberate
+  difference: positions and `(<- 1)` are codepoints, not bytes. `look` with a
+  negative offset gives lookbehind, which the regex engine lacks.
+- `String.startsWith(prefix, toffset)`: `(.startsWith s pre off)` now takes
+  the Java offset form, backed by a new `cljc/str-starts-at?` native that
+  compares in place (no substring allocation) — the peg literal matcher's
+  primitive.
+
+### Changed
+- Non-ASCII strings index through a **cursor cache**: `nth`/`subs`/
+  `str/index-of` on a string with multibyte chars used to walk from byte 0 on
+  every call, so a sequential scan was quadratic (200k-char scan: 29 s). Each
+  string now remembers its last (codepoint, byte) position and steps forward or
+  backward from it (69 ms). Backward steps are taken only when the string is
+  well-formed UTF-8 (a flag computed with the codepoint count); a stray
+  continuation byte would desync a reverse walk, so dirty strings restart from
+  the front. ASCII strings were and remain O(1).
+- Regex: `(?<` — lookbehind or a named group — is now a loud
+  `regex: (?<...) is not supported` error. It used to parse as an ordinary
+  group with a stray `?`, so `(re-find #"(?<=a)b" "ab")` silently returned
+  nil where Java returns `"b"`.
 
 ## v0.4.2 — 2026-09-06
 
