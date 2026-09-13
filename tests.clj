@@ -2742,6 +2742,20 @@
                (ex-message (try (read-string "(def a\n  (let [x 1\n") (catch Exception e e)))
                "(line 3)"))
 
+; ── #! shebang lines are reader comments (Clojure's dispatch comment reader) ──
+;; An executable script starts with #!/usr/bin/env cljc; the reader must skip
+;; that line WITHOUT consuming its newline, so error line numbers stay honest.
+(assert= 42 (read-string "#!/usr/bin/env cljc\n42"))
+(assert= [1 2] (read-string "[1 #! inline comment\n 2]"))   ; comment anywhere, not just line 1
+(spit "cljc_shebang_test.clj"
+      "#!/usr/bin/env cljc\n(def sheb-x 7)\n(defn sheb-f [n] (nth [1 2 3] n))\n")
+(load-file "cljc_shebang_test.clj")
+(assert= 7 sheb-x)
+(try (sheb-f 99) (catch Exception e nil))
+;; line 3, not line 2: the shebang consumed a line but not its terminator
+(assert= true (clojure.string/includes? (cljc/last-trace*) "cljc_shebang_test.clj:3"))
+(sh "rm -f cljc_shebang_test.clj")
+
 ; ── var meta carries :doc/:arglists; error traces reach into VM'd bodies ──
 (let [m (meta (var docqol-f))]
   (assert= 'docqol-f (:name m))

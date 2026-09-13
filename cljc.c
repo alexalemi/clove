@@ -122,7 +122,7 @@ static void cljc_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLJC_VERSION "0.5.0"
+#define CLJC_VERSION "0.6.0"
 #ifndef CLJC_SHAREDIR
 #define CLJC_SHAREDIR "/usr/local/share/cljc"
 #endif
@@ -2424,6 +2424,12 @@ static void skip_ws(const char **p) {
         if (**p == '\n') { if (rd_line) { rd_line++; rd_line_start = *p + 1; } (*p)++; }
         else if (isspace((unsigned char)**p) || **p == ',') { (*p)++; }
         else if (**p == ';') { while (**p && **p != '\n') (*p)++; }
+        /* #! ... : shebang / dispatch comment. Clojure registers `!` in the
+         * dispatch table as a comment reader, so this is a line comment
+         * ANYWHERE, not just line 1 -- which is also what makes an executable
+         * `#!/usr/bin/env cljc` script just work on every load path. The \n
+         * is left for the branch above, so rd_line stays accurate. */
+        else if (**p == '#' && (*p)[1] == '!') { while (**p && **p != '\n') (*p)++; }
         else break;
     }
 }

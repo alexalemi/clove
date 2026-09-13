@@ -4,9 +4,9 @@ Goal: a babashka-coverage-ish Clojure interpreter in one embeddable C file
 (`cljc.c`), inspired by Janet. Build: `make`. Tests: `make test`
 (suite + conformance); `make test-full` adds the `CLJC_GC_STRESS=1` pass.
 
-## Status (as of 2026-09-07, v0.5.0)
+## Status (as of 2026-09-13, v0.6.0)
 
-~15,400 lines, zero warnings, ~1470 assertions in `tests.clj` + 412-expression
+~15,860 lines, zero warnings, ~1470 assertions in `tests.clj` + 417-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan),
@@ -15,7 +15,9 @@ GC-stress on every push; tagged releases publish portable binaries.
 
 ### Done
 - **Reader**: lists/vectors/maps/strings (with escapes), keywords, comments,
-  commas-as-whitespace, `'` `` ` `` `~` `~@`
+  commas-as-whitespace, `'` `` ` `` `~` `~@`; `#!` is a to-end-of-line comment
+  anywhere (Clojure's dispatch comment reader), so `#!/usr/bin/env cljc` +
+  `chmod +x` gives a directly executable script on every load path
 - **Eval**: special forms `quote if do def defn defmacro let fn loop recur
   and or when cond quasiquote`; macro expansion (fn with `is_macro` flag,
   unevaluated args, expansion re-evaluated)

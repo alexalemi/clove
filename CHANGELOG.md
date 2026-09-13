@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.0 — 2026-09-13
+
+### Added
+- **Shebang support for executable scripts.** `#!` now reads as a comment to
+  end of line, matching Clojure's reader (which registers `!` in the dispatch
+  table as a comment reader), so `#!/usr/bin/env cljc` + `chmod +x` gives a
+  directly runnable script. Because it lives in the reader's whitespace skipper
+  rather than in the script entry point, it holds on every path — `cljc
+  file.clj`, `load-file`, `require`, stdin, `cljc lint`, `cljc watch`, and the
+  source embedded by `cljc bundle` — and anywhere in a file, not only line 1.
+  The newline is left for the line counter, so error traces still report
+  honest line numbers.
+
 ## v0.5.0 — 2026-09-07
 
 ### Added

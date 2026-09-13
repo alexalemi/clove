@@ -97,6 +97,37 @@ unmodified, including non-ASCII text (astral chars in its `\uXXXX` escaping
 assume UTF-16 surrogates — pass `:escape-unicode false` for those, or use the
 UTF-8-native `json.clj` battery). Heavier interop may still need porting.
 
+**Executable scripts.** `#!` is a reader comment (as in Clojure's reader), so a
+script can name its own interpreter and be run directly:
+
+```clojure
+#!/usr/bin/env cljc
+(println "hello," (or (first *args*) "world"))
+```
+
+```sh
+chmod +x hello && ./hello there      #=> hello, there
+```
+
+`*args*` holds the arguments after the script path, and `cljc bundle hello out`
+compiles the same file — shebang and all — into a standalone binary. Since `#!`
+comments run to end of line *anywhere*, not just on line 1, a shebang survives
+`load-file`, `require`, `cljc lint`, and piping through stdin.
+
+`/usr/bin/env` accepts no interpreter arguments on Linux. When the script needs
+to choose its own interpreter — a repo-local `./cljc`, a wrapper, an env var —
+use the `sh` trampoline: `sh` sees `#_(` as a comment and reaches the `exec`;
+the reader sees a discarded form and reaches the code.
+
+```clojure
+#!/bin/sh
+#_(
+   exec "${CLJC:-cljc}" "$0" "$@"
+   )
+(println "args:" (vec *args*))
+```
+
+
 ## Platforms
 
 CI builds and runs the full suite (normal + GC-stress) on every push:
