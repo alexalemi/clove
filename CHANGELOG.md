@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.6.0 — 2026-09-13
+## v0.5.1 — 2026-09-13
 
 ### Added
 - **Shebang support for executable scripts.** `#!` now reads as a comment to
