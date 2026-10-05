@@ -2756,6 +2756,128 @@
 (assert= true (clojure.string/includes? (cljc/last-trace*) "cljc_shebang_test.clj:3"))
 (sh "rm -f cljc_shebang_test.clj")
 
+; ── host-interop + numeric-tower gaps found bringing up minijax (2026-09-13) ──
+;; Clojure coerces at integer positions (RT.intCast): truncation toward zero.
+(assert= 2 (nth [1 2 3] 1.9))
+(assert= "ello" (subs "hello" 1.7))
+(assert= 1 (nth [1 2 3] 1/2))
+;; ...but the JIT/FFI bridge stays strict: a ^long fn must not silently
+;; truncate 2.5 and disagree with its interpreted twin (see jit-fib above).
+
+;; real double arrays: (def double-array int-array) used to swallow the point
+(let [a (double-array 3)]
+  (aset a 0 2.5) (aset a 1 7)                      ; any number widens in
+  (assert= [2.5 7.0 0.0] (vec a))
+  (assert= 2.5 (aget a 0))
+  (assert= 2.5 (a 0))
+  (assert= 2.5 (nth a 0))
+  (assert= '(2.5 7.0 0.0) (seq a))
+  (assert= 3 (alength a))
+  (assert= :double-array (type a)))
+(assert= [1 2 3] (vec (int-array [1 2 3])))         ; int arrays unchanged
+(assert= :int-array (type (int-array 2)))
+(assert= [1.5 1.5] (vec (double-array 2 1.5)))
+
+;; keyword-as-fn is RT.get: it must see every collection `get` sees
+(assert= 1 (:a (into (sorted-map) [[:a 1] [:b 2]])))
+(assert= :a (:a (sorted-set :a)))
+(assert= :a (:a #{:a}))
+(assert= :dflt (:z {:a 5} :dflt))
+
+;; map literals evaluate in SOURCE order, like Clojure's array-map literals:
+;; {:result (f) :values @acc} must run f before reading acc
+(let [log (atom []) t (fn [x] (swap! log conj x) x)]
+  (assert= {:a 1 :b 2 :c 3} {:a (t 1) :b (t 2) :c (t 3)})
+  (assert= [1 2 3] @log))
+(let [c (atom {})]
+  (assert= {:r :ran :v {:x 1}} {:r (do (swap! c assoc :x 1) :ran) :v @c}))
+
+;; Math/signum: NaN and both zeros pass through unchanged
+(assert= [-1.0 1.0 0.0] [(Math/signum -3.0) (Math/signum 2.5) (Math/signum 0.0)])
+(assert= true (cljc/nan?* (Math/signum ##NaN)))
+
+;; java.util.Random is the JVM's 48-bit LCG, value-for-value
+(let [r (java.util.Random. 42)]
+  (assert= 0.7275636800328681 (.nextDouble r))
+  (assert= 0.6832234717598454 (.nextDouble r))
+  (assert= 5694868678511409995 (.nextLong r))
+  (assert= 1190043011 (.nextInt r))
+  (assert= 8 (.nextInt r 10))
+  (assert= true (.nextBoolean r))
+  (assert= -0.8761154839986063 (.nextGaussian r))
+  (assert= -0.10449443722947346 (.nextGaussian r)))   ; the cached deviate
+
+;; format %g follows Java (keeps trailing zeros), not C (strips them)
+(assert= "2.000" (format "%.4g" 2.0))
+(assert= "2.00000" (format "%g" 2.0))
+(assert= "1.235e+04" (format "%.4g" 12345.678))
+
+;; inc/dec reach past int64, and bigint is idempotent
+(assert= 100000000000000000000N (inc (bigint "99999999999999999999")))
+(assert= -100000000000000000000N (dec (bigint "-99999999999999999999")))
+(assert= 3/2 (inc 1/2))
+(assert= 99999999999999999999N (bigint (bigint "99999999999999999999")))
+
+;; java.math.BigDecimal: exact, HALF_UP, JVM-compatible toString
+(assert= "0.142857142857142857142857142857"
+         (str (.divide (BigDecimal. "1") (BigDecimal. "7") (java.math.MathContext. 30))))
+(assert= "0.25" (str (.divide (BigDecimal. "2") (BigDecimal. "8")   ; exact -> preferred scale
+                              (java.math.MathContext. 5))))
+(assert= "123.4567" (str (.add (BigDecimal. "123.456") (BigDecimal. "0.0007"))))
+(assert= "0.0864192" (str (.multiply (BigDecimal. "123.456") (BigDecimal. "0.0007"))))
+(assert= "-2.5E+3" (str (.scaleByPowerOfTen (BigDecimal. "-2.5") 3)))  ; sci notation
+(assert= "123.4560" (str (.setScale (BigDecimal. "123.456") 4 java.math.RoundingMode/HALF_UP)))
+(assert= "1.01" (str (.setScale (BigDecimal. "1.005") 2 java.math.RoundingMode/HALF_UP)))
+(assert= 1 (.compareTo (BigDecimal. "1.005") (BigDecimal. "1")))
+(assert= 2.5 (double (BigDecimal. "2.5")))
+
+;; BigDecimal is a real number type (CLJC_BIGDEC), not a tagged map: the core
+;; numeric ops, =, hash, compare and the printer all know it
+(assert= 3.0M (+ 1.5M 1.5M))
+(assert= 3.0M (let [b (BigDecimal. "1.5")] (+ b b)))
+(assert= "1.5M" (pr-str (BigDecimal. "1.5")))
+(assert= "1.5" (str 1.5M))
+(assert= true (decimal? 1.5M))                       ; the literal reads as BigDecimal
+(assert= [true false] [(number? 1M) (map? 1M)])
+(assert= true (= 1.0M 1.00M))                        ; = is by value, like compareTo
+(assert= (hash 1.0M) (hash 1.00M))                   ; ...so hash must agree
+(assert= false (= 1M 1))                             ; but categories still differ
+(assert= true (== 1M 1))
+(assert= 1.25M (+ 1M 1/4))                           ; ratio converts exactly
+(assert= 1.5 (+ 1M 0.5))                             ; a double wins
+(assert= "1.50M" (pr-str (/ 150M 1E+2M)))            ; preferred scale a.s - b.s
+(assert= "3M" (pr-str (/ 6.0M 2.0M)))
+(assert= "Non-terminating decimal expansion; no exact representable decimal result."
+         (try (/ 1M 3M) (catch Exception e (ex-message e))))
+(assert= "Non-terminating decimal expansion; no exact representable decimal result."
+         (try (.divide 1M 3M) (catch Exception e (ex-message e))))
+(assert= ["3.0M" "1.5M" "0.5M" "0E+3M"]
+         (mapv pr-str [(quot 7.5M 2) (rem 7.5M 2) (mod -7.5M 2) (quot 1E+3M 7000M)]))
+(assert= '(1/2 0.7 1.5M 2) (sort [2 1.5M 1/2 0.7]))
+(assert= "1.01" (format "%.2f" 1.005M))              ; exact HALF_UP, not via double
+(assert= "-0.000" (format "%.3f" -8.1E-7M))
+(assert= 3/2 (rationalize 1.5M))
+(assert= 2 (long 2.7M))
+(assert= "1000" (.toPlainString 1E+3M))              ; plain never uses E notation
+;; MathContext division rounds once: double rounding gave -0.484498
+(assert= "-0.484497" (str (.divide 484299M -999590.3008M (java.math.MathContext. 6))))
+
+;; nextInt(n) rejects the biased last block, as the JVM's int-overflow test
+;; does -- missing it desyncs the stream about once per 2^31/n draws
+(let [r (java.util.Random. 42)]
+  (assert= [117392763 1467211248 102948884]
+           [(.nextInt r 1500000000) (.nextInt r 1500000000) (.nextInt r 1500000000)]))
+
+;; an int array refuses a non-integer rather than truncating it; the
+;; constructors still coerce, as Clojure's int-array does
+(assert= true (clojure.string/includes?
+                (try (aset (int-array 2) 0 2.5) (catch Exception e (ex-message e)))
+                "argument type mismatch"))
+(assert= [1 2] (vec (int-array [1.5 2.7])))
+
+;; map-literal keys that only collide once evaluated are a runtime error
+(assert= "Duplicate key: 1" (try (let [x 1] {x 1 1 2}) (catch Exception e (ex-message e))))
+
 ; ── var meta carries :doc/:arglists; error traces reach into VM'd bodies ──
 (let [m (meta (var docqol-f))]
   (assert= 'docqol-f (:name m))

@@ -157,7 +157,8 @@ typedef enum {
     CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
     CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
     CLJC_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
-    CLJC_IARRAY,    /* mutable flat int64 array: (int-array n) — no per-element boxing */
+    CLJC_IARRAY,    /* mutable flat array of int64 or double: (int-array n) /
+                     * (double-array n) — no per-element boxing */
     CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
     CLJC_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
                      * true, (= () nil) false, but seq/to_seq of it is NIL so the
@@ -167,6 +168,9 @@ typedef enum {
                      * demote back to CLJC_INT, so the common case never allocates */
     CLJC_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
                      * reduced, den!=1 (den==1 demotes to the integer) */
+    CLJC_BIGDEC,    /* java.math.BigDecimal: unscaled (INT or BIGINT) x 10^-scale.
+                     * Never normalized -- 1.0M and 1.00M keep their scales, as in
+                     * Java -- but = and hash compare by value (compareTo == 0) */
     CLJC_VAR,       /* a Var: a named reference to a global binding. Derefs to the
                      * binding's current value, is IFn (calls the value), and
                      * carries {:name :ns} metadata — what (resolve sym) returns */
@@ -222,7 +226,11 @@ struct Cljc {
         struct { Cljc *root; Cljc **tail; uint32_t count; uint32_t edit_id;
                  uint8_t shift; uint8_t taillen; bool alive; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
-        struct { Cljc *root; size_t count; } map;
+        /* lit_order is set only on a map LITERAL as read: the reader's
+         * original (k1 v1 k2 v2 ...) form list, kept so eval can evaluate
+         * entries in source order (a HAMT has none). NULL on every map built
+         * at runtime -- map_assoc allocates a fresh zeroed cell. */
+        struct { Cljc *root; size_t count; Cljc *lit_order; } map;
         /* sorted set/map: root of a weight-balanced tree (NIL when empty); cmp is
          * the comparator fn (NIL = default cmp_values). */
         struct { Cljc *root; Cljc *cmp; bool is_map; } sorted;
@@ -246,6 +254,7 @@ struct Cljc {
          * mag[n-1] != 0 (never stored as zero — zero demotes to CLJC_INT). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
         struct { Cljc *num; Cljc *den; } ratio;   /* CLJC_RATIO */
+        struct { Cljc *u; int64_t s; } bigdec;     /* CLJC_BIGDEC: u * 10^-s */
         struct { const char *name; } var;          /* CLJC_VAR: canonical binding name */
         struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
@@ -254,8 +263,12 @@ struct Cljc {
         struct { uint32_t *code; Cljc **consts;
                  uint32_t ncode; uint16_t nconst; } chunk;
         struct Coro *coro;   /* CLJC_CORO: heap-allocated coroutine state */
-        /* CLJC_IARRAY: cell-owned flat buffer (freed on sweep); no GC children */
-        struct { int64_t *data; uint32_t n; } iarr;
+        /* CLJC_IARRAY: cell-owned flat buffer (freed on sweep); no GC children.
+         * dbl=true marks a double-array: the same 8-byte slots hold IEEE bit
+         * patterns instead of integers. Same element size, same allocation and
+         * sweep path, and still nothing for the GC to trace -- only the read
+         * and write ends need to know which kind it is. */
+        struct { int64_t *data; uint32_t n; bool dbl; } iarr;
     } as;
 };
 
@@ -293,8 +306,14 @@ static const char *intern(const char *s, size_t n);
 static bool cljc_eq(Cljc *a, Cljc *b);
 static bool map_find(Cljc *m, Cljc *key, Cljc **out);
 static double as_num(Cljc *v);
+static Cljc *iarr_get(Cljc *a, int64_t i);
+static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs);
+static void iarr_set(Cljc *a, int64_t i, Cljc *v, const char *what);
 static Cljc *big_from_decimal(const char *s);
 static char *big_to_decimal(Cljc *v);
+static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R);
+static bool big_is_zero(Cljc *A);
+static Cljc *bd_parse(const char *t, size_t n);
 static Cljc *make_ratio(Cljc *num, Cljc *den);
 static Cljc *to_seq(Cljc *v);
 static Cljc *seq1(Cljc *v);
@@ -617,6 +636,7 @@ static const char *val_type_name(Cljc *v) {
         case CLJC_INT: case CLJC_BIGINT: return "an integer";
         case CLJC_DOUBLE:  return "a float";
         case CLJC_RATIO:   return "a ratio";
+        case CLJC_BIGDEC:  return "a decimal";
         case CLJC_STRING:  return "a string";
         case CLJC_CHAR:    return "a character";
         case CLJC_KEYWORD: return "a keyword";
@@ -632,7 +652,7 @@ static const char *val_type_name(Cljc *v) {
         case CLJC_ATOM:    return "an atom";
         case CLJC_VAR:     return "a var";
         case CLJC_CORO:    return "a coroutine";
-        case CLJC_IARRAY:  return "an int-array";
+        case CLJC_IARRAY:  return v->as.iarr.dbl ? "a double-array" : "an int-array";
         default:           return "a value";
     }
 }
@@ -1228,6 +1248,9 @@ static void gc_drain(void) {
                 mark_push(v->as.ratio.num);
                 mark_push(v->as.ratio.den);
                 break;
+            case CLJC_BIGDEC:
+                mark_push(v->as.bigdec.u);
+                break;
             case CLJC_VECTOR:
             case CLJC_TVEC:
                 for (size_t i = 0; i < v->as.vec.taillen; i++) mark_push(v->as.vec.tail[i]);
@@ -1236,6 +1259,7 @@ static void gc_drain(void) {
             case CLJC_MAP:
             case CLJC_SET:
                 mark_push(v->as.map.root);          /* NULL-safe */
+                mark_push(v->as.map.lit_order);     /* map literals only; NULL otherwise */
                 break;
             case CLJC_SORTED:
                 mark_push(v->as.sorted.root);
@@ -1565,6 +1589,12 @@ static uint32_t cljc_hash(Cljc *v) {
             for (uint32_t i = 0; i < v->as.big.n; i++) h = h * 31 + v->as.big.mag[i];
             return mix64(h); }
         case CLJC_RATIO: return mix64(cljc_hash(v->as.ratio.num) * 31 + cljc_hash(v->as.ratio.den));
+        case CLJC_BIGDEC: {   /* = is by value, so hash the trailing-zero-stripped form */
+            Cljc *u = v->as.bigdec.u, *q, *r; int64_t sc = v->as.bigdec.s;
+            if (big_is_zero(u)) sc = 0;
+            else for (;;) { big_divmod(u, mk_int(10), &q, &r); if (!big_is_zero(r)) break; u = q; sc--; }
+            return mix64(cljc_hash(u) * 31 + (uint64_t)sc + 0x9e3779b97f4a7c15ull);
+        }
         case CLJC_DOUBLE: {
             double d = v->as.d;
             if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
@@ -2162,7 +2192,7 @@ static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
         return argv[0];                       /* shim passthrough */
     if (argv[0] != NIL && argv[0]->tag == CLJC_IARRAY) {   /* array -> vector copy */
         Cljc *arr = argv[0], *v = mk_empty_vec();
-        for (uint32_t i = 0; i < arr->as.iarr.n; i++) v = vec_conj1(v, mk_int(arr->as.iarr.data[i]));
+        for (uint32_t i = 0; i < arr->as.iarr.n; i++) v = vec_conj1(v, iarr_get(arr, i));
         return v;
     }
     Cljc *t = as_tvec(argv[0], "persistent!");
@@ -2239,7 +2269,7 @@ static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
         int64_t i = as_int(argv[1], "assoc!");
         if (i < 0 || i >= (int64_t)arr->as.iarr.n)
             cljc_error("assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
-        arr->as.iarr.data[i] = as_int(argv[2], "assoc!");
+        iarr_set(arr, i, argv[2], "assoc!");
         return arr;
     }
     (void)env; (void)nargs;
@@ -2367,9 +2397,23 @@ static Cljc *peel_meta_sym_priv(Cljc *v, bool *priv) {
 static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
 static int64_t as_int(Cljc *v, const char *what) {
-    if (v == NULL || v->tag != CLJC_INT)
-        cljc_error("%s: expected a number, got %s", what, val_desc(v));
-    return v->as.i;
+    if (v != NULL) {
+        if (v->tag == CLJC_INT) return v->as.i;
+        /* Clojure coerces at integer positions (RT.intCast): (nth v 1.9) is
+         * index 1, (subs s 1/2) index 0 -- truncation toward zero, which is
+         * what a C cast already does. Numeric code that computes an index in
+         * floating point (chebfun, array shapes) relies on this. A BIGINT
+         * here is by construction out of int64 range (in-range values demote
+         * to CLJC_INT), so it falls through to the error below. */
+        if (v->tag == CLJC_DOUBLE || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
+            double d = as_num(v);
+            if (!(d >= -9.2233720368547758e18 && d <= 9.2233720368547758e18))
+                cljc_error("%s: value out of integer range: %g", what, d);
+            return (int64_t)d;
+        }
+    }
+    cljc_error("%s: expected a number, got %s", what, val_desc(v));
+    return 0;
 }
 
 /* ───── Growable string buffer ───────────────────────────────────────── */
@@ -2377,6 +2421,7 @@ static int64_t as_int(Cljc *v, const char *what) {
 /* Shared by the reader (string escapes) and the printer, so that `str`,
  * `pr-str`, and stdout printing all use a single implementation. */
 typedef struct { char *data; size_t len, cap; } SBuf;
+static void bd_print(SBuf *sb, Cljc *v);
 
 static void sb_grow(SBuf *sb, size_t need) {
     if (sb->len + need + 1 <= sb->cap) return;
@@ -2466,6 +2511,12 @@ static Cljc *read_atom(const char **p) {
                 free(tmp);
                 return r;
             }
+        }
+        /* BigDecimal literal: 1.5M, 1M, 1E+3M -- the decimal text before M */
+        if (start[n - 1] == 'M') {
+            Cljc *d = bd_parse(start, n - 1);
+            if (!d) rd_error("invalid number: %.*s", (int)n, start);
+            return d;
         }
         /* ratio literal: [+-]?digits/digits -> exact rational */
         {
@@ -2960,6 +3011,9 @@ static Cljc *read_form(const char **p) {
                 rd_error("duplicate key in map literal");
             m = map_assoc(m, l->as.cons.head, l->as.cons.tail->as.cons.head);
         }
+        m->as.map.lit_order = list;   /* source order for eval; costs nothing --
+                                       * this list is already built and would
+                                       * otherwise be garbage */
         return m;
     }
     if (c == '"') return read_string(p);
@@ -3706,7 +3760,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
             return;
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_CHAR:
-        case CLJC_KEYWORD: case CLJC_BIGINT: case CLJC_RATIO:
+        case CLJC_KEYWORD: case CLJC_BIGINT: case CLJC_RATIO: case CLJC_BIGDEC:
         case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
             /* map/set literals with computed elements are rare in hot
              * bodies; constant ones are common — non-constant fall back */
@@ -4416,9 +4470,12 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     /* Keywords as functions: (:key m) and (:key m default). */
     if (fn->tag == CLJC_KEYWORD) {
         if (nargs < 1 || nargs > 2) cljc_error("keyword lookup takes 1 or 2 args, got %d", nargs);
-        Cljc *out;
-        if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
-        return a1;
+        /* Clojure's Keyword.invoke is exactly RT.get, so this has to cover
+         * every collection `get` covers. Matching only CLJC_MAP here made
+         * (:k (sorted-map ...)) and (:k #{:k}) read as nil instead of finding
+         * the entry -- a silent wrong answer, not an error. */
+        Cljc *gargv[3] = { a0, fn, a1 };
+        return prim_get(env, gargv, nargs > 1 ? 3 : 2);
     }
     if (fn->tag == CLJC_MAP) {
         /* a deftype instance implementing `invoke` is callable (SCI's Var-as-fn
@@ -4456,7 +4513,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
         if (a0 == NIL || a0->tag != CLJC_INT || a0->as.i < 0 ||
             a0->as.i >= (int64_t)fn->as.iarr.n)
             cljc_error("int-array lookup: bad index");
-        return mk_int(fn->as.iarr.data[a0->as.i]);
+        return iarr_get(fn, a0->as.i);
     }
     if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
@@ -4746,7 +4803,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
         case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
-        case CLJC_BIGINT: case CLJC_RATIO: case CLJC_VAR:
+        case CLJC_BIGINT: case CLJC_RATIO: case CLJC_BIGDEC: case CLJC_VAR:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
         case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO: case CLJC_IARRAY:
         case CLJC_SORTED:  /* a constructed sorted coll has no reader literal */
@@ -4771,8 +4828,33 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
         }
         case CLJC_MAP: {
             /* Map literal: evaluate each key/value form, assoc into a fresh
-             * map. Evaluation order follows hash order, not source order. */
+             * map. Clojure evaluates the entries in SOURCE order -- a small
+             * map literal is an array-map, whose seq is insertion order -- so
+             * {:result (f) :values @acc} runs f before reading acc. A HAMT has
+             * no source order, so walk the reader's original k/v form list
+             * when we have it (every map literal) and fall back to hash order
+             * for a map form built some other way, e.g. by a macro. */
             Cljc *m = mk_map();
+            Cljc *ord = form->as.map.lit_order;
+            if (ord) {
+                for (Cljc *l = ord; l && l->tag == CLJC_LIST;
+                     l = l->as.cons.tail->as.cons.tail) {
+                    Cljc *k = eval(env, l->as.cons.head);
+                    Cljc *val = eval(env, l->as.cons.tail->as.cons.head);
+                    size_t before = m->as.map.count;
+                    m = map_assoc(m, k, val);
+                    /* the reader rejects {:a 1 :a 2}; keys that only collide
+                     * once evaluated, (let [x 1] {x 1 1 2}), are caught here,
+                     * as Clojure's runtime map construction does */
+                    if (m->as.map.count == before) {
+                        SBuf kb = {0}; print_to(&kb, k, true);
+                        char msg[256]; snprintf(msg, sizeof msg, "Duplicate key: %s", kb.data ? kb.data : "");
+                        free(kb.data);
+                        cljc_error("%s", msg);
+                    }
+                }
+                return m;
+            }
             for (Cljc *e = map_entry_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
                 Cljc *k = eval(env, e->as.cons.head->as.cons.head);
                 Cljc *val = eval(env, e->as.cons.head->as.cons.tail);
@@ -5593,10 +5675,12 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_EMPTY: sb_puts(sb, "()"); break;
         case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
-        case CLJC_IARRAY: sb_printf(sb, "#<int-array %u>", v->as.iarr.n); break;
+        case CLJC_IARRAY: sb_printf(sb, "#<%s-array %u>",
+                                    v->as.iarr.dbl ? "double" : "int", v->as.iarr.n); break;
         case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
         case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
+        case CLJC_BIGDEC: bd_print(sb, v); if (readably) sb_putc(sb, 'M'); break;
         case CLJC_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
         case CLJC_DOUBLE: format_double(sb, v->as.d); break;
         case CLJC_SYMBOL: sb_puts(sb, v->as.sym); break;
@@ -6285,8 +6369,21 @@ static Cljc *big_from_decimal(const char *s) {
 }
 
 /* ───── Exact rationals ──────────────────────────────────────────────── */
-static Cljc *rat_num(Cljc *v) { return v->tag == CLJC_RATIO ? v->as.ratio.num : v; }
-static Cljc *rat_den(Cljc *v) { return v->tag == CLJC_RATIO ? v->as.ratio.den : mk_int(1); }
+static Cljc *pow10_big(int64_t k);
+static int num_cmp(Cljc *a, Cljc *b);
+/* A BIGDEC u*10^-s reads as the (unreduced) fraction u*10^max(0,-s) / 10^max(0,s),
+ * so exact comparison and ratio arithmetic need no separate decimal path. */
+static Cljc *rat_num(Cljc *v) {
+    if (v->tag == CLJC_RATIO) return v->as.ratio.num;
+    if (v->tag == CLJC_BIGDEC)
+        return v->as.bigdec.s < 0 ? big_mul(v->as.bigdec.u, pow10_big(-v->as.bigdec.s)) : v->as.bigdec.u;
+    return v;
+}
+static Cljc *rat_den(Cljc *v) {
+    if (v->tag == CLJC_RATIO) return v->as.ratio.den;
+    if (v->tag == CLJC_BIGDEC && v->as.bigdec.s > 0) return pow10_big(v->as.bigdec.s);
+    return mk_int(1);
+}
 
 /* Build a reduced rational from num/den (each INT or BIGINT): force den>0,
  * divide out the gcd, and demote to an integer when den becomes 1. */
@@ -6308,6 +6405,196 @@ static double ratio_to_double(Cljc *v) {
     return big_to_double(v->as.ratio.num) / big_to_double(v->as.ratio.den);
 }
 
+/* ───── java.math.BigDecimal ─────────────────────────────────────────────
+ * unscaled * 10^-scale, unscaled an INT or BIGINT. Arithmetic is exact and
+ * follows Java's scale rules: + and - take the larger scale, * adds scales,
+ * and / is Java's exact divide -- the quotient at the smallest scale >= the
+ * preferred scale (dividend.scale - divisor.scale) that represents it, or an
+ * ArithmeticException when the expansion does not terminate (1M/3M). */
+static Cljc *mk_bigdec(Cljc *u, int64_t s) {
+    Cljc *d = alloc(CLJC_BIGDEC);
+    d->as.bigdec.u = u; d->as.bigdec.s = s;
+    return d;
+}
+static Cljc *pow10_big(int64_t k) {          /* 10^k, k >= 0, by squaring */
+    Cljc *r = mk_int(1), *b = mk_int(10);
+    for (; k > 0; k >>= 1) {
+        if (k & 1) r = big_mul(r, b);
+        if (k > 1) b = big_mul(b, b);
+    }
+    return r;
+}
+/* the unscaled value of x re-expressed at scale s (s >= x's scale) */
+static Cljc *bd_unscaled_at(Cljc *x, int64_t s) {
+    return s == x->as.bigdec.s ? x->as.bigdec.u : big_mul(x->as.bigdec.u, pow10_big(s - x->as.bigdec.s));
+}
+/* Exact num/den * 10^-pref as a decimal at the smallest scale >= pref. With
+ * num/den reduced, den must be 2^a 5^b, and k = max(a,b) extra digits make it
+ * exact; anything else never terminates. */
+static Cljc *bd_exact_quot(Cljc *num, Cljc *den, int64_t pref) {
+    if (big_is_zero(den)) cljc_error("Divide by zero");
+    if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
+    if (big_is_zero(num)) return mk_bigdec(mk_int(0), pref);
+    Cljc *g = big_gcd(num, den);
+    if (!(g->tag == CLJC_INT && g->as.i == 1)) {
+        Cljc *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
+        num = qn; den = qd;
+    }
+    int64_t twos = 0, fives = 0;
+    Cljc *d = den, *q, *r;
+    for (;;) { big_divmod(d, mk_int(2), &q, &r); if (!big_is_zero(r)) break; d = q; twos++; }
+    for (;;) { big_divmod(d, mk_int(5), &q, &r); if (!big_is_zero(r)) break; d = q; fives++; }
+    if (!(d->tag == CLJC_INT && d->as.i == 1))
+        cljc_error("Non-terminating decimal expansion; no exact representable decimal result.");
+    int64_t k = twos > fives ? twos : fives;
+    Cljc *mult; big_divmod(pow10_big(k), den, &mult, NULL);   /* 10^k / den, exact */
+    return mk_bigdec(big_mul(num, mult), k + pref);
+}
+/* any exact number -> BIGDEC: integers at scale 0, ratios by exact division */
+static Cljc *to_bigdec(Cljc *v) {
+    if (v->tag == CLJC_BIGDEC) return v;
+    if (v->tag == CLJC_RATIO) return bd_exact_quot(v->as.ratio.num, v->as.ratio.den, 0);
+    return mk_bigdec(v, 0);
+}
+static Cljc *bd_div(Cljc *a, Cljc *b) {
+    a = to_bigdec(a); b = to_bigdec(b);
+    return bd_exact_quot(a->as.bigdec.u, b->as.bigdec.u, a->as.bigdec.s - b->as.bigdec.s);
+}
+/* "1.50", "-2.5e3", "+.5": Java's BigDecimal(String) grammar; NULL if malformed */
+static Cljc *bd_parse(const char *t, size_t n) {
+    size_t i = 0; bool neg = false;
+    if (i < n && (t[i] == '+' || t[i] == '-')) neg = t[i++] == '-';
+    char *digs = xmalloc(n + 2); size_t nd = 0; int64_t frac = 0; bool dot = false, any = false;
+    for (; i < n; i++) {
+        char c = t[i];
+        if (c >= '0' && c <= '9') { digs[nd++] = c; any = true; if (dot) frac++; }
+        else if (c == '.' && !dot) dot = true;
+        else break;
+    }
+    int64_t expo = 0;
+    if (any && i < n && (t[i] == 'e' || t[i] == 'E')) {
+        i++; bool eneg = false, edig = false;
+        if (i < n && (t[i] == '+' || t[i] == '-')) eneg = t[i++] == '-';
+        for (; i < n && t[i] >= '0' && t[i] <= '9'; i++) {
+            if (expo > 100000000) { free(digs); cljc_error("BigDecimal: exponent out of range"); }
+            expo = expo * 10 + (t[i] - '0'); edig = true;
+        }
+        if (!edig) any = false;
+        if (eneg) expo = -expo;
+    }
+    if (!any || i != n) { free(digs); return NULL; }
+    digs[nd] = '\0';
+    Cljc *u = big_from_decimal(digs);
+    free(digs);
+    if (neg) u = big_addsub(mk_int(0), u, 1);
+    return mk_bigdec(u, frac - expo);
+}
+/* Java's BigDecimal.toString: plain when scale >= 0 and the adjusted exponent
+ * >= -6, otherwise one digit, a point, and E+n/E-n (so 1E+3M stays 1E+3). */
+static void bd_print(SBuf *sb, Cljc *v) {
+    Cljc *u = v->as.bigdec.u; int64_t s = v->as.bigdec.s;
+    char *ds = big_to_decimal(u), *p = ds;
+    if (*p == '-') { sb_putc(sb, '-'); p++; }
+    int64_t nd = (int64_t)strlen(p), adj = nd - 1 - s;
+    if (s >= 0 && adj >= -6) {
+        if (s == 0) sb_puts(sb, p);
+        else if (nd > s) {
+            for (int64_t i = 0; i < nd - s; i++) sb_putc(sb, p[i]);
+            sb_putc(sb, '.'); sb_puts(sb, p + (nd - s));
+        } else {
+            sb_puts(sb, "0.");
+            for (int64_t i = 0; i < s - nd; i++) sb_putc(sb, '0');
+            sb_puts(sb, p);
+        }
+    } else {
+        sb_putc(sb, p[0]);
+        if (nd > 1) { sb_putc(sb, '.'); sb_puts(sb, p + 1); }
+        char e[32]; snprintf(e, sizeof e, "E%c%lld", adj < 0 ? '-' : '+', (long long)(adj < 0 ? -adj : adj));
+        sb_puts(sb, e);
+    }
+    free(ds);
+}
+/* value rescaled to scale n, rounding HALF_UP (ties away from zero) */
+static Cljc *bd_round_half_up(Cljc *v, int64_t n) {
+    int64_t s = v->as.bigdec.s;
+    if (n >= s) return mk_bigdec(bd_unscaled_at(v, n), n);
+    Cljc *d = pow10_big(s - n), *q, *r;
+    big_divmod(v->as.bigdec.u, d, &q, &r);
+    Cljc *r2 = big_mul(big_abs(r), mk_int(2));
+    if (big_cmp(r2, d) >= 0)
+        q = big_addsub(q, mk_int(1), big_cmp(v->as.bigdec.u, mk_int(0)) < 0);
+    return mk_bigdec(q, n);
+}
+/* plain notation, never E -- %f output and toPlainString agree on this */
+static void bd_print_plain(SBuf *sb, Cljc *v) {
+    int64_t s = v->as.bigdec.s;
+    if (s < 0) { v = mk_bigdec(bd_unscaled_at(v, 0), 0); s = 0; }
+    char *ds = big_to_decimal(v->as.bigdec.u), *p = ds;
+    if (*p == '-') { sb_putc(sb, '-'); p++; }
+    int64_t nd = (int64_t)strlen(p);
+    if (s == 0) sb_puts(sb, p);
+    else if (nd > s) {
+        for (int64_t i = 0; i < nd - s; i++) sb_putc(sb, p[i]);
+        sb_putc(sb, '.'); sb_puts(sb, p + (nd - s));
+    } else {
+        sb_puts(sb, "0.");
+        for (int64_t i = 0; i < s - nd; i++) sb_putc(sb, '0');
+        sb_puts(sb, p);
+    }
+    free(ds);
+}
+/* correctly rounded: let strtod round the exact decimal text */
+static double bd_to_double(Cljc *v) {
+    SBuf sb = {0}; bd_print(&sb, v);
+    double d = strtod(sb.data, NULL);
+    free(sb.data);
+    return d;
+}
+
+/* (bigdec x) / (BigDecimal. x): strings parse exactly; a double goes through
+ * its shortest repr, as BigDecimal.valueOf does, so (bigdec 0.1) is 0.1M */
+static Cljc *prim_to_bigdec(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; need_nargs(nargs, 1, "bigdec");
+    Cljc *v = argv[0];
+    if (v != NIL && v->tag == CLJC_STRING) {
+        Cljc *d = bd_parse(v->as.str, strlen(v->as.str));
+        if (!d) cljc_error("NumberFormatException: invalid BigDecimal: \"%s\"", v->as.str);
+        return d;
+    }
+    if (v != NIL && v->tag == CLJC_DOUBLE) {
+        if (!isfinite(v->as.d)) cljc_error("NumberFormatException: infinite or NaN");
+        SBuf sb = {0}; format_double(&sb, v->as.d);
+        Cljc *d = bd_parse(sb.data, sb.len);
+        free(sb.data);
+        return d;
+    }
+    if (v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC))
+        return to_bigdec(v);
+    cljc_error("bigdec: expected a number or string, got %s", val_desc(v));
+    return NIL;
+}
+static Cljc *need_bigdec(Cljc *v, const char *what) {
+    if (v == NIL || v->tag != CLJC_BIGDEC) cljc_error("%s: expected a BigDecimal, got %s", what, val_desc(v));
+    return v;
+}
+static Cljc *prim_bd_unscaled(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs; return need_bigdec(argv[0], "unscaledValue")->as.bigdec.u;
+}
+static Cljc *prim_bd_scale(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; (void)nargs; return mk_int(need_bigdec(argv[0], "scale")->as.bigdec.s);
+}
+static Cljc *prim_mk_bigdec(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; need_nargs(nargs, 2, "cljc/mk-bd");
+    Cljc *u = argv[0];
+    if (u == NIL || (u->tag != CLJC_INT && u->tag != CLJC_BIGINT)) cljc_error("cljc/mk-bd: unscaled must be an integer");
+    return mk_bigdec(u, as_int(argv[1], "cljc/mk-bd"));
+}
+static Cljc *prim_bd_to_ratio(CljcEnv *env, Cljc **argv, int nargs) {   /* (rationalize 1.5M) */
+    (void)env; (void)nargs;
+    Cljc *v = need_bigdec(argv[0], "rationalize");
+    return make_ratio(rat_num(v), rat_den(v));
+}
+
 typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV } ArithOp;
 
 static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
@@ -6324,12 +6611,13 @@ static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
  * bigint operand always takes the exact path regardless of `promote`. */
 static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
     size_t n = (size_t)nargs;
-    bool is_float = false, is_big = false, is_ratio = false;
+    bool is_float = false, is_big = false, is_ratio = false, is_dec = false;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *v = argv[ai_];
         if (v->tag == CLJC_DOUBLE) is_float = true;
         else if (v->tag == CLJC_BIGINT) is_big = true;
         else if (v->tag == CLJC_RATIO) is_ratio = true;
+        else if (v->tag == CLJC_BIGDEC) is_dec = true;
         else if (v->tag != CLJC_INT) cljc_error("expected a number, got %s", val_desc(v));
     }
     if (n == 0) {
@@ -6338,6 +6626,8 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         cljc_error("wrong number of args (0)");
     }
     if (is_float) goto float_path;
+    /* a BigDecimal anywhere makes the result a BigDecimal (doubles aside) */
+    if (is_dec) goto dec_path;
     /* division of exact integers yields an exact ratio (Clojure), so all
      * non-float division and anything touching a ratio takes the ratio path */
     if (op == OP_DIV || is_ratio) goto ratio_path;
@@ -6410,6 +6700,27 @@ ratio_path: {
             if (!(g->tag == CLJC_INT && g->as.i == 1)) { Cljc *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
         }
         return make_ratio(rn, rd);
+    }
+
+dec_path: {
+        Cljc *acc = to_bigdec(argv[0]);
+        if (n == 1) {
+            if (op == OP_SUB) return mk_bigdec(big_addsub(mk_int(0), acc->as.bigdec.u, 1), acc->as.bigdec.s);
+            if (op == OP_DIV) return bd_div(mk_int(1), acc);
+            return acc;
+        }
+        for (int ai_ = 1; ai_ < nargs; ai_++) {
+            Cljc *x = to_bigdec(argv[ai_]);
+            int64_t sa = acc->as.bigdec.s, sb = x->as.bigdec.s, sm = sa > sb ? sa : sb;
+            switch (op) {
+                case OP_ADD: case OP_SUB:
+                    acc = mk_bigdec(big_addsub(bd_unscaled_at(acc, sm), bd_unscaled_at(x, sm), op == OP_SUB), sm);
+                    break;
+                case OP_MUL: acc = mk_bigdec(big_mul(acc->as.bigdec.u, x->as.bigdec.u), sa + sb); break;
+                case OP_DIV: acc = bd_div(acc, x); break;
+            }
+        }
+        return acc;
     }
 
 float_path:;
@@ -6536,6 +6847,7 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         case CLJC_RATIO: return big_cmp(a->as.ratio.num, b->as.ratio.num) == 0 &&
                                 big_cmp(a->as.ratio.den, b->as.ratio.den) == 0;
         case CLJC_DOUBLE: return a->as.d == b->as.d;
+        case CLJC_BIGDEC: return num_cmp(a, b) == 0;   /* (= 1.0M 1.00M), as Clojure */
         case CLJC_SYMBOL: return a->as.sym == b->as.sym;
         case CLJC_KEYWORD: return a->as.kw == b->as.kw;
         case CLJC_STRING: return strcmp(a->as.str, b->as.str) == 0;
@@ -6586,6 +6898,7 @@ static double as_num(Cljc *v) {
     if (v->tag == CLJC_DOUBLE) return v->as.d;
     if (v->tag == CLJC_BIGINT) return big_to_double(v);
     if (v->tag == CLJC_RATIO) return ratio_to_double(v);
+    if (v->tag == CLJC_BIGDEC) return bd_to_double(v);
     cljc_error("expected a number, got %s", val_desc(v));
     return 0;
 }
@@ -6595,13 +6908,14 @@ static double as_num(Cljc *v) {
  * comparison would lose precision between adjacent large integers). */
 static int num_cmp(Cljc *a, Cljc *b) {
     int ta = a->tag, tb = b->tag;
-#define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO)
+#define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO || (t) == CLJC_BIGDEC)
     if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb))
         cljc_error("can't compare numerically: got %s", val_desc(!CLJC_ISNUM(ta) ? a : b));
     if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
         double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
     }
-    if (ta == CLJC_RATIO || tb == CLJC_RATIO)   /* a/b ? c/d  <=>  a*d ? c*b (dens > 0) */
+    if (ta == CLJC_RATIO || tb == CLJC_RATIO || ta == CLJC_BIGDEC || tb == CLJC_BIGDEC)
+        /* a/b ? c/d  <=>  a*d ? c*b (dens > 0); decimals read as fractions */
         return big_cmp(big_mul(rat_num(a), rat_den(b)), big_mul(rat_num(b), rat_den(a)));
     if (ta == CLJC_BIGINT || tb == CLJC_BIGINT) return big_cmp(a, b);
     int64_t x = a->as.i, y = b->as.i; return x < y ? -1 : (x > y ? 1 : 0);
@@ -6757,7 +7071,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
         }
     }
     if (coll && coll->tag == CLJC_IARRAY) {
-        if (n >= 0 && n < (int64_t)coll->as.iarr.n) return mk_int(coll->as.iarr.data[n]);
+        if (n >= 0 && n < (int64_t)coll->as.iarr.n) return iarr_get(coll, n);
         if (not_found) return not_found;
         cljc_error("nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
     }
@@ -6900,7 +7214,8 @@ TYPE_PRED(set_p,     v != NIL && (v->tag == CLJC_SET || (v->tag == CLJC_SORTED &
 TYPE_PRED(sorted_p,  v != NIL && v->tag == CLJC_SORTED)
 TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
 TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
-TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO))
+TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC))
+TYPE_PRED(decimal_p, v != NIL && v->tag == CLJC_BIGDEC)
 TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
 TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
 TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
@@ -6938,6 +7253,13 @@ static Cljc *prim_inc(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *v = argv[0];
     if (v->tag == CLJC_DOUBLE) return mk_double(v->as.d + 1);
+    /* bigints and ratios take the generic add: (inc 10000000000000000000N)
+     * must not fail just because the value outgrew int64, and (inc 1/2) is
+     * 3/2. Only the int64 fast path stays inline. */
+    if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
+        Cljc *two[2] = { v, mk_int(1) };
+        return arith(OP_ADD, two, 2, false);
+    }
     return mk_int(as_int(v, "inc") + 1);
 }
 
@@ -6945,12 +7267,45 @@ static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     Cljc *v = argv[0];
     if (v->tag == CLJC_DOUBLE) return mk_double(v->as.d - 1);
+    if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
+        Cljc *two[2] = { v, mk_int(1) };
+        return arith(OP_SUB, two, 2, false);
+    }
     return mk_int(as_int(v, "dec") - 1);
+}
+
+/* BigDecimal quot is Java's divideToIntegralValue: the truncated quotient at
+ * the preferred scale (a.scale - b.scale), so (quot 7.5M 2) is 3.0M; rem is
+ * a - quot*b. Both via the fraction view of each operand. */
+static Cljc *bd_quot(Cljc *a, Cljc *b) {
+    Cljc *A = to_bigdec(a), *B = to_bigdec(b), *q;
+    big_divmod(big_mul(rat_num(A), rat_den(B)), big_mul(rat_den(A), rat_num(B)), &q, NULL);
+    int64_t pref = A->as.bigdec.s - B->as.bigdec.s;
+    if (pref >= 0) return mk_bigdec(big_mul(q, pow10_big(pref)), pref);
+    if (big_is_zero(q)) return mk_bigdec(q, pref);      /* Java: 0E+3, not 0 */
+    int64_t sc = 0; Cljc *qq, *r;
+    while (sc > pref && !big_is_zero(q)) {
+        big_divmod(q, mk_int(10), &qq, &r); if (!big_is_zero(r)) break; q = qq; sc--;
+    }
+    return mk_bigdec(q, sc);
+}
+static Cljc *bd_rem(Cljc *a, Cljc *b) {
+    Cljc *m[2] = { bd_quot(a, b), b };
+    Cljc *s[2] = { a, arith(OP_MUL, m, 2, false) };
+    return arith(OP_SUB, s, 2, false);
 }
 
 static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "mod");
+    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) {
+        Cljc *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
+        if (num_cmp(r, mk_int(0)) != 0 && (num_cmp(argv[0], mk_int(0)) > 0) != (num_cmp(argv[1], mk_int(0)) > 0)) {
+            Cljc *two[2] = { r, argv[1] };
+            r = arith(OP_ADD, two, 2, false);
+        }
+        return r;
+    }
     if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
         Cljc *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
         if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
@@ -6980,35 +7335,60 @@ static Cljc *prim_hash_map(CljcEnv *env, Cljc **argv, int nargs) {
  * Flat cell-owned buffer: 8 bytes/element vs ~160 for the old transient-vector
  * shim; aget/aset are O(1) loads/stores with no allocation (beyond the
  * smallint cache covering most aget results). */
-static Cljc *mk_iarray(uint32_t n) {
+static Cljc *mk_iarray_of(uint32_t n, bool dbl) {
     Cljc *a = alloc(CLJC_IARRAY);
     a->as.iarr.n = n;
+    a->as.iarr.dbl = dbl;
     a->as.iarr.data = xmalloc(sizeof(int64_t) * (n ? n : 1));
-    memset(a->as.iarr.data, 0, sizeof(int64_t) * (n ? n : 1));
+    memset(a->as.iarr.data, 0, sizeof(int64_t) * (n ? n : 1));   /* 0 and 0.0 are both all-zero bits */
     gc_extra_bytes += sizeof(int64_t) * (n ? n : 1);
     return a;
 }
+static Cljc *mk_iarray(uint32_t n) { return mk_iarray_of(n, false); }
 
-static Cljc *prim_int_array(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env;
+/* Element access. memcpy rather than a cast through int64_t*: type-punning a
+ * double through an integer pointer is undefined, and every compiler folds
+ * these into a single load/store anyway. */
+static Cljc *iarr_get(Cljc *a, int64_t i) {
+    if (!a->as.iarr.dbl) return mk_int(a->as.iarr.data[i]);
+    double d; memcpy(&d, &a->as.iarr.data[i], sizeof d);
+    return mk_double(d);
+}
+static void iarr_set(Cljc *a, int64_t i, Cljc *v, const char *what) {
+    if (!a->as.iarr.dbl) { a->as.iarr.data[i] = as_int(v, what); return; }
+    double d = as_num(v);   /* any number widens in, as Clojure's aset-double does --
+                             * deliberately looser than the JVM's reflective aset,
+                             * which rejects (aset doubles i 7) for a long 7 */
+    memcpy(&a->as.iarr.data[i], &d, sizeof d);
+}
+
+/* (T-array n) / (T-array n init) / (T-array coll), shared by both element
+ * types -- they differ only in what a slot holds. */
+static Cljc *array_ctor(Cljc **argv, int nargs, bool dbl, const char *name) {
     Cljc *a0 = argv[0];
-    if (a0 != NIL && a0->tag == CLJC_INT) {           /* (int-array n) / (int-array n init) */
+    if (a0 != NIL && a0->tag == CLJC_INT) {
         if (a0->as.i < 0 || a0->as.i > (int64_t)UINT32_MAX)
-            cljc_error("int-array: bad size %lld", (long long)a0->as.i);
-        Cljc *arr = mk_iarray((uint32_t)a0->as.i);
-        if (nargs > 1) {
-            int64_t init = as_int(argv[1], "int-array");
-            for (uint32_t i = 0; i < arr->as.iarr.n; i++) arr->as.iarr.data[i] = init;
-        }
+            cljc_error("%s: bad size %lld", name, (long long)a0->as.i);
+        Cljc *arr = mk_iarray_of((uint32_t)a0->as.i, dbl);
+        if (nargs > 1)
+            for (uint32_t i = 0; i < arr->as.iarr.n; i++) iarr_set(arr, i, argv[1], name);
         return arr;
     }
-    Cljc *s = to_seq(a0);                             /* (int-array coll) */
+    Cljc *s = to_seq(a0);
     size_t n = list_len(s);
-    Cljc *arr = mk_iarray((uint32_t)n);
+    Cljc *arr = mk_iarray_of((uint32_t)n, dbl);
     size_t i = 0;
     for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
-        arr->as.iarr.data[i++] = as_int(l->as.cons.head, "int-array");
+        iarr_set(arr, i++, l->as.cons.head, name);
     return arr;
+}
+
+static Cljc *prim_int_array(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; return array_ctor(argv, nargs, false, "int-array");
+}
+
+static Cljc *prim_double_array(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env; return array_ctor(argv, nargs, true, "double-array");
 }
 
 static Cljc *prim_aget(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7018,7 +7398,7 @@ static Cljc *prim_aget(CljcEnv *env, Cljc **argv, int nargs) {
         int64_t i = as_int(argv[1], "aget");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
             cljc_error("aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
-        return mk_int(a->as.iarr.data[i]);
+        return iarr_get(a, i);
     }
     /* legacy path: transient vectors / vectors behave as arrays */
     Cljc *two[2] = {a, argv[1]};
@@ -7032,7 +7412,12 @@ static Cljc *prim_aset(CljcEnv *env, Cljc **argv, int nargs) {
         int64_t i = as_int(argv[1], "aset");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
             cljc_error("aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
-        a->as.iarr.data[i] = as_int(argv[2], "aset");
+        /* an int array stores what it is handed or refuses, like the JVM's
+         * aset: (aset ints 0 2.5) must not quietly keep 2. The constructors
+         * still coerce -- (int-array [1.5]) truncates, as Clojure's does. */
+        if (!a->as.iarr.dbl && (argv[2] == NIL || argv[2]->tag != CLJC_INT))
+            cljc_error("aset: argument type mismatch: an int array can't hold %s", val_desc(argv[2]));
+        iarr_set(a, i, argv[2], "aset");
         return argv[2];
     }
     Cljc *r = prim_assoc_bang(env, argv, 3);          /* legacy transient path */
@@ -7066,7 +7451,7 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
         if (sorted_get(env, coll, k, &out)) return out;
     } else if (coll != NIL && coll->tag == CLJC_IARRAY && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && k->as.i < (int64_t)coll->as.iarr.n)
-            return mk_int(coll->as.iarr.data[k->as.i]);
+            return iarr_get(coll, k->as.i);
     } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
                && k->tag == CLJC_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
@@ -7220,6 +7605,7 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "rem");
+    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) return bd_rem(argv[0], argv[1]);
     if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
         Cljc *r; big_divmod(argv[0], argv[1], NULL, &r); return r;
     }
@@ -7384,7 +7770,7 @@ static Cljc *to_seq(Cljc *v) {
     if (v->tag == CLJC_IARRAY) {
         Cljc *out = NIL, **t = &out;
         for (uint32_t i = 0; i < v->as.iarr.n; i++) {
-            *t = mk_cons(mk_int(v->as.iarr.data[i]), NIL);
+            *t = mk_cons(iarr_get(v, i), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
@@ -8848,6 +9234,11 @@ static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
     if (v != NIL && v->tag == CLJC_INT) return v;
     if (v != NIL && v->tag == CLJC_CHAR) return mk_int((int64_t)v->as.chr);  /* (int \a) => 97 */
     if (v != NIL && v->tag == CLJC_DOUBLE) return mk_int((int64_t)v->as.d);
+    if (v != NIL && (v->tag == CLJC_BIGDEC || v->tag == CLJC_RATIO)) {   /* (long 2.7M) => 2 */
+        Cljc *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
+        if (q->tag != CLJC_INT) cljc_error("int: value out of range: %s", val_desc(v));
+        return q;
+    }
     if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
         return mk_int((int64_t)(unsigned char)v->as.str[0]);  /* lenient: (int "a") */
     cljc_error("int: expected a number or character");
@@ -8956,6 +9347,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_INT: n = "int"; break;
         case CLJC_BIGINT: n = "bigint"; break;
         case CLJC_RATIO: n = "ratio"; break;
+        case CLJC_BIGDEC: n = "BigDecimal"; break;
         case CLJC_VAR: n = "var"; break;
         case CLJC_DOUBLE: n = "double"; break;
         case CLJC_STRING: n = "string"; break;
@@ -8967,7 +9359,7 @@ static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
         case CLJC_VECTOR: n = "vector"; break;
         case CLJC_SET: n = "set"; break;
         case CLJC_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
-        case CLJC_IARRAY: n = "int-array"; break;
+        case CLJC_IARRAY: n = v->as.iarr.dbl ? "double-array" : "int-array"; break;
         case CLJC_TVEC: n = "transient-vector"; break;
         case CLJC_ATOM: n = "atom"; break;
         case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
@@ -9138,7 +9530,7 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     /* a scalar is clearly not derefable: surface the mistake rather than
      * silently returning it (which becomes a cryptic error downstream). */
     if (v != NIL) switch (v->tag) {
-        case CLJC_INT: case CLJC_BIGINT: case CLJC_DOUBLE: case CLJC_RATIO:
+        case CLJC_INT: case CLJC_BIGINT: case CLJC_DOUBLE: case CLJC_RATIO: case CLJC_BIGDEC:
         case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_SYMBOL:
         case CLJC_BOOL:
             cljc_error("deref: %s is not derefable (expected an atom, var, or delay)",
@@ -9227,8 +9619,7 @@ static int cmp_values(Cljc *a, Cljc *b) {
     if (a == b) return 0;
     if (a == NIL) return -1;          /* nil sorts first */
     if (b == NIL) return 1;
-    bool a_num = a->tag == CLJC_INT || a->tag == CLJC_DOUBLE || a->tag == CLJC_BIGINT || a->tag == CLJC_RATIO;
-    bool b_num = b->tag == CLJC_INT || b->tag == CLJC_DOUBLE || b->tag == CLJC_BIGINT || b->tag == CLJC_RATIO;
+    bool a_num = CLJC_ISNUM(a->tag), b_num = CLJC_ISNUM(b->tag);
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
     if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
@@ -9623,6 +10014,7 @@ static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {
 static Cljc *prim_quot(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "quot");
+    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) return bd_quot(argv[0], argv[1]);
     if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
         Cljc *q; big_divmod(argv[0], argv[1], &q, NULL); return q;
     }
@@ -10439,8 +10831,36 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
                 snprintf(tmp, sizeof tmp, cfmt, (long long)as_int(v, "format"));
                 sb_puts(&out, tmp);
                 break;
-            case 'f': case 'e': case 'g':
-                snprintf(cfmt, sizeof cfmt, "%%%s%c", spec, conv);
+            case 'f': case 'e': case 'E': case 'g': case 'G':
+                /* Java formats a BigDecimal's %f from its exact value, HALF_UP:
+                 * (format "%.2f" 1.005M) is "1.01", where the double 1.005 is
+                 * really 1.00499... and gives "1.00". Width and '-' still
+                 * apply; the result is padded like any string. */
+                if (conv == 'f' && v != NIL && v->tag == CLJC_BIGDEC) {
+                    const char *dot = strchr(spec, '.');
+                    int64_t prec = dot ? atoi(dot + 1) : 6;
+                    SBuf num = {0};
+                    Cljc *rv = bd_round_half_up(v, prec);
+                    /* Java keeps the sign of a negative value that rounds to
+                     * zero: (format "%.3f" -8.1E-7M) is "-0.000" */
+                    if (big_is_zero(rv->as.bigdec.u) && big_cmp(v->as.bigdec.u, mk_int(0)) < 0) sb_putc(&num, '-');
+                    bd_print_plain(&num, rv);
+                    char wspec[16]; size_t wl = dot ? (size_t)(dot - spec) : strlen(spec);
+                    if (wl >= sizeof wspec) wl = sizeof wspec - 1;
+                    memcpy(wspec, spec, wl); wspec[wl] = '\0';
+                    snprintf(cfmt, sizeof cfmt, "%%%ss", wspec);
+                    snprintf(tmp, sizeof tmp, cfmt, num.data);
+                    sb_puts(&out, tmp);
+                    free(num.data);
+                    break;
+                }
+                /* Java's %g keeps trailing zeros -- (format "%.4g" 2.0) is
+                 * "2.000", not C's "2". C spells that as the '#' flag, so add
+                 * it for g/G; f and e already agree between the two. */
+                if (conv == 'g' || conv == 'G')
+                    snprintf(cfmt, sizeof cfmt, "%%#%s%c", spec, conv);
+                else
+                    snprintf(cfmt, sizeof cfmt, "%%%s%c", spec, conv);
                 snprintf(tmp, sizeof tmp, cfmt, as_num(v));
                 sb_puts(&out, tmp);
                 break;
@@ -10632,6 +11052,14 @@ MATH1(cbrt, cbrt)
 MATH1(floor, floor)
 MATH1(ceil, ceil)
 MATH1(trunc, trunc)
+
+/* Java's Math.signum: -1.0/0.0/1.0, but NaN and both zeros pass through
+ * unchanged (so (signum -0.0) is -0.0, not 0.0). C has no signum(). */
+static double c_signum(double x) {
+    if (x != x || x == 0.0) return x;
+    return x > 0.0 ? 1.0 : -1.0;
+}
+MATH1(signum, c_signum)
 
 /* trigonometric */
 MATH1(sin, sin)
@@ -11149,7 +11577,15 @@ static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
 static void *fa_mk_double(double d) { return mk_double(d); }
 static void *fa_mk_str(const char *s) { return s ? mk_str(s, strlen(s)) : NIL; }  /* NULL => nil */
 static void *fa_nil(void) { return NIL; }
-static long long fa_as_int(void *v) { return (long long)as_int((Cljc *)v, "ffi"); }
+/* Strict on purpose: as_int coerces at Clojure index positions, but a
+ * JIT-compiled ^long function handed 2.5 must not quietly compute on 2 --
+ * its interpreted twin would return a double. Reject instead. */
+static long long fa_as_int(void *v) {
+    Cljc *c = (Cljc *)v;
+    if (c == NULL || c->tag != CLJC_INT)
+        cljc_error("ffi: expected an integer, got %s", val_desc(c));
+    return (long long)c->as.i;
+}
 static double fa_as_double(void *v) { return as_num((Cljc *)v); }
 static const char *fa_as_str(void *v) { return as_str((Cljc *)v, "ffi"); }
 static void *fa_nth_arg(void *args, int i) {
@@ -11945,12 +12381,11 @@ static const char *PRELUDE =
     "(defn indexed? [x] (vector? x))\n"
     "(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (seq? x)))\n"
     "(defn reversible? [x] (vector? x))\n"
-    "(defn decimal? [_] false)\n"
     "(defn float? [x] (double? x))\n"
     "(defn bigint? [x] (= (type x) :bigint))\n"
     "(defn integer? [x] (or (int? x) (bigint? x)))\n"
     "(defn ratio? [x] (= (type x) :ratio))\n"
-    "(defn rational? [x] (or (integer? x) (ratio? x)))\n"
+    "(defn rational? [x] (or (integer? x) (ratio? x) (decimal? x)))\n"
     "(defn volatile? [x] (= :atom (type x)))\n"   /* realized?: Tier 3.5 */
     "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
     "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
@@ -11960,14 +12395,21 @@ static const char *PRELUDE =
     "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
     /* numeric coercions (cljc ints are int64, no bignum/ratio) */
     "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
-    "(defn num [x] x) (defn bigdec [x] (if (string? x) (or (parse-double x) x) x))\n"
-    "(defn bigint [x] (if (string? x) (read-string (str x \"N\")) (int x)))\n"
+    "(defn num [x] x) (defn bigdec [x] (cljc/->bd x))\n"
+    /* idempotent: (bigint x) on a value that is already a bigint must not
+       round-trip through int, which caps at int64 */
+    "(defn bigint [x] (cond (string? x) (read-string (str x \"N\"))\n"
+    "                       (bigint? x) x\n"
+    "                       (decimal? x) (let [r (cljc/bd->ratio x)]\n"
+    "                                      (if (ratio? r) (quot (numerator r) (denominator r)) r))\n"
+    "                       :else (int x)))\n"
     "(defn biginteger [x] (bigint x))\n"
     /* rationalize: exact ratio from a double's shortest decimal repr (str x
      * matches Java's Double.toString, so this tracks JVM semantics:
      * (rationalize 0.1) => 1/10). Integral results demote to int64 where the
      * JVM keeps BigInt — the documented bigness divergence. */
     "(defn rationalize [x]\n"
+    "  (if (decimal? x) (cljc/bd->ratio x)\n"
     "  (if (double? x)\n"
     "    (let [s (str x)\n"
     "          [mant expo] (str/split s \"E\")\n"
@@ -11982,7 +12424,7 @@ static const char *PRELUDE =
     "      (if (pos? k)\n"
     "        (/ n (reduce *' (repeat k 10)))\n"
     "        (* n (reduce *' (repeat (- k) 10)))))\n"
-    "    x))\n"
+    "    x)))\n"
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
     /* unchecked math == checked in cljc */
     "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
@@ -12145,7 +12587,7 @@ static const char *PRELUDE =
     /* aget/aset/alength are C natives (IARRAY fast path, legacy fallback) */
 
     /* remaining array constructors / ops as transient (mutable) arrays */
-    "(def double-array int-array) (def float-array int-array) (def short-array int-array)\n"
+    "(def float-array double-array) (def short-array int-array)\n"
     "(def char-array int-array) (def boolean-array int-array)\n"
     "(defn make-array [_ & dims] (object-array (first dims)))\n"
     "(defn to-array [coll] (int-array (vec coll)))\n"
@@ -12184,7 +12626,7 @@ static const char *PRELUDE =
     "(def Long :int) (def Integer :int) (def Double :double)\n"
     "(def Float :double) (def Byte :int) (def Short :int) (def Number :number)\n"
     "(def Keyword :keyword) (def Symbol :symbol) (def String :string) (def Boolean :bool) (def Character :char)\n"
-    "(def BigInt :bigint) (def BigInteger :bigint) (def BigDecimal :double) (def Ratio :ratio)\n"
+    "(def BigInt :bigint) (def BigInteger :bigint) (def BigDecimal :BigDecimal) (def Ratio :ratio)\n"
     /* host exception/error classes (catch dispatch values, sci class tables) */
     "(def Exception :Exception) (def Throwable :Throwable) (def Error :Error)\n"
     "(def RuntimeException :RuntimeException) (def AssertionError :AssertionError)\n"
@@ -12753,6 +13195,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/pprint-str*", prim_pprint_str);
     cljc_define_native(e, "cljc/nan?*", prim_nan_p);
     cljc_define_native(e, "int-array",  prim_int_array);
+    cljc_define_native(e, "double-array", prim_double_array);
     cljc_define_native(e, "long-array", prim_int_array);
     cljc_define_native(e, "byte-array", prim_int_array);
     cljc_define_native(e, "aget",    prim_aget);
@@ -12851,6 +13294,7 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "Math/round", prim_round);
     cljc_define_native(e, "Math/abs",   prim_math_abs);
     cljc_define_native(e, "Math/trunc", prim_trunc);
+    cljc_define_native(e, "Math/signum", prim_signum);
     cljc_define_native(e, "Math/sin",   prim_sin);
     cljc_define_native(e, "Math/cos",   prim_cos);
     cljc_define_native(e, "Math/tan",   prim_tan);
@@ -12891,6 +13335,12 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "list?",   prim_list_p);
     cljc_define_native(e, "vector?", prim_vector_p);
     cljc_define_native(e, "number?", prim_number_p);
+    cljc_define_native(e, "decimal?", prim_decimal_p);
+    cljc_define_native(e, "cljc/->bd", prim_to_bigdec);
+    cljc_define_native(e, "cljc/bd-u", prim_bd_unscaled);
+    cljc_define_native(e, "cljc/bd-s", prim_bd_scale);
+    cljc_define_native(e, "cljc/mk-bd", prim_mk_bigdec);
+    cljc_define_native(e, "cljc/bd->ratio", prim_bd_to_ratio);
     cljc_define_native(e, "int?",    prim_int_p);
     cljc_define_native(e, "double?", prim_double_p);
     cljc_define_native(e, "string?", prim_string_p);
@@ -13706,6 +14156,58 @@ CljcEnv *cljc_new_env(void) {
         "(defn java.util.UUID/randomUUID [] (random-uuid))\n"
         "(defn java.util.UUID/fromString [s] s)\n"
         "(defn UUID/randomUUID [] (random-uuid))\n"
+        /* java.util.Random: the JVM's exact 48-bit LCG (seed scramble,
+           multiplier 0x5DEECE66D, addend 0xB), so a seeded stream matches
+           the JVM value-for-value -- ported numeric code often pins test
+           expectations to it. cljc's `*` wraps at int64 exactly like Java's
+           long, which is what makes the mod-2^48 step come out right. */
+        "(def java.util.Random :Random)\n"
+        "(defn java.util.Random.\n"
+        "  ([] (java.util.Random. (long (* (rand) 9007199254740992))))\n"
+        "  ([seed] {:cljc/type :Random\n"
+        "           :seed (atom (bit-and (bit-xor (long seed) 25214903917) 281474976710655))\n"
+        "           :spare (atom nil)}))\n"
+        /* next(bits): advance, take the high `bits`, return it as a signed
+           32-bit int (only bits=32 can actually go negative). */
+        "(defn cljc/rnd-next* [r bits]\n"
+        "  (let [s (swap! (:seed r) (fn [x] (bit-and (+ (* x 25214903917) 11) 281474976710655)))\n"
+        "        v (bit-shift-right s (- 48 bits))]\n"
+        "    (if (>= v 2147483648) (- v 4294967296) v)))\n"
+        "(defn .setSeed [r seed]\n"
+        "  (reset! (:seed r) (bit-and (bit-xor (long seed) 25214903917) 281474976710655))\n"
+        "  (reset! (:spare r) nil) nil)\n"
+        "(defn .nextDouble [r]\n"
+        "  (/ (+ (* (cljc/rnd-next* r 26) 134217728) (cljc/rnd-next* r 27)) 9007199254740992.0))\n"
+        "(defn .nextFloat [r] (/ (cljc/rnd-next* r 24) 16777216.0))\n"
+        "(defn .nextLong [r] (+ (* (cljc/rnd-next* r 32) 4294967296) (cljc/rnd-next* r 32)))\n"
+        "(defn .nextBoolean [r] (not= 0 (cljc/rnd-next* r 1)))\n"
+        /* nextInt(n): power-of-two bounds take the high bits; otherwise reject
+           the last partial block so the distribution stays uniform (Java's loop).
+           Java detects that block by u - v + (n-1) overflowing int; cljc's
+           int64 never overflows there, so test the 2^31 crossing directly. */
+        "(defn .nextInt\n"
+        "  ([r] (cljc/rnd-next* r 32))\n"
+        "  ([r n]\n"
+        "   (when-not (pos? n) (throw (ex-info \"bound must be positive\" {:bound n})))\n"
+        "   (if (zero? (bit-and n (dec n)))\n"
+        "     (bit-shift-right (* n (cljc/rnd-next* r 31)) 31)\n"
+        "     (loop [u (cljc/rnd-next* r 31)]\n"
+        "       (let [v (mod u n)]\n"
+        "         (if (>= (+ (- u v) (dec n)) 2147483648) (recur (cljc/rnd-next* r 31)) v))))))\n"
+        /* nextGaussian: Java's Marsaglia polar method, including the cached
+           second deviate -- drop it and the stream desynchronises from the JVM. */
+        "(defn .nextGaussian [r]\n"
+        "  (if-let [g (deref (:spare r))]\n"
+        "    (do (reset! (:spare r) nil) g)\n"
+        "    (loop []\n"
+        "      (let [v1 (- (* 2 (.nextDouble r)) 1)\n"
+        "            v2 (- (* 2 (.nextDouble r)) 1)\n"
+        "            s  (+ (* v1 v1) (* v2 v2))]\n"
+        "        (if (or (>= s 1) (zero? s))\n"
+        "          (recur)\n"
+        "          (let [m (Math/sqrt (/ (* -2 (Math/log s)) s))]\n"
+        "            (reset! (:spare r) (* v2 m))\n"
+        "            (* v1 m)))))))\n"
         "(def class type)\n"
         "(def java.lang.CharSequence :java.lang.CharSequence)\n"
         "(derive :string :java.lang.CharSequence)\n"
@@ -13816,6 +14318,127 @@ CljcEnv *cljc_new_env(void) {
         "(defn .doubleValue [x] (double x))\n"
         "(defn .longValue [x] (long x))\n"
         "(defn .intValue [x] (int x))\n"
+        /* ── java.math.BigDecimal ──
+           The type itself is C (CLJC_BIGDEC): + - * / quot rem mod with Java's
+           scale rules and exact division, =/compare/hash by value, printing,
+           and 1.5M literals. What stays here is the MathContext layer --
+           precision-limited HALF_UP rounding -- and the instance methods,
+           checked against the JVM over a 250-case random corpus x 10 ops. */
+        "(defn cljc/pow10 [k]\n"
+        "  (loop [r 1N b 10N k k]\n"
+        "    (cond (zero? k) r\n"
+        "          (odd? k)  (recur (*' r b) (*' b b) (quot k 2))\n"
+        "          :else     (recur r (*' b b) (quot k 2)))))\n"
+        "\n"
+        /* private abs/max: prelude internals must not route through names a
+           program may shadow -- (:refer-clojure :exclude [abs max min]) is
+           common in numeric code, and tests.clj rebinds abs to C's int abs. */
+        "(defn cljc/bd-abs [x] (if (neg? x) (-' 0 x) x))\n"
+        "(defn cljc/bd-max [a b] (if (> a b) a b))\n"
+        "(defn cljc/bd-digits [u] (if (zero? u) 1 (count (str (cljc/bd-abs u)))))\n"
+        "\n"
+        ";; HALF_UP: ties round away from zero\n"
+        "(defn cljc/bd-rescale [x n]\n"
+        "  (let [s (cljc/bd-s x) u (cljc/bd-u x)]\n"
+        "    (if (>= n s)\n"
+        "      (cljc/mk-bd (*' u (cljc/pow10 (- n s))) n)\n"
+        "      (let [d (cljc/pow10 (- s n))\n"
+        "            q (quot u d)\n"
+        "            r (cljc/bd-abs (rem u d))]\n"
+        "        (cljc/mk-bd (if (>= (*' 2 r) d) (if (neg? u) (dec q) (inc q)) q) n)))))\n"
+        "\n"
+        "(defn cljc/bd-round [x prec]\n"
+        "  (let [d (cljc/bd-digits (cljc/bd-u x))]\n"
+        "    (if (and (pos? prec) (> d prec)) (cljc/bd-rescale x (- (cljc/bd-s x) (- d prec))) x)))\n"
+        "\n"
+        "(defn cljc/bd-strip\n"
+        "  \"Drop trailing zeros from the unscaled value, but never past scale `pref`.\"\n"
+        "  [x pref]\n"
+        "  (loop [u (cljc/bd-u x) s (cljc/bd-s x)]\n"
+        "    (if (and (> s pref) (not (zero? u)) (zero? (rem u 10)))\n"
+        "      (recur (quot u 10) (dec s))\n"
+        "      (cljc/mk-bd u s))))\n"
+        "\n"
+        ";; division under a MathContext: round to `prec` significant digits\n"
+        ";; instead of throwing on a non-terminating expansion\n"
+        "(defn cljc/bd-div [a b prec]\n"
+        "  (let [a (cljc/->bd a) b (cljc/->bd b)\n"
+        "        ua (cljc/bd-u a) ub (cljc/bd-u b) sa (cljc/bd-s a) sb (cljc/bd-s b)]\n"
+        "    (when (zero? ub) (throw (ex-info \"Division by zero\" {})))\n"
+        "    ;; A zero dividend short-circuits to zero at the preferred scale, the\n"
+        "    ;; way Java normalizes it -- the general path would invent a scale\n"
+        "    ;; from the guard digits and print 0E-45 instead of 0.\n"
+        "    (if (zero? ua)\n"
+        "      (cljc/mk-bd 0 (- sa sb))\n"
+        "    (let [prec  (if (pos? prec) prec 34)\n"
+        "          shift (cljc/bd-max 0 (+ (- prec (cljc/bd-digits ua)) (cljc/bd-digits ub) 2))\n"
+        "          n     (*' ua (cljc/pow10 shift))\n"
+        "          q     (quot n ub)\n"
+        "          r     (cljc/bd-abs (rem n ub))\n"
+        "          scale (+ shift sa (- sb))]\n"
+        "      (if (zero? r)\n"
+        "        ;; Exact: Java returns the exact quotient reduced toward the preferred\n"
+        "        ;; scale (this.scale - divisor.scale), so 2/8 is 0.25, not 0.25000.\n"
+        "        ;; Strip BEFORE the precision test -- trailing zeros are not\n"
+        "        ;; significant digits, and 2500000E-7 only looks like 7 of them.\n"
+        "        (let [st (cljc/bd-strip (cljc/mk-bd q scale) (- sa sb))]\n"
+        "          (if (<= (cljc/bd-digits (cljc/bd-u st)) prec) st (cljc/bd-round st prec)))\n"
+        /* Inexact: q carries >= prec+1 digits; round ONCE to `prec`. Rounding
+           the guard digit first and then trimming double-rounds (a dropped
+           tail of 0.49 -> 0.5 -> up). The nonzero remainder r is a sticky bit,
+           so a dropped tail of exactly half still rounds up. */
+        "        (let [qa (cljc/bd-abs q)\n"
+        "              ex (- (cljc/bd-digits qa) prec)\n"
+        "              p  (cljc/pow10 ex)\n"
+        "              k  (quot qa p)\n"
+        "              k  (if (>= (*' 2 (rem qa p)) p) (inc k) k)\n"
+        "              sc (- scale ex)\n"
+        "              [k sc] (if (> (cljc/bd-digits k) prec) [(quot k 10) (dec sc)] [k sc])]\n"
+        "          (cljc/mk-bd (if (neg? q) (-' 0 k) k) sc)))))))\n"
+        "\n"
+        ";; ── surface ──\n"
+        "(defn BigDecimal. [x] (cljc/->bd x))\n"
+        "(defn java.math.BigDecimal. [x] (cljc/->bd x))\n"
+        "(def BigDecimal/ONE 1M)\n"
+        "(def BigDecimal/ZERO 0M)\n"
+        "(def BigDecimal/TEN 10M)\n"
+        "(def java.math.BigDecimal/ONE BigDecimal/ONE)\n"
+        "(def java.math.BigDecimal/ZERO BigDecimal/ZERO)\n"
+        "(def java.math.BigDecimal/TEN BigDecimal/TEN)\n"
+        "(defn java.math.MathContext. [p] {:cljc/type :MathContext :precision p})\n"
+        "(defn MathContext. [p] {:cljc/type :MathContext :precision p})\n"
+        "(def RoundingMode/HALF_UP :half-up)\n"
+        "(def java.math.RoundingMode/HALF_UP :half-up)\n"
+        "(defn .setScale ([x n] (cljc/bd-rescale (cljc/->bd x) n))\n"
+        "                ([x n _mode] (cljc/bd-rescale (cljc/->bd x) n)))\n"
+        "(defn .scaleByPowerOfTen [x n] (let [x (cljc/->bd x)] (cljc/mk-bd (cljc/bd-u x) (- (cljc/bd-s x) n))))\n"
+        "(defn .unscaledValue [x] (cljc/bd-u (cljc/->bd x)))\n"
+        "(defn .scale [x] (cljc/bd-s (cljc/->bd x)))\n"
+        "(defn .precision [x] (cljc/bd-digits (cljc/bd-u (cljc/->bd x))))\n"
+        "(defn .abs [x] (if (neg? x) (- x) x))\n"
+        ";; toPlainString never switches to E notation, unlike toString\n"
+        "(defn .toPlainString [x]\n"
+        "  (let [x (cljc/->bd x) s (cljc/bd-s x) u (cljc/bd-u x)]\n"
+        "    (cond (zero? s) (str u)\n"
+        "          (neg? s)  (if (zero? u) \"0\" (apply str u (repeat (- s) \"0\")))\n"
+        "          :else (let [ds (str (cljc/bd-abs u))\n"
+        "                      ds (if (<= (count ds) s) (str (apply str (repeat (- (inc s) (count ds)) \"0\")) ds) ds)\n"
+        "                      i  (- (count ds) s)]\n"
+        "                  (str (when (neg? u) \"-\") (subs ds 0 i) \".\" (subs ds i))))))\n"
+        "(defn .subtract ([a b] (- (cljc/->bd a) b))\n"
+        "                ([a b mc] (cljc/bd-round (- (cljc/->bd a) b) (:precision mc))))\n"
+        "(defn .multiply ([a b] (* (cljc/->bd a) b))\n"
+        "                ([a b mc] (cljc/bd-round (* (cljc/->bd a) b) (:precision mc))))\n"
+        ";; no MathContext: Java's exact divide, which throws on 1/3\n"
+        "(defn .divide ([a b] (/ (cljc/->bd a) b))\n"
+        "              ([a b mc] (if (map? mc)\n"
+        "                          (cljc/bd-div a b (:precision mc))\n"
+        "                          (cljc/bd-rescale (cljc/bd-div a b (+ mc 10)) mc)))\n"
+        "              ([a b sc _mode] (cljc/bd-rescale (cljc/bd-div a b (+ sc 10)) sc)))\n"
+        ";; .add is already a collection shim -- extend it, don't replace it\n"
+        "(defn .add\n"
+        "  ([a b] (if (decimal? a) (+ a b) (do (swap! a clojure.core/conj b) true)))\n"
+        "  ([a b mc] (cljc/bd-round (+ (cljc/->bd a) b) (:precision mc))))\n"
         /* Clojure signature: (defmulti name docstring? attr-map? dispatch-fn
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */

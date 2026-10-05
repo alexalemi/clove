@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`java.math.BigDecimal`**, as a real numeric type: unscaled integer +
+  decimal scale, so the arithmetic is exact. `1.5M` literals; `+ - * /`,
+  `quot`/`rem`/`mod`, `inc`/`dec`, `compare`, `==` and `=` all accept it, with
+  Java's scale rules (`(+ 1.5M 1.5M)` is `3.0M`, `(/ 150M 1E+2M)` is `1.50M`)
+  and Java's exact division — `(/ 1M 3M)` throws "Non-terminating decimal
+  expansion" instead of guessing. `=` and `hash` go by value, so
+  `(= 1.0M 1.00M)` and `#{1.0M}` finds `1.00M`, as in Clojure. Mixed with
+  integers or ratios the result stays a BigDecimal; a double makes it a
+  double. Prints `1.5M` under `pr`, `1.5` under `str`, with Java's switch to
+  `1E+3` notation. `number?`/`decimal?`/`rational?` are true; `bigdec`,
+  `double`, `long`, `rationalize` and `format "%.2f"` (exact HALF_UP, so
+  `1.005M` → `"1.01"`) all convert it. Interop: `BigDecimal.`,
+  `ONE`/`ZERO`/`TEN`, `MathContext.`, `RoundingMode/HALF_UP`, and
+  `.add`/`.subtract`/`.multiply`/`.divide`/`.setScale`/`.scaleByPowerOfTen`/
+  `.abs`/`.negate`/`.compareTo`/`.precision`/`.scale`/`.unscaledValue`/
+  `.toPlainString`/`.doubleValue`. Differentially fuzzed against the JVM:
+  2000 random cases x 25 operations, identical.
+- **`java.util.Random`**: the JVM's exact 48-bit LCG — `.nextDouble`,
+  `.nextLong`, `.nextInt` (both arities), `.nextBoolean`, `.nextFloat`,
+  `.nextGaussian` (Marsaglia polar, with Java's cached second deviate),
+  `.setSeed`. A seeded stream matches the JVM value-for-value, which is what
+  ported numeric code pins its expectations to.
+- **Real `double-array`s.** `double-array` was `(def double-array int-array)`:
+  callable, but it could not hold a double. Arrays now carry an element-type
+  flag and store IEEE bit patterns in the same 8-byte slots — same allocation,
+  sweep, and GC treatment, with only the read and write ends aware of which
+  kind it is. `float-array` follows; `int-array` is unchanged.
+- `Math/signum` (NaN and both zeros pass through, as in Java).
+
+### Fixed
+- **Keyword lookup missed sorted maps and sets.** `(:k (sorted-map ...))` and
+  `(:k #{:k})` returned nil while `(get ...)` found the entry — a silent wrong
+  answer. Clojure's `Keyword.invoke` is exactly `RT.get`, so it now delegates
+  there and covers every collection `get` covers.
+- **Map literals now evaluate in source order.** Entries were evaluated in
+  HAMT hash order, so `{:result (f) :values @acc}` read `acc` *before* running
+  `f`. Clojure evaluates small map literals left to right (they are array-maps,
+  whose seq is insertion order); the reader now keeps its original k/v form
+  list — which it already built — and eval walks that.
+- **Integral doubles coerce at index positions**, following `RT.intCast`:
+  `(nth v 1.9)` is index 1 and `(subs s 1.7)` drops one character, as in
+  Clojure. Numeric code that computes an index in floating point relies on it.
+  The JIT/FFI bridge stays strict on purpose — a `^long` function handed 2.5
+  must not quietly compute on 2 and disagree with its interpreted twin.
+- `format` `%g`/`%G` follow Java, which keeps trailing zeros, rather than C,
+  which strips them: `(format "%.4g" 2.0)` is now `"2.000"`. `%E` also works.
+- `inc`/`dec` no longer fail on bigints and ratios — `(inc 99999999999999999999N)`
+  and `(inc 1/2)` now work instead of erroring on the int64 fast path.
+- `bigint` is idempotent: `(bigint (bigint x))` no longer round-trips through
+  `int` and caps at int64.
+- **`aset` on an int array refuses a non-integer.** Since index positions
+  started coercing, `(aset (int-array 2) 0 2.5)` stored `2` without a word;
+  it now throws "argument type mismatch" like the JVM. `(int-array [1.5])`
+  still truncates, as Clojure's does.
+- **Map literals reject keys that collide at runtime**: `(let [x 1] {x 1 1 2})`
+  throws "Duplicate key: 1" instead of silently keeping one entry.
+
 ## v0.5.1 — 2026-09-13
 
 ### Added
