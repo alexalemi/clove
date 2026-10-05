@@ -3,3 +3,8 @@ cljc
 examples/host
 .nrepl-port
 advent/
+build.log
+target/
+benchmarks/aoc/target/
+.clj-kondo/.cache/
+.claude/scheduled_tasks.lock
