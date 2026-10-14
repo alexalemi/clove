@@ -1,10 +1,17 @@
 ; cljc regression tests — each (assert= expected actual) prints PASS/FAIL.
-; Run: ./cljc < tests.clj   (or: make test)
+; Run: ./cljc tests.clj   (or: make test)
+;
+; The verdict is the EXIT STATUS plus the last line ("tests complete: N passed,
+; M failed"), not a grep of the output: tests are free to print words like
+; "error". A script-mode abort exits non-zero before the summary is reached.
 
+(def cljc-test-passed (atom 0))
+(def cljc-test-failed (atom 0))
 (defn assert= [expected actual]
   (if (= expected actual)
-    (println "PASS")
-    (println "FAIL: expected" (pr-str expected) "got" (pr-str actual))))
+    (do (swap! cljc-test-passed inc) (println "PASS"))
+    (do (swap! cljc-test-failed inc)
+        (println "FAIL: expected" (pr-str expected) "got" (pr-str actual)))))
 
 ; Platform capability probes — sections that need a POSIX shell + cc (FFI,
 ; JIT, subprocess e2e) or coroutines (csp, futures, core.async) self-skip
@@ -20,6 +27,9 @@
 (assert= 6 (+ 1 2 3))
 (assert= 2432902008176640000 (reduce * (range 1 21)))
 (assert= 2 (mod -7 3))
+;; abs of Long/MIN_VALUE is itself (Math.abs), not a "long overflow". Up here
+;; because the FFI section below rebinds `abs` to libc's.
+(assert= [-9223372036854775808 3 2.5 7/2] [(abs -9223372036854775808) (abs -3) (abs -2.5) (abs -7/2)])
 (assert= -1 (rem -7 3))
 (assert= 3.5 (/ 7.0 2))
 (assert= true (< 1 2 3))
@@ -388,7 +398,7 @@
 (assert= [5] @dlog)
 (assert= 8 (letfn [(f [x] (if (zero? x) 0 (+ 2 (g (dec x))))) (g [x] (f x))] (f 4)))
 (assert= :ok (try (assert (= 1 1)) :ok))
-(assert= true (string? (ex-message (try (assert (= 1 2)) (catch Exception e e)))))
+(assert= true (string? (ex-message (try (assert (= 1 2)) (catch AssertionError e e)))))
 (assert= [1 2 3] `[1 ~@(list 2 3)])   ; splice inside vector template
 
 ; ── HAMT engine ──
@@ -1653,7 +1663,7 @@
 (assert= true (< 1e300 ##Inf))
 (assert= true (> -1e300 ##-Inf))
 (assert= false (= ##NaN ##NaN))
-(assert= :threw (try (assert false "context here") (catch Exception e :threw)))
+(assert= :threw (try (assert false "context here") (catch AssertionError e :threw)))
 (assert= nil (assert true "fine"))
 
 ; time / == / distinct? / deftype-stub / queue / priority peek-pop on maps
@@ -1720,7 +1730,7 @@
 (assert= 15 (Character/digit \f 16))
 (assert= -1 (Character/digit \z 10))
 (assert= 2.0 (Math/sqrt 4))
-(assert= :threw (try (throw (AssertionError. "boom")) (catch Exception e :threw)))
+(assert= :threw (try (throw (AssertionError. "boom")) (catch AssertionError e :threw)))
 
 ; variadic map (transpose idiom) + regex lookahead
 (assert= '((1 3 5) (2 4 6)) (apply map list [[1 2] [3 4] [5 6]]))
@@ -2411,7 +2421,7 @@
 ; ── :pre / :post conditions (% is the return value) ──
 (defn pp-checked [x] {:pre [(pos? x)] :post [(> % x)]} (* x 2))
 (assert= 6 (pp-checked 3))
-(assert= true (try (pp-checked -1) false (catch Exception e (clojure.string/includes? (ex-message e) "Assert"))))
+(assert= true (try (pp-checked -1) false (catch AssertionError e (clojure.string/includes? (ex-message e) "Assert"))))
 ; ── partition 4-arity (pad) + when-first ──
 (assert= '((1 2 3) (4 5 :p)) (partition 3 3 [:p :p] [1 2 3 4 5]))
 (assert= :a (when-first [x [:a :b]] x))
@@ -2889,6 +2899,9 @@
              (cljc/last-trace*))]
   ;; frames from a loaded file carry file:line (main-script frames stay bare "line N")
   (assert= true (clojure.string/includes? tr "at (nth ...) cljc_tracetest.clj:2"))
+  ;; tt-f tail-calls the NATIVE nth: a native does not reuse the caller's frame,
+  ;; so (tt-f ...) must still be in the trace (it used to be overwritten)
+  (assert= true (clojure.string/includes? tr "at (tt-f ...) cljc_tracetest.clj:4"))
   (assert= true (clojure.string/includes? tr "at (tt-g ...) cljc_tracetest.clj:5")))
 (sh "rm -f cljc_tracetest.clj")
 
@@ -3300,4 +3313,150 @@
 (assert= 'user *ns*)
 (sh "rm -f cljc_s50_nslib.clj")
 
-(println "tests complete")
+; ── int64 overflow: + - * inc dec throw "long overflow" (they used to wrap
+;    silently); +' -' *' promote; unchecked-* are the ones that wrap ──
+(defn ovf-msg [f] (try (f) :no-throw (catch ArithmeticException e (ex-message e))))
+(assert= "long overflow" (ovf-msg #(* 4611686018427387904 4)))
+(assert= "long overflow" (ovf-msg #(+ 9223372036854775807 1)))
+(assert= "long overflow" (ovf-msg #(- -9223372036854775808 1)))
+(assert= "long overflow" (ovf-msg #(- -9223372036854775808)))
+(assert= "long overflow" (ovf-msg #(inc 9223372036854775807)))
+(assert= "long overflow" (ovf-msg #(dec -9223372036854775808)))
+(assert= "long overflow" (ovf-msg #(reduce * (range 1 30))))
+(assert= "long overflow" (ovf-msg #(+ 1 2 9223372036854775807)))
+(assert= 9223372036854775807 (+ 9223372036854775806 1))          ; the edge itself is fine
+(assert= -9223372036854775808 (- -9223372036854775807 1))
+(assert= -9223372036854775808 (* -4611686018427387904 2))
+(assert= 18446744073709551616N (*' 4611686018427387904 4))
+(assert= 9223372036854775808N (inc' 9223372036854775807))
+(assert= 109223372036854775807N (+ 9223372036854775807 100000000000000000000N))  ; a bigint operand: exact path
+(assert= 9.223372036854776E18 (+ 9223372036854775807 1.0))
+(assert= 0 (unchecked-multiply 4611686018427387904 4))
+(assert= -9223372036854775808 (unchecked-add 9223372036854775807 1))
+(assert= 9223372036854775807 (unchecked-subtract -9223372036854775808 1))
+(assert= -9223372036854775808 (unchecked-inc 9223372036854775807))
+(assert= 9223372036854775807 (unchecked-dec -9223372036854775808))
+(assert= -9223372036854775808 (unchecked-negate -9223372036854775808))
+(assert= -9223372036854775808 (unchecked-add-int 9223372036854775807 1))
+
+; ── typed catch: the first clause whose class the exception IS-A handles it;
+;    no clause matching rethrows. (catch used to ignore the class: the first
+;    clause took everything.) ──
+(assert= :right (try (throw (ex-info "x" {})) (catch ArithmeticException e :wrong) (catch Exception e :right)))
+(assert= :outer (try (try (throw (ex-info "x" {})) (catch ArithmeticException e :inner))
+                     (catch Exception e :outer)))
+(assert= {:k 1} (try (throw (ex-info "x" {:k 1})) (catch clojure.lang.ExceptionInfo e (ex-data e))))
+(assert= :right (try (throw (ex-info "x" {})) (catch IllegalStateException e :wrong) (catch RuntimeException e :right)))
+(assert= :right (try (/ 1 0) (catch clojure.lang.ExceptionInfo e :wrong) (catch ArithmeticException e :right)))
+(assert= :right (try (/ 1 0) (catch IllegalArgumentException e :wrong) (catch Throwable e :right)))
+(assert= :right (try (nth [1] 5) (catch ArithmeticException e :wrong) (catch IndexOutOfBoundsException e :right)))
+(assert= "boo" (try (throw (IllegalArgumentException. "boo"))
+                    (catch IllegalStateException e :wrong)
+                    (catch IllegalArgumentException e (ex-message e))))
+(assert= :right (try (throw (NumberFormatException. "n")) (catch IllegalArgumentException e :right)))  ; subclass
+(assert= :right (try (throw (Exception. "plain")) (catch RuntimeException e :wrong) (catch Exception e :right)))
+(assert= :right (try (throw (java.lang.IllegalStateException. "q")) (catch java.lang.IllegalStateException e :right)))
+;; AssertionError is an Error, not an Exception -- as on the JVM
+(assert= :right (try (assert false) (catch Exception e :wrong) (catch AssertionError e :right)))
+(assert= :right (try (try (assert false) (catch Exception e :wrong)) (catch Throwable e :right)))
+;; an UNTYPED interpreter error still takes any clause that is not provably wrong
+(assert= :permissive (try (undefined-fn-xyz 1) (catch NumberFormatException e :permissive)))
+(assert= :right (try (+ 1 nil) (catch clojure.lang.ExceptionInfo e :wrong) (catch Exception e :right)))
+(assert= :right (try (throw :a-keyword) (catch clojure.lang.ExceptionInfo e :wrong) (catch Exception e :right)))
+;; the class survives a rethrow and a trip through finally -- even when the
+;; finally body throws and catches an error of its own
+(assert= :typed (try (try (/ 1 0) (catch Exception e (throw e))) (catch ArithmeticException e :typed)))
+(assert= {:k 1} (try (try (throw (ex-info "x" {:k 1}))
+                          (catch ArithmeticException e :inner)
+                          (finally (try (/ 1 0) (catch Exception _ nil))))
+                     (catch Exception e (ex-data e))))
+(assert= "Divide by zero" (try (try (/ 1 0)
+                                    (catch IllegalStateException e :inner)
+                                    (finally (try (throw (ex-info "y" {})) (catch Exception _ nil))))
+                               (catch ArithmeticException e (ex-message e))))
+(let [log (atom [])]
+  (assert= :outer (try (try (throw (ex-info "x" {}))
+                            (catch ArithmeticException e :inner)
+                            (finally (swap! log conj :fin)))
+                       (catch Exception e :outer)))
+  (assert= [:fin] @log))
+;; class / instance? see the recorded class; an ex-info is still a map
+(let [e (ex-info "m" {:a 1})]
+  (assert= [true true true true false]
+           [(instance? clojure.lang.ExceptionInfo e) (instance? Exception e) (instance? Throwable e)
+            (instance? RuntimeException e) (instance? Error e)])
+  (assert= clojure.lang.ExceptionInfo (class e))
+  (assert= true (map? e)))
+(assert= ArithmeticException (class (try (/ 1 0) (catch Exception e e))))
+(assert= [true false] (let [e (IllegalArgumentException. "x")]
+                        [(instance? IllegalArgumentException e) (instance? clojure.lang.ExceptionInfo e)]))
+;; Integer/parseInt and friends THROW on junk (they returned nil); parse-long is the nil one
+(assert= "For input string: \"zz\"" (try (Integer/parseInt "zz") (catch NumberFormatException e (ex-message e))))
+(assert= :nfe (try (Long/parseLong "") (catch NumberFormatException e :nfe)))
+(assert= :nfe (try (Double/parseDouble "x") (catch NumberFormatException e :nfe)))
+(assert= [42 1.5 nil] [(Integer/parseInt "42") (Double/parseDouble "1.5") (parse-long "zz")])
+(assert= :iae (try (case 3 1 :one) (catch IllegalArgumentException e :iae)))
+(when cljc-test-coro?
+  (assert= "f" (try @(future (throw (IllegalStateException. "f")))
+                    (catch IllegalArgumentException e :wrong)
+                    (catch IllegalStateException e (ex-message e)))))
+
+; ── printing bigints/decimals: print/println/pr carry the N/M suffix, str of a
+;    bare number drops it (toString), and str of a COLLECTION prints its
+;    contents readably -- all as Clojure does ──
+(let [b 100000000000000000000N]
+  (assert= "100000000000000000000" (str b))
+  (assert= "100000000000000000000N" (pr-str b))
+  (assert= "100000000000000000000N 1.50M" (print-str b 1.50M))
+  (assert= "100000000000000000000N\n" (with-out-str (println b)))
+  (assert= "1.50M" (with-out-str (print 1.50M)))
+  (assert= "1.50" (str 1.50M))
+  (assert= "[100000000000000000000N \"a\" \\c]" (str [b "a" \c]))
+  (assert= "100000000000000000000|1.5" (format "%s|%s" b 1.5M))
+  (assert= "100000000000000000000,1.5,s" (clojure.string/join "," [b 1.5M "s"])))
+(assert= "[1 \"b\"]" (str [1 "b"]))
+(assert= "{:a \"x\"}" (str {:a "x"}))
+(assert= "#{\"a\"}" (str #{"a"}))
+(assert= "(\"a\" 1)" (str (list "a" 1)))
+(assert= "a[\"b\"]:kc" (str "a" ["b"] :k \c))
+(assert= "[a b]\n" (with-out-str (println ["a" "b"])))            ; print stays raw at depth
+(assert= "x [a]" (print-str "x" ["a"]))
+(assert= "custom" (str (reify Object (toString [_] "custom"))))    ; toString dispatch intact
+(assert= "abc" (str (StringBuilder. "abc")))
+
+; ── `cljc -e A -e B`: a repeated -e separates expressions ──
+(when cljc-test-unix?
+  (let [exe (str (cljc/exe-dir*) "/cljc")]
+    (assert= "3" (str/trim (:out (sh (str exe " -e '(def a 1)' -e '(+ a 2)'")))))))
+
+
+; ── found by fuzz/fuzz.sh (differential vs babashka) on its first runs ──
+;; subvec checks its bounds (it silently clamped)
+(assert= :oob (try (subvec [1 2] 2 5) (catch IndexOutOfBoundsException e :oob)))
+(assert= :oob (try (subvec [1 2] 2 1) (catch IndexOutOfBoundsException e :oob)))
+(assert= :oob (try (subvec [1 2] 3) (catch IndexOutOfBoundsException e :oob)))
+(assert= [[2 3] [] [1]] [(subvec [1 2 3] 1) (subvec [1 2] 2 2) (subvec [1 2] 0 1)])
+;; ratio -> double is Java's Ratio.doubleValue: 16 significant digits, then nearest double
+(assert= "409092.18749999994" (str (/ 1.5 (/ 8 2181825))))
+(assert= "0.15652173913043482" (str (/ (/ -3 23) (/ (/ 5 -3) 2.0))))
+(assert= [0.3333333333333333 -3.5 3.333333333333333E-25] [(double 1/3) (double -7/2) (double 1/3000000000000000000000000)])
+;; (str/replace s "" r): the empty string matches before every char and at the end
+(assert= ["42842142142442" "x" "-h-é-"] [(clojure.string/replace "8114" "" "42") (clojure.string/replace "" "" "x") (clojure.string/replace "hé" "" "-")])
+;; long of an out-of-range double/bigint throws (the C cast was undefined behavior)
+(assert= "Value out of range for long: 1.0E19" (try (long 1e19) (catch IllegalArgumentException e (ex-message e))))
+(assert= :iae (try (long 100000000000000000000N) (catch IllegalArgumentException e :iae)))
+(assert= [0 9223372036854775807 -2 9200000000000000000] [(long ##NaN) (long 9.223372036854775807E18) (long -2.7) (long 9.2e18)])
+;; Integer/parseInt is 32-bit; the radix arity takes a sign
+(assert= :nfe (try (Integer/parseInt "3000000000") (catch NumberFormatException e :nfe)))
+(assert= :nfe (try (Integer/parseInt nil) (catch NumberFormatException e :nfe)))
+(assert= [255 -255 12 9223372036854775807] [(Integer/parseInt "ff" 16) (Long/parseLong "-ff" 16) (Long/parseLong "+12" 10) (Long/parseLong "9223372036854775807")])
+;; pop: empty is IllegalStateException (it was untyped, so the first catch took it); (pop nil) is nil
+(assert= "Can't pop empty vector" (try (pop []) (catch IndexOutOfBoundsException e :wrong) (catch IllegalStateException e (ex-message e))))
+(assert= [:ise nil [1] '(2)] [(try (pop (list)) (catch IllegalStateException e :ise)) (pop nil) (pop [1 2]) (pop (list 1 2))])
+;; nil / non-number where a number goes: NullPointerException / ClassCastException
+(assert= :npe (try (+ 1 nil) (catch ArithmeticException e :wrong) (catch NullPointerException e :npe)))
+(assert= :cce (try (+ 1 "a") (catch NullPointerException e :wrong) (catch ClassCastException e :cce)))
+(assert= :npe (try (quot nil 2) (catch ArithmeticException e :wrong) (catch NullPointerException e :npe)))
+
+(println (str "tests complete: " @cljc-test-passed " passed, " @cljc-test-failed " failed"))
+(when (pos? @cljc-test-failed) (System/exit 1))

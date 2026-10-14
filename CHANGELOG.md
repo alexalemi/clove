@@ -2,7 +2,53 @@
 
 ## Unreleased
 
+### Changed — behavior that used to diverge silently from Clojure
+- **Integer overflow throws.** `+`, `-`, `*`, `inc` and `dec` raise
+  `ArithmeticException` "long overflow" when the result leaves the int64
+  range, as Clojure does; they used to wrap, so `(* 4611686018427387904 4)`
+  was `0`. `+'`/`-'`/`*'`/`inc'`/`dec'` still promote to a bigint, and
+  `unchecked-add`/`-subtract`/`-multiply`/`-inc`/`-dec`/`-negate` are now the
+  ones that wrap (they were aliases of the checked ops). Measured cost on the
+  arithmetic benchmarks: 0–4% (fib, fib32 within noise; the tight `loop`/`recur` counter 4%). Code that relied on wrapping —
+  hash mixers, LCGs — needs the `unchecked-` forms, as on the JVM.
+- **`catch` is typed.** The first `catch` clause whose class the exception
+  *is-a* handles it, and an exception no clause matches is rethrown (after
+  `finally`); `catch` used to ignore the class, so the first clause took
+  everything. Classes are recorded on `ex-info` (`ExceptionInfo`), on the
+  exception constructors (`IllegalArgumentException.`, `IllegalStateException.`,
+  `Exception.`, … plus new `Throwable.`, `Error.`, `ArithmeticException.`,
+  `NumberFormatException.`, `IndexOutOfBoundsException.`,
+  `NullPointerException.`, `ClassCastException.`, `InterruptedException.`), on
+  `assert`/`:pre`/`:post` failures (`AssertionError` — an `Error`, so
+  `(catch Exception e …)` no longer swallows a failed assertion), and on the
+  interpreter errors with an obvious JVM class: division by zero and overflow
+  (`ArithmeticException`), index out of bounds, number parsing, nil or a
+  non-number where a number goes (`NullPointerException`/`ClassCastException`),
+  `case`/`condp` fall-through and missing multimethods
+  (`IllegalArgumentException`), stack overflow (`StackOverflowError`). Other
+  interpreter errors stay untyped and match any clause except
+  `ExceptionInfo`/`AssertionError`/`Error`. `class` and `instance?` report
+  the recorded class; the class survives rethrow, `finally`, and futures.
+  `(is (thrown? SomeClass …))` in the test battery checks the class too.
+- **`Integer/parseInt`, `Long/parseLong`, `Double/parseDouble` throw
+  `NumberFormatException`** on malformed input; they returned nil, so
+  `(try (Integer/parseInt s) (catch NumberFormatException _ 0))` yielded nil.
+  `Integer/parseInt` also rejects values outside the 32-bit range, and the
+  radix arities accept a sign. `parse-long`/`parse-double` remain the
+  nil-returning ones.
+- **Printing bigints and decimals.** `print`/`println`/`print-str` emit the
+  `N`/`M` suffix like `pr` does (`1.5M`, not `1.5`); `str` of a bare number
+  still drops it. And `str` of a collection prints its contents readably:
+  `(str ["a" 1.5M])` is `"[\"a\" 1.5M]"`, where it was `"[a 1.5]"`.
+
 ### Added
+- **`make fuzz` / nightly fuzz workflow.** `fuzz/gen_expr.py` generates random
+  typed core expressions and `fuzz/fuzz.sh` runs them (plus the string
+  corpora) through cljc and babashka and diffs the output; a GitHub workflow
+  runs it nightly with fresh, printed seeds. Its first runs found the six
+  divergences listed under Fixed below.
+- `cljc -e A -e B` — a repeated `-e` separates expressions (it was read as a
+  symbol).
 - **`java.math.BigDecimal`**, as a real numeric type: unscaled integer +
   decimal scale, so the arithmetic is exact. `1.5M` literals; `+ - * /`,
   `quot`/`rem`/`mod`, `inc`/`dec`, `compare`, `==` and `=` all accept it, with
@@ -33,6 +79,19 @@
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- Found by the new fuzzer: `subvec` now checks its bounds (it clamped
+  silently); ratio→double conversion follows Java's `Ratio.doubleValue` (16
+  significant digits, then nearest double), so `(/ 1.5 8/2181825)` prints
+  `409092.18749999994` as on the JVM; `(str/replace s "" r)` inserts between
+  every character instead of erroring; `(long 1e19)` and `long` of an
+  out-of-range bigint throw "Value out of range for long" (the cast was
+  undefined behavior in C); `(abs Long/MIN_VALUE)` is `Long/MIN_VALUE`.
+- **A pending exception survives `finally`.** The exception in flight lived
+  only in globals, so a `finally` body that threw and caught an error of its
+  own replaced what was rethrown afterwards.
+- **Error traces keep the frame of a function that tail-calls a native.**
+  `(defn f [x] (+ x 1))` failing inside `+` showed `(+ ...)` directly under
+  `f`'s caller: the native's frame replaced `f`'s instead of stacking on it.
 - **Keyword lookup missed sorted maps and sets.** `(:k (sorted-map ...))` and
   `(:k #{:k})` returned nil while `(get ...)` found the entry — a silent wrong
   answer. Clojure's `Keyword.invoke` is exactly `RT.get`, so it now delegates

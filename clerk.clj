@@ -102,7 +102,7 @@
         err (atom nil)
         out (with-out-str
               (try (reset! val (eval (read-string (str "(do " text "\n)"))))
-                   (catch Exception e (reset! err (ex-message e)))))]
+                   (catch Throwable e (reset! err (ex-message e)))))]
     {:value @val :error @err :out out}))
 
 ;; ── incremental cache ──
@@ -375,7 +375,7 @@
   (if (clerk/long-seq? v)
     (str "<pre class=\"value\">" (clerk/escape (clerk/pr-bounded v)) "</pre>")
     (or (some (fn [{:keys [pred render]}]
-                (when (try (pred v) (catch Exception e nil)) (render v)))
+                (when (try (pred v) (catch Throwable e nil)) (render v)))
               (reverse @clerk/viewers))
         (str "<pre class=\"value\">" (clerk/escape (pr-str v)) "</pre>"))))
 
@@ -527,7 +527,7 @@ th{background:#efeeea}
 
 (defn cljc/clerk-render-safe [path old-html]
   (try (clerk/render-file path true)
-       (catch Exception e
+       (catch Throwable e
          (println "clerk: render failed:" (ex-message e))
          old-html)))
 

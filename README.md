@@ -146,7 +146,7 @@ same `tests.clj` runs everywhere.
 
 | Area | Coverage |
 |---|---|
-| **Numbers** | int64, **bignums** (`123…890N` literals and the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
+| **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **bignums** (`123…890N` literals and the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
 | **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
@@ -154,7 +154,7 @@ same `tests.clj` runs everywhere.
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
 | **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
-| **Errors** | `throw` any value, `try`/`catch`/`finally`, `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
+| **Errors** | `throw` any value, `try`/`catch`/`finally` with **typed `catch`** (first clause the exception is-a; `class`/`instance?` agree), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
 | **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
 | **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **PEGs** | `peg.clj` battery: [Janet's](https://janet-lang.org/docs/peg.html) parsing-expression grammars as plain data — `(peg/match '(* (<- :w+) "=" (number :d+)) "k=7")` ⇒ `["k" 7]`; grammars as maps with `:main`, ordered choice, `any`/`some`/`between`, `if`/`if-not`/`look` (arbitrary lookahead *and* lookbehind), `to`/`thru`, `sub`/`split`, captures with tags (`<-` `group` `replace` `cmt` `accumulate` `number` `backmatch` `->` `unref` …), `find`/`find-all`/`replace`/`replace-all`; codepoint-indexed; verified case-for-case against the Janet binary |
@@ -417,10 +417,20 @@ embeddability matter; use bb/JVM where throughput does.
   `(count "𝄞")` is 1 (Clojure says 2 — a surrogate pair). Storage is UTF-8;
   pure-ASCII strings keep O(1) indexing. A slurped binary file still indexes
   byte-per-byte (invalid sequences fall back to one byte = one char)
-- `catch` is untyped — the class in `(catch Exception e …)` is ignored; the
-  first `catch` wins
-- Plain integer arithmetic wraps on int64 overflow (Clojure's `*`/`+` throw);
-  use the auto-promoting `*'`/`+'`/`-'` or `…N` literals for bignums
+- `catch` is typed, but coarsely. An exception's class is recorded where it
+  is known — `ex-info`, the `(IllegalStateException. …)`-style constructors,
+  `assert`, and the interpreter errors with an obvious JVM class (arithmetic,
+  index out of bounds, number parsing, nil or a non-number where a number
+  goes, stack overflow) — and the first `catch` clause it *is-a* handles it;
+  no match rethrows. The remaining interpreter errors are *untyped* and take
+  any clause except `ExceptionInfo`, `AssertionError` and `Error`, so
+  `(catch SomeSpecificException e …)` around one still works
+- In-range BigInts are longs: `1N` reads as `1`, and bigint arithmetic whose
+  result fits a long returns a long. So `(reduce * 1N (range 1 30))` throws
+  "long overflow" where Clojure's BigInt contagion keeps going — use `*'`/
+  `+'`/`-'`, which promote
+- Float division by zero is `##Inf`/`##NaN` whatever the operand types, as in
+  compiled Clojure with primitive doubles; boxed JVM math (and babashka) throws
 - Hash maps/sets iterate in hash order, not insertion order (use sorted
   collections for ordered traversal)
 - Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not
@@ -444,9 +454,13 @@ milestone log is in [HISTORY.md](HISTORY.md).
 ```sh
 make test                      # normal suite + conformance
 make test-full                 # adds CLJC_GC_STRESS=1 (slow; shakes out GC roots)
+make fuzz                      # differential fuzz vs babashka (needs bb + python3)
 # sanitizers (flags required by conservative stack scanning, as with Boehm GC):
-cc -g -fsanitize=address,undefined -o /tmp/cljc-asan cljc.c -lm
-ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 /tmp/cljc-asan tests.clj
+# -O1 on purpose: at -O0 stale stack slots root values and hide missing GC roots
+# built AS ./cljc: the suite's subprocess tests re-invoke "<exe-dir>/cljc"
+cc -g -O1 -fsanitize=address,undefined -o cljc cljc.c -lm -ldl
+ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 ./cljc tests.clj
+make -B cljc                   # back to the normal build
 ```
 
 Every bug fix lands with a regression assertion in `tests.clj`.

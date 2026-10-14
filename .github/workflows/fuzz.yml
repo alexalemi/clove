@@ -1,0 +1,48 @@
+# Nightly differential fuzz: random expressions through cljc and babashka,
+# diffed (fuzz/fuzz.sh). The conformance corpus in CI is FIXED -- it only
+# guards against regressions. This is the job that finds new divergences.
+#
+# Each run uses fresh seeds derived from the run id and prints them; a failure
+# reproduces locally with `fuzz/fuzz.sh <seed> <n>`. A finding is either a bug
+# (fix it, add the expression to fuzz/conformance.txt) or a deliberate
+# divergence (teach fuzz/gen_expr.py to avoid it, and say why there).
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'Seed to reproduce (default: derived from the run id)'
+        required: false
+      n:
+        description: 'Expressions per seed'
+        required: false
+        default: '3000'
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install babashka
+        run: |
+          curl -sLO https://raw.githubusercontent.com/babashka/babashka/master/install
+          chmod +x install
+          sudo ./install
+          bb --version
+      - name: Build
+        run: make
+      - name: Fuzz
+        env:
+          SEED: ${{ github.event.inputs.seed }}
+          N: ${{ github.event.inputs.n }}
+        run: |
+          n=${N:-3000}
+          if [ -n "$SEED" ]; then seeds="$SEED"; else
+            seeds=$(for i in 1 2 3 4 5; do echo $(( GITHUB_RUN_ID * 10 + i )); done); fi
+          rc=0
+          for s in $seeds; do fuzz/fuzz.sh "$s" "$n" || rc=1; done
+          exit $rc

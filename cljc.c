@@ -14,6 +14,41 @@
  * near the top of the thread's stack before evaluating, and do not hold Cljc
  * pointers across evaluations unless they are reachable from the root env.
  * Assumes a downward-growing stack (x86/ARM/RISC-V).
+ *
+ * MAP OF THIS FILE — top-level sections, in order. Each is a banner you can
+ * jump to; list them all with line numbers via
+ *     grep -n '^/\* ───── ' cljc.c        (major)
+ *     grep -n '^/\* ── ' cljc.c           (minor, within a major section)
+ *
+ *   Value representation ......... the Cljc cell, tags, the union
+ *   Environment .................. lexical frames, root bindings
+ *   Forward declarations
+ *   Error handling ............... ErrFrame/longjmp, cljc_error, traces
+ *   Coroutines ................... stackful ucontext fibers
+ *   C-stack depth guard
+ *   Constructors ................. mk_int/mk_str/mk_cons..., codepoint strings
+ *   Symbol/keyword interning
+ *   Environment (implementation)
+ *   Garbage collector ............ mark/sweep, conservative stack scan
+ *   Hashing
+ *   HAMT persistent maps ......... + sets, public map interface
+ *   Persistent vectors ........... + transients
+ *   Argument validation helpers
+ *   Growable string buffer
+ *   Reader
+ *   Evaluator .................... eval_body, destructuring, symbol resolution
+ *   Bytecode VM .................. compiler + vm_run
+ *   apply + tree-walking evaluator  special forms; "Exception classes" (typed catch)
+ *   Printer ...................... print_to (pr/print), str_to (str), pprint
+ *   Primitives ................... the natives, by family:
+ *     Arbitrary-precision integers, Exact rationals, java.math.BigDecimal,
+ *     arithmetic, seq library, Regex engine, exceptions, atoms, compare/sort,
+ *     Sorted set/map, coercions, strings, file IO, TCP, format, math, bits,
+ *     coroutine engine, sh/FFI
+ *   Public C API ................. the embedding surface
+ *   Prelude ...................... core fns/macros as Clojure source
+ *   Runtime init ................. native registration, later prelude tiers
+ *   REPL, line editor, nREPL server, subcommands (main)   [#ifndef CLJC_NO_MAIN]
  */
 
 #ifdef __APPLE__
@@ -541,6 +576,10 @@ static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
 static Cljc *cur_exc;   /* exception value in flight; a GC root */
+/* Class of a message-style error in flight: a simple JVM class name such as
+ * "ArithmeticException" (set by cljc_error_cls), or NULL for the untyped
+ * majority raised through plain cljc_error. See "Exception classes" below. */
+static const char *err_class;
 
 /* ───── Coroutines (stackful, ucontext-backed) ───────────────────────────
  * A Coro owns its own C stack; the interpreter runs on it normally (eval
@@ -619,7 +658,28 @@ __attribute__((noreturn, format(printf, 1, 2)))
 #endif
 static void cljc_error(const char *fmt, ...) {
     cur_exc = NULL;  /* message-style error */
+    err_class = NULL;   /* untyped: any (catch Class e) but ExceptionInfo takes it */
     /* err_token persists only when the caller set it just before */
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(err_msg, sizeof err_msg, fmt, ap);
+    va_end(ap);
+    trace_snapshot();
+    cljc_raise();
+}
+
+/* cljc_error with a JVM exception class attached, for the sites whose class
+ * ported code actually dispatches on: (catch ArithmeticException e ...) around
+ * a division, (catch IndexOutOfBoundsException e ...) around an nth. */
+#if defined(__GNUC__) || defined(__clang__)
+#ifdef __MINGW_PRINTF_FORMAT
+__attribute__((noreturn, format(__MINGW_PRINTF_FORMAT, 2, 3)))
+#else
+__attribute__((noreturn, format(printf, 2, 3)))
+#endif
+#endif
+static void cljc_error_cls(const char *cls, const char *fmt, ...) {
+    cur_exc = NULL;
+    err_class = cls;
     va_list ap; va_start(ap, fmt);
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
@@ -693,6 +753,7 @@ __attribute__((noreturn))
 #endif
 static void cljc_throw_value(Cljc *v) {
     cur_exc = v;
+    err_class = NULL;   /* a thrown value carries its class in its metadata */
     snprintf(err_msg, sizeof err_msg, "uncaught exception");
     trace_snapshot();
     cljc_raise();
@@ -747,13 +808,13 @@ static void cljc_check_stack(void) {
 #endif
         floor = main_stack_floor;
     if (floor && sp < floor)
-        cljc_error("stack overflow — usually deep non-tail recursion: "
+        cljc_error_cls("StackOverflowError", "stack overflow — usually deep non-tail recursion: "
                    "use loop/recur (or reduce) instead of self-calls that grow the stack");
 }
 
 static void vpush(Cljc *v) {
     if (vsp >= vstack_cap)
-        cljc_error("value stack overflow — usually deep non-tail recursion: "
+        cljc_error_cls("StackOverflowError", "value stack overflow — usually deep non-tail recursion: "
                    "use loop/recur (or reduce) instead of self-calls that grow the stack");
     vstack[vsp++] = v;
 }
@@ -2007,7 +2068,7 @@ static size_t vec_tailoff(Cljc *v) {
 }
 
 static Cljc *vec_nth(Cljc *v, size_t i) {
-    if (i >= v->as.vec.count) cljc_error("index %zu out of bounds for length %u", i, v->as.vec.count);
+    if (i >= v->as.vec.count) cljc_error_cls("IndexOutOfBoundsException", "index %zu out of bounds for length %u", i, v->as.vec.count);
     size_t off = vec_tailoff(v);
     if (i >= off) return v->as.vec.tail[i - off];
     Cljc *node = v->as.vec.root;
@@ -2125,7 +2186,7 @@ static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
 static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
     uint32_t cnt = v->as.vec.count;
     if (i == cnt) return vec_conj1(v, x);  /* assoc at len appends */
-    if (i > cnt) cljc_error("assoc: index %zu out of bounds for length %u", i, cnt);
+    if (i > cnt) cljc_error_cls("IndexOutOfBoundsException", "assoc: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(v);
     if (i >= off) {
         Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
@@ -2268,7 +2329,7 @@ static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
         Cljc *arr = argv[0];
         int64_t i = as_int(argv[1], "assoc!");
         if (i < 0 || i >= (int64_t)arr->as.iarr.n)
-            cljc_error("assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
+            cljc_error_cls("IndexOutOfBoundsException", "assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
         iarr_set(arr, i, argv[2], "assoc!");
         return arr;
     }
@@ -2280,7 +2341,7 @@ static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *x = argv[2];
     uint32_t cnt = t->as.vec.count;
     if (i == cnt) { Cljc *cargs[2] = {t, x}; return prim_conj_bang(env, cargs, 2); }
-    if (i > cnt) cljc_error("assoc!: index %zu out of bounds for length %u", i, cnt);
+    if (i > cnt) cljc_error_cls("IndexOutOfBoundsException", "assoc!: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(t);
     if (i >= off) {                              /* in-place: zero alloc */
         t->as.vec.tail[i - off] = x;
@@ -2412,7 +2473,10 @@ static int64_t as_int(Cljc *v, const char *what) {
             return (int64_t)d;
         }
     }
-    cljc_error("%s: expected a number, got %s", what, val_desc(v));
+    /* the JVM's two type errors: nil where a number goes is an NPE, anything
+     * else a ClassCastException -- classed so a typed catch sees them */
+    cljc_error_cls(v == NULL || v == NIL ? "NullPointerException" : "ClassCastException",
+                   "%s: expected a number, got %s", what, val_desc(v));
     return 0;
 }
 
@@ -3457,6 +3521,7 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
 
 static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
 static void print_to(SBuf *sb, Cljc *v, bool readably);
+static void str_to(SBuf *sb, Cljc *v);
 
 /* Expand a macro with &form bound to the call form for the duration — its
  * :line/:file meta is how location-aware macros (dbg) know where they are.
@@ -4352,6 +4417,8 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
     return true;
 }
 
+/* ───── apply + tree-walking evaluator (special forms) ─────────────────── */
+
 static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     cljc_check_stack();   /* raise a catchable error before the C stack overflows */
     /* NATIVE/FN are the overwhelmingly common cases — check them before VAR so
@@ -4440,9 +4507,20 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             recur_keep = result;   /* root the cell across the next iteration */
             /* a tail call REPLACES this fn's trace frame (mirrors real frame
              * elision; recur loops stay at one slot) */
+            int native_frame = -1;   /* extra trace slot for a native tail call */
             if (g_tc_form) {
-                if (tc_frame < 0 && eval_sp < EVAL_STACK_MAX) tc_frame = eval_sp++;
-                if (tc_frame >= 0) eval_stack[tc_frame] = g_tc_form;
+                if (result->meta && result->meta->tag != CLJC_FN) {
+                    /* a native does not reuse this frame, so its form goes
+                     * ABOVE the current one: (defn f [x] (+ x 1)) failing in
+                     * + must still show `(f ...)` in the trace */
+                    if (eval_sp < EVAL_STACK_MAX) {
+                        native_frame = eval_sp;
+                        eval_stack[eval_sp++] = g_tc_form;
+                    }
+                } else {
+                    if (tc_frame < 0 && eval_sp < EVAL_STACK_MAX) tc_frame = eval_sp++;
+                    if (tc_frame >= 0) eval_stack[tc_frame] = g_tc_form;
+                }
                 g_tc_form = NULL;
             }
             argv = result->as.recur.spill
@@ -4459,6 +4537,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                      * recur_keep after the call pins the sentinel live. */
                     Cljc *rv = apply(env, newfn, argv, nargs);
                     recur_keep = result;
+                    if (native_frame >= 0) eval_sp = native_frame;
                     if (tc_frame >= 0) eval_sp = tc_frame;
                     return rv;
                 }
@@ -4518,7 +4597,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
     if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
         if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
-            cljc_error("index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
+            cljc_error_cls("IndexOutOfBoundsException", "index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
         return vec_nth(fn, (size_t)a0->as.i);
     }
     /* Symbols as functions: ('k m) and ('k m default), like keywords. */
@@ -4782,6 +4861,103 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
     return form;
 }
 
+/* ── Exception classes ──
+ * Exceptions are plain values (an ex-info is a map, an interpreter error a
+ * string), so a JVM class rides in METADATA: {:type :IllegalArgumentException}.
+ * `type`/`class` already honor :type, and equality/hash ignore metadata.
+ *   - (ex-info ...)                     → :ExceptionInfo
+ *   - (IllegalStateException. "..") etc → that class
+ *   - cljc_error_cls sites              → their class, attached when caught
+ *   - plain cljc_error, (throw 42)      → none: UNTYPED
+ * (catch C e ...) picks the first clause whose class the exception is-a,
+ * walking the table below. An UNTYPED exception takes any clause except the
+ * ones it certainly is not (ExceptionInfo, AssertionError, Error): most
+ * interpreter errors do not know their JVM class, and
+ * (try (parse s) (catch SomeSpecificException _ dflt)) must keep working. */
+static const char *const exc_parents[][2] = {
+    {"Exception", "Throwable"}, {"Error", "Throwable"},
+    {"RuntimeException", "Exception"},
+    {"IllegalArgumentException", "RuntimeException"},
+    {"NumberFormatException", "IllegalArgumentException"},
+    {"ArityException", "IllegalArgumentException"},
+    {"IllegalStateException", "RuntimeException"},
+    {"ArithmeticException", "RuntimeException"},
+    {"UnsupportedOperationException", "RuntimeException"},
+    {"IndexOutOfBoundsException", "RuntimeException"},
+    {"ArrayIndexOutOfBoundsException", "IndexOutOfBoundsException"},
+    {"StringIndexOutOfBoundsException", "IndexOutOfBoundsException"},
+    {"ClassCastException", "RuntimeException"},
+    {"NullPointerException", "RuntimeException"},
+    {"NoSuchElementException", "RuntimeException"},
+    {"ConcurrentModificationException", "RuntimeException"},
+    {"UncheckedIOException", "RuntimeException"},
+    {"ExceptionInfo", "RuntimeException"},
+    {"IOException", "Exception"},
+    {"FileNotFoundException", "IOException"}, {"EOFException", "IOException"},
+    {"UnknownHostException", "IOException"}, {"SocketException", "IOException"},
+    {"ConnectException", "SocketException"},
+    {"InterruptedException", "Exception"}, {"TimeoutException", "Exception"},
+    {"ExecutionException", "Exception"}, {"ClassNotFoundException", "Exception"},
+    {"AssertionError", "Error"}, {"VirtualMachineError", "Error"},
+    {"StackOverflowError", "VirtualMachineError"},
+    {"OutOfMemoryError", "VirtualMachineError"},
+};
+
+/* java.lang.Exception → Exception: classes match by simple name */
+static const char *class_simple(const char *n) {
+    const char *d = strrchr(n, '.');
+    return (d && d[1]) ? d + 1 : n;
+}
+
+static const char *exc_parent(const char *c) {
+    if (!strcmp(c, "Throwable")) return NULL;
+    for (size_t i = 0; i < sizeof exc_parents / sizeof exc_parents[0]; i++)
+        if (!strcmp(exc_parents[i][0], c)) return exc_parents[i][1];
+    return "Exception";   /* a class the table has never heard of */
+}
+
+static bool exc_isa(const char *cls, const char *target) {
+    if (!strcmp(target, "Object")) return true;
+    if (!strcmp(target, "IExceptionInfo")) target = "ExceptionInfo";
+    for (int guard = 0; cls && guard < 16; guard++, cls = exc_parent(cls))
+        if (!strcmp(cls, target)) return true;
+    return false;
+}
+
+/* The class recorded on an exception value, or NULL when untyped. */
+static const char *exc_class_of(Cljc *v) {
+    Cljc *t;
+    if (v == NULL || v == NIL || v->meta == NULL || v->meta->tag != CLJC_MAP) return NULL;
+    if (!map_find(v->meta, mk_kw(intern("type", 4)), &t) || t == NIL) return NULL;
+    if (t->tag == CLJC_KEYWORD) return class_simple(t->as.kw);
+    if (t->tag == CLJC_SYMBOL) return class_simple(t->as.sym);
+    return NULL;
+}
+
+static Cljc *exc_with_class(Cljc *v, const char *cls) {
+    Cljc *m = map_assoc(mk_map(), mk_kw(intern("type", 4)), mk_kw(intern(cls, strlen(cls))));
+    v->meta = m;
+    return v;
+}
+
+/* The exception in flight as a value: what (catch _ e) binds. A message-style
+ * error becomes its message string, carrying err_class when it has one. */
+static Cljc *err_as_value(void) {
+    if (cur_exc) return cur_exc;
+    Cljc *sv = mk_str(err_msg, strlen(err_msg));
+    return err_class ? exc_with_class(sv, err_class) : sv;
+}
+
+static bool catch_matches(const char *catch_class, Cljc *exc) {
+    const char *c = class_simple(catch_class);
+    if (!strcmp(c, "Throwable") || !strcmp(c, "Object")) return true;
+    const char *ec = exc_class_of(exc);
+    if (!ec)
+        return strcmp(c, "ExceptionInfo") && strcmp(c, "IExceptionInfo") &&
+               strcmp(c, "AssertionError") && strcmp(c, "Error");
+    return exc_isa(ec, c);
+}
+
 static Cljc *eval_inner(CljcEnv *env, Cljc *form);
 
 /* eval wrapper: maintains the form stack that error traces snapshot.
@@ -4966,10 +5142,11 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     }
                 }
                 if (s == SYM_TRY) {
-                    /* (try body... (catch ExClass e handler...) (finally fin...))
-                     * The class symbol is accepted and ignored (untyped catch —
-                     * a documented divergence). finally runs on every exit:
-                     * normal, body throw, or handler throw. */
+                    /* (try body... (catch ExClass e handler...)... (finally fin...))
+                     * The first catch clause whose class matches handles the
+                     * exception (catch_matches; see "Exception classes"); none
+                     * matching rethrows it. finally runs on every exit: normal,
+                     * body throw, handler throw, or no clause matching. */
                     Cljc *body = NIL, **bt = &body;
                     Cljc *catch_clause = NULL, *finally_clause = NULL;
                     for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
@@ -4979,9 +5156,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                          ? f->as.cons.head->as.sym : NULL;
                         if (fh == SYM_CATCH) {
                             if (finally_clause) cljc_error("try: catch must precede finally");
-                            /* catch is untyped here, so the FIRST catch handles
-                             * any exception; extra (catch ..) clauses for other
-                             * classes are accepted and skipped. */
+                            need_args(f->as.cons.tail, 2, "catch");
+                            sym_name(f->as.cons.tail->as.cons.head, "catch class");
+                            sym_name(f->as.cons.tail->as.cons.tail->as.cons.head,
+                                     "catch binding");
                             if (!catch_clause) catch_clause = f;
                         } else if (fh == SYM_FINALLY) {
                             if (finally_clause) cljc_error("try: only one finally clause is allowed");
@@ -4993,16 +5171,11 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             bt = &(*bt)->as.cons.tail;
                         }
                     }
-                    if (catch_clause) {
-                        need_args(catch_clause->as.cons.tail, 2, "catch");
-                        sym_name(catch_clause->as.cons.tail->as.cons.head, "catch class");
-                        sym_name(catch_clause->as.cons.tail->as.cons.tail->as.cons.head,
-                                 "catch binding");
-                    }
 
                     /* volatile: read after a longjmp back into this frame. */
                     Cljc * volatile body_v = body;
-                    Cljc * volatile catch_v = catch_clause;
+                    Cljc * volatile catch_v = catch_clause;   /* first catch, or NULL */
+                    Cljc * volatile clauses_v = rest;
                     Cljc * volatile finally_v = finally_clause;
                     Cljc * volatile result = NIL;
                     volatile bool pending = false;  /* unhandled exception to rethrow */
@@ -5027,13 +5200,27 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         rd_line = frame.rd_line_save;
                         rd_line_start = frame.rd_start_save;
                         rd_file_cell = frame.rd_file_save;
+                        /* first clause whose class the exception is-a */
+                        Cljc *exc = NULL, *hit = NULL;
                         if (catch_v) {
+                            exc = err_as_value();
+                            for (Cljc *c = clauses_v; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
+                                Cljc *f = c->as.cons.head;
+                                if (f != NIL && f->tag == CLJC_LIST &&
+                                    f->as.cons.head->tag == CLJC_SYMBOL &&
+                                    f->as.cons.head->as.sym == SYM_CATCH &&
+                                    catch_matches(f->as.cons.tail->as.cons.head->as.sym, exc)) {
+                                    hit = f;
+                                    break;
+                                }
+                            }
+                        }
+                        if (hit) {
                             /* Bind the exception value; run the handler under
                              * its own frame so finally still runs if it throws. */
-                            Cljc *exc = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
                             cur_exc = NULL;
                             CljcEnv *scope = env_new(env);
-                            Cljc *cc = catch_v->as.cons.tail;       /* (Class e body...) */
+                            Cljc *cc = hit->as.cons.tail;           /* (Class e body...) */
                             env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
                             ErrFrame hframe;
                             hframe.prev = err_top;
@@ -5058,11 +5245,28 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 pending = true;     /* handler threw */
                             }
                         } else {
-                            pending = true;         /* no catch: rethrow after finally */
+                            pending = true;   /* no clause took it: rethrow after finally */
                         }
                     }
-                    if (finally_v)  /* a throwing finally replaces any pending exception */
+                    if (finally_v) {  /* a throwing finally replaces any pending exception */
+                        /* The pending exception lives in globals (cur_exc, or
+                         * err_msg + err_class), and the finally body is free to
+                         * throw and catch errors of its own -- park it across. */
+                        Cljc *pend_exc = NULL, *pend_val = NULL;
+                        const char *pend_cls = NULL;
+                        if (pending) {
+                            pend_exc = cur_exc;
+                            pend_val = err_as_value();
+                            pend_cls = err_class;
+                        }
                         eval_body(env, finally_v->as.cons.tail);
+                        if (pending) {
+                            cur_exc = pend_exc;
+                            err_class = pend_cls;
+                            if (!pend_exc)
+                                snprintf(err_msg, sizeof err_msg, "%s", pend_val->as.str);
+                        }
+                    }
                     if (pending) cljc_raise();
                     return result;
                 }
@@ -5667,7 +5871,10 @@ static void sb_put_utf8(SBuf *sb, int32_t cp) {
 }
 
 /* readably=true  → pr semantics: strings get quotes (read-back form)
- * readably=false → str/print semantics: strings render raw */
+ * readably=false → print semantics: strings render raw, at every depth
+ * Bigints/decimals carry their N/M suffix in BOTH (Clojure's print-method
+ * emits it regardless of *print-readably*). `str` is a third thing -- Java's
+ * toString -- and lives in str_to below. */
 static void print_to(SBuf *sb, Cljc *v, bool readably) {
     if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
     switch (v->tag) {
@@ -5677,10 +5884,10 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
         case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
         case CLJC_IARRAY: sb_printf(sb, "#<%s-array %u>",
                                     v->as.iarr.dbl ? "double" : "int", v->as.iarr.n); break;
-        case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); if (readably) sb_putc(sb, 'N'); free(s); } break;
+        case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); sb_putc(sb, 'N'); free(s); } break;
         case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
-        case CLJC_BIGDEC: bd_print(sb, v); if (readably) sb_putc(sb, 'M'); break;
+        case CLJC_BIGDEC: bd_print(sb, v); sb_putc(sb, 'M'); break;
         case CLJC_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
         case CLJC_DOUBLE: format_double(sb, v->as.d); break;
         case CLJC_SYMBOL: sb_puts(sb, v->as.sym); break;
@@ -5786,7 +5993,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                 Cljc *out;
                 if (dispatch_deftype_method(gc_root_envs[0], v, "toString", NULL, 0, &out) &&
                     out != v) {
-                    print_to(sb, out, false);
+                    str_to(sb, out);
                     break;
                 }
                 /* a reify keeps its methods per-instance in :cljc/impls */
@@ -5796,7 +6003,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                     map_find(impls, mk_sym(intern("toString", 8)), &ts) && ts != NIL) {
                     Cljc *args1[1] = { v };
                     Cljc *rr = apply(gc_root_envs[0], ts, args1, 1);
-                    if (rr != v) { print_to(sb, rr, false); break; }
+                    if (rr != v) { str_to(sb, rr); break; }
                 }
             }
             (void)ty;
@@ -5902,6 +6109,29 @@ static void print(Cljc *v) {
     SBuf sb = {0};
     print_to(&sb, v, true);
     if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
+}
+
+/* str semantics = Java's toString, which is neither pr nor print:
+ *   - a scalar renders raw: "a" → a, \c → c, and a BigInt/BigDecimal WITHOUT
+ *     its N/M suffix ((str 1N) is "1" where (print-str 1N) is "1N")
+ *   - a collection renders as pr would: (str ["a" 1N]) is "[\"a\" 1N]"
+ * Tagged maps (records, deftypes, reify, StringBuilder) keep the print path,
+ * which is where their toString dispatch lives. */
+static void str_to(SBuf *sb, Cljc *v) {
+    if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
+    switch (v->tag) {
+        case CLJC_BIGINT: { char *d = big_to_decimal(v); sb_puts(sb, d); free(d); } break;
+        case CLJC_BIGDEC: bd_print(sb, v); break;
+        case CLJC_LIST: case CLJC_EMPTY: case CLJC_LAZY: case CLJC_VECTOR:
+        case CLJC_SET: case CLJC_SORTED:
+            print_to(sb, v, true); break;
+        case CLJC_MAP: {
+            Cljc *ty;
+            print_to(sb, v, !map_find(v, mk_kw(intern("cljc/type", 9)), &ty));
+            break;
+        }
+        default: print_to(sb, v, false); break;
+    }
 }
 
 /* ── pretty printer ─────────────────────────────────────────────────────
@@ -6306,7 +6536,7 @@ static int big_cmp(Cljc *A, Cljc *B) {
  * bit long division on magnitudes — simple and correct; fine at our scale. */
 static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
-    if (b.sign == 0) cljc_error("Divide by zero");
+    if (b.sign == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
     if (a.sign == 0 || umag_cmp(a.mag, a.n, b.mag, b.n) < 0) {
         if (Q) *Q = mk_int(0);
         if (R) { uint32_t *m = umalloc(a.n ? a.n : 1); memcpy(m, a.mag, a.n * 4); *R = big_norm(a.sign, m, a.n); }
@@ -6388,7 +6618,7 @@ static Cljc *rat_den(Cljc *v) {
 /* Build a reduced rational from num/den (each INT or BIGINT): force den>0,
  * divide out the gcd, and demote to an integer when den becomes 1. */
 static Cljc *make_ratio(Cljc *num, Cljc *den) {
-    if (big_is_zero(den)) cljc_error("Divide by zero");
+    if (big_is_zero(den)) cljc_error_cls("ArithmeticException", "Divide by zero");
     if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
     if (big_is_zero(num)) return mk_int(0);
     Cljc *g = big_gcd(num, den);
@@ -6401,8 +6631,33 @@ static Cljc *make_ratio(Cljc *num, Cljc *den) {
     r->as.ratio.num = num; r->as.ratio.den = den;
     return r;
 }
+/* Java's Ratio.doubleValue(): the quotient rounded to 16 significant decimal
+ * digits (MathContext.DECIMAL64, HALF_EVEN) and THEN to the nearest double --
+ * not the correctly rounded quotient. The two differ in the last bit for some
+ * ratios, and (/ 1.5 8/2181825) has to print what the JVM prints. */
 static double ratio_to_double(Cljc *v) {
-    return big_to_double(v->as.ratio.num) / big_to_double(v->as.ratio.den);
+    Cljc *an = big_abs(v->as.ratio.num), *ad = big_abs(v->as.ratio.den);
+    bool neg = (big_cmp(v->as.ratio.num, mk_int(0)) < 0) != (big_cmp(v->as.ratio.den, mk_int(0)) < 0);
+    char *sn = big_to_decimal(an), *sd = big_to_decimal(ad);
+    /* scale so the integer quotient has 16 digits (17 before the retry) */
+    int64_t k = 16 - ((int64_t)strlen(sn) - (int64_t)strlen(sd));
+    free(sn); free(sd);
+    Cljc *q, *r, *D, *lim = pow10_big(16);
+    for (;;) {
+        Cljc *N = k > 0 ? big_mul(an, pow10_big(k)) : an;
+        D = k < 0 ? big_mul(ad, pow10_big(-k)) : ad;
+        big_divmod(N, D, &q, &r);
+        if (big_cmp(q, lim) < 0) break;
+        k--;
+    }
+    int c = big_cmp(big_addsub(r, r, 0), D);          /* remainder vs half */
+    if (c > 0 || (c == 0 && q->tag == CLJC_INT && (q->as.i & 1)))
+        q = big_addsub(q, mk_int(1), 0);
+    char *sq = big_to_decimal(q);
+    char buf[80];
+    snprintf(buf, sizeof buf, "%s%se%lld", neg ? "-" : "", sq, (long long)-k);
+    free(sq);
+    return strtod(buf, NULL);
 }
 
 /* ───── java.math.BigDecimal ─────────────────────────────────────────────
@@ -6432,7 +6687,7 @@ static Cljc *bd_unscaled_at(Cljc *x, int64_t s) {
  * num/den reduced, den must be 2^a 5^b, and k = max(a,b) extra digits make it
  * exact; anything else never terminates. */
 static Cljc *bd_exact_quot(Cljc *num, Cljc *den, int64_t pref) {
-    if (big_is_zero(den)) cljc_error("Divide by zero");
+    if (big_is_zero(den)) cljc_error_cls("ArithmeticException", "Divide by zero");
     if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
     if (big_is_zero(num)) return mk_bigdec(mk_int(0), pref);
     Cljc *g = big_gcd(num, den);
@@ -6606,10 +6861,18 @@ static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
     }
 }
 
-/* promote=false: int64 ops wrap (the +,-,* used everywhere, incl. unchecked).
- * promote=true: int64 overflow auto-promotes to bigint (the +',-',*' ops). A
- * bigint operand always takes the exact path regardless of `promote`. */
-static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
+/* What an int64 overflow does:
+ *   AR_CHECK   throw ArithmeticException "long overflow" -- Clojure's + - *
+ *   AR_PROMOTE spill into a bigint                        -- +' -' *'
+ *   AR_WRAP    two's-complement wraparound                -- unchecked-add etc.
+ * A bigint operand always takes the exact path regardless of mode. */
+typedef enum { AR_WRAP, AR_CHECK, AR_PROMOTE } ArithMode;
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noreturn, cold))
+#endif
+static void long_overflow(void) { cljc_error_cls("ArithmeticException", "long overflow"); }
+
+static Cljc *arith(ArithOp op, Cljc **argv, int nargs, ArithMode mode) {
     size_t n = (size_t)nargs;
     bool is_float = false, is_big = false, is_ratio = false, is_dec = false;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -6618,7 +6881,9 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         else if (v->tag == CLJC_BIGINT) is_big = true;
         else if (v->tag == CLJC_RATIO) is_ratio = true;
         else if (v->tag == CLJC_BIGDEC) is_dec = true;
-        else if (v->tag != CLJC_INT) cljc_error("expected a number, got %s", val_desc(v));
+        else if (v->tag != CLJC_INT)
+            cljc_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
+                           "expected a number, got %s", val_desc(v));
     }
     if (n == 0) {
         if (op == OP_ADD) return mk_int(0);
@@ -6637,20 +6902,24 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, bool promote) {
         int64_t acc = argv[0]->as.i;
         int ai_;
         if (n == 1) {
-            if (op == OP_SUB) {  /* negate; INT64_MIN overflows -> promote */
-                if (promote && acc == INT64_MIN) return big_addsub(mk_int(0), argv[0], 1);
+            if (op == OP_SUB) {  /* negate; INT64_MIN has no positive twin */
+                if (acc == INT64_MIN && mode != AR_WRAP) {
+                    if (mode == AR_PROMOTE) return big_addsub(mk_int(0), argv[0], 1);
+                    long_overflow();
+                }
                 return mk_int((int64_t)(0u - (uint64_t)acc));  /* unsigned: no UB at MIN */
             }
             return mk_int(acc);   /* OP_DIV never gets here (ratio path) */
         }
         for (ai_ = 1; ai_ < nargs; ai_++) {
             int64_t x = argv[ai_]->as.i;
-            if (promote) {            /* checked: spill into bigint on overflow */
+            if (mode != AR_WRAP) {    /* checked: throw, or spill into bigint */
                 int64_t r; bool ovf;
                 if (op == OP_ADD) ovf = __builtin_add_overflow(acc, x, &r);
                 else if (op == OP_SUB) ovf = __builtin_sub_overflow(acc, x, &r);
                 else ovf = __builtin_mul_overflow(acc, x, &r);
                 if (ovf) {
+                    if (mode == AR_CHECK) long_overflow();
                     Cljc *b = mk_int(acc);
                     for (; ai_ < nargs; ai_++) b = big_binop(op, b, argv[ai_]);
                     return b;
@@ -6743,14 +7012,19 @@ float_path:;
     return mk_double(facc);
 }
 
-static Cljc *prim_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, false); }
-static Cljc *prim_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, false); }
-static Cljc *prim_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, false); }
-static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs, false); }
+static Cljc *prim_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_CHECK); }
+static Cljc *prim_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_CHECK); }
+static Cljc *prim_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_CHECK); }
+static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs, AR_CHECK); }
 /* auto-promoting +' -' *' (Clojure): int64 overflow grows to bigint */
-static Cljc *prim_addq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, true); }
-static Cljc *prim_subq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, true); }
-static Cljc *prim_mulq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, true); }
+static Cljc *prim_addq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_PROMOTE); }
+static Cljc *prim_subq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_PROMOTE); }
+static Cljc *prim_mulq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_PROMOTE); }
+/* unchecked-add/-subtract/-multiply (and unchecked-negate, the 1-arg -):
+ * wrap like a JVM long. Hash mixers and LCGs depend on exactly this. */
+static Cljc *prim_unchecked_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_WRAP); }
+static Cljc *prim_unchecked_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_WRAP); }
+static Cljc *prim_unchecked_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_WRAP); }
 static Cljc *prim_numerator(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env; (void)nargs; Cljc *v = argv[0];
     if (v->tag == CLJC_RATIO) return v->as.ratio.num;
@@ -6899,7 +7173,8 @@ static double as_num(Cljc *v) {
     if (v->tag == CLJC_BIGINT) return big_to_double(v);
     if (v->tag == CLJC_RATIO) return ratio_to_double(v);
     if (v->tag == CLJC_BIGDEC) return bd_to_double(v);
-    cljc_error("expected a number, got %s", val_desc(v));
+    cljc_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
+                   "expected a number, got %s", val_desc(v));
     return 0;
 }
 
@@ -6991,12 +7266,30 @@ static Cljc *prim_str(CljcEnv *env, Cljc **argv, int nargs) {
     sb_grow(&sb, 1); sb.data[0] = '\0';
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Cljc *v = argv[ai_];
-        if (v != NIL) print_to(&sb, v, false);  /* (str nil) => "" */
+        if (v != NIL) str_to(&sb, v);  /* (str nil) => "" */
     }
     Cljc *r = mk_str(sb.data, sb.len);
     free(sb.data);
     return r;
 }
+
+/* print-str / println-str: print semantics (raw strings, N/M suffixes),
+ * NOT (str/join " " (map str xs)) -- str drops the suffix and quotes
+ * strings nested in collections. */
+static Cljc *print_str_args(Cljc **argv, int nargs, bool newline) {
+    SBuf sb = {0};
+    sb_grow(&sb, 1); sb.data[0] = '\0';
+    for (int ai_ = 0; ai_ < nargs; ai_++) {
+        if (ai_) sb_putc(&sb, ' ');
+        print_to(&sb, argv[ai_], false);
+    }
+    if (newline) sb_putc(&sb, '\n');
+    Cljc *r = mk_str(sb.data, sb.len);
+    free(sb.data);
+    return r;
+}
+static Cljc *prim_print_str(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_str_args(argv, nargs, false); }
+static Cljc *prim_println_str(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_str_args(argv, nargs, true); }
 
 static Cljc *prim_pr_str(CljcEnv *env, Cljc **argv, int nargs) {
     (void)env;
@@ -7067,24 +7360,24 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
             for (Cljc *l = to_seq(out); l != NIL; l = to_seq(l->as.cons.tail))
                 if (n-- == 0) return l->as.cons.head;
             if (not_found) return not_found;
-            cljc_error("nth: index %lld out of bounds", (long long)orig_idx);
+            cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
         }
     }
     if (coll && coll->tag == CLJC_IARRAY) {
         if (n >= 0 && n < (int64_t)coll->as.iarr.n) return iarr_get(coll, n);
         if (not_found) return not_found;
-        cljc_error("nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
+        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
     }
     if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
         if (not_found) return not_found;
-        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
+        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
     } else if (coll && coll->tag == CLJC_STRING) {
         size_t ncp = str_cp_count(coll);
         if (n >= 0 && (size_t)n < ncp)
             return mk_char(str_cp_at(coll, (size_t)n));   /* (nth "abc" 1) => \b */
         if (not_found) return not_found;
-        cljc_error("nth: index %lld out of bounds for length %zu", (long long)orig_idx, ncp);
+        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, ncp);
     } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
         /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
         for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
@@ -7092,7 +7385,7 @@ static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
             if (n-- == 0) return l->as.cons.head;
     }
     if (not_found) return not_found;
-    cljc_error("nth: index %lld out of bounds", (long long)orig_idx);
+    cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
     return NIL;
 }
 
@@ -7258,9 +7551,11 @@ static Cljc *prim_inc(CljcEnv *env, Cljc **argv, int nargs) {
      * 3/2. Only the int64 fast path stays inline. */
     if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
         Cljc *two[2] = { v, mk_int(1) };
-        return arith(OP_ADD, two, 2, false);
+        return arith(OP_ADD, two, 2, AR_CHECK);
     }
-    return mk_int(as_int(v, "inc") + 1);
+    int64_t r;
+    if (__builtin_add_overflow(as_int(v, "inc"), (int64_t)1, &r)) long_overflow();
+    return mk_int(r);
 }
 
 static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7269,9 +7564,11 @@ static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
     if (v->tag == CLJC_DOUBLE) return mk_double(v->as.d - 1);
     if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
         Cljc *two[2] = { v, mk_int(1) };
-        return arith(OP_SUB, two, 2, false);
+        return arith(OP_SUB, two, 2, AR_CHECK);
     }
-    return mk_int(as_int(v, "dec") - 1);
+    int64_t r;
+    if (__builtin_sub_overflow(as_int(v, "dec"), (int64_t)1, &r)) long_overflow();
+    return mk_int(r);
 }
 
 /* BigDecimal quot is Java's divideToIntegralValue: the truncated quotient at
@@ -7291,8 +7588,8 @@ static Cljc *bd_quot(Cljc *a, Cljc *b) {
 }
 static Cljc *bd_rem(Cljc *a, Cljc *b) {
     Cljc *m[2] = { bd_quot(a, b), b };
-    Cljc *s[2] = { a, arith(OP_MUL, m, 2, false) };
-    return arith(OP_SUB, s, 2, false);
+    Cljc *s[2] = { a, arith(OP_MUL, m, 2, AR_CHECK) };
+    return arith(OP_SUB, s, 2, AR_CHECK);
 }
 
 static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
@@ -7302,7 +7599,7 @@ static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
         Cljc *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
         if (num_cmp(r, mk_int(0)) != 0 && (num_cmp(argv[0], mk_int(0)) > 0) != (num_cmp(argv[1], mk_int(0)) > 0)) {
             Cljc *two[2] = { r, argv[1] };
-            r = arith(OP_ADD, two, 2, false);
+            r = arith(OP_ADD, two, 2, AR_CHECK);
         }
         return r;
     }
@@ -7314,7 +7611,7 @@ static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "mod");
     int64_t b = as_int(argv[1], "mod");
-    if (b == 0) cljc_error("Divide by zero");
+    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
     int64_t m = a % b;
     if (m != 0 && ((m < 0) != (b < 0))) m += b;  /* Clojure mod follows divisor's sign */
     return mk_int(m);
@@ -7397,7 +7694,7 @@ static Cljc *prim_aget(CljcEnv *env, Cljc **argv, int nargs) {
     if (a != NIL && a->tag == CLJC_IARRAY) {
         int64_t i = as_int(argv[1], "aget");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
-            cljc_error("aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+            cljc_error_cls("IndexOutOfBoundsException", "aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
         return iarr_get(a, i);
     }
     /* legacy path: transient vectors / vectors behave as arrays */
@@ -7411,7 +7708,7 @@ static Cljc *prim_aset(CljcEnv *env, Cljc **argv, int nargs) {
     if (a != NIL && a->tag == CLJC_IARRAY) {
         int64_t i = as_int(argv[1], "aset");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
-            cljc_error("aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+            cljc_error_cls("IndexOutOfBoundsException", "aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
         /* an int array stores what it is handed or refuses, like the JVM's
          * aset: (aset ints 0 2.5) must not quietly keep 2. The constructors
          * still coerce -- (int-array [1.5]) truncates, as Clojure's does. */
@@ -7486,7 +7783,7 @@ static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
             if (k->tag != CLJC_INT)
                 cljc_error("assoc: vector index must be an integer, got %s", val_desc(k));
             if (k->as.i < 0)
-                cljc_error("assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
+                cljc_error_cls("IndexOutOfBoundsException", "assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
             r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
         } else cljc_error("assoc: %s is not associative", val_desc(r));
     }
@@ -7611,7 +7908,7 @@ static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "rem");
     int64_t b = as_int(argv[1], "rem");
-    if (b == 0) cljc_error("Divide by zero");
+    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
     return mk_int(a % b);
 }
 
@@ -9233,7 +9530,27 @@ static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
     Cljc *v = argv[0];
     if (v != NIL && v->tag == CLJC_INT) return v;
     if (v != NIL && v->tag == CLJC_CHAR) return mk_int((int64_t)v->as.chr);  /* (int \a) => 97 */
-    if (v != NIL && v->tag == CLJC_DOUBLE) return mk_int((int64_t)v->as.d);
+    if (v != NIL && v->tag == CLJC_DOUBLE) {
+        /* Clojure's RT.longCast: truncate; NaN is 0; outside the long range
+         * throws (a bare C cast there is undefined behavior). 2^63 itself
+         * passes Java's `x > Long.MAX_VALUE` test and saturates. */
+        double d = v->as.d;
+        if (d != d) return mk_int(0);
+        if (d == 9223372036854775808.0) return mk_int(INT64_MAX);
+        if (d < -9223372036854775808.0 || d > 9223372036854775808.0) {
+            SBuf sb = {0}; format_double(&sb, d);
+            char msg[64]; snprintf(msg, sizeof msg, "%s", sb.data ? sb.data : "");
+            free(sb.data);
+            cljc_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+        }
+        return mk_int((int64_t)d);
+    }
+    if (v != NIL && v->tag == CLJC_BIGINT) {
+        char *ds = big_to_decimal(v);
+        char msg[96]; snprintf(msg, sizeof msg, "%s", ds);
+        free(ds);
+        cljc_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+    }
     if (v != NIL && (v->tag == CLJC_BIGDEC || v->tag == CLJC_RATIO)) {   /* (long 2.7M) => 2 */
         Cljc *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
         if (q->tag != CLJC_INT) cljc_error("int: value out of range: %s", val_desc(v));
@@ -9453,7 +9770,36 @@ static Cljc *prim_ex_info(CljcEnv *env, Cljc **argv, int nargs) {
     m = map_assoc(m, mk_kw(kw_data()), argv[1]);
     if (nargs >= 3 && argv[2] != NIL)           /* (ex-info msg data cause) */
         m = map_assoc(m, mk_kw(intern("cause", 5)), argv[2]);
-    return m;
+    return exc_with_class(m, "ExceptionInfo");
+}
+
+/* (cljc/ex-isa?* class x) — is x an exception of (a subclass of) class?
+ * Backs instance? for exception classes; false for untyped values. */
+static Cljc *prim_ex_isa(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    need_nargs(nargs, 2, "cljc/ex-isa?*");
+    Cljc *c = argv[0];
+    const char *ec = exc_class_of(argv[1]);
+    if (!ec || c == NIL || (c->tag != CLJC_KEYWORD && c->tag != CLJC_SYMBOL)) return FALSE;
+    return mk_bool(exc_isa(ec, class_simple(c->tag == CLJC_KEYWORD ? c->as.kw : c->as.sym)));
+}
+
+/* (cljc/ex-class* x) — the class keyword recorded on an exception, else nil.
+ * `class` consults it; `type` deliberately does not (an ex-info still types
+ * as :map, so protocols and multimethods extended to maps keep applying). */
+static Cljc *prim_ex_class(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    need_nargs(nargs, 1, "cljc/ex-class*");
+    const char *ec = exc_class_of(argv[0]);
+    return ec ? mk_kw(intern(ec, strlen(ec))) : NIL;
+}
+
+/* (cljc/ex-typed* class-keyword ex) — ex re-classed (constructor shims). */
+static Cljc *prim_ex_typed(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    need_nargs(nargs, 2, "cljc/ex-typed*");
+    if (argv[0] == NIL || argv[0]->tag != CLJC_KEYWORD) cljc_error("cljc/ex-typed*: expected a class keyword");
+    return exc_with_class(argv[1], class_simple(argv[0]->as.kw));
 }
 
 static Cljc *prim_ex_message(CljcEnv *env, Cljc **argv, int nargs) {
@@ -10020,14 +10366,15 @@ static Cljc *prim_quot(CljcEnv *env, Cljc **argv, int nargs) {
     }
     int64_t a = as_int(argv[0], "quot");
     int64_t b = as_int(argv[1], "quot");
-    if (b == 0) cljc_error("Divide by zero");
+    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
     return mk_int(a / b);
 }
 
 /* ── strings ── */
 
 static char *as_str(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_STRING) cljc_error("%s: expected a string", what);
+    if (v == NIL) cljc_error_cls("NullPointerException", "%s: expected a string, got nil", what);
+    if (v->tag != CLJC_STRING) cljc_error("%s: expected a string", what);
     return v->as.str;
 }
 
@@ -10056,7 +10403,7 @@ static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
     int64_t end = nargs > 2
         ? as_int(argv[2], "subs") : (int64_t)len;
     if (start < 0 || end < start || (size_t)end > len)
-        cljc_error("subs: start %lld, end %lld out of bounds for length %zu",
+        cljc_error_cls("IndexOutOfBoundsException", "subs: start %lld, end %lld out of bounds for length %zu",
                    (long long)start, (long long)end, len);
     size_t b0 = str_cp_to_byte(sv, (size_t)start);
     size_t b1 = str_cp_to_byte(sv, (size_t)end);
@@ -10240,7 +10587,7 @@ static Cljc *prim_spit(CljcEnv *env, Cljc **argv, int nargs) {
     FILE *f = fopen(path, "wb");
     if (!f) cljc_error("spit: cannot open %s", path);
     SBuf sb = {0};
-    print_to(&sb, content, false);
+    str_to(&sb, content);
     if (sb.data) fwrite(sb.data, 1, sb.len, f);
     free(sb.data);
     fclose(f);
@@ -10690,7 +11037,7 @@ static Cljc *prim_tcp_send(CljcEnv *env, Cljc **argv, int nargs) {
     int fd = (int)as_int(argv[0], "tcp/send");
     Cljc *v = argv[1];
     SBuf sb = {0};
-    print_to(&sb, v, false);
+    str_to(&sb, v);
     const char *p = sb.data ? sb.data : "";
     size_t left = sb.len;
     while (left > 0) {
@@ -10807,7 +11154,7 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
         switch (conv) {
             case 's': {
                 SBuf t = {0};
-                print_to(&t, v, false);
+                str_to(&t, v);
                 if (si == 0) {  /* no width/precision: append directly, any length */
                     if (t.data) sb_puts(&out, t.data);
                 } else {
@@ -10887,10 +11234,22 @@ static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
     char *m = as_str(argv[1], "replace");
     char *r = as_str(argv[2], "replace");
     size_t mlen = strlen(m);
-    if (mlen == 0) cljc_error("replace: empty match string");
     SBuf out = {0};
     sb_grow(&out, 1); out.data[0] = '\0';
     const char *p = s;
+    if (mlen == 0) {
+        /* Java: the empty string matches before every character and at the
+         * end -- (str/replace "ab" "" "-") is "-a-b-" */
+        for (;;) {
+            sb_puts(&out, r);
+            if (!*p) break;
+            sb_putc(&out, *p++);
+            while (((unsigned char)*p & 0xC0) == 0x80) sb_putc(&out, *p++);   /* rest of the codepoint */
+        }
+        Cljc *res0 = mk_str(out.data, out.len);
+        free(out.data);
+        return res0;
+    }
     for (;;) {
         const char *hit = strstr(p, m);
         if (!hit) { sb_puts(&out, p); break; }
@@ -11325,7 +11684,7 @@ static Cljc *prim_pop(CljcEnv *env, Cljc **argv, int nargs) {
     if (v != NIL && v->tag == CLJC_LIST) return v->as.cons.tail;
     if (v != NIL && v->tag == CLJC_VECTOR) {
         uint32_t cnt = v->as.vec.count;
-        if (cnt == 0) cljc_error("pop: empty vector");
+        if (cnt == 0) cljc_error_cls("IllegalStateException", "Can't pop empty vector");
         if (v->as.vec.taillen > 1)  /* fast path: shrink the tail */
             return vec_cell(v->as.vec.root, v->as.vec.shift, cnt - 1,
                             v->as.vec.tail, (uint8_t)(v->as.vec.taillen - 1), NULL);
@@ -11334,7 +11693,9 @@ static Cljc *prim_pop(CljcEnv *env, Cljc **argv, int nargs) {
         for (size_t i = 0; i + 1 < cnt; i++) nv = vec_conj1(nv, vec_nth(v, i));
         return nv;
     }
-    cljc_error("pop: %s is not a list or vector", val_desc(v));
+    if (v == NIL) return NIL;                       /* (pop nil) is nil */
+    if (v->tag == CLJC_EMPTY) cljc_error_cls("IllegalStateException", "Can't pop empty list");
+    cljc_error_cls("ClassCastException", "pop: %s is not a list or vector", val_desc(v));
     return NIL;
 }
 
@@ -11439,7 +11800,7 @@ static void coro_trampoline(void) {
         vsp = base.vsp_save; eval_sp = base.esp_save; vm_tsp = base.vm_tsp_save; cur_reader_ns = base.ns_save; if (g_ns_binding && base.nsvar_save) g_ns_binding->value = base.nsvar_save;
         rd_line = base.rd_line_save; rd_line_start = base.rd_start_save;
         rd_file_cell = base.rd_file_save;
-        self->error = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
+        self->error = err_as_value();
         self->xfer = self->error;
     }
     coro_switch_out(self, CORO_DEAD, NULL);
@@ -11646,6 +12007,8 @@ void cljc_set_stack_base(void *p) {
     }
 }
 
+/* ───── Prelude (Clojure source: core fns and macros) ─────────────────── */
+
 /* Core functions and macros written in cljc itself. Evaluated once at env
  * creation — every line here is one we don't maintain as a C primitive. */
 static const char *PRELUDE =
@@ -11654,7 +12017,8 @@ static const char *PRELUDE =
     "(defn not= [& args] (not (apply = args)))\n"
     "(defn even? [n] (zero? (mod n 2)))\n"
     "(defn odd? [n] (not (even? n)))\n"
-    "(defn abs [x] (if (neg? x) (- x) x))\n"
+    /* (abs Long/MIN_VALUE) is Long/MIN_VALUE (Math.abs), not an overflow */
+    "(defn abs [x] (if (neg? x) (if (int? x) (unchecked-subtract x) (- x)) x))\n"
     "(defn max [x & xs] (reduce (fn [a b] (if (> a b) a b)) x xs))\n"
     "(defn min [x & xs] (reduce (fn [a b] (if (< a b) a b)) x xs))\n"
     "(defn complement [f] (fn [& args] (not (apply f args))))\n"
@@ -11846,9 +12210,8 @@ static const char *PRELUDE =
     "      (cons 'cond\n"
     "        (loop [cs clauses acc (list)]\n"
     "          (if (empty? cs)\n"
-    "            (reverse (cons (list 'throw (list 'ex-info\n"
-    "                                             (list 'str \"No matching clause: \" (list 'pr-str g))\n"
-    "                                             {}))\n"
+    "            (reverse (cons (list 'throw (list 'IllegalArgumentException.\n"
+    "                                             (list 'str \"No matching clause: \" (list 'pr-str g))))\n"
     "                           (cons :else acc)))\n"
     "            (if (empty? (rest cs))\n"
     "              (reverse (cons (first cs) (cons :else acc)))\n"
@@ -11891,7 +12254,25 @@ static const char *PRELUDE =
        A host/deftype class resolves to a type keyword: plain type equality. */
     /* protocol (a vector of method syms) -> satisfies?; a class keyword -> the
        type ISA the class, so a supertype like Number matches an int/double too. */
-    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (isa? (type x) c)))\n"
+    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (or (isa? (type x) c) (cljc/ex-isa?* c x))))\n"
+    /* Exception constructors: an ex-info map re-classed, so (catch C e) and
+       (instance? C e) see the class the code asked for. */
+    "(defn cljc/ex-ctor [cls]\n"
+    "  (fn ([] (cljc/ex-typed* cls (ex-info \"\" {})))\n"
+    "      ([msg] (cljc/ex-typed* cls (ex-info (str msg) {})))\n"
+    "      ([msg c] (cljc/ex-typed* cls (ex-info (str msg) {} c)))))\n"
+    "(def Throwable. (cljc/ex-ctor :Throwable)) (def Exception. (cljc/ex-ctor :Exception))\n"
+    "(def Error. (cljc/ex-ctor :Error)) (def AssertionError. (cljc/ex-ctor :AssertionError))\n"
+    "(def RuntimeException. (cljc/ex-ctor :RuntimeException))\n"
+    "(def IllegalArgumentException. (cljc/ex-ctor :IllegalArgumentException))\n"
+    "(def IllegalStateException. (cljc/ex-ctor :IllegalStateException))\n"
+    "(def UnsupportedOperationException. (cljc/ex-ctor :UnsupportedOperationException))\n"
+    "(def ArithmeticException. (cljc/ex-ctor :ArithmeticException))\n"
+    "(def NumberFormatException. (cljc/ex-ctor :NumberFormatException))\n"
+    "(def IndexOutOfBoundsException. (cljc/ex-ctor :IndexOutOfBoundsException))\n"
+    "(def NullPointerException. (cljc/ex-ctor :NullPointerException))\n"
+    "(def ClassCastException. (cljc/ex-ctor :ClassCastException))\n"
+    "(def InterruptedException. (cljc/ex-ctor :InterruptedException))\n"
     "(defn nnext [s] (next (next s)))\n"
     "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
     "(defn reduced [x] (cons '**reduced** (cons x nil)))\n"
@@ -11902,7 +12283,10 @@ static const char *PRELUDE =
     "(defn key [e] (first e))\n"
     "(defn subvec\n"
     "  ([v s] (subvec v s (count v)))\n"
-    "  ([v s e] (vec (take (- e s) (drop s v)))))\n"
+    "  ([v s e]\n"
+    "   (when (or (< s 0) (> e (count v)) (> s e))\n"
+    "     (throw (IndexOutOfBoundsException. (str \"subvec: \" s \" to \" e \" out of bounds for length \" (count v)))))\n"
+    "   (vec (take (- e s) (drop s v)))))\n"
     /* defrecord registers its type here so a deftype can be told apart from a
        record (both are tagged maps in cljc). map? stays native (records, plain
        maps, AND deftypes all read as maps — instaparse relies on this). */
@@ -11936,7 +12320,7 @@ static const char *PRELUDE =
        check the type tag directly, not map?. */
     "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
     "                          (let [t (get x :cljc/type)] (and t (isa? t :clojure.lang.Sequential))))))\n"
-    "(defn class [x] (if (fn? x) x (type x)))\n"   /* fn reflects on itself (below) */
+    "(defn class [x] (if (fn? x) x (or (cljc/ex-class* x) (type x))))\n"   /* fn reflects on itself (below) */
     /* synthesize java.lang.reflect.Method info from cljc fn arities so libraries
        that compute arity by reflection (emmy.function) work without the JVM */
     "(defn .getDeclaredMethods [c]\n"
@@ -12360,8 +12744,9 @@ static const char *PRELUDE =
     "        :else (boolean (some (fn [e] (= e x)) s))))\n"
     "(defn .trim [s] (str/trim (str s)))\n"
     "(defn array-map [& kvs] (apply hash-map kvs))\n"
-    "(defn Double/parseDouble [s] (parse-double (str s)))\n"
-    "(defn Float/parseFloat [s] (parse-double (str s)))\n"
+    "(defn Double/parseDouble [s]\n"
+    "  (or (parse-double (str s)) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
+    "(def Float/parseFloat Double/parseDouble)\n"
     /* STM refs: cljc is single-threaded, so atoms model refs exactly */
     "(defn ref [x & _] (atom x))\n"
     "(defmacro dosync [& body] `(do ~@body))\n"
@@ -12426,12 +12811,15 @@ static const char *PRELUDE =
     "        (* n (reduce *' (repeat (- k) 10)))))\n"
     "    x)))\n"
     "(defn double [x] (* 1.0 x)) (defn float [x] (* 1.0 x))\n"
-    /* unchecked math == checked in cljc */
-    "(def unchecked-add +) (def unchecked-subtract -) (def unchecked-multiply *)\n"
+    /* unchecked-add/-subtract/-multiply are natives that wrap (+ - * throw
+       "long overflow"); the rest derive from them. The -int variants wrap at
+       64 bits, not 32 -- there is no int type here. */
     "(defn inc' [x] (+' x 1)) (defn dec' [x] (-' x 1))\n"   /* auto-promoting inc/dec */
-    "(def unchecked-dec dec) (def unchecked-inc inc) (def unchecked-negate -)\n"
-    "(def unchecked-add-int +) (def unchecked-subtract-int -) (def unchecked-multiply-int *)\n"
-    "(def unchecked-dec-int dec) (def unchecked-inc-int inc) (def unchecked-negate-int -)\n"
+    "(defn unchecked-dec [x] (unchecked-subtract x 1)) (defn unchecked-inc [x] (unchecked-add x 1))\n"
+    "(defn unchecked-negate [x] (unchecked-subtract x))\n"
+    "(def unchecked-add-int unchecked-add) (def unchecked-subtract-int unchecked-subtract)\n"
+    "(def unchecked-multiply-int unchecked-multiply)\n"
+    "(def unchecked-dec-int unchecked-dec) (def unchecked-inc-int unchecked-inc) (def unchecked-negate-int unchecked-negate)\n"
     "(def unchecked-divide-int quot) (def unchecked-remainder-int rem)\n"
     "(def unchecked-int int) (def unchecked-long int) (def unchecked-byte int)\n"
     "(def unchecked-short int) (def unchecked-char int)\n"
@@ -12498,9 +12886,9 @@ static const char *PRELUDE =
     "        (if (pred input)\n"
     "          (reduced {:cljc/halt (if retf (retf (rf result) input) input)})\n"
     "          (rf result input)))))))\n"
-    "(defn print-str [& xs] (str/join \" \" (map str xs)))\n"
+
     "(defn prn-str [& xs] (str (apply pr-str xs) \"\\n\"))\n"
-    "(defn println-str [& xs] (str (str/join \" \" (map str xs)) \"\\n\"))\n"
+
     "(defn test [_] :ok)\n"
     "(def char-name-string {}) (def char-escape-string {})\n"
     "(defn seq-to-map-for-destructuring [s] (if (map? s) s (apply hash-map s)))\n"
@@ -12531,15 +12919,25 @@ static const char *PRELUDE =
     "(defn str/re-quote-replacement [s] (str/replace (str/replace s \"\\\\\" \"\\\\\\\\\") \"$\" \"\\\\$\"))\n"
     /* clojure.string/foo resolves to cljc's str/foo (same for set/walk) */
     "(cljc/alias* \"clojure.string\" \"str\")\n"
-    "(defn Integer/parseInt\n"
-    "  ([s] (parse-long s))\n"
+    /* These THROW NumberFormatException on junk (parse-long is the one that
+       returns nil), and Integer/parseInt also on values outside the int range. */
+    "(defn cljc/nfe [s] (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\"))))\n"
+    "(defn Long/parseLong\n"
+    "  ([s] (or (when (string? s) (parse-long s)) (cljc/nfe s)))\n"
     "  ([s radix]\n"
-    "   (reduce (fn [acc c]\n"
-    "             (let [d (Character/digit c radix)]\n"
-    "               (when (neg? d) (throw (ex-info (str \"bad digit: \" c) {})))\n"
-    "               (+ (* acc radix) d)))\n"
-    "           0 (seq s))))\n"
-    "(def Long/parseLong Integer/parseInt)\n"
+    "   (when-not (string? s) (cljc/nfe s))\n"
+    "   (let [neg (str/starts-with? s \"-\")\n"
+    "         digits (if (or neg (str/starts-with? s \"+\")) (subs s 1) s)\n"
+    "         _ (when (= digits \"\") (cljc/nfe s))\n"
+    "         n (reduce (fn [acc c]\n"
+    "                     (let [d (Character/digit c radix)]\n"
+    "                       (when (neg? d) (cljc/nfe s))\n"
+    "                       (+ (* acc radix) d)))\n"
+    "                   0 (seq digits))]\n"
+    "     (if neg (- n) n))))\n"
+    "(defn Integer/parseInt [s & radix]\n"
+    "  (let [n (apply Long/parseLong s radix)]\n"
+    "    (if (<= -2147483648 n 2147483647) n (cljc/nfe s))))\n"
     /* toString/radix is SIGNED (Java prefixes '-'); toBinaryString is UNSIGNED
      * (Java renders the raw two's-complement word). They are different
      * functions and one cannot be defined as the other. Digits are accumulated
@@ -12563,12 +12961,6 @@ static const char *PRELUDE =
     "            (recur (unsigned-bit-shift-right n 1)\n"
     "                   (str (get cljc/digit-chars (bit-and n 1)) acc))))))\n"
     "(defn Integer/toBinaryString [n] (Long/toBinaryString (bit-and n 4294967295)))\n"
-    "(defn AssertionError. [msg] (ex-info (str msg) {}))\n"
-    "(defn RuntimeException. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
-    "(defn Exception. ([] (ex-info \"\" {})) ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
-    "(defn IllegalArgumentException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
-    "(defn IllegalStateException. ([msg] (ex-info (str msg) {})) ([msg c] (ex-info (str msg) {} c)))\n"
-    "(defn UnsupportedOperationException. [msg] (ex-info (str msg) {}))\n"
     /* mutable arrays, as transient vectors (assoc! mutates in place) */
     /* int-array/long-array/byte-array are C natives (flat int64 buffers) */
 
@@ -12578,7 +12970,7 @@ static const char *PRELUDE =
     "(defn LazilyPersistentVector/createOwning [oa] (vec oa))\n"
     "(defn PersistentArrayMap/createWithCheck [arr]\n"
     "  (let [v (vec arr) m (apply hash-map v)]\n"
-    "    (when-not (= (* 2 (count m)) (count v)) (throw (ex-info \"Duplicate key\" {})))\n"
+    "    (when-not (= (* 2 (count m)) (count v)) (throw (IllegalArgumentException. \"Duplicate key\")))\n"
     "    m))\n"
     /* java.util.HashMap: a mutable map as an atom holding a persistent map */
     "(defn HashMap. ([] (atom {})) ([_] (atom {})) ([_ _] (atom {})))\n"
@@ -12640,6 +13032,17 @@ static const char *PRELUDE =
     "(def UnsupportedOperationException :UnsupportedOperationException)\n"
     "(def ClassNotFoundException :ClassNotFoundException)\n"
     "(def StackOverflowError :StackOverflowError)\n"
+    "(def ExceptionInfo :ExceptionInfo) (def clojure.lang.ExceptionInfo :ExceptionInfo)\n"
+    "(def IExceptionInfo :IExceptionInfo) (def clojure.lang.IExceptionInfo :IExceptionInfo)\n"
+    "(def java.lang.Exception :Exception) (def java.lang.Throwable :Throwable) (def java.lang.Error :Error)\n"
+    "(def java.lang.RuntimeException :RuntimeException) (def java.lang.AssertionError :AssertionError)\n"
+    "(def java.lang.IllegalArgumentException :IllegalArgumentException)\n"
+    "(def java.lang.IllegalStateException :IllegalStateException)\n"
+    "(def java.lang.ArithmeticException :ArithmeticException)\n"
+    "(def java.lang.NumberFormatException :NumberFormatException)\n"
+    "(def java.lang.IndexOutOfBoundsException :IndexOutOfBoundsException)\n"
+    "(def java.lang.UnsupportedOperationException :UnsupportedOperationException)\n"
+    "(def java.lang.InterruptedException :InterruptedException)\n"
     "(defn File. [path] path)\n"
     /* date/uuid host classes (#inst/#uuid data-reader setup) — inert stubs */
     "(defn java.text.SimpleDateFormat. [& _] (atom nil))\n"
@@ -12974,7 +13377,7 @@ static const char *PRELUDE =
     "      (cons 'cond\n"
     "        (loop [cs clauses acc (list)]\n"
     "          (if (empty? cs)\n"
-    "            (reverse (cons '(throw (ex-info \"condp: no matching clause\" {})) (cons :else acc)))\n"
+    "            (reverse (cons '(throw (IllegalArgumentException. \"condp: no matching clause\")) (cons :else acc)))\n"
     "            (if (empty? (rest cs))\n"
     "              (reverse (cons (first cs) (cons :else acc)))\n"
     "              (recur (rest (rest cs))\n"
@@ -13068,9 +13471,9 @@ static const char *PRELUDE =
     "  ([f & args] (trampoline (fn [] (apply f args)))))\n"
     "(defmacro assert\n"
     "  ([x] `(when-not ~x\n"
-    "          (throw (ex-info (str \"Assert failed: \" (pr-str '~x)) {}))))\n"
+    "          (throw (AssertionError. (str \"Assert failed: \" (pr-str '~x))))))\n"
     "  ([x msg] `(when-not ~x\n"
-    "              (throw (ex-info (str \"Assert failed: \" ~msg \"\\n\" (pr-str '~x)) {})))))\n"
+    "              (throw (AssertionError. (str \"Assert failed: \" ~msg \"\\n\" (pr-str '~x)))))))\n"
     /* ── doc / apropos: interactive documentation ──
      * Built-in/native docstrings live in the docs.clj battery (generated,
      * shipped in the share dir), lazily loaded on first use so scripts that
@@ -13129,6 +13532,8 @@ static const char *PRELUDE =
     "                (sort (map str (cljc/root-names*))))))\n"
     ;
 
+/* ───── Runtime init: native registration, later prelude tiers ────────── */
+
 CljcEnv *cljc_new_env(void) {
     if (!NIL) {
         gc_stress = getenv("CLJC_GC_STRESS") != NULL;
@@ -13170,6 +13575,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "+'",      prim_addq);
     cljc_define_native(e, "-'",      prim_subq);
     cljc_define_native(e, "*'",      prim_mulq);
+    cljc_define_native(e, "unchecked-add",      prim_unchecked_add);
+    cljc_define_native(e, "unchecked-subtract", prim_unchecked_sub);
+    cljc_define_native(e, "unchecked-multiply", prim_unchecked_mul);
     cljc_define_native(e, "numerator",   prim_numerator);
     cljc_define_native(e, "denominator", prim_denominator);
     cljc_define_native(e, "/",       prim_div);
@@ -13183,6 +13591,8 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "cljc/eprintln*", prim_eprintln);
     cljc_define_native(e, "str",     prim_str);
     cljc_define_native(e, "pr-str",  prim_pr_str);
+    cljc_define_native(e, "print-str",   prim_print_str);
+    cljc_define_native(e, "println-str", prim_println_str);
     cljc_define_native(e, "list",    prim_list);
     cljc_define_native(e, "first",   prim_first);
     cljc_define_native(e, "second",  prim_second);
@@ -13357,6 +13767,9 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "gc",      prim_gc);
     cljc_define_native(e, "throw",      prim_throw);
     cljc_define_native(e, "ex-info",    prim_ex_info);
+    cljc_define_native(e, "cljc/ex-isa?*",   prim_ex_isa);
+    cljc_define_native(e, "cljc/ex-class*",  prim_ex_class);
+    cljc_define_native(e, "cljc/ex-typed*",  prim_ex_typed);
     cljc_define_native(e, "ex-message", prim_ex_message);
     cljc_define_native(e, "ex-data",    prim_ex_data);
     cljc_define_native(e, "atom",    prim_atom);
@@ -14170,7 +14583,7 @@ CljcEnv *cljc_new_env(void) {
         /* next(bits): advance, take the high `bits`, return it as a signed
            32-bit int (only bits=32 can actually go negative). */
         "(defn cljc/rnd-next* [r bits]\n"
-        "  (let [s (swap! (:seed r) (fn [x] (bit-and (+ (* x 25214903917) 11) 281474976710655)))\n"
+        "  (let [s (swap! (:seed r) (fn [x] (bit-and (unchecked-add (unchecked-multiply x 25214903917) 11) 281474976710655)))\n"
         "        v (bit-shift-right s (- 48 bits))]\n"
         "    (if (>= v 2147483648) (- v 4294967296) v)))\n"
         "(defn .setSeed [r seed]\n"
@@ -14188,7 +14601,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn .nextInt\n"
         "  ([r] (cljc/rnd-next* r 32))\n"
         "  ([r n]\n"
-        "   (when-not (pos? n) (throw (ex-info \"bound must be positive\" {:bound n})))\n"
+        "   (when-not (pos? n) (throw (IllegalArgumentException. \"bound must be positive\")))\n"
         "   (if (zero? (bit-and n (dec n)))\n"
         "     (bit-shift-right (* n (cljc/rnd-next* r 31)) 31)\n"
         "     (loop [u (cljc/rnd-next* r 31)]\n"
@@ -14208,7 +14621,7 @@ CljcEnv *cljc_new_env(void) {
         "          (let [m (Math/sqrt (/ (* -2 (Math/log s)) s))]\n"
         "            (reset! (:spare r) (* v2 m))\n"
         "            (* v1 m)))))))\n"
-        "(def class type)\n"
+        "(defn class [x] (or (cljc/ex-class* x) (type x)))\n"
         "(def java.lang.CharSequence :java.lang.CharSequence)\n"
         "(derive :string :java.lang.CharSequence)\n"
         "(def clojure.lang.Named :clojure.lang.Named)\n"
@@ -14286,11 +14699,11 @@ CljcEnv *cljc_new_env(void) {
         "  (dotimes [i (- end from)]\n"
         "    (aset buf (+ off i) (int (.charAt s (+ from i)))))\n"
         "  nil)\n"
-        "(defn Long/valueOf [s] (or (parse-long s) (throw (ex-info (str \"bad long: \" s) {}))))\n"
+        "(defn Long/valueOf [s] (or (parse-long s) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
         "(defn Integer/toHexString [n] (format \"%x\" n))\n"
         "(defn Long/toHexString [n] (format \"%x\" n))\n"
-        "(defn Double/valueOf [s] (or (parse-double s) (throw (ex-info (str \"bad double: \" s) {}))))\n"
-        "(defn EOFException. [msg] (ex-info msg {:type :eof}))\n"
+        "(defn Double/valueOf [s] (or (parse-double s) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
+        "(defn EOFException. [msg] (cljc/ex-typed* :EOFException (ex-info msg {:type :eof})))\n"
         "(def cljc/compiler-specials*\n"
         "  ;; the JVM compiler's special-form table (riddley walks against it):\n"
         "  ;; a map of special symbols -> truthy is all consumers look for\n"
@@ -14364,7 +14777,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn cljc/bd-div [a b prec]\n"
         "  (let [a (cljc/->bd a) b (cljc/->bd b)\n"
         "        ua (cljc/bd-u a) ub (cljc/bd-u b) sa (cljc/bd-s a) sb (cljc/bd-s b)]\n"
-        "    (when (zero? ub) (throw (ex-info \"Division by zero\" {})))\n"
+        "    (when (zero? ub) (throw (ArithmeticException. \"Division by zero\")))\n"
         "    ;; A zero dividend short-circuits to zero at the preferred scale, the\n"
         "    ;; way Java normalizes it -- the general path would invent a scale\n"
         "    ;; from the guard digits and print 0E-45 instead of 0.\n"
@@ -14471,8 +14884,8 @@ CljcEnv *cljc_new_env(void) {
         "                          (get t# ~default))]\n"
         "               (if m#\n"
         "                 (apply m# args#)\n"
-        "                 (throw (ex-info (str \"No method in \" '~name\n"
-        "                                      \" for \" (pr-str dv#)) {}))))))\n"
+        "                 (throw (IllegalArgumentException. (str \"No method in \" '~name\n"
+        "                                      \" for \" (pr-str dv#))))))))\n"
         "         {:cljc/mm-key '~key})))))\n"
         "(defmacro defmethod [name dval params & body]\n"
         /* peel reader metadata off the multimethod name (e.g. defgeneric passes
@@ -14778,7 +15191,7 @@ CljcEnv *cljc_new_env(void) {
         "          (cljc/pending-realize! state nil (ex-info \"future cancelled\" {:cljc/cancelled true}))\n"
         "          (do (swap! state assoc :started true)\n"
         "              (try (cljc/pending-realize! state (f) nil)\n"
-        "                   (catch Exception e (cljc/pending-realize! state nil e)))))))\n"
+        "                   (catch Throwable e (cljc/pending-realize! state nil e)))))))\n"
         "    (CljcFuture. state)))\n"
         "(defmacro future [& body] `(future-call (fn [] ~@body)))\n"
         "(defn future? [x] (and (map? x) (= :CljcFuture (:cljc/type x))))\n"
@@ -14879,11 +15292,11 @@ CljcEnv *cljc_new_env(void) {
         "                    (swap! st assoc :val nv)\n"
         "                    (cljc/fire-watches! a old nv)\n"
         "                    true)\n"
-        "                  (catch Exception e\n"
+        "                  (catch Throwable e\n"
         "                    (let [m (deref st)]\n"
         "                      (if (= :continue (:error-mode m))\n"
         "                        (do (when-let [h (:error-handler m)]\n"
-        "                              (try (h a e) (catch Exception _ nil)))\n"
+        "                              (try (h a e) (catch Throwable _ nil)))\n"
         "                            true)\n"
         /* :fail — store the error, keep the remaining queue HELD */
         "                        (do (swap! st assoc :error e) false)))))\n"
@@ -14957,7 +15370,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn ref [v & _] (CljcRef. (swap! cljc/ref-counter inc) (atom {:val v :version 0 :watches {}})))\n"
         "(defn cljc/tx-check! [op]\n"
         "  (when-not (cljc/tx)\n"
-        "    (throw (ex-info (str op \": no transaction running (use dosync)\") {}))))\n"
+        "    (throw (IllegalStateException. (str op \": no transaction running (use dosync)\")))))\n"
         "(defn ref-set [r v]\n"
         "  (cljc/tx-check! \"ref-set\")\n"
         "  (let [tx (cljc/tx) id (:id r)]\n"
@@ -15021,7 +15434,7 @@ CljcEnv *cljc_new_env(void) {
         "(defmacro sync [_ & body] `(cljc/tx-run (fn [] ~@body)))\n"
         "(defmacro io! [& body]\n"
         "  `(if (cljc/tx)\n"
-        "     (throw (ex-info \"io! block inside a transaction\" {}))\n"
+        "     (throw (IllegalStateException. \"io! block inside a transaction\"))\n"
         "     (do ~@body)))\n"
         "(defn ref-history-count [_] 0)\n"
         "(defn ref-min-history ([r] 0) ([r n] r))\n"
@@ -15713,7 +16126,7 @@ static int run_repl(CljcEnv *env) {
         hist_add(form);
         if (setjmp(err_jmp) != 0) {
             /* *e / (pst): keep the exception around for the post-mortem */
-            Cljc *exc = cur_exc ? cur_exc : mk_str(err_msg, strlen(err_msg));
+            Cljc *exc = err_as_value();
             env_define_root(env_root(env), intern("*e", 2), exc);
             print_error();
             vsp = 0;
@@ -16374,6 +16787,9 @@ int main(int argc, char **argv) {
         Cljc *volatile last = NIL;
         for (int i = 2; i < argc; i++) {
             const char *p = argv[i];
+            /* `cljc -e A -e B` (the clojure/bb spelling): a repeated flag
+             * separates expressions, it is not itself one */
+            if (!strcmp(p, "-e") && i + 1 < argc) continue;
             while (*p) {
                 skip_ws(&p);
                 if (!*p) break;

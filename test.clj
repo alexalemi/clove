@@ -32,10 +32,14 @@
   ([form msg]
    (if (and (list? form) (= 'thrown? (first form)))
      `(cljc/test-report
-        (try (do ~@(drop 2 form)) false (catch Exception e# true))
+        (try (do ~@(drop 2 form)) false
+             (catch ~(second form) e# true)
+             (catch Throwable e#
+               (println "ERROR in is: expected" '~(second form) "but got" (class e#) (ex-message e#))
+               false))
         '~form ~msg)
      `(cljc/test-report
-        (try ~form (catch Exception e#
+        (try ~form (catch Throwable e#
                      (println "ERROR in is:" (ex-message e#)) false))
         '~form ~msg))))
 
@@ -63,7 +67,7 @@
    (reset! cljc/test-fail 0)
    (doseq [[tname f] @cljc/tests]
      (swap! cljc/test-context conj (str tname))
-     (try (f) (catch Exception e
+     (try (f) (catch Throwable e
                 (swap! cljc/test-fail inc)
                 (println "ERROR" tname ":" (ex-message e))))
      (swap! cljc/test-context pop))

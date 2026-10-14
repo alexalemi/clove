@@ -128,7 +128,7 @@
         (csp/go                          ; one goroutine per connection
           (when-let [req (read-request conn)]
             (let [resp (try (handler req)
-                            (catch Exception e
+                            (catch Throwable e
                               {:status 500 :body (str "Internal Error: " (ex-message e))}))]
               (csp/send! conn (response->str resp))))
           (tcp/close conn))

@@ -17,13 +17,20 @@ example: examples/host.c cljc.c
 	$(CC) $(CFLAGS) -o examples/host examples/host.c -lm -ldl
 	./examples/host
 
-# Each suite runs ONCE, capturing output instead of piping to grep. A pipe
-# yields grep's exit status, not cljc's, so catching a crash used to need a
-# second identical run -- which doubled the suite's cost. $$out gives both
-# the exit code and the text to scan, from one run.
+# The verdict is cljc's exit status plus the suite's summary line -- never a
+# grep for "FAIL|error" over the output, which broke on any test that
+# legitimately printed the word "error". tests.clj exits 1 if any assertion
+# failed; a script-mode abort exits non-zero before the summary prints.
+# $(1) = env prefix. On failure show everything except the PASS noise.
+define run_suite
+	@out=$$($(1) ./cljc tests.clj 2>&1); rc=$$?; \
+	  if [ $$rc -ne 0 ] || ! echo "$$out" | tail -1 | grep -q '^tests complete: [0-9]* passed, 0 failed$$'; then \
+	    echo "$$out" | grep -v '^PASS$$' | tail -40; echo "suite FAILED (rc=$$rc)"; exit 1; fi; \
+	  echo "$(1) $$(echo "$$out" | tail -1)"
+endef
+
 test: cljc
-	@out=$$(./cljc tests.clj 2>&1) || { echo "$$out"; exit 1; }; \
-	  echo "$$out" | grep -E 'FAIL|error' && exit 1 || true
+	$(call run_suite,)
 	@$(MAKE) --no-print-directory conformance
 	@echo "all tests pass (normal + conformance)"
 
@@ -32,8 +39,7 @@ test: cljc
 # ~8x slower than the normal run (140s vs 18s here) and dominates everything
 # else, so it lives in CI and pre-release rather than in every install.
 test-full: test
-	@out=$$(CLJC_GC_STRESS=1 ./cljc tests.clj 2>&1) || { echo "$$out"; exit 1; }; \
-	  echo "$$out" | grep -E 'FAIL|error' && exit 1 || true
+	$(call run_suite,CLJC_GC_STRESS=1)
 	@echo "all tests pass (normal + GC stress + conformance)"
 
 # Diff the conformance corpus against the checked-in JVM-Clojure golden file.
@@ -46,42 +52,24 @@ conformance: cljc
 	    && echo "conformance: golden verified against babashka"; \
 	else echo "conformance: bb not on PATH, golden not re-verified"; fi
 
+# Differential fuzz against babashka (needs bb + python3): random typed
+# expressions, BMP strings, string invariants. `make fuzz SEED=7 N=5000`
+# reproduces a run; the nightly workflow (.github/workflows/fuzz.yml) runs it
+# with fresh seeds.
+fuzz: cljc
+	@fuzz/fuzz.sh "$(SEED)" "$(N)"
+
 install: cljc
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 cljc $(DESTDIR)$(PREFIX)/bin/cljc
 	install -d $(DESTDIR)$(SHAREDIR)
 	install -m 644 $(BATTERIES) $(DESTDIR)$(SHAREDIR)/
 	install -m 644 cljc.c $(DESTDIR)$(SHAREDIR)/   # `cljc bundle` needs the source
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure
-	install -m 644 vendor/clojure/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/core
-	install -m 644 vendor/clojure/core/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/core/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/java
-	install -m 644 vendor/clojure/java/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/java/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/data
-	install -m 644 vendor/clojure/data/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/data/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/math
-	install -m 644 vendor/clojure/math/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/math/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/markdown
-	install -m 644 vendor/nextjournal/*.clj* $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/
-	install -m 644 vendor/nextjournal/markdown/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/nextjournal/markdown/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/medley
-	install -m 644 vendor/medley/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/medley/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/cheshire
-	install -m 644 vendor/cheshire/*.clj $(DESTDIR)$(SHAREDIR)/vendor/cheshire/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clojure/tools
-	install -m 644 vendor/clojure/tools/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clojure/tools/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/taoensso
-	install -m 644 vendor/taoensso/*.clj $(DESTDIR)$(SHAREDIR)/vendor/taoensso/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/bencode
-	install -m 644 vendor/bencode/*.clj $(DESTDIR)$(SHAREDIR)/vendor/bencode/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/babashka
-	install -m 644 vendor/babashka/*.clj $(DESTDIR)$(SHAREDIR)/vendor/babashka/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals
-	install -m 644 vendor/camel_snake_kebab/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/
-	install -m 644 vendor/camel_snake_kebab/internals/*.cljc $(DESTDIR)$(SHAREDIR)/vendor/camel_snake_kebab/internals/
-	install -d $(DESTDIR)$(SHAREDIR)/vendor/clj_yaml
-	install -m 644 vendor/clj_yaml/*.clj $(DESTDIR)$(SHAREDIR)/vendor/clj_yaml/
+	@# every vendored source, whatever directories exist -- a new vendor/ lib
+	@# needs no Makefile edit (plain install -d/-m: BSD install has no -D)
+	@find vendor -type f \( -name '*.clj' -o -name '*.cljc' -o -name '*.edn' \) | while read -r f; do \
+	  install -d "$(DESTDIR)$(SHAREDIR)/$$(dirname "$$f")" && \
+	  install -m 644 "$$f" "$(DESTDIR)$(SHAREDIR)/$$f" || exit 1; done
 	@echo "installed $(DESTDIR)$(PREFIX)/bin/cljc (batteries: $(SHAREDIR))"
 
 uninstall:
@@ -96,4 +84,4 @@ lint:
 	clj-kondo --lint json.clj libc.clj test.clj examples 2>/dev/null || true
 	@echo "(name files .cljc if they use #?(:cljc ...) reader conditionals)"
 
-.PHONY: run test test-full clean example lint install uninstall
+.PHONY: run test test-full conformance fuzz clean example lint install uninstall

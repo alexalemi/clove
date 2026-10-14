@@ -1128,3 +1128,59 @@ cljc's niche:
   hosts call from any stack depth; errors are captured from cur_exc/err_msg
   and the interpreter survives. Also fixed: the C CLI's `argc != 4` guard
   had been rejecting ALL bundle flags (--static/--windows/--cc) — now >= 4.
+
+## 2026-10-14: the silent-divergence round (summary)
+
+A health review turned into one pass over the places where cljc gave a
+different answer from Clojure *without an error* — worse than a missing
+feature for an interpreter whose job is running unmodified libraries.
+
+- **Checked integer arithmetic.** `arith()` takes a mode (wrap / check /
+  promote) instead of a `promote` bool; `+ - * inc dec` throw "long overflow",
+  `unchecked-*` are natives that wrap, the `java.util.Random` LCG moved to the
+  unchecked forms. The overflow test was the open question in PLAN.md
+  ("measure before deciding"): hyperfine on fib / loop / fib32 / hashmap put
+  it at 0–4% (4% on the tight loop counter, noise elsewhere).
+- **Typed catch** ("Exception classes" in cljc.c). Exceptions stay plain
+  values; the class rides in metadata (`{:type :IllegalStateException}`), set
+  by `ex-info`, the constructor shims, and `cljc_error_cls` at the error sites
+  whose JVM class is obvious. `catch` walks a small parent table. The design
+  constraint was the *other* direction: most interpreter errors do not know
+  their JVM class, so an untyped error still takes any clause that is not
+  provably wrong — otherwise `(catch NumberFormatException _ dflt)` around an
+  untagged site would start leaking. A pending exception is now parked across
+  `finally` (it lived only in globals). `AssertionError` is an `Error`: four
+  suite tests that caught a failed assert with `Exception` were encoding the
+  old untyped behavior and now assert the JVM's; the batteries' wrappers
+  around user code (test bodies, notebook cells, HTTP handlers, nREPL eval,
+  futures, agents) catch `Throwable`.
+- **Printer.** N/M suffixes are unconditional in `print_to`; `str` is its own
+  entry point (`str_to`: Java toString — bare number without suffix,
+  collection contents readable). `print-str`/`println-str` became natives.
+- **Fuzzer in the repo.** `fuzz/gen_expr.py` + `fuzz/fuzz.sh` (`make fuzz`),
+  nightly workflow with printed seeds. First runs found: `subvec` clamping,
+  ratio→double not following `Ratio.doubleValue`, `(str/replace s "" r)`,
+  `(long 1e19)` (a C cast with undefined behavior), `(abs Long/MIN_VALUE)`, untyped `(pop [])`,
+  64-bit `Integer/parseInt`. Then 45 seeds x 2000 expressions, clean after the last fix. Things
+  it found that are NOT bugs are steered around in the generator, with the
+  reason: boxed-vs-primitive JVM math (float ÷ exact zero, `(- x MIN_VALUE)`)
+  and in-range BigInt demotion.
+- **CI was weaker than it looked.** The ASan job's check was
+  `! grep -E 'FAIL|error' out.txt`, and under `set -e` a `!`-negated command
+  can never fail a step — so that job passed whatever the suite printed. It
+  also built `cljc-asan` while the suite re-invokes `<exe-dir>/cljc`, so once
+  the binary stopped being tracked in git every subprocess test there failed
+  with "not found", silently. Now: the suite exits 1 on any failed assertion
+  and prints a summary line, every job checks status + that line, the
+  sanitizer build is `-O1` (per the GC-root lesson), named `./cljc`, and runs
+  a GC-stress pass too.
+- Also: `make install` finds vendored sources instead of listing directories;
+  `cljc -e A -e B`; a native reached by tail call no longer overwrites its
+  caller's trace frame; a map of the file at the top of cljc.c.
+- Verification: suite normal + GC-stress + ASan/UBSan at -O1 (normal and
+  stress), conformance vs babashka, the 262 advent solutions byte-identical
+  old-vs-new, minijax 74/74.
+
+Left open (PLAN.md): BigInt contagion — `1N`-seeded arithmetic now throws
+"long overflow" instead of wrapping, loud but still not Clojure's answer —
+and classifying more interpreter error sites.

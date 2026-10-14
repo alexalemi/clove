@@ -54,7 +54,7 @@
   (let [v (atom nil) err (atom nil)
         out (with-out-str
               (try (reset! v (eval (read-string (str "(do " code "\n)"))))
-                   (catch Exception e (reset! err (or (ex-message e) "error")))))]
+                   (catch Throwable e (reset! err (or (ex-message e) "error")))))]
     (when (seq out) (reply conn {"id" id "session" sess "out" out}))
     (if @err
       (reply conn {"id" id "session" sess "err" (str @err "\n")

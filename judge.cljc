@@ -180,7 +180,7 @@
                               (when (seq expected) 2) [snap])))
       :error
       (let [msg (try (do (eval expr) :judge-no-error)
-                     (catch Exception e (ex-message e)))]
+                     (catch Throwable e (ex-message e)))]
         (if (= msg :judge-no-error)
           (do (swap! judge-fail inc)
               (println (str file ":" (judge-line-of src (:start form-rec))
@@ -219,7 +219,7 @@
             (judge-eval-test file src form-rec form kind)
             (eval form))))
       nil
-      (catch Exception e
+      (catch Throwable e
         (println (str "judge: error loading " file ": " (ex-message e)))
         :load-error))))
 

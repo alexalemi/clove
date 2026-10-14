@@ -1,6 +1,11 @@
 # CI: build + full regression suite on every platform cljc claims to support.
 # The suite self-skips platform-dependent sections (see the capability probes
 # at the top of tests.clj), so one tests.clj runs everywhere.
+#
+# Pass/fail is cljc's exit status plus the suite's last line ("tests complete:
+# N passed, 0 failed") -- tests.clj exits 1 on any failed assertion, and a
+# script-mode abort exits non-zero before that line prints. Never grep the
+# output for "fail|error": tests legitimately print those words.
 name: CI
 
 on:
@@ -23,17 +28,46 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # -O1, not -O0: unoptimized code keeps every temporary in a stack slot,
+      # and the conservative stack scan then roots values that -O1 drops --
+      # which hides exactly the missing-GC-root bugs this job exists to find.
+      # -fno-sanitize-recover: a UBSan report fails the run via exit status.
+      # Named ./cljc, not cljc-asan: the suite re-invokes "<exe-dir>/cljc" and
+      # "./cljc" for its subprocess tests (exit codes, bundle, judge, TUI
+      # natives), so the sanitizer build has to BE that binary -- otherwise
+      # those tests fail with "not found", and they run uninstrumented anyway.
       - name: Build with ASan/UBSan
-        run: cc -g -fsanitize=address,undefined -o cljc-asan cljc.c -lm -ldl
+        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o cljc cljc.c -lm -ldl
       - name: Test under sanitizers
         env:
           # conservative stack scanning reads the whole stack range and never
           # frees pool blocks — leak/UAR checkers must be off (same as Boehm)
           ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
         run: |
-          ./cljc-asan tests.clj > out.txt 2>&1
-          ! grep -E 'FAIL|error|ERROR|runtime error' out.txt
-          grep -q PASS out.txt
+          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          tail -1 out.txt
+          if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS$' out.txt | tail -60; exit 1; fi
+
+  # Sanitizers + GC stress together: collecting every 512 allocations is what
+  # turns a missing root into a use of a swept cell, and ASan is what turns
+  # that use into a report. Slow, so it gets its own job.
+  linux-asan-gc-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with ASan/UBSan
+        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o cljc cljc.c -lm -ldl
+      - name: Test under sanitizers (GC stress)
+        env:
+          ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
+          CLJC_GC_STRESS: "1"
+        run: |
+          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          tail -1 out.txt
+          if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS$' out.txt | tail -60; exit 1; fi
 
   macos-arm64:
     runs-on: macos-14
@@ -51,14 +85,15 @@ jobs:
           CLJC_UNBUFFERED: "1"
         run: |
           rc=0; time ./cljc tests.clj > out.txt 2>&1 || rc=$?
-          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt)"
-          if grep -inE 'fail|error' out.txt; then tail -30 out.txt; exit 1; fi
-          exit $rc
+          echo "suite rc=$rc: $(tail -1 out.txt)"
+          if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS$' out.txt | tail -60; exit 1; fi
       - name: Test (GC stress)
         run: |
           rc=0; CLJC_GC_STRESS=1 ./cljc tests.clj > out2.txt 2>&1 || rc=$?
-          if grep -inE 'fail|error' out2.txt; then tail -30 out2.txt; exit 1; fi
-          exit $rc
+          echo "suite rc=$rc: $(tail -1 out2.txt)"
+          if [ $rc -ne 0 ] || ! tail -1 out2.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS$' out2.txt | tail -60; exit 1; fi
 
   # Intel coverage without an Intel runner: build the x86_64 slice on the
   # arm64 runner and run the suite under Rosetta 2.
@@ -83,11 +118,9 @@ jobs:
           CLJC_CC: "cc -arch x86_64"
         run: |
           rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
-          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt)"
-          [ $rc -ne 0 ] && tail -40 out.txt
-          if grep -inE 'fail|error' out.txt; then tail -30 out.txt; exit 1; fi
-          grep -q PASS out.txt
-          exit $rc
+          echo "suite rc=$rc: $(tail -1 out.txt)"
+          if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS$' out.txt | tail -60; exit 1; fi
 
   windows:
     runs-on: windows-latest
@@ -115,18 +148,15 @@ jobs:
           CLJC_UNBUFFERED: "1"
         run: |
           rc=0; ./cljc.exe tests.clj > out.txt 2>&1 || rc=$?
-          echo "suite rc=$rc, PASS count: $(grep -c PASS out.txt), lines: $(wc -l < out.txt)"
-          tail -3 out.txt
-          if grep -inE 'fail|error' out.txt; then exit 1; fi
-          grep -q PASS out.txt
+          echo "suite rc=$rc: $(tail -1 out.txt | tr -d '\r'), lines: $(wc -l < out.txt)"
+          if [ $rc -ne 0 ] || ! tail -1 out.txt | tr -d '\r' | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS' out.txt | tail -60; exit 1; fi
           grep SKIP out.txt
-          exit $rc
       - name: Test (GC stress)
         env:
           CLJC_UNBUFFERED: "1"
         run: |
           rc=0; CLJC_GC_STRESS=1 ./cljc.exe tests.clj > out2.txt 2>&1 || rc=$?
-          tail -3 out2.txt
-          if grep -inE 'fail|error' out2.txt; then exit 1; fi
-          grep -q PASS out2.txt
-          exit $rc
+          echo "suite rc=$rc: $(tail -1 out2.txt | tr -d '\r')"
+          if [ $rc -ne 0 ] || ! tail -1 out2.txt | tr -d '\r' | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
+            grep -v '^PASS' out2.txt | tail -60; exit 1; fi

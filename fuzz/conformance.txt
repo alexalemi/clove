@@ -479,3 +479,43 @@
 ;; java.util.Random: the JVM's LCG, including nextInt's rejection loop
 (let [r (java.util.Random. 7)] (reduce + (repeatedly 5000 #(.nextInt r 2000000))))
 (let [r (java.util.Random. 42)] [(.nextInt r 1500000000) (.nextInt r 1500000000) (.nextInt r 1500000000)])
+
+; ── checked long arithmetic: + - * inc dec throw, +' -' *' promote, unchecked-* wrap ──
+(try (* 4611686018427387904 4) (catch ArithmeticException e (ex-message e)))
+(try (+ 9223372036854775807 1) (catch ArithmeticException e (ex-message e)))
+(try (inc 9223372036854775807) (catch ArithmeticException e (ex-message e)))
+(try (dec -9223372036854775808) (catch ArithmeticException e (ex-message e)))
+(try (reduce * (range 1 30)) (catch ArithmeticException e :overflow))
+[(+ 9223372036854775806 1) (* -4611686018427387904 2) (*' 4611686018427387904 4) (inc' 9223372036854775807)]
+[(unchecked-multiply 4611686018427387904 4) (unchecked-add 9223372036854775807 1) (unchecked-inc 9223372036854775807) (unchecked-negate -9223372036854775808)]
+[(abs -9223372036854775808) (abs -3) (abs -2.5)]
+; ── typed catch: first matching clause wins, no match rethrows ──
+(try (throw (ex-info "x" {})) (catch ArithmeticException e :wrong) (catch Exception e :right))
+(try (try (throw (ex-info "x" {})) (catch ArithmeticException e :inner)) (catch Exception e :outer))
+(try (/ 1 0) (catch clojure.lang.ExceptionInfo e :wrong) (catch ArithmeticException e :right))
+(try (nth [1] 5) (catch ArithmeticException e :wrong) (catch IndexOutOfBoundsException e :right))
+(try (throw (IllegalArgumentException. "boo")) (catch IllegalStateException e :wrong) (catch IllegalArgumentException e (ex-message e)))
+(try (throw (NumberFormatException. "n")) (catch IllegalArgumentException e :subclass))
+(try (throw (Exception. "plain")) (catch RuntimeException e :wrong) (catch Exception e :right))
+(try (assert false) (catch Exception e :wrong) (catch AssertionError e :right))
+(try (+ 1 nil) (catch ArithmeticException e :wrong) (catch NullPointerException e :npe))
+(try (+ 1 "a") (catch NullPointerException e :wrong) (catch ClassCastException e :cce))
+(try (try (/ 1 0) (catch Exception e (throw e))) (catch ArithmeticException e :rethrown))
+(try (try (throw (ex-info "x" {:k 1})) (catch ArithmeticException e :inner) (finally (try (/ 1 0) (catch Exception _ nil)))) (catch Exception e (ex-data e)))
+(let [e (ex-info "m" {})] [(instance? clojure.lang.ExceptionInfo e) (instance? Exception e) (instance? RuntimeException e) (instance? Error e)])
+(let [e (IllegalArgumentException. "x")] [(instance? IllegalArgumentException e) (instance? RuntimeException e) (instance? clojure.lang.ExceptionInfo e)])
+(try (Integer/parseInt "zz") (catch NumberFormatException e (ex-message e)))
+(try (Integer/parseInt "3000000000") (catch NumberFormatException e :nfe))
+[(Integer/parseInt "42") (Integer/parseInt "ff" 16) (Long/parseLong "-ff" 16) (Double/parseDouble "1.5") (parse-long "zz")]
+(try (case 3 1 :one) (catch IllegalArgumentException e :iae))
+; ── printing: N/M suffixes, str vs print vs pr ──
+[(str 100000000000000000000N) (pr-str 100000000000000000000N) (print-str 100000000000000000000N 1.50M) (str 1.50M)]
+(with-out-str (println 100000000000000000000N [1.5M "a"]))
+[(str [100000000000000000000N "a" \c]) (str {:a "x"}) (str #{"a"}) (str (list "a" 1)) (str "a" ["b"] :k \c)]
+[(print-str "x" ["a"]) (format "%s|%s" 100000000000000000000N 1.5M) (clojure.string/join "," [1.5M "s" ["t"]])]
+; ── found by fuzz/fuzz.sh ──
+[(try (subvec [1 2] 2 5) (catch IndexOutOfBoundsException e :oob)) (subvec [1 2 3] 1) (subvec [1 2] 2 2)]
+[(/ 1.5 (/ 8 2181825)) (/ (/ -3 23) (/ (/ 5 -3) 2.0)) (double 1/3) (double 1/3000000000000000000000000) (double 123456789012345678901234567890/7)]
+[(clojure.string/replace "8114" "" "42") (clojure.string/replace "" "" "x")]
+[(try (long 1e19) (catch IllegalArgumentException e (ex-message e))) (long ##NaN) (long -2.7) (long 9.223372036854775807E18)]
+[(try (pop []) (catch IndexOutOfBoundsException e :wrong) (catch IllegalStateException e (ex-message e))) (try (pop (list)) (catch IllegalStateException e :ise)) (pop nil) (pop [1 2])]

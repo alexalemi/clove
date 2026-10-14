@@ -1,3 +1,4 @@
+(require 'clojure.set 'clojure.string)
 (doseq [line (str/split-lines (slurp (first *args*)))
         :when (not (or (str/blank? line) (str/starts-with? line ";")))]
-  (prn (try (eval (read-string line)) (catch Exception e :FUZZERR))))
+  (prn (try (eval (read-string line)) (catch Throwable e :FUZZERR))))

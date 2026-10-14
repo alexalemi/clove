@@ -1,3 +1,4 @@
+(require 'clojure.set 'clojure.string)
 (doseq [line (clojure.string/split-lines (slurp (first *command-line-args*)))
         :when (not (or (clojure.string/blank? line)
                        (clojure.string/starts-with? line ";")))]

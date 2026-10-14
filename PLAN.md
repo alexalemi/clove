@@ -9,19 +9,27 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-10-04, unreleased on top of v0.5.1)
+## Status (as of 2026-10-14, unreleased on top of v0.5.1)
 
-~16,500 lines, zero warnings, ~1680 assertions in `tests.clj` + 462-expression
+~17,000 lines, zero warnings, ~1920 assertions in `tests.clj` + ~500-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
-required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan),
-macOS arm64 + x86_64/Rosetta, Windows (MSYS2 mingw64) — suite runs normal +
-GC-stress on every push; tagged releases publish portable binaries.
+required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan at
+-O1, normal and GC-stress), macOS arm64 + x86_64/Rosetta, Windows (MSYS2
+mingw64) — suite runs normal + GC-stress on every push; a nightly job runs the
+differential fuzzer against babashka (`make fuzz`); tagged releases publish
+portable binaries. Suite verdict is the exit status + the "tests complete: N
+passed, 0 failed" line, never a grep for "error".
 
-Most recent work: minijax bring-up (74/74), then BigDecimal promoted from a
-prelude tagged map to a C numeric type (CLJC_BIGDEC) — exact arithmetic with
-Java's scale rules, `1.5M` literals, value `=`/hash, exact `%f` — fuzzed
-identical to the JVM over 2000 cases x 25 ops.
+Most recent work (2026-10-14): the silent-divergence round. `+ - * inc dec`
+throw "long overflow" instead of wrapping (`unchecked-*` wrap); `catch` is
+typed (see "Exception classes" in cljc.c); `print`/`println` carry `N`/`M` and
+`str` of a collection prints its contents readably; `fuzz/gen_expr.py` +
+`fuzz/fuzz.sh` put the random-expression fuzzer in the repo, and its first
+runs found six more divergences (subvec bounds, Ratio.doubleValue rounding,
+empty-pattern replace, long range, abs of MIN_VALUE, 32-bit parseInt), all
+fixed. Before that: minijax bring-up (74/74) and BigDecimal as a C numeric
+type.
 
 ### GC invariants (read before touching allocation paths!)
 1. Only `cell_alloc`/`env_alloc` can trigger collection (`xmalloc` cannot).
@@ -43,13 +51,24 @@ Things the history log leaves unresolved, roughly by value:
   registry misses. Fix is to qualify inside library loads, held back until a
   prelude/battery audit confirms nothing relies on cljc's bare-symbol
   (non-hygienic) templates. Details: HISTORY.md, specter/meander entries.
-- **`*` wraps on int64 overflow** where Clojure throws "long overflow".
-  Silent wrong answers in ported numeric code; `*'` is the workaround. A
-  checked `*` costs an overflow test on the hottest arithmetic path —
-  measure before deciding.
-- **`println`/`print` of bigints and decimals** omit the `N`/`M` suffix
-  (Clojure prints `1N`, `1.5M`; only `str` drops it). The printer has a
-  single `readably` flag, and `str` and `print` share the non-readable side.
+- **BigInt contagion.** In-range BigInts are longs (`1N` reads as `1`; a
+  bigint result that fits demotes), so `(reduce * 1N (range 1 30))` now
+  throws "long overflow" — loud, where it used to wrap silently, but Clojure
+  keeps going in BigInt. The real fix is a non-demoting BIGINT, which touches
+  every `->tag == CLJC_INT` integer check (`as_int` is the main choke point),
+  `=`/`hash` across the two representations, and `int?` vs `integer?`.
+  `fuzz.sh` strips the `N` suffix before diffing so this stays quiet there.
+- **Untyped interpreter errors.** Only the error sites with an obvious JVM
+  class go through `cljc_error_cls` (arithmetic, index bounds, number
+  parsing, nil/non-number arguments, stack overflow). Everything else is
+  untyped and matches any `catch` clause but ExceptionInfo/AssertionError/
+  Error. Classify more sites as ported code turns out to dispatch on them —
+  wrong-arity (ArityException) and "not a function" (ClassCastException) are
+  the likely next ones. `type` of an exception is still its representation
+  (`:map`/`:string`); only `class` and `instance?` see the recorded class.
+- **Float division by an exact zero** is `##Inf` (as compiled Clojure with
+  primitive doubles); boxed JVM math and babashka throw. Typing-dependent on
+  the JVM itself, so there is no single right answer — left as is.
 - **BigDecimal leftovers**: `(BigDecimal. 0.1)` uses the double's shortest
   repr (Java's `valueOf`) rather than the exact binary expansion; only
   HALF_UP rounding; no `*math-context*`; `(bigint 2.7M)` demotes to a long
@@ -80,8 +99,9 @@ Things the history log leaves unresolved, roughly by value:
   host language. The single embeddable `cljc.c` file is the constraint.
 
 ## Known divergences from Clojure (deliberate)
-- `catch` is untyped; hash maps/sets iterate in hash order; plain int64
-  arithmetic wraps (see README's list — it supersedes this one)
+- `catch` is typed only as far as exception classes are recorded; hash
+  maps/sets iterate in hash order; in-range BigInts are longs (see README's
+  list — it supersedes this one)
 - Namespaces: flat global + per-ns aliases behind a symbol-based namespace
   layer; top-level `user` defs are bare, hence visible from other
   namespaces; no remove-ns/ns-unmap (root Bindings are append-only)
@@ -90,11 +110,18 @@ Things the history log leaves unresolved, roughly by value:
 
 ## Testing conventions
 - `tests.clj` — every bug fix gets a regression assertion (assert= prints
-  PASS/FAIL; script mode aborts on first `error:`)
+  PASS/FAIL and counts; the file exits 1 if any failed, and script mode
+  aborts non-zero on the first uncaught error)
 - Verify sweeps: `make test-full`, then an ASan build at **-O1** (at -O0
   the stack keeps values alive that -O1 drops, hiding missing GC roots):
-  `cc -g -O1 -fsanitize=address,undefined -o /tmp/cljc-asan cljc.c -lm -ldl`
-  with the ASAN_OPTIONS above, both normal and stress.
+  `cc -g -O1 -fsanitize=address,undefined -o cljc cljc.c -lm -ldl`
+  with the ASAN_OPTIONS above, both normal and stress. Build it AS `./cljc`:
+  the suite's subprocess tests re-invoke `<exe-dir>/cljc`, and under any other
+  name they fail with "not found" (CI's ASan job did exactly that, unnoticed,
+  while its `! grep` check could not fail a `set -e` step).
 - Behavior that has a JVM answer goes in `fuzz/conformance.txt` too;
-  regenerate the golden with `bb -f fuzz/runner.clj -- fuzz/conformance.txt`.
+  regenerate the golden with
+  `bb -f fuzz/runner.clj -- fuzz/conformance.txt > fuzz/conformance_expected.txt`.
+- `make fuzz` (differential vs babashka) before a release and after touching
+  numerics, printing, or exceptions; a finding becomes a conformance line.
 - Memory bound check: 2M-iteration churn loop should stay ~5 MB RSS.
