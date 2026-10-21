@@ -62,6 +62,18 @@ returning the value, so code keeps working while you watch it. After an error,
 `*e` holds the exception and `(pst)` reprints its message and trace. `(pprint x)`
 is a real pretty-printer (fill layout, aligned map values).
 
+**Ask Claude, in the REPL.** A line starting with `? ` goes to Claude instead
+of the evaluator: `? why did [3] throw` sends the question with this session's
+transcript (inputs, results, errors, earlier answers) and a standing prompt
+about cljc, and the answer streams in as it's written. Claude can look things
+up on its own — `doc`, `source`, `dir`, `apropos`, `find-doc`, a var's value —
+but never runs code itself: when running something would help, it writes the
+line into your prompt (`claude⟩ (reduce + (filter odd? xs))`), and you edit
+it, press Enter to run it, or `^C` to decline. It sees what you ran and the
+output. The answer lands in `*1`. Needs `curl` and `ANTHROPIC_API_KEY`; model
+and effort live in `claude/config` (see `claude.clj`). `?x` alone is still a
+symbol, so logic variables are unaffected.
+
 **Errors that point somewhere.** Uncaught errors show the offending source line
 with a caret, a trace with exact lines that reaches *inside* function bodies
 (`at (nth ...) other_file.clj:2`), typo suggestions (`Did you mean `println`?`),

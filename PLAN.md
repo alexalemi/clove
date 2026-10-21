@@ -21,7 +21,17 @@ differential fuzzer against babashka (`make fuzz`); tagged releases publish
 portable binaries. Suite verdict is the exit status + the "tests complete: N
 passed, 0 failed" line, never a grep for "error".
 
-Most recent work (2026-10-14): the silent-divergence round. `+ - * inc dec`
+Most recent work (2026-10-20): `? question` in the REPL asks Claude
+(`claude.clj` battery; C side keeps a 32 KB session transcript in
+`repl_log`, dispatches `? ` lines, and exposes `cljc/repl-edit*` (line editor
+with preloaded text) + `cljc/repl-log*`; `cljc/sh-lines*` streams the SSE
+response). Tools: read-only `cljc_lookup` runs automatically; `propose_form`
+only pre-fills the prompt — nothing Claude writes runs without the user's
+Enter. Follow-ups: Windows key handling (`%VAR%` or a curl `-K` file), capture
+`println` output of user forms in the transcript (only results/errors are
+logged now), multi-line proposals (the editor is single-line).
+
+Before that (2026-10-14): the silent-divergence round. `+ - * inc dec`
 throw "long overflow" instead of wrapping (`unchecked-*` wrap); `catch` is
 typed (see "Exception classes" in cljc.c); `print`/`println` carry `N`/`M` and
 `str` of a collection prints its contents readably; `fuzz/gen_expr.py` +

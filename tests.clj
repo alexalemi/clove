@@ -3458,5 +3458,41 @@
 (assert= :cce (try (+ 1 "a") (catch NullPointerException e :wrong) (catch ClassCastException e :cce)))
 (assert= :npe (try (quot nil 2) (catch ArithmeticException e :wrong) (catch NullPointerException e :npe)))
 
+;; claude.clj (`? question` at the REPL): request shape + the cljc_eval tool, no network
+(require '[claude])
+(let [m (claude/first-message "why?" "cljc[1]> (+ 1 2)\n[1] 3\n")
+      body (claude/request [m])]
+  (assert= "user" (get m "role"))
+  (assert= true (str/ends-with? (get m "content") "</repl-transcript>\n\nwhy?"))
+  (assert= "why?" (get (claude/first-message "why?" "") "content"))
+  (assert= ["claude-opus-5-5" "adaptive" true ["cljc_lookup" "propose_form"]]
+           [(get body "model") (get-in body ["thinking" "type"]) (get body "stream") (mapv #(get % "name") (get body "tools"))])
+  (assert= true (map? (json/parse (json/write body)))))
+(assert= ":x\n=> 3" (#'claude/eval-code "(println :x) (+ 1 2)"))
+(assert= "!! Divide by zero" (#'claude/eval-code "(/ 1 0)"))
+(assert= true (str/ends-with? (#'claude/eval-code "(range)") " 49 ...)"))   ; infinite results print capped
+(assert= true (str/includes? (claude/lookup "doc" "juxt") "(juxt f g)"))
+(assert= "nope-zz does not resolve" (claude/lookup "value" "nope-zz"))
+;; SSE: text deltas reach on-text; a tool_use's streamed JSON input reassembles
+(let [said (atom "")
+      st (reduce #(claude/sse-step %1 %2 (fn [t] (swap! said str t))) {:blocks (sorted-map)}
+                 ["event: content_block_start"
+                  "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}"
+                  "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}"
+                  "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"propose_form\",\"input\":{}}}"
+                  "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"code\\\": \\\"(inc\"}}"
+                  "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\" 1)\\\"}\"}}"
+                  "data: {\"type\":\"content_block_stop\",\"index\":1}"
+                  "" "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}"])]
+  (assert= "hi" @said)
+  (assert= "tool_use" (:stop st))
+  (assert= [{"type" "text" "text" "hi"} {"type" "tool_use" "id" "t" "name" "propose_form" "input" {"code" "(inc 1)"}}]
+           (vec (vals (:blocks st)))))
+;; cljc/sh-lines*: one call per output line, exit status back; a throw closes the pipe
+(let [ls (atom [])]
+  (assert= 3 (cljc/sh-lines* "printf 'a\\nb\\n'; exit 3" #(swap! ls conj %)))
+  (assert= ["a" "b"] @ls))
+(assert= "stop" (try (cljc/sh-lines* "yes" (fn [_] (throw (ex-info "stop" {})))) (catch Exception e (ex-message e))))
+
 (println (str "tests complete: " @cljc-test-passed " passed, " @cljc-test-failed " failed"))
 (when (pos? @cljc-test-failed) (System/exit 1))

@@ -11913,6 +11913,55 @@ static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
     return m;
 }
 
+#ifndef CLJC_NO_MAIN   /* defined with the REPL */
+static Cljc *prim_repl_edit(CljcEnv *env, Cljc **argv, int nargs);
+static Cljc *prim_repl_log(CljcEnv *env, Cljc **argv, int nargs);
+#endif
+
+/* (cljc/sh-lines* "cmd" f) → exit status. Like sh, but calls (f line) for
+ * each line of output (stdout+stderr, newline stripped) as it arrives, so a
+ * long-running command — a streaming curl — can be consumed incrementally.
+ * An error thrown by f closes the pipe (the child sees SIGPIPE) and
+ * propagates. */
+static Cljc *prim_sh_lines(CljcEnv *env, Cljc **argv, int nargs) {
+    if (nargs != 2) cljc_error("cljc/sh-lines*: expected cmd and fn");
+    char *cmd = as_str(argv[0], "cljc/sh-lines*");
+    Cljc *f = argv[1];
+    SBuf full = {0};
+    sb_puts(&full, cmd);
+    sb_puts(&full, " 2>&1");
+    FILE *volatile p = popen(full.data, "r");
+    free(full.data);
+    if (!p) cljc_error("cljc/sh-lines*: popen failed");
+    ErrFrame fr;
+    fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
+    fr.vm_tsp_save = vm_tsp; fr.ns_save = cur_reader_ns; fr.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL; fr.rd_line_save = rd_line;
+    fr.rd_start_save = rd_line_start; fr.rd_file_save = rd_file_cell;
+    err_top = &fr;
+    if (setjmp(fr.jb) != 0) {          /* f threw: close up, then rethrow */
+        err_top = fr.prev;
+        pclose(p);
+        cljc_raise();
+    }
+    SBuf line = {0};
+    int c;
+    for (;;) {
+        c = fgetc(p);
+        if (c == EOF || c == '\n') {
+            if (c == EOF && line.len == 0) break;
+            if (line.len && line.data[line.len-1] == '\r') line.len--;
+            Cljc *a[1] = { mk_str(line.data ? line.data : "", line.len) };
+            line.len = 0;
+            apply(env, f, a, 1);
+            if (c == EOF) break;
+        } else sb_putc(&line, (char)c);
+    }
+    free(line.data);
+    err_top = fr.prev;
+    int status = pclose(p);
+    return mk_int(status == -1 ? -1 : WEXITSTATUS(status));
+}
+
 /* Vtable handed to FFI modules — generated glue marshals exclusively
  * through these, so modules need no cljc symbols or headers. Append-only:
  * reordering breaks every compiled module. */
@@ -13812,6 +13861,11 @@ CljcEnv *cljc_new_env(void) {
     cljc_define_native(e, "flush", prim_flush);
     cljc_define_native(e, "cljc/isatty*", prim_isatty);
     cljc_define_native(e, "cljc/raw-mode*", prim_raw_mode);
+    cljc_define_native(e, "cljc/sh-lines*", prim_sh_lines);
+#ifndef CLJC_NO_MAIN
+    cljc_define_native(e, "cljc/repl-edit*", prim_repl_edit);
+    cljc_define_native(e, "cljc/repl-log*", prim_repl_log);
+#endif
     cljc_define_native(e, "cljc/read-key*", prim_read_key);
     cljc_define_native(e, "cljc/term-size*", prim_term_size);
     cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
@@ -15907,10 +15961,14 @@ static bool rl_raw_enter(RlTermState *st) {
 static void rl_raw_exit(RlTermState *st) { tcsetattr(0, TCSAFLUSH, &st->orig); }
 #endif
 
-static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+/* Edit one line; `init` (may be NULL) is preloaded with the cursor at its
+ * end, so a proposed line can be accepted with Enter or edited first. */
+static bool rl_edit_init(const char *prompt, char *buf, size_t bufcap, const char *init) {
     RlTermState st;
     if (!rl_raw_enter(&st)) {   /* not a capable console: plain line input */
-        fputs(prompt, stdout); fflush(stdout);
+        fputs(prompt, stdout);
+        if (init) fputs(init, stdout);
+        fflush(stdout);
         if (!fgets(buf, (int)bufcap, stdin)) return false;
         buf[strcspn(buf, "\n")] = 0;
         return true;
@@ -15919,6 +15977,10 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
     int hidx = rl_hist_n;
     char saved[RL_MAX] = "";
     buf[0] = 0;
+    if (init) {
+        snprintf(buf, bufcap, "%s", init);
+        len = pos = strlen(buf);
+    }
     rl_refresh(prompt, buf, pos);
     for (;;) {
         int c = getchar();
@@ -16032,6 +16094,10 @@ static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
     }
 }
 
+static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
+    return rl_edit_init(prompt, buf, bufcap, NULL);
+}
+
 static bool balanced(const char *s) {
     int depth = 0;
     bool in_str = false, in_com = false;
@@ -16090,6 +16156,73 @@ static void repl_record(CljcEnv *env, Cljc *result) {
     env_define_root(env_root(env), intern("*1", 2), result);
 }
 
+/* The session transcript `? question` hands to Claude: inputs, rendered
+ * results, errors and earlier answers, as the user saw them. Plain malloc
+ * memory (never a Cljc value), capped by dropping the oldest whole lines. */
+#define REPL_LOG_MAX (32 * 1024)
+static SBuf repl_log;
+static void repl_log_add(const char *pfx, const char *s, size_t n) {
+    sb_puts(&repl_log, pfx);
+    sb_grow(&repl_log, n + 1);
+    memcpy(repl_log.data + repl_log.len, s, n);
+    repl_log.len += n;
+    repl_log.data[repl_log.len] = '\0';
+    if (n == 0 || s[n-1] != '\n') sb_putc(&repl_log, '\n');
+    if (repl_log.len > REPL_LOG_MAX) {
+        const char *cut = strchr(repl_log.data + repl_log.len - REPL_LOG_MAX, '\n');
+        size_t drop = cut ? (size_t)(cut + 1 - repl_log.data) : repl_log.len;
+        memmove(repl_log.data, repl_log.data + drop, repl_log.len - drop + 1);
+        repl_log.len -= drop;
+    }
+}
+
+/* (cljc/repl-edit* prompt init) → the line as edited (Enter accepts), or
+ * nil when it comes back empty (^C clears) or on EOF. A non-empty line also
+ * joins the ↑ history. Used by claude.clj to propose a form for the user to
+ * run. */
+static Cljc *prim_repl_edit(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs != 2) cljc_error("cljc/repl-edit*: expected prompt and initial text");
+    const char *prompt = as_str(argv[0], "cljc/repl-edit*");
+    const char *init = argv[1] == NIL ? NULL : as_str(argv[1], "cljc/repl-edit*");
+    char line[RL_MAX];
+    fflush(stdout);
+    if (!rl_edit_init(prompt, line, sizeof line, init)) return NIL;
+    const char *t = line;
+    while (*t == ' ') t++;
+    if (!*t) return NIL;
+    hist_add(line);
+    return mk_str(line, strlen(line));
+}
+
+/* (cljc/repl-log* s) → nil; append s to the transcript `? ` sends along. */
+static Cljc *prim_repl_log(CljcEnv *env, Cljc **argv, int nargs) {
+    (void)env;
+    if (nargs != 1) cljc_error("cljc/repl-log*: expected a string");
+    const char *s = as_str(argv[0], "cljc/repl-log*");
+    repl_log_add("", s, strlen(s));
+    return NIL;
+}
+
+/* `? question`: answer via claude.clj's claude/ask (loaded on first use),
+ * passing the transcript. Errors (no key, curl failure) longjmp to the
+ * REPL's handler like any eval error. */
+static Cljc *repl_ask_claude(CljcEnv *env, const char *q) {
+    Binding *b = root_find(env_root(env), intern("claude/ask", 10), NULL, false);
+    if (!b || b->value == NIL) {
+        const char *src = "(require '[claude])";
+        eval(env, read_form(&src));
+        b = root_find(env_root(env), intern("claude/ask", 10), NULL, false);
+        if (!b || b->value == NIL) cljc_error("claude.clj did not define claude/ask");
+    }
+    Cljc *argv[2] = { mk_str(q, strlen(q)),
+                      mk_str(repl_log.data ? repl_log.data : "", repl_log.len) };
+    return apply(env_root(env), b->value, argv, 2);
+}
+
+/* `? ...` is prose for Claude, not code — but `?x` stays a symbol (logic vars) */
+static bool is_ask_line(const char *s) { return s[0] == '?' && (s[1] == ' ' || s[1] == 0); }
+
 static int run_repl(CljcEnv *env) {
     cljc_interactive = true;
     hist_load();
@@ -16102,7 +16235,7 @@ static int run_repl(CljcEnv *env) {
     sa.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa, NULL);
 #endif
-    printf("cljc %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out\n",
+    printf("cljc %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out, ? question asks Claude\n",
            CLJC_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];
@@ -16113,7 +16246,7 @@ static int run_repl(CljcEnv *env) {
         snprintf(prompt, sizeof prompt, "cljc[%d]> ", out_n);
         if (!rl_edit(prompt, line, sizeof line)) break;
         snprintf(form, sizeof form, "%s", line);
-        while (form[0] != '!' && !balanced(form)) {
+        while (form[0] != '!' && !is_ask_line(form) && !balanced(form)) {
             char cprompt[64];
             int ind = open_depth(form) * 2;
             if (ind > 40) ind = 40;
@@ -16128,6 +16261,12 @@ static int run_repl(CljcEnv *env) {
             /* *e / (pst): keep the exception around for the post-mortem */
             Cljc *exc = err_as_value();
             env_define_root(env_root(env), intern("*e", 2), exc);
+            {
+                SBuf eb = {0};
+                print_to(&eb, exc, true);
+                repl_log_add("!! ", eb.data ? eb.data : "", eb.len);
+                free(eb.data);
+            }
             print_error();
             vsp = 0;
             eval_sp = 0;
@@ -16140,6 +16279,26 @@ static int run_repl(CljcEnv *env) {
         rd_line = 1;
         rd_line_start = form;
         rd_file_cell = NULL;   /* typed forms have no :file (a stale one would mislabel) */
+        {   /* log the input, numbered like the prompt it was typed at */
+            char pfx[32];
+            snprintf(pfx, sizeof pfx, "cljc[%d]> ", out_n);
+            repl_log_add(pfx, form, strlen(form));
+        }
+        if (is_ask_line(form)) {               /* ask mode: ? why did [3] fail */
+            const char *q = form + 1;
+            while (*q == ' ') q++;
+            if (!*q) {
+                printf("? <question> asks Claude, with this session's transcript as context "
+                       "(needs curl + ANTHROPIC_API_KEY; see claude.clj)\n");
+                continue;
+            }
+            Cljc *ans = repl_ask_claude(env, q);
+            if (ans->tag == CLJC_STRING)   /* already streamed to the terminal */
+                repl_log_add("claude: ", ans->as.str, strlen(ans->as.str));
+            repl_record(env, ans);   /* *1 is the answer */
+            out_n++;
+            continue;
+        }
         if (form[0] == '!') {                  /* shell mode: !ls -la */
             const char *cmd = form + 1;
             while (*cmd == ' ') cmd++;
@@ -16147,8 +16306,10 @@ static int run_repl(CljcEnv *env) {
             Cljc *carg[1] = {mk_str(cmd, strlen(cmd))};
             Cljc *r = prim_sh(env, carg, 1);   /* {:exit n :out s} */
             Cljc *out, *exitc;
-            if (map_find(r, mk_kw(intern("out", 3)), &out) && out->tag == CLJC_STRING)
+            if (map_find(r, mk_kw(intern("out", 3)), &out) && out->tag == CLJC_STRING) {
                 fputs(out->as.str, stdout);
+                repl_log_add("", out->as.str, strlen(out->as.str));
+            }
             if (map_find(r, mk_kw(intern("exit", 4)), &exitc) &&
                 exitc->tag == CLJC_INT && exitc->as.i != 0)
                 printf("\x1b[31m[exit %lld]\x1b[0m\n", (long long)exitc->as.i);
@@ -16179,6 +16340,11 @@ static int run_repl(CljcEnv *env) {
                 if ((int)sb.len > tw - 8) { sb.len = 0; pp_to(&sb, result, 0, tw - 8, 0); }
                 if (guard) plb->value = saved_pl;
                 if (sb.data) fwrite(sb.data, 1, sb.len, stdout);
+                {
+                    char pfx[32];
+                    snprintf(pfx, sizeof pfx, "[%d] ", out_n);
+                    repl_log_add(pfx, sb.data ? sb.data : "", sb.len);
+                }
                 free(sb.data);
             }
             putchar('\n');

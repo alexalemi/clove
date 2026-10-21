@@ -42,6 +42,18 @@
   `(str ["a" 1.5M])` is `"[\"a\" 1.5M]"`, where it was `"[a 1.5]"`.
 
 ### Added
+- **`? question` at the REPL asks Claude.** The question goes out with the
+  session transcript (inputs, results, errors, earlier answers; last 32 KB)
+  and a system prompt describing cljc; the answer streams in. Claude's tools:
+  `cljc_lookup` (doc/source/dir/apropos/find-doc/var value — read-only, runs
+  without asking) and `propose_form`, which writes one line into your prompt
+  to edit, run with Enter, or decline with `^C` — Claude never runs code
+  itself. The answer is numbered like a result and held in `*1`. Implemented in
+  the new `claude.clj` battery (`(claude/ask "...")` works from code too) over
+  `curl`; needs `ANTHROPIC_API_KEY`. Uses `claude-opus-5-5` with server-side
+  refusal fallbacks. POSIX shells only for now (the key is expanded as `$VAR`).
+- **`cljc/sh-lines*`** runs a shell command and calls a fn on each output line
+  as it arrives (what the streaming above is built on).
 - **`make fuzz` / nightly fuzz workflow.** `fuzz/gen_expr.py` generates random
   typed core expressions and `fuzz/fuzz.sh` runs them (plus the string
   corpora) through cljc and babashka and diffs the output; a GitHub workflow
