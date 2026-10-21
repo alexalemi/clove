@@ -7079,22 +7079,22 @@ static Clove *prim_denominator(CloveEnv *env, Clove **argv, int nargs) {
     clove_error("denominator: not a rational");  return NIL;
 }
 
-/* Sequential equality across lists and vectors, Clojure-style:
- * (= [1 2 3] '(1 2 3)) is true. */
+/* Sequential equality across lists, vectors and lazy seqs, Clojure-style:
+ * (= [1 2 3] '(1 2 3)) is true. Seqs are forced one cell at a time, so a
+ * finite side ends the walk: (= [0 1 2] (range)) is false, not a hang. */
 static bool seq_eq(Clove *a, Clove *b) {
-    /* Normalize both to an index/cursor walk. */
-    Clove *la = (a->tag == CLOVE_LIST) ? a : NULL;
-    Clove *lb = (b->tag == CLOVE_LIST) ? b : NULL;
+    bool va = a->tag == CLOVE_VECTOR, vb = b->tag == CLOVE_VECTOR;
+    Clove *la = va ? NULL : seq1(a), *lb = vb ? NULL : seq1(b);
     size_t ia = 0, ib = 0;
     for (;;) {
-        bool done_a = la ? (la == NIL) : (ia >= vec_len(a));
-        bool done_b = lb ? (lb == NIL) : (ib >= vec_len(b));
+        bool done_a = va ? (ia >= vec_len(a)) : (la == NIL);
+        bool done_b = vb ? (ib >= vec_len(b)) : (lb == NIL);
         if (done_a || done_b) return done_a && done_b;
-        Clove *xa = la ? la->as.cons.head : vec_nth(a, ia);
-        Clove *xb = lb ? lb->as.cons.head : vec_nth(b, ib);
+        Clove *xa = va ? vec_nth(a, ia) : la->as.cons.head;
+        Clove *xb = vb ? vec_nth(b, ib) : lb->as.cons.head;
         if (!clove_eq(xa, xb)) return false;
-        if (la) la = la->as.cons.tail; else ia++;
-        if (lb) lb = lb->as.cons.tail; else ib++;
+        if (va) ia++; else la = seq1(la->as.cons.tail);
+        if (vb) ib++; else lb = seq1(lb->as.cons.tail);
     }
 }
 
@@ -7134,8 +7134,7 @@ static bool clove_eq(Clove *a, Clove *b) {
     bool a_seq = a->tag == CLOVE_LIST || a->tag == CLOVE_VECTOR || a->tag == CLOVE_LAZY || a->tag == CLOVE_EMPTY;
     bool b_seq = b->tag == CLOVE_LIST || b->tag == CLOVE_VECTOR || b->tag == CLOVE_LAZY || b->tag == CLOVE_EMPTY;
     if (a_seq && b_seq)  /* to_seq also surfaces lazy tails hidden in lists */
-        return seq_eq(a->tag == CLOVE_VECTOR ? a : to_seq(a),
-                      b->tag == CLOVE_VECTOR ? b : to_seq(b));
+        return seq_eq(a, b);
     /* sorted collections compare as their set/map category, across tags */
     if (a->tag == CLOVE_SORTED || b->tag == CLOVE_SORTED) {
         bool a_set = a->tag == CLOVE_SET || (a->tag == CLOVE_SORTED && !a->as.sorted.is_map);
@@ -13339,13 +13338,15 @@ static const char *PRELUDE =
     "(defn qualified-ident? [x] (and (ident? x) (str/includes? (str x) \"/\")))\n"
     "(defn simple-ident? [x] (and (ident? x) (not (str/includes? (str x) \"/\"))))\n"
     "(def global-hierarchy (atom {}))\n"
+    "(defn inspect \"Browse x in a full-screen terminal inspector (inspect.clj); returns the value last viewed.\"\n"
+    "  [x] (require '[inspect]) (inspect/inspect x))\n"
     "(defn clove/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
     "       (catch Exception e nil)))\n"
     "(defn clove/project-paths []\n"
     "  (loop [pre \"\"]\n"                       /* "" -> "../" -> "../../" ... */
-    "    (let [ps (mapcat (fn [n] (clove/edn-paths (str pre n))) [\"deps.edn\" \"bb.edn\"])]\n"
+    "    (let [ps (mapcat (fn [n] (clove/edn-paths (str pre n))) [\"clove.edn\" \"deps.edn\" \"bb.edn\"])]\n"
     "      (cond\n"
     "        (seq ps) (map (fn [p] (str pre p)) ps)\n"   /* resolve to the config's dir */
     "        (> (count pre) 60) nil\n"            /* stop after ~20 levels */

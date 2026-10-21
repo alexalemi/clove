@@ -3650,5 +3650,8 @@
         out (with-out-str (reset! r (inspect/inspect {:a 1})))]
     (assert= ["{:a 1}\n" {:a 1}] [out @r])))                                ; pprint + return
 
+;; = between a finite and an infinite seq walks lazily and stops (was a hang)
+(assert= [false false false true] [(= [0 1 2] (range)) (= (range 3) (range)) (= (range) '(0 1)) (= (range 3) [0 1 2])])
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
