@@ -3562,11 +3562,11 @@
   (assert= ["repl" "run" "test"] (keys (:tasks (tasks/parse-config (read-string (get fs "clove.edn")))))))
 ;; running: a failing dependency stops the run and its exit status comes back
 (when clove-test-unix?
-  (let [out (with-out-str
+  (let [out (binding [*err* (StringWriter.)] (with-out-str
               (assert= 3 (tasks/run-task (tasks/parse-config '{:tasks {ok "echo ran-ok"
                                                                         bad {:depends [ok] :task "exit 3"}
                                                                         top {:depends [bad] :task "echo NEVER"}}})
-                                         "." "top" [])))]
+                                         "." "top" []))))]
     (assert= true (str/includes? out "ran-ok"))
     (assert= false (str/includes? out "NEVER"))))
 (assert= [:x ["a"]] (binding [*out* (StringWriter.)]
