@@ -338,6 +338,8 @@ static Clove *eval(CloveEnv *env, Clove *form);
 static Clove *read_form(const char **src);
 static void print(Clove *v);
 static const char *intern(const char *s, size_t n);
+static const char *intern_qual(const char *ns, const char *nm);
+static const char *intern_qual_n(const char *ns, size_t nl, const char *nm, size_t ml);
 static bool clove_eq(Clove *a, Clove *b);
 static bool map_find(Clove *m, Clove *key, Clove **out);
 static double as_num(Clove *v);
@@ -553,7 +555,7 @@ static Clove *rd_file_cell;   /* display name of the file being read (one string
 static int rd_line;                 /* 1-based; 0 = no tracking */
 static const char *rd_line_start;   /* for column computation */
 static char err_trace[1536];
-static char err_file[160];         /* :file of the innermost located frame ("" = none) */
+static char err_file[1024];         /* :file of the innermost located frame ("" = none) */
 /* Ctrl-C during a REPL evaluation: the SIGINT handler sets this; eval() and
  * VOP_CALL raise a catchable "interrupted" error at the next call boundary.
  * Only the REPL installs the handler — scripts keep default-die semantics
@@ -574,7 +576,29 @@ static const char *err_token;      /* offending symbol, when known */
 static long long err_col = -1;
 static ErrFrame *err_top;
 static jmp_buf err_jmp;
-static char err_msg[256];
+/* The message of a message-style error in flight. Heap-grown to fit: a fixed
+ * buffer silently cut long messages (a 300-char symbol name) at 255 chars. */
+static char *err_msg = "";
+static size_t err_msg_cap;
+static void err_msg_vset(const char *fmt, va_list ap) {
+    va_list ap2; va_copy(ap2, ap);
+    int n = vsnprintf(err_msg_cap ? err_msg : NULL, err_msg_cap, fmt, ap2);
+    va_end(ap2);
+    if (n < 0) n = 0;
+    if ((size_t)n >= err_msg_cap) {
+        size_t cap = (size_t)n + 1 < 256 ? 256 : (size_t)n + 1;
+        char *m = malloc(cap);
+        if (!m) { err_msg = "out of memory"; err_msg_cap = 0; return; }
+        if (err_msg_cap) free(err_msg);
+        err_msg = m; err_msg_cap = cap;
+        vsnprintf(err_msg, err_msg_cap, fmt, ap);
+    }
+}
+static void err_msg_set(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    err_msg_vset(fmt, ap);
+    va_end(ap);
+}
 static Clove *cur_exc;   /* exception value in flight; a GC root */
 /* Class of a message-style error in flight: a simple JVM class name such as
  * "ArithmeticException" (set by clove_error_cls), or NULL for the untyped
@@ -661,7 +685,7 @@ static void clove_error(const char *fmt, ...) {
     err_class = NULL;   /* untyped: any (catch Class e) but ExceptionInfo takes it */
     /* err_token persists only when the caller set it just before */
     va_list ap; va_start(ap, fmt);
-    vsnprintf(err_msg, sizeof err_msg, fmt, ap);
+    err_msg_vset(fmt, ap);
     va_end(ap);
     trace_snapshot();
     clove_raise();
@@ -681,7 +705,7 @@ static void clove_error_cls(const char *cls, const char *fmt, ...) {
     cur_exc = NULL;
     err_class = cls;
     va_list ap; va_start(ap, fmt);
-    vsnprintf(err_msg, sizeof err_msg, fmt, ap);
+    err_msg_vset(fmt, ap);
     va_end(ap);
     trace_snapshot();
     clove_raise();
@@ -754,7 +778,7 @@ __attribute__((noreturn))
 static void clove_throw_value(Clove *v) {
     cur_exc = v;
     err_class = NULL;   /* a thrown value carries its class in its metadata */
-    snprintf(err_msg, sizeof err_msg, "uncaught exception");
+    err_msg_set("uncaught exception");
     trace_snapshot();
     clove_raise();
 }
@@ -1140,9 +1164,7 @@ static const char *env_define_root(CloveEnv *root, const char *name, Clove *valu
      * binding was stored under, so def can key :private tracking on it. */
     if (cur_reader_ns && strcmp(cur_reader_ns, "user") &&
         (!strchr(name, '/') || !strcmp(name, "/"))) {
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s", cur_reader_ns, name);
-        name = intern(buf, strlen(buf));
+        name = intern_qual(cur_reader_ns, name);
     }
     for (Binding *b = root->bindings; b; b = b->next)
         if (b->name == name) { b->value = value; return name; }
@@ -2502,11 +2524,31 @@ static void sb_puts(SBuf *sb, const char *s) {
     sb->len += n; sb->data[sb->len] = '\0';
 }
 static void sb_printf(SBuf *sb, const char *fmt, ...) {
-    char tmp[64];
-    va_list ap; va_start(ap, fmt);
-    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_list ap, ap2; va_start(ap, fmt); va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);   /* any length: no fixed buffer to cut it */
+    va_end(ap2);
+    if (n > 0) {
+        sb_grow(sb, (size_t)n + 1);
+        vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap);
+        sb->len += (size_t)n;
+    }
     va_end(ap);
-    sb_puts(sb, tmp);
+}
+
+/* intern "ns/name" with no length cap (the stack buffer is only the fast path) */
+static const char *intern_qual_n(const char *ns, size_t nl, const char *nm, size_t ml) {
+    char sbuf[256];
+    size_t len = nl + 1 + ml;
+    char *buf = len < sizeof sbuf ? sbuf : malloc(len + 1);
+    if (!buf) clove_error("out of memory");
+    memcpy(buf, ns, nl); buf[nl] = '/';
+    memcpy(buf + nl + 1, nm, ml); buf[len] = '\0';
+    const char *r = intern(buf, len);
+    if (buf != sbuf) free(buf);
+    return r;
+}
+static const char *intern_qual(const char *ns, const char *nm) {
+    return intern_qual_n(ns, strlen(ns), nm, strlen(nm));
 }
 
 /* ───── Reader ───────────────────────────────────────────────────────── */
@@ -2517,11 +2559,16 @@ static void sb_printf(SBuf *sb, const char *fmt, ...) {
 __attribute__((noreturn, format(printf, 1, 2)))
 #endif
 static void rd_error(const char *fmt, ...) {
-    char msg[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof msg, fmt, ap);
+    static SBuf mb;   /* reused: clove_error copies it into err_msg */
+    mb.len = 0;
+    va_list ap, ap2;
+    va_start(ap, fmt); va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    va_end(ap2);
+    sb_grow(&mb, n > 0 ? (size_t)n + 1 : 1);
+    vsnprintf(mb.data, n > 0 ? (size_t)n + 1 : 1, fmt, ap);
     va_end(ap);
+    const char *msg = mb.data;
     if (rd_line > 0 && rd_file_cell)
         clove_error("%s (%s:%d)", msg, rd_file_cell->as.str, rd_line);
     if (rd_line > 0) clove_error("%s (line %d)", msg, rd_line);
@@ -2601,8 +2648,19 @@ static Clove *read_atom(const char **p) {
                 }
             }
         }
-        char buf[64]; if (n >= sizeof buf) clove_error("number too long");
+        /* stack copy for the common case; a long literal (a 70-digit
+         * double) gets a heap copy instead of a "number too long" error.
+         * Only the double path below can return after a heap copy. */
+        char sbuf[64];
+        char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
         memcpy(buf, start, n); buf[n] = '\0';
+        if (buf != sbuf) {
+            double dv = strtod(buf, NULL);
+            bool flt = memchr(buf, '.', n) || memchr(buf, 'e', n) || memchr(buf, 'E', n);
+            free(buf);
+            if (!flt) rd_error("invalid number: %.*s", (int)(n > 80 ? 80 : n), start);
+            return mk_double(dv);
+        }
         int64_t sign = 1;
         char *d = buf;
         if (*d == '+' || *d == '-') { if (*d == '-') sign = -1; d++; }
@@ -2638,19 +2696,16 @@ static Clove *read_atom(const char **p) {
             const char *body = start + 2;
             size_t blen = n - 2;
             const char *slash = memchr(body, '/', blen);
-            char buf[256];
             if (slash) {
                 size_t alen = (size_t)(slash - body);
                 const char *al = intern(body, alen);
                 const char *full = alias_lookup(al, cur_reader_ns);
                 if (!full) full = cur_reader_ns;
-                snprintf(buf, sizeof buf, "%s/%.*s", full ? full : "",
-                         (int)(blen - alen - 1), slash + 1);
-            } else {
-                snprintf(buf, sizeof buf, "%s/%.*s",
-                         cur_reader_ns ? cur_reader_ns : "", (int)blen, body);
+                if (!full) full = "";
+                return mk_kw(intern_qual_n(full, strlen(full), slash + 1, blen - alen - 1));
             }
-            return mk_kw(intern(buf, strlen(buf)));
+            const char *home = cur_reader_ns ? cur_reader_ns : "";
+            return mk_kw(intern_qual_n(home, strlen(home), body, blen));
         }
         return mk_kw(intern(start + 1, n - 1));
     }
@@ -3022,9 +3077,10 @@ static Clove *read_form(const char **p) {
         *p += 2;
         bool auto_ns = (**p == ':');
         if (auto_ns) (*p)++;
-        char nsbuf[256]; size_t nl = 0;
-        while (**p && **p != '{' && !isspace((unsigned char)**p) && nl < 255) nsbuf[nl++] = *(*p)++;
-        nsbuf[nl] = '\0';
+        const char *ns0 = *p;
+        while (**p && **p != '{' && !isspace((unsigned char)**p)) (*p)++;
+        size_t nl = (size_t)(*p - ns0);
+        const char *nsbuf = nl ? intern(ns0, nl) : NULL;
         skip_ws(p);
         if (**p != '{') clove_error("namespaced map literal expects {");
         const char *ns = nl ? nsbuf : (cur_reader_ns ? cur_reader_ns : "user");
@@ -3043,9 +3099,8 @@ static Clove *read_form(const char **p) {
                                                    : mk_sym(intern(bare, strlen(bare)));
                     }
                 } else {
-                    char buf[512]; snprintf(buf, sizeof buf, "%s/%s", ns, nm);
-                    k = k->tag == CLOVE_KEYWORD ? mk_kw(intern(buf, strlen(buf)))
-                                               : mk_sym(intern(buf, strlen(buf)));
+                    const char *q = intern_qual(ns, nm);
+                    k = k->tag == CLOVE_KEYWORD ? mk_kw(q) : mk_sym(q);
                 }
             }
             m = map_assoc(m, k, val);
@@ -3348,9 +3403,7 @@ static bool private_denied(const char *qual, const char *home_ns) {
 static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                           bool public_only) {
     if (home_ns) {
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s", home_ns, name);
-        const char *qual = intern(buf, strlen(buf));
+        const char *qual = intern_qual(home_ns, name);
         for (Binding *b = root->bindings; b; b = b->next)
             if (b->name == qual) return b;
         /* refer alias: <home-ns>/name -> <source-ns>/name (shared global) */
@@ -3394,9 +3447,7 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
             const char *pre = intern(name, (size_t)(slash - name));
             const char *full = alias_lookup(pre, home_ns);
             if (full) {
-                char buf[256];
-                snprintf(buf, sizeof buf, "%s/%s", full, slash + 1);
-                const char *qual = intern(buf, strlen(buf));
+                const char *qual = intern_qual(full, slash + 1);
                 const char *bare = intern(slash + 1, strlen(slash + 1));
                 for (Binding *b = root->bindings; b; b = b->next)
                     if (b->name == qual) {
@@ -3417,12 +3468,8 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
         for (const char *p = name; *p; p++) {
             if (*p == '.' && p[1] >= 'A' && p[1] <= 'Z') {
                 size_t pre = (size_t)(p - name);
-                char buf[256];
-                if (pre + strlen(p) < sizeof buf) {
-                    memcpy(buf, name, pre);
-                    buf[pre] = '/';
-                    strcpy(buf + pre + 1, p + 1);
-                    const char *q = intern(buf, strlen(buf));
+                {
+                    const char *q = intern_qual_n(name, pre, p + 1, strlen(p + 1));
                     for (Binding *b = root->bindings; b; b = b->next)
                         if (b->name == q) return b;
                 }
@@ -4839,9 +4886,7 @@ static Clove *qq_expand(CloveEnv *env, Clove *form) {
                 const char *full = alias_lookup(intern(form->as.symc.name, plen),
                                                 form->as.symc.home_ns);
                 if (full && strncmp(full, form->as.symc.name, plen) != 0) {
-                    char buf[256];
-                    snprintf(buf, sizeof buf, "%s/%s", full, slash + 1);
-                    return mk_sym(intern(buf, strlen(buf)));
+                    return mk_sym(intern_qual(full, slash + 1));
                 }
             }
         }
@@ -4852,10 +4897,7 @@ static Clove *qq_expand(CloveEnv *env, Clove *form) {
      * constants real Clojure code writes against syntax-quoted forms. */
     if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns &&
         !strchr(form->as.symc.name, '/')) {
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s",
-                 form->as.symc.home_ns, form->as.symc.name);
-        const char *qual = intern(buf, strlen(buf));
+        const char *qual = intern_qual(form->as.symc.home_ns, form->as.symc.name);
         for (Binding *b = env_root(env)->bindings; b; b = b->next)
             if (b->name == qual) return mk_sym(qual);
     }
@@ -5026,9 +5068,11 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                      * as Clojure's runtime map construction does */
                     if (m->as.map.count == before) {
                         SBuf kb = {0}; print_to(&kb, k, true);
-                        char msg[256]; snprintf(msg, sizeof msg, "Duplicate key: %s", kb.data ? kb.data : "");
+                        static SBuf dk;   /* clove_error copies; reused, never leaked */
+                        dk.len = 0;
+                        sb_puts(&dk, kb.data ? kb.data : "");
                         free(kb.data);
-                        clove_error("%s", msg);
+                        clove_error("Duplicate key: %s", dk.data);
                     }
                 }
                 return m;
@@ -5266,7 +5310,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                             cur_exc = pend_exc;
                             err_class = pend_cls;
                             if (!pend_exc)
-                                snprintf(err_msg, sizeof err_msg, "%s", pend_val->as.str);
+                                err_msg_set("%s", pend_val->as.str);
                         }
                     }
                     if (pending) clove_raise();
@@ -5367,10 +5411,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                              * (def ^:dynamic *v*) inside (ns foo) lands
                              * under foo/, and binding must find it there */
                             if (symc->as.symc.home_ns && !strchr(nm, '/')) {
-                                char buf[256];
-                                snprintf(buf, sizeof buf, "%s/%s",
-                                         symc->as.symc.home_ns, nm);
-                                const char *qual = intern(buf, strlen(buf));
+                                const char *qual = intern_qual(symc->as.symc.home_ns, nm);
                                 for (Binding *x = root->bindings; x; x = x->next)
                                     if (x->name == qual) { b = x; break; }
                                 /* binding a referred var rebinds the shared
@@ -5395,9 +5436,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                                     const char *base = slash + 1;
                                     const char *full = alias_lookup(pre, symc->as.symc.home_ns);
                                     if (full) {
-                                        char qb[256];
-                                        snprintf(qb, sizeof qb, "%s/%s", full, base);
-                                        const char *q = intern(qb, strlen(qb));
+                                        const char *q = intern_qual(full, base);
                                         for (Binding *x = root->bindings; x; x = x->next)
                                             if (x->name == q) { b = x; break; }
                                     }
@@ -8335,12 +8374,14 @@ static Clove *prim_concat(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_gensym(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     static int counter = 0;
-    char buf[64];
     const char *prefix = "G__";
     if (nargs > 0 && argv[0]->tag == CLOVE_STRING)
         prefix = argv[0]->as.str;
-    snprintf(buf, sizeof buf, "%s%d", prefix, counter++);
-    return mk_sym(intern(buf, strlen(buf)));
+    SBuf sb = {0};
+    sb_printf(&sb, "%s%d", prefix, counter++);
+    const char *nm = intern(sb.data, sb.len);
+    free(sb.data);
+    return mk_sym(nm);
 }
 
 static Clove *prim_seq(CloveEnv *env, Clove **argv, int nargs) {
@@ -9541,17 +9582,21 @@ static Clove *prim_int(CloveEnv *env, Clove **argv, int nargs) {
         if (d == 9223372036854775808.0) return mk_int(INT64_MAX);
         if (d < -9223372036854775808.0 || d > 9223372036854775808.0) {
             SBuf sb = {0}; format_double(&sb, d);
-            char msg[64]; snprintf(msg, sizeof msg, "%s", sb.data ? sb.data : "");
+            static SBuf vr;
+            vr.len = 0;
+            sb_puts(&vr, sb.data ? sb.data : "");
             free(sb.data);
-            clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+            clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", vr.data);
         }
         return mk_int((int64_t)d);
     }
     if (v != NIL && v->tag == CLOVE_BIGINT) {
         char *ds = big_to_decimal(v);
-        char msg[96]; snprintf(msg, sizeof msg, "%s", ds);
+        static SBuf vr;
+        vr.len = 0;
+        sb_puts(&vr, ds);
         free(ds);
-        clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+        clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", vr.data);
     }
     if (v != NIL && (v->tag == CLOVE_BIGDEC || v->tag == CLOVE_RATIO)) {   /* (long 2.7M) => 2 */
         Clove *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
@@ -10351,9 +10396,7 @@ static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs >= 2 && argv[0] != NIL) {
         const char *ns = as_named(argv[0], "symbol");
         const char *nm = symbol_name_of(argv[1]);
-        char buf[256];
-        snprintf(buf, sizeof buf, "%s/%s", ns, nm);
-        return mk_sym(intern(buf, strlen(buf)));
+        return mk_sym(intern_qual(ns, nm));
     }
     const char *n = symbol_name_of(nargs >= 2 ? argv[1] : argv[0]);
     return mk_sym(intern(n, strlen(n)));
@@ -11135,6 +11178,33 @@ static Clove *prim_print(CloveEnv *env, Clove **argv, int nargs) { return print_
 
 /* ── format / string-replace / regex string ops ── */
 
+/* Pad a formatted number per a printf flag/width spec ("08", "-10", "+",
+ * " "; any ".prec" is already applied): '+'/' ' prefix a non-negative
+ * number, '0' zero-fills after the sign (numeric values only), '-' left-
+ * justifies, otherwise right-justify with spaces. */
+static void fmt_pad_num(SBuf *out, const char *num, const char *spec, bool numeric) {
+    bool left = false, plus = false, space = false, zero = false;
+    const char *f = spec;
+    for (; *f && strchr("-+ 0#", *f); f++) {
+        if (*f == '-') left = true;
+        else if (*f == '+') plus = true;
+        else if (*f == ' ') space = true;
+        else if (*f == '0') zero = true;
+    }
+    size_t width = (size_t)atoi(f);
+    const char *sign = "";
+    if (*num == '-') { sign = "-"; num++; }
+    else if (numeric && plus) sign = "+";
+    else if (numeric && space) sign = " ";
+    size_t len = strlen(sign) + strlen(num);
+    size_t pad = width > len ? width - len : 0;
+    if (!left && !(zero && numeric)) for (size_t i = 0; i < pad; i++) sb_putc(out, ' ');
+    sb_puts(out, sign);
+    if (!left && zero && numeric) for (size_t i = 0; i < pad; i++) sb_putc(out, '0');
+    sb_puts(out, num);
+    if (left) for (size_t i = 0; i < pad; i++) sb_putc(out, ' ');
+}
+
 static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *fmt = as_str(argv[0], "format");
@@ -11152,7 +11222,7 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
         if (!conv) clove_error("format: dangling %%");
         if (ai >= nargs) clove_error("format: not enough arguments");
         Clove *v = argv[ai++];
-        char cfmt[32], tmp[512];
+        char cfmt[32];
         switch (conv) {
             case 's': {
                 SBuf t = {0};
@@ -11161,8 +11231,7 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                     if (t.data) sb_puts(&out, t.data);
                 } else {
                     snprintf(cfmt, sizeof cfmt, "%%%ss", spec);
-                    snprintf(tmp, sizeof tmp, cfmt, t.data ? t.data : "");
-                    sb_puts(&out, tmp);
+                    sb_printf(&out, cfmt, t.data ? t.data : "");
                 }
                 free(t.data);
                 break;
@@ -11177,29 +11246,44 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                     break;
                 }
                 snprintf(cfmt, sizeof cfmt, "%%%sll%c", spec, conv);
-                snprintf(tmp, sizeof tmp, cfmt, (long long)as_int(v, "format"));
-                sb_puts(&out, tmp);
+                sb_printf(&out, cfmt, (long long)as_int(v, "format"));
                 break;
             case 'f': case 'e': case 'E': case 'g': case 'G':
                 /* Java formats a BigDecimal's %f from its exact value, HALF_UP:
                  * (format "%.2f" 1.005M) is "1.01", where the double 1.005 is
                  * really 1.00499... and gives "1.00". Width and '-' still
                  * apply; the result is padded like any string. */
-                if (conv == 'f' && v != NIL && v->tag == CLOVE_BIGDEC) {
+                if (v != NIL && v->tag == CLOVE_DOUBLE && (isnan(v->as.d) || isinf(v->as.d))) {
+                    /* Java spells these NaN / Infinity, never C's nan / inf */
+                    fmt_pad_num(&out, isnan(v->as.d) ? "NaN" : v->as.d < 0 ? "-Infinity" : "Infinity",
+                                spec, false);
+                    break;
+                }
+                /* A double's %f is Java's too: round its SHORTEST decimal
+                 * form (what (str d) prints) HALF_UP, not C's exact binary
+                 * expansion -- (format "%.1f" 0.25) is "0.3" and
+                 * (format "%.20f" 0.1) has no ...555 tail. Same path as a
+                 * BigDecimal, which Java formats from its exact value. */
+                Clove *bdv = NULL;
+                if (conv == 'f' && v != NIL && v->tag == CLOVE_BIGDEC) bdv = v;
+                else if (conv == 'f' && v != NIL && v->tag == CLOVE_DOUBLE) {
+                    SBuf ds = {0};
+                    format_double(&ds, v->as.d);
+                    bdv = bd_parse(ds.data, ds.len);
+                    free(ds.data);
+                }
+                if (bdv) {
                     const char *dot = strchr(spec, '.');
                     int64_t prec = dot ? atoi(dot + 1) : 6;
                     SBuf num = {0};
-                    Clove *rv = bd_round_half_up(v, prec);
+                    Clove *rv = bd_round_half_up(bdv, prec);
                     /* Java keeps the sign of a negative value that rounds to
                      * zero: (format "%.3f" -8.1E-7M) is "-0.000" */
-                    if (big_is_zero(rv->as.bigdec.u) && big_cmp(v->as.bigdec.u, mk_int(0)) < 0) sb_putc(&num, '-');
+                    bool negz = v->tag == CLOVE_DOUBLE ? signbit(v->as.d) != 0
+                                                       : big_cmp(v->as.bigdec.u, mk_int(0)) < 0;
+                    if (big_is_zero(rv->as.bigdec.u) && negz) sb_putc(&num, '-');
                     bd_print_plain(&num, rv);
-                    char wspec[16]; size_t wl = dot ? (size_t)(dot - spec) : strlen(spec);
-                    if (wl >= sizeof wspec) wl = sizeof wspec - 1;
-                    memcpy(wspec, spec, wl); wspec[wl] = '\0';
-                    snprintf(cfmt, sizeof cfmt, "%%%ss", wspec);
-                    snprintf(tmp, sizeof tmp, cfmt, num.data);
-                    sb_puts(&out, tmp);
+                    fmt_pad_num(&out, num.data, spec, true);
                     free(num.data);
                     break;
                 }
@@ -11210,8 +11294,7 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                     snprintf(cfmt, sizeof cfmt, "%%#%s%c", spec, conv);
                 else
                     snprintf(cfmt, sizeof cfmt, "%%%s%c", spec, conv);
-                snprintf(tmp, sizeof tmp, cfmt, as_num(v));
-                sb_puts(&out, tmp);
+                sb_printf(&out, cfmt, as_num(v));
                 break;
             default:
                 clove_error("format: unsupported conversion %%%c", conv);

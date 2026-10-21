@@ -101,6 +101,17 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- **Long names, messages and format output are no longer cut off.** Fixed
+  C buffers silently truncated: interpreter error messages at 255 chars;
+  namespace-qualified names (a `def` in a namespace, `::kw`, `#:ns{}` map
+  keys, `(symbol ns name)`, syntax-quote and var lookup) at 255; `gensym`
+  names at 63; `format` output with a width (`%5s`) at 511; and a decimal
+  literal over 63 chars was a "number too long" error. Each now grows to fit.
+  The differential fuzzer generates long names so this stays covered.
+- **`%f` of a double formats like Java.** It rounds the double's shortest
+  decimal form HALF_UP (`(format "%.1f" 0.25)` is `"0.3"`, `(format "%.20f"
+  0.1)` has no `...555` tail), and NaN/infinity print as `NaN`/`Infinity`
+  instead of C's `nan`/`inf`. Found by the fuzzer's new long-number cases.
 - Found by the new fuzzer: `subvec` now checks its bounds (it clamped
   silently); ratio→double conversion follows Java's `Ratio.doubleValue` (16
   significant digits, then nearest double), so `(/ 1.5 8/2181825)` prints

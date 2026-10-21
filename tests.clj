@@ -3496,5 +3496,23 @@
     (assert= ["a" "b"] @ls)))
 (assert= "stop" (try (clove/sh-lines* "yes" (fn [_] (throw (ex-info "stop" {})))) (catch Exception e (ex-message e))))
 
+;; fixed C buffers used to cut long names/messages/output (the article-inspired
+;; audit, 2026-10-21): every one of these was truncated at 63/255/511 chars
+(let [L (apply str (repeat 300 "a"))]
+  (assert= true (> (count (try (eval (symbol L)) (catch Exception e (ex-message e)))) 300))   ; error message
+  (assert= 306 (count (str (read-string (str "::" L)))))                                   ; ::kw → :user/…
+  (assert= (str L "/a") (subs (str (first (keys (read-string (str "#:" L "{:a 1}"))))) 1)) ; #:ns{} prefix
+  (assert= 601 (count (str (symbol L L))))
+  (assert= true (> (count (str (gensym L))) 300))
+  (assert= 600 (count (format "%5s" (apply str (repeat 600 "x")))))
+  (assert= true (str/includes? (try (long (bigint (apply str (repeat 120 "9")))) (catch Exception e (ex-message e)))
+                               (apply str (repeat 120 "9"))))
+  (eval (read-string (str "(do (ns longns.x) (def " L " 41) (in-ns 'user))")))
+  (assert= 41 (eval (read-string (str "longns.x/" L)))))                                 ; qualified def + lookup
+(assert= 1.1111111111111112 (read-string (str "1." (apply str (repeat 70 "1")))))         ; was "number too long"
+;; %f of a double is Java's: shortest decimal form, rounded HALF_UP; NaN/Infinity spelled out
+(assert= "0.3|0.10000000000000000000|3|-0.01|-0003.14|+1.1| 2.000|1.3     |NaN|Infinity|100000000000000000000000.00|-0.00"
+         (format "%.1f|%.20f|%.0f|%.2f|%08.2f|%+.1f|% .3f|%-8.1f|%.3f|%5.1f|%.2f|%.2f" 0.25 0.1 2.5 -0.005 -3.14159 1.05 2.0 1.25 ##NaN ##Inf 1e23 -0.0))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

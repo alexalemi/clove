@@ -62,6 +62,12 @@ def lit_str():
     return '"' + pick(WORDS) + '"'
 
 
+def long_name():
+    """A symbol-safe string well past 256 chars: fixed C buffers used to cut
+    names, messages and format output there (the 64/255/511-byte cliffs)."""
+    return f'(apply str (repeat {random.randint(60, 400)} "ab"))'
+
+
 def lit_vec():
     return "[" + " ".join(small() for _ in range(random.randint(0, 6))) + "]"
 
@@ -220,7 +226,15 @@ class Gen:
         if d >= MAXD or random.random() < 0.2:
             return lit_str()
         d += 1
-        r = random.randrange(19)
+        r = random.randrange(20)
+        if r == 19:
+            ln = long_name()
+            return pick([f"(name (keyword {ln}))",
+                         f"(str (symbol {ln} {ln}))",
+                         f"(namespace (keyword {ln} \"k\"))",
+                         f"(str (read-string (str \":\" {ln} \"/k\")))",
+                         f"(format \"%5s|%-3s\" {ln} {self.str(d)})",
+                         f"(str (count (format \"%.2f\" 1e{random.randint(200, 308)})))"])
         if r == 0:
             return f"(str {self.str(d)} {self.str(d)})"
         if r == 1:

@@ -21,6 +21,14 @@ differential fuzzer against babashka (`make fuzz`); tagged releases publish
 portable binaries. Suite verdict is the exit status + the "tests complete: N
 passed, 0 failed" line, never a grep for "error".
 
+Fixed-buffer audit (2026-10-21): every `char buf[N]` that could cut a value
+users see now grows (err_msg is heap-grown via err_msg_vset, `intern_qual`
+builds ns/name, `sb_printf` is unbounded); display-only buffers (prompt,
+paths for hints, the capped error trace, val_desc's %.60s) stay fixed on
+purpose. %f of doubles goes through the BigDecimal path (shortest digits,
+HALF_UP) and `fmt_pad_num` applies flags/width. fuzz/gen_expr.py now emits
+long names (`long_name()`).
+
 Renamed cljc → clove (2026-10-20): binary, source file, env vars, share dir,
 `clove/` helpers and the C API all moved; `:cljc` stays a reader-conditional
 alias and `~/.cljc_history` is migrated on first REPL start. HISTORY.md and
