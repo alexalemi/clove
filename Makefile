@@ -5,7 +5,7 @@ CFLAGS  ?= -O2 -falign-functions=64 -falign-loops=32 -Wall -Wextra -Wno-unused-p
 PREFIX  ?= /usr/local
 DESTDIR ?=
 SHAREDIR = $(PREFIX)/share/clove
-BATTERIES = docs.clj claude.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj peg.clj
+BATTERIES = docs.clj claude.clj tasks.clj inspect.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj peg.clj
 
 clove: clove.c
 	$(CC) $(CFLAGS) -DCLOVE_SHAREDIR='"$(SHAREDIR)"' -o $@ $< -lm -ldl

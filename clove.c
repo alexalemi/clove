@@ -16762,6 +16762,9 @@ static void usage(FILE *f) {
         "\n"
         "subcommands:\n"
         "  run <file> [args]          run a script (explicit form)\n"
+        "  run <task> [args]          run a task from ./clove.edn (bb-tasks style)\n"
+        "  tasks                      list ./clove.edn's tasks with their docs\n"
+        "  new <name>                 scaffold a project: src, test, clove.edn\n"
         "  -m <namespace> [args]      require the ns, call its -main (like bb -m)\n"
         "  eval <expr...>             evaluate, print the last value (alias -e)\n"
         "  repl                       interactive REPL\n"
@@ -17016,9 +17019,23 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "nrepl") || !strcmp(cmd, "--nrepl"))
         return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
     if (!strcmp(cmd, "run")) {
-        if (argc < 3) { fputs("usage: clove run <file.clj> [args]\n", stderr); return 1; }
-        set_args(env, argc, argv, 3);
-        return run_script(env, argv[2]);
+        /* `clove run <file>` runs a script; `clove run <task>` runs a task
+         * from ./clove.edn (tasks.clj); bare `clove run` lists the tasks. */
+        struct stat rst;
+        if (argc >= 3 && stat(argv[2], &rst) == 0 && S_ISREG(rst.st_mode)) {
+            set_args(env, argc, argv, 3);
+            return run_script(env, argv[2]);
+        }
+        set_args(env, argc, argv, 2);
+        return run_subprogram_int_exit(env, "(require '[tasks]) (tasks/run-main *args*)");
+    }
+    if (!strcmp(cmd, "tasks")) {
+        set_args(env, argc, argv, 2);
+        return run_subprogram_int_exit(env, "(require '[tasks]) (tasks/list-main *args*)");
+    }
+    if (!strcmp(cmd, "new")) {
+        set_args(env, argc, argv, 2);
+        return run_subprogram_int_exit(env, "(require '[tasks]) (tasks/new-main *args*)");
     }
     if (!strcmp(cmd, "-m") || !strcmp(cmd, "--main")) {
         /* clove -m <ns> [args] — require the namespace, then call its -main
