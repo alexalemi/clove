@@ -53,8 +53,18 @@ special forms (`(doc if)`) and natives. `(source take-while)` reconstructs a
 fn's stored definition. `(dir clojure.string)` lists a namespace's publics
 (auto-requiring it). `(apropos "index")` and `(find-doc "lazy")` search.
 Tab completes, `Ctrl-R` reverse-searches history, `↑↓` walk it, results are
-numbered (`*1 *2 *3`, `(*results* n)`), wide results pretty-print to your
-terminal width, and multi-line entry indents with paren depth.
+numbered (`*1 *2 *3`, `(*results* n)`), and wide results pretty-print to your
+terminal width. `(inspect x)` browses a value full-screen — drill into maps,
+vectors, atoms and infinite seqs, `q` hands back what you were looking at.
+
+**Editing.** The prompt is a small multi-line editor: Enter runs a complete
+form and otherwise opens an indented new line (Alt-Enter always does), ↑ brings
+back whole multi-line forms, brackets and quotes auto-pair, pastes land
+verbatim, and the arglists of the call you're typing show dimly after the
+cursor. vi users get vi mode — insert/normal, motions, `d`/`c`/`y` with counts
+and text objects (`ciw`, `di(`, `ya"`), `u`, `.` — when `~/.inputrc` says
+`set editing-mode vi`, `CLOVE_EDIT_MODE=vi` is set, or after
+`(clove/edit-mode :vi)`.
 
 **Debugging.** Wrap any subexpression in `(dbg expr)` — or use the reader
 shorthand `#p expr` — and it prints `#dbg file.clj:12 (* x x) => 49` while
@@ -72,7 +82,8 @@ line into your prompt (`claude⟩ (reduce + (filter odd? xs))`), and you edit
 it, press Enter to run it, or `^C` to decline. It sees what you ran and the
 output. The answer lands in `*1`. Needs `curl` and `ANTHROPIC_API_KEY`; model
 and effort live in `claude/config` (see `claude.clj`). `?x` alone is still a
-symbol, so logic variables are unaffected.
+symbol, so logic variables are unaffected. A bare `?` right after an error
+asks Claude to explain it.
 
 **Errors that point somewhere.** Uncaught errors show the offending source line
 with a caret, a trace with exact lines that reaches *inside* function bodies
@@ -84,6 +95,9 @@ the actual fix: `try (require 'clojure.set) first`. Stack overflows say
 **Workflow subcommands.**
 
 ```sh
+clove new my-app          # scaffold: clove.edn, src/, test/
+clove tasks               # list clove.edn's :tasks
+clove run test            # run one (deps first; args go to the task)
 clove watch script.clj    # rerun on every save (fresh process each run)
 clove vendor weavejester/medley                  # or a full git URL:
 clove vendor https://github.com/clojure/data.json
@@ -354,7 +368,10 @@ reference private puzzle inputs, so they live outside this repo.)
   `#?(:clove …)` reader conditionals. For runtime-defined vars (`ffi/define`), add
   a `(declare …)` like `libc.clj` does.
 - **Tests**: `clojure.test` is bundled — `deftest`, `is` (with `thrown?`),
-  `testing`, `run-tests`.
+  `testing`, `run-tests`. A failed `(is (= …))` prints a path diff of where the
+  values differ.
+- **Tasks**: `clove.edn` holds `:paths` and `:tasks`, as in `bb.edn`:
+  `{:tasks {test "clove test", ci {:depends [lint test] :task (println "ok")}}}`.
 - **Dependencies**: `clove vendor <git-url|github-user/repo>` copies a
   pure-Clojure library's sources into `./vendor/` and reports which of its
   namespaces load.

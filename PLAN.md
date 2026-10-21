@@ -9,7 +9,7 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-10-14, unreleased on top of v0.5.1)
+## Status (as of 2026-10-21, unreleased on top of v0.5.1)
 
 ~17,000 lines, zero warnings, ~1920 assertions in `tests.clj` + ~500-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
@@ -29,6 +29,17 @@ purpose. %f of doubles goes through the BigDecimal path (shortest digits,
 HALF_UP) and `fmt_pad_num` applies flags/width. fuzz/gen_expr.py now emits
 long names (`long_name()`).
 
+Joy round (2026-10-21): the line editor (`/* ───── Line editor` in clove.c)
+is a whole-frame-redraw multi-line editor: `Ed` state, `ed_render` computes
+rows from term_width, `ed_key` decodes escapes (lone Esc = 25–40 ms quiet),
+vi normal mode in `ed_normal_cmd` (+ `.` via a key replay queue), arglist
+hints via `ed_arglists` (doc-info under its own ErrFrame, cached), history v2
+(escaped newlines). `tests/pty_repl.py` (`make test-pty`, needs pexpect)
+drives it. Also: `inspect.clj` (pure render/step + a raw-mode loop),
+test.clj path diffs (`clove/diff-paths`), `tasks.clj` (`clove run/tasks/new`,
+clove.edn), bare `?` after an error. Not done: vi visual mode, editor on
+Windows untested by hand (compiles; VT input mode).
+
 Renamed cljc → clove (2026-10-20): binary, source file, env vars, share dir,
 `clove/` helpers and the C API all moved; `:cljc` stays a reader-conditional
 alias and `~/.cljc_history` is migrated on first REPL start. HISTORY.md and
@@ -43,7 +54,7 @@ response). Tools: read-only `clove_lookup` runs automatically; `propose_form`
 only pre-fills the prompt — nothing Claude writes runs without the user's
 Enter. Follow-ups: Windows key handling (`%VAR%` or a curl `-K` file), capture
 `println` output of user forms in the transcript (only results/errors are
-logged now), multi-line proposals (the editor is single-line).
+logged now), multi-line proposals (the editor is multi-line now; propose_form still sends one line).
 
 Before that (2026-10-14): the silent-divergence round. `+ - * inc dec`
 throw "long overflow" instead of wrapping (`unchecked-*` wrap); `catch` is
@@ -148,4 +159,6 @@ Things the history log leaves unresolved, roughly by value:
   `bb -f fuzz/runner.clj -- fuzz/conformance.txt > fuzz/conformance_expected.txt`.
 - `make fuzz` (differential vs babashka) before a release and after touching
   numerics, printing, or exceptions; a finding becomes a conformance line.
+- `make test-pty` after touching the line editor (pexpect; ASan builds pass
+  too, timing is loose enough).
 - Memory bound check: 2M-iteration churn loop should stay ~5 MB RSS.

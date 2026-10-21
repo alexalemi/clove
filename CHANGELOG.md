@@ -52,6 +52,39 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
   `(str ["a" 1.5M])` is `"[\"a\" 1.5M]"`, where it was `"[a 1.5]"`.
 
 ### Added
+- **A multi-line REPL editor, with vi mode.** Enter runs a complete form and
+  otherwise opens a new line indented for the open brackets; Alt-Enter /
+  Ctrl-J always add a line; ↑/↓ move between lines and walk history past the
+  first/last, and history keeps whole multi-line forms (`~/.clove_history`
+  moves to an escaped v2 format, upgraded in place). Brackets and quotes
+  auto-pair (typing a closer steps over it, Backspace removes an empty pair),
+  pastes arrive verbatim (bracketed paste), `\(` is a char, not a bracket,
+  and the arglists of the call around the cursor show dimly after the text
+  (`(map inc▏)  [f] [f c] [f c1 c2] …`). vi mode — `CLOVE_EDIT_MODE=vi`,
+  `set editing-mode vi` in `~/.inputrc`, or `(clove/edit-mode :vi)` — has
+  insert/normal with cursor shapes, the usual motions (`hjkl w b e W B E 0 ^ $
+  f F t T ; , % gg G`), `d`/`c`/`y` with counts, motions and text objects
+  (`iw aw i( a( ib i[ i{ i" a"` …), `dd cc yy D C Y x X s S r ~ J p P o O`,
+  `u`/`Ctrl-R`, and `.`. `make test-pty` drives it through a real pty.
+- **A bare `?` right after an error** asks Claude to explain that error
+  (the REPL hints `(? explains)` when a key is set).
+- **`(inspect x)`** opens a full-screen data inspector (`inspect.clj`):
+  breadcrumbs, `j`/`k`/PgUp/PgDn/`g`/`G` to move, Enter/`l` into a map entry,
+  element, or atom's value, `h` back, `q` returns the value being viewed.
+  Lazy and infinite seqs realize only what's on screen. Without a terminal it
+  pprints.
+- **Test failures show where values differ.** `(is (= expected actual))`
+  evaluates each side once and prints `expected:`/`actual:` and a path diff
+  (`[:roles 1]  expected :dev, got :ops`, at most 10 lines); the header names
+  the test (`FAIL in (users)`). `clove/diff-paths` gives the diff as data.
+- **Project tasks, like `bb tasks`.** `clove run <task>` runs a task from the
+  nearest `clove.edn` (`{:paths [...] :tasks {test "clove test" ...}}`;
+  strings are shell commands, lists are Clojure forms, maps take `:task`
+  `:doc` `:depends` `:interactive`), with dependencies run once each in order,
+  args passed to the named task, the failing status propagated, and a
+  did-you-mean for typos. `clove tasks` lists them; `clove new my-app`
+  scaffolds a project (clove.edn, src/, test/, README). `clove.edn`'s
+  `:paths` join the load path like `deps.edn`'s.
 - **`? question` at the REPL asks Claude.** The question goes out with the
   session transcript (inputs, results, errors, earlier answers; last 32 KB)
   and a system prompt describing clove; the answer streams in. Claude's tools:
@@ -101,6 +134,8 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- **`=` between a finite and an infinite seq** returns false instead of
+  hanging: `(= [0 1 2] (range))`.
 - **Long names, messages and format output are no longer cut off.** Fixed
   C buffers silently truncated: interpreter error messages at 255 chars;
   namespace-qualified names (a `def` in a namespace, `::kw`, `#:ns{}` map
