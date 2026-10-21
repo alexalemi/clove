@@ -3,7 +3,8 @@
 ;;   (require '[inspect])
 ;;   (inspect/inspect {:users [{:name "ada"} {:name "bob"}]})
 ;;
-;; ↑/↓ or k/j move · PgUp/PgDn page · g/G top/bottom · Enter/→/l open the
+;; ↑/↓ or k/j move · PgUp/PgDn (or Space) page · g/G top/bottom (G realizes at
+;; most 10000 entries ahead on a seq) · Enter/→/l open the
 ;; selected entry · ←/h/Backspace back up (the old selection comes back)
 ;; q/Esc quit, RETURNING the value being viewed — so (inspect x) doubles as
 ;; "dig out the piece I want" at the REPL. When stdout is not a terminal it
