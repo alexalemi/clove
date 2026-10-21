@@ -1,4 +1,4 @@
-;; clj-kondo config for the clove dialect (github.com/alexalemi/cljc)
+;; clj-kondo config for the clove dialect (github.com/alexalemi/clove)
 ;;
 ;; clove differs from Clojure in ways a static analyzer must be told about:
 ;; - no namespaces: str/trim, json/parse, Math/sqrt are flat globals
