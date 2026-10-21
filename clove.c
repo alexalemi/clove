@@ -16311,6 +16311,7 @@ static Clove *repl_ask_claude(CloveEnv *env, const char *q) {
 }
 
 /* `? ...` is prose for Claude, not code — but `?x` stays a symbol (logic vars) */
+static bool repl_last_error;   /* did the previous entry end in an error? */
 static bool is_ask_line(const char *s) { return s[0] == '?' && (s[1] == ' ' || s[1] == 0); }
 
 static int run_repl(CloveEnv *env) {
@@ -16358,6 +16359,11 @@ static int run_repl(CloveEnv *env) {
                 free(eb.data);
             }
             print_error();
+            repl_last_error = true;
+            {   /* point at `?` only when it can work: a terminal and a key */
+                const char *k = getenv("ANTHROPIC_API_KEY");
+                if (k && *k && isatty(1)) printf("\x1b[2m(? explains)\x1b[0m\n");
+            }
             vsp = 0;
             eval_sp = 0;
             vm_tsp = 0;
@@ -16377,9 +16383,13 @@ static int run_repl(CloveEnv *env) {
         if (is_ask_line(form)) {               /* ask mode: ? why did [3] fail */
             const char *q = form + 1;
             while (*q == ' ') q++;
+            if (!*q && repl_last_error) /* bare ? right after an error: explain it */
+                q = "Explain the error at the end of the transcript: what went wrong "
+                    "and how to fix it.";
             if (!*q) {
                 printf("? <question> asks Claude, with this session's transcript as context "
-                       "(needs curl + ANTHROPIC_API_KEY; see claude.clj)\n");
+                       "(needs curl + ANTHROPIC_API_KEY; see claude.clj). "
+                       "A bare ? right after an error explains it.\n");
                 continue;
             }
             Clove *ans = repl_ask_claude(env, q);
@@ -16389,6 +16399,7 @@ static int run_repl(CloveEnv *env) {
             out_n++;
             continue;
         }
+        repl_last_error = false;           /* this entry succeeds unless it longjmps */
         if (form[0] == '!') {                  /* shell mode: !ls -la */
             const char *cmd = form + 1;
             while (*cmd == ' ') cmd++;
