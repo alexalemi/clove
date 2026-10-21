@@ -3574,5 +3574,81 @@
                                       "." "t" ["a"])
                       tasks-test-seen))
 
+;; ── test.clj failure diffs + inspect.clj (pure parts; no tty needed) ────────
+(load-file "test.clj")
+(assert= [] (clove/diff-paths {:a [1 2] :b #{1}} {:a [1 2] :b #{1}}))       ; equal → empty
+(assert= [{:path [:b :c] :expected 2 :actual 3} {:path [:d] :only-in-actual 4}]
+         (clove/diff-paths {:a 1 :b {:c 2}} {:a 1 :b {:c 3} :d 4}))
+(assert= [{:path [:x 2] :only-in-expected 3}] (clove/diff-paths {:x [1 2 3]} {:x [1 2]}))
+(assert= [{:path [1] :expected 2 :actual 9} {:path [2] :only-in-actual 3}]
+         (clove/diff-paths '(1 2) [1 9 3]))                                  ; seq vs vector: by index
+(assert= [{:path [] :only-in-expected 1} {:path [] :only-in-actual 3}] (clove/diff-paths #{1 2} #{2 3}))
+(assert= [{:path [:k] :expected [1] :actual {:a 1}}] (clove/diff-paths {:k [1]} {:k {:a 1}})) ; type mismatch = leaf
+(let [d (clove/diff-paths (range 3) (range) 20)]                             ; infinite side: capped walk
+  (assert= 20 (count d))
+  (assert= true (:truncated (meta d))))
+(let [ls (clove/format-diff (clove/diff-paths (vec (range 30)) (vec (range 1 31))) 10)]
+  (assert= 11 (count ls))
+  (assert= "[0]  expected 0, got 1" (first ls))
+  (assert= "… and 20 more" (last ls)))
+(assert= ["[:b :c]  expected 2, got 3" "[:d]     only in actual: 4"]
+         (clove/format-diff (clove/diff-paths {:b {:c 2}} {:b {:c 3} :d 4})))
+;; is: = arguments evaluated once; a failure prints values + diff and the test name
+(let [n (atom 0) p @clove/test-pass f @clove/test-fail]
+  (is (= 1 (do (swap! n inc) 1)))
+  (assert= 1 @n)
+  (let [out (with-out-str
+              (reset! clove/test-name 'demo-test)
+              (testing "ctx" (is (= {:a 1 :b 2} {:a 1 :b 3}) "msg"))
+              (is (not= 1 1))
+              (reset! clove/test-name nil))]
+    (assert= true (str/includes? out "FAIL in (demo-test) ctx  msg\n"))
+    (assert= true (str/includes? out "\n    actual: {"))
+    (assert= true (str/includes? out "      diff: [:b]  expected 2, got 3\n"))
+    (assert= true (str/includes? out "    actual: (not (not= 1 1))")))
+  (assert= "" (with-out-str (is (thrown? Exception (throw (ex-info "x" {}))))))
+  (reset! clove/test-pass p) (reset! clove/test-fail f))
+
+(require '[inspect])
+(defn clove-ti-plain [s] (str/replace s (re-pattern "\u001b\\[[0-9]*m") ""))   ; drop SGR codes
+(def clove-ti-data (sorted-map :a [1 2 {:b (range)}] :name "hello world"))   ; sorted: stable row order
+(let [s0 (inspect/init clove-ti-data 6 40)
+      ls (str/split-lines (inspect/render s0 6 40))]
+  (assert= 6 (count ls))
+  (assert= "root  sorted-map, 2 entries" (first ls))
+  (assert= true (str/starts-with? (second ls) "\u001b[7m> :a  "))           ; selected row
+  (assert= true (str/ends-with? (second ls) "…\u001b[0m"))                  ; preview truncated
+  (assert= true (every? #(<= (count %) 40) (map clove-ti-plain ls)))
+  (assert= "  :name  \"hello world\"" (nth ls 2)))
+(let [s (reduce inspect/step (inspect/init clove-ti-data 6 40) ["l" "j" "j" "j" "j"])] ; clamp at last
+  (assert= [1 2 {:b :x}] (update (inspect/current s) 2 (constantly {:b :x})))
+  (assert= 2 (:sel (peek (:stack s))))
+  (let [s (reduce inspect/step s ["\r" "\r"])                              ; into {:b ..}, then (range)
+        ls (str/split-lines (inspect/render s 6 40))]
+    (assert= "root > :a > 2 > :b  lazy-seq, 4+ items…" (first ls))       ; never counted
+    (assert= 4 (count (:stack s)))
+    (let [back (reduce inspect/step s ["h" "h"])]
+      (assert= 2 (:sel (peek (:stack back))))                              ; selection restored
+      (assert= "root > :a" (str/join " > " (map :crumb (:stack back))))))
+  (let [s (reduce inspect/step s ["\r" "\r" "\u001b[6~" "\u001b[6~"])]   ; page down the infinite seq
+    (assert= 8 (:sel (peek (:stack s))))
+    (assert= 5 (:scroll (peek (:stack s))))
+    (assert= 0 (:sel (peek (:stack (inspect/step s "g")))))))
+(assert= 0 (:sel (peek (:stack (inspect/step (inspect/init [1 2]) "k")))))   ; clamp at top
+(assert= 1 (count (:stack (inspect/step (inspect/init [1]) "h"))))           ; can't go above root
+(assert= true (:done (inspect/step (inspect/init 1) "q")))
+(assert= true (:done (inspect/step (inspect/init 1) nil)))                   ; EOF quits
+(assert= 41 (inspect/current (inspect/step (inspect/init 41) "\r")))          ; scalar: no children
+(assert= 999 (:sel (peek (:stack (inspect/step (inspect/init (vec (range 1000)) 10 40) "G")))))
+(assert= true (string? (inspect/render (inspect/init (range)) 10 40)))        ; infinite root terminates
+(assert= "root  atom, 1 item" (first (str/split-lines (inspect/render (inspect/init (atom {:x 1})) 5 40))))
+(assert= ["root  string, 3 lines" (str "> " (apply str (repeat 28 "a")))]  ; long strings wrap
+         (map clove-ti-plain
+              (take 2 (str/split-lines (inspect/render (inspect/init (apply str (repeat 60 "a"))) 6 30)))))
+(when-not (clove/isatty*)              ; under a terminal this would open the TUI
+  (let [r (atom nil)
+        out (with-out-str (reset! r (inspect/inspect {:a 1})))]
+    (assert= ["{:a 1}\n" {:a 1}] [out @r])))                                ; pprint + return
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
