@@ -3514,5 +3514,65 @@
 (assert= "0.3|0.10000000000000000000|3|-0.01|-0003.14|+1.1| 2.000|1.3     |NaN|Infinity|100000000000000000000000.00|-0.00"
          (format "%.1f|%.20f|%.0f|%.2f|%08.2f|%+.1f|% .3f|%-8.1f|%.3f|%5.1f|%.2f|%.2f" 0.25 0.1 2.5 -0.005 -3.14159 1.05 2.0 1.25 ##NaN ##Inf 1e23 -0.0))
 
+;; ── tasks.clj: clove run <task> / clove tasks / clove new ──────────────────
+(require '[tasks])
+(let [cfg (tasks/parse-config
+            '{:paths [src test]
+              :tasks {build "make all"
+                      hello (println "hi")
+                      test {:doc "run the tests" :task "clove test"}
+                      ci {:doc "everything" :depends [build test]}
+                      -setup "echo private"}})
+      ts (:tasks cfg)]
+  (assert= ["src" "test"] (:paths cfg))
+  (assert= {:task "make all" :depends []} (get ts "build"))
+  (assert= '(println "hi") (:task (get ts "hello")))
+  (assert= ["build" "test"] (:depends (get ts "ci")))
+  (assert= ["build" "test" "ci"] (tasks/plan ts "ci"))
+  ;; listing: hidden names dropped, doc column aligned past the longest name
+  (assert= ["build" "ci     everything" "hello" "test   run the tests"]
+           (vec (tasks/listing-lines ts)))
+  (assert= "test" (tasks/suggest "tset" (keys ts)))
+  (assert= nil (tasks/suggest "deploy" (keys ts)))
+  (assert= true (str/includes? (try (tasks/plan ts "tst") (catch Exception e (ex-message e)))
+                               "Did you mean `test`?")))
+;; plan: deps first, each once (diamond), cycles and unknown deps named
+(let [ts {"a" {:task "x" :depends ["b" "c"]} "b" {:task "x" :depends ["d"]}
+          "c" {:task "x" :depends ["d"]} "d" {:task "x" :depends []}}]
+  (assert= ["d" "b" "c" "a"] (tasks/plan ts "a")))
+(assert= "dependency cycle: b -> c -> b"
+         (try (tasks/plan {"a" {:depends ["b"]} "b" {:depends ["c"]} "c" {:depends ["b"]}} "a")
+              (catch Exception e (ex-message e))))
+(assert= "task `a` depends on unknown task `zz`"
+         (try (tasks/plan {"a" {:task "x" :depends ["zz"]}} "a") (catch Exception e (ex-message e))))
+(assert= true (str/includes? (try (tasks/parse-config '{:tasks {x 42}}) (catch Exception e (ex-message e)))
+                             "task x"))
+(assert= [0 3 1 2] (map #(apply tasks/levenshtein %) [["" ""] ["abc" ""] ["kitten" "sitten"] ["ab" "ba"]]))
+;; shell commands: cd to the root, :paths exported, args quoted
+(assert= "cd '..' || exit 1; CLOVE_PATH=\"$PWD/src${CLOVE_PATH:+:$CLOVE_PATH}\"; export CLOVE_PATH; echo 'a b' 'it'\\''s'"
+         (tasks/shell-command "echo" ["a b" "it's"] ".." ["src"] false))
+(assert= "cd /d \"..\\..\" && echo \"x\"" (tasks/shell-command "echo" ["x"] "../.." [] true))
+;; clove new: name check + munging (my-app -> ns my-app.core in my_app/core.clj)
+(assert= [true true false false] (map tasks/valid-project-name? ["my-app" "acme.tool" "9x" "a/b"]))
+(assert= "my_app/core.clj" (tasks/ns->path "my-app.core"))
+(let [fs (tasks/scaffold-files "my-app")]
+  (assert= #{"clove.edn" "src/my_app/core.clj" "test/my_app/core_test.clj" "README.md" ".gitignore"}
+           (set (keys fs)))
+  (assert= '(ns my-app.core) (read-string (get fs "src/my_app/core.clj")))
+  (assert= ["repl" "run" "test"] (keys (:tasks (tasks/parse-config (read-string (get fs "clove.edn")))))))
+;; running: a failing dependency stops the run and its exit status comes back
+(when clove-test-unix?
+  (let [out (with-out-str
+              (assert= 3 (tasks/run-task (tasks/parse-config '{:tasks {ok "echo ran-ok"
+                                                                        bad {:depends [ok] :task "exit 3"}
+                                                                        top {:depends [bad] :task "echo NEVER"}}})
+                                         "." "top" [])))]
+    (assert= true (str/includes? out "ran-ok"))
+    (assert= false (str/includes? out "NEVER"))))
+(assert= [:x ["a"]] (binding [*out* (StringWriter.)]
+                      (tasks/run-task (tasks/parse-config '{:tasks {t (def tasks-test-seen [:x (vec *command-line-args*)])}})
+                                      "." "t" ["a"])
+                      tasks-test-seen))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
