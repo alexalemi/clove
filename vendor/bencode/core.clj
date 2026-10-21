@@ -1,5 +1,5 @@
 (ns bencode.core
-  "Bencode read/write over cljc's char reader/writer shims (StringReader./
+  "Bencode read/write over clove's char reader/writer shims (StringReader./
    PushbackReader. for in, StringWriter. for out).")
 
 (defn write-bencode [out x]

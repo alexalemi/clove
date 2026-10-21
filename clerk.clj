@@ -1,23 +1,23 @@
-;; clerk.clj — Clerk-style literate notebooks for cljc.
+;; clerk.clj — Clerk-style literate notebooks for clove.
 ;;
-;;   cljc notebook notebook.clj [port]     live server (default 7878)
-;;   cljc notebook somedir/ [port]         watch the tree; saving any .clj
+;;   clove notebook notebook.clj [port]     live server (default 7878)
+;;   clove notebook somedir/ [port]         watch the tree; saving any .clj
 ;;                                         in it switches the view to it
-;;   cljc notebook notebook.clj -o out.html  static single-file build
+;;   clove notebook notebook.clj -o out.html  static single-file build
 ;;
 ;; A notebook is an ordinary .clj file: top-level ;; comments render as
 ;; markdown prose, every top-level form is a code cell evaluated in order
 ;; (shared env, errors isolated per cell). Single-; comments are invisible.
 ;; Directives above a form: ;; @clerk:hide-code  ;; @clerk:hide-result
 ;;
-;; Uses only core natives (tcp/*, cljc/mtime*, with-out-str) — no FFI, so
+;; Uses only core natives (tcp/*, clove/mtime*, with-out-str) — no FFI, so
 ;; it works without a C compiler available.
 
 ;; ── cell parser ──
 ;; Line scanner: track paren depth and in-string across lines; prose and
 ;; directives are only recognized at depth 0 between forms.
 
-(defn cljc/clerk-scan-line
+(defn clove/clerk-scan-line
   "Advance [depth in-string?] across one line of code."
   [line depth instr]
   (loop [i 0 d depth instr instr]
@@ -57,7 +57,7 @@
               t (str/trim line)]
           (if (= mode :code)
             ;; inside a form: accumulate until depth returns to 0
-            (let [[d i2] (cljc/clerk-scan-line line depth instr)
+            (let [[d i2] (clove/clerk-scan-line line depth instr)
                   acc (conj acc line)]
               (if (and (<= d 0) (not i2))
                 (recur more (flush-cell cells :code acc dirs) nil [] 0 false {})
@@ -88,7 +88,7 @@
               ;; code line
               :else
               (let [cells (flush-cell cells mode acc dirs)
-                    [d i2] (cljc/clerk-scan-line line 0 false)]
+                    [d i2] (clove/clerk-scan-line line 0 false)]
                 (if (and (<= d 0) (not i2))
                   (recur more (flush-cell cells :code [line] dirs) nil [] 0 false {})
                   (recur more cells :code [line] d i2 dirs))))))))))
@@ -188,7 +188,7 @@
       (str/replace "<" "&lt;")
       (str/replace ">" "&gt;")))
 
-(defn cljc/clerk-splice
+(defn clove/clerk-splice
   "Replace the leftmost re-find hit with (render groups), recursing on the
   text either side. Backref-free substitute for regex replace."
   [s re render recur-fn]
@@ -200,22 +200,22 @@
            (recur-fn (subs s (+ i (count whole))))))
     nil))
 
-(defn cljc/clerk-inline-fmt
+(defn clove/clerk-inline-fmt
   "Links, bold, italic on already-escaped text (no backtick content)."
   [s]
-  (or (cljc/clerk-splice s #"\[([^\]]+)\]\(([^)]+)\)"
+  (or (clove/clerk-splice s #"\[([^\]]+)\]\(([^)]+)\)"
                          (fn [[_ text url]]
                            (str "<a href=\"" url "\">" text "</a>"))
-                         cljc/clerk-inline-fmt)
-      (cljc/clerk-splice s #"\*\*([^*]+)\*\*"
+                         clove/clerk-inline-fmt)
+      (clove/clerk-splice s #"\*\*([^*]+)\*\*"
                          (fn [[_ b]] (str "<strong>" b "</strong>"))
-                         cljc/clerk-inline-fmt)
-      (cljc/clerk-splice s #"\*([^*]+)\*"
+                         clove/clerk-inline-fmt)
+      (clove/clerk-splice s #"\*([^*]+)\*"
                          (fn [[_ i]] (str "<em>" i "</em>"))
-                         cljc/clerk-inline-fmt)
+                         clove/clerk-inline-fmt)
       s))
 
-(defn cljc/clerk-inline
+(defn clove/clerk-inline
   "Inline markdown: split on backticks — odd segments are code spans."
   [s]
   (let [parts (str/split s "`")]
@@ -223,7 +223,7 @@
       (map-indexed (fn [i p]
                      (if (odd? i)
                        (str "<code>" (clerk/escape p) "</code>")
-                       (cljc/clerk-inline-fmt (clerk/escape p))))
+                       (clove/clerk-inline-fmt (clerk/escape p))))
                    parts))))
 
 (defn clerk/md->html
@@ -236,7 +236,7 @@
       (let [flush-para (fn [html]
                          (if (empty? para)
                            html
-                           (str html "<p>" (cljc/clerk-inline (str/join " " para)) "</p>")))]
+                           (str html "<p>" (clove/clerk-inline (str/join " " para)) "</p>")))]
         (if (empty? lines)
           (close-ol (close-list (flush-para html) in-list) in-ol)
           (let [line (str/trim (first lines))
@@ -244,26 +244,26 @@
             (cond
               (str/starts-with? line "### ")
               (recur more (str (close-ol (close-list (flush-para html) in-list) in-ol)
-                               "<h3>" (cljc/clerk-inline (subs line 4)) "</h3>")
+                               "<h3>" (clove/clerk-inline (subs line 4)) "</h3>")
                      [] false false)
               (str/starts-with? line "## ")
               (recur more (str (close-ol (close-list (flush-para html) in-list) in-ol)
-                               "<h2>" (cljc/clerk-inline (subs line 3)) "</h2>")
+                               "<h2>" (clove/clerk-inline (subs line 3)) "</h2>")
                      [] false false)
               (str/starts-with? line "# ")
               (recur more (str (close-ol (close-list (flush-para html) in-list) in-ol)
-                               "<h1>" (cljc/clerk-inline (subs line 2)) "</h1>")
+                               "<h1>" (clove/clerk-inline (subs line 2)) "</h1>")
                      [] false false)
               (str/starts-with? line "- ")
               (recur more (str (close-ol (flush-para html) in-ol)
                                (if in-list "" "<ul>")
-                               "<li>" (cljc/clerk-inline (subs line 2)) "</li>")
+                               "<li>" (clove/clerk-inline (subs line 2)) "</li>")
                      [] true false)
               (re-matches #"\d+\. .*" line)
               (let [[_ item] (re-matches #"\d+\. (.*)" line)]
                 (recur more (str (close-list (flush-para html) in-list)
                                  (if in-ol "" "<ol>")
-                                 "<li>" (cljc/clerk-inline item) "</li>")
+                                 "<li>" (clove/clerk-inline item) "</li>")
                        [] false true))
               (= line "")
               (recur more (close-ol (close-list (flush-para html) in-list) in-ol)
@@ -274,7 +274,7 @@
 
 ;; ── code syntax highlighting (server-side, span classes) ──
 
-(defn cljc/clerk-scan-while [s i pred]
+(defn clove/clerk-scan-while [s i pred]
   (loop [j i]
     (if (and (< j (count s)) (pred (subs s j (inc j)))) (recur (inc j)) j)))
 
@@ -310,15 +310,15 @@
                             :else (recur (inc k))))]
               (recur j (str out "<span class=\"str\">" (clerk/escape (subs code i j)) "</span>")))
             (= c ":")
-            (let [j (cljc/clerk-scan-while code (inc i) token-char?)]
+            (let [j (clove/clerk-scan-while code (inc i) token-char?)]
               (recur j (str out "<span class=\"kwd\">" (clerk/escape (subs code i j)) "</span>")))
             (str/includes? "0123456789" c)
-            (let [j (cljc/clerk-scan-while code i token-char?)]
+            (let [j (clove/clerk-scan-while code i token-char?)]
               (recur j (str out "<span class=\"lit\">" (clerk/escape (subs code i j)) "</span>")))
             (str/includes? "()[]{}" c)
             (recur (inc i) (str out "<span class=\"pun\">" (clerk/escape c) "</span>"))
             (token-char? c)
-            (let [j (cljc/clerk-scan-while code i token-char?)
+            (let [j (clove/clerk-scan-while code i token-char?)
                   tok (subs code i j)]
               (recur j (str out (if (contains? clerk/hl-specials tok)
                                   (str "<span class=\"spe\">" (clerk/escape tok) "</span>")
@@ -334,7 +334,7 @@
 (defn clerk/register-viewer! [pred render]
   (swap! clerk/viewers conj {:pred pred :render render}))
 
-(defn cljc/clerk-table-row [tag cells]
+(defn clove/clerk-table-row [tag cells]
   (str "<tr>" (str/join "" (map (fn [c] (str "<" tag ">" (clerk/escape (clerk/pr-bounded c)) "</" tag ">")) cells)) "</tr>"))
 
 ;; map → two-column key/value table
@@ -342,7 +342,7 @@
   (fn [v] (map? v))
   (fn [m]
     (str "<table>"
-         (str/join "" (map (fn [[k v]] (cljc/clerk-table-row "td" [k v])) (seq m)))
+         (str/join "" (map (fn [[k v]] (clove/clerk-table-row "td" [k v])) (seq m)))
          "</table>")))
 
 ;; seq of same-keyed maps → 2D table
@@ -351,8 +351,8 @@
   (fn [rows]
     (let [cols (keys (first rows))]
       (str "<table>"
-           (cljc/clerk-table-row "th" cols)
-           (str/join "" (map (fn [r] (cljc/clerk-table-row "td" (map (fn [k] (get r k)) cols))) rows))
+           (clove/clerk-table-row "th" cols)
+           (str/join "" (map (fn [r] (clove/clerk-table-row "td" (map (fn [k] (get r k)) cols))) rows))
            "</table>"))))
 
 ;; string that looks like markup → raw html (charts, svg, images)
@@ -411,7 +411,7 @@
     (clerk/render-md c)
     (clerk/render-code c (clerk/eval-cell (:text c)))))
 
-(def cljc/clerk-css "
+(def clove/clerk-css "
 body{background:#f8f8f8;color:#383838;margin:0;
      font:17px/1.65 'Source Serif 4',Georgia,'Linux Libertine',serif}
 main{max-width:760px;margin:2.5rem auto;padding:0 1.2rem}
@@ -434,23 +434,23 @@ th{background:#efeeea}
 .lit{color:#406040}.pun{color:#9a917f}.spe{color:#8a3fa0;font-weight:600}
 ")
 
-(def cljc/clerk-katex
+(def clove/clerk-katex
   (str "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css\">"
        "<script defer src=\"https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js\"></script>"
        "<script defer src=\"https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js\" "
        "onload=\"renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]})\"></script>"))
 
-(def cljc/clerk-sse-js
+(def clove/clerk-sse-js
   "<script>new EventSource('/events').onmessage=function(e){if(e.data==='reload')location.reload()};</script>")
 
 (defn clerk/page [title cells-html live?]
   (str "<!doctype html><html><head><meta charset=\"utf-8\">"
        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
        "<title>" (clerk/escape title) "</title>"
-       "<style>" cljc/clerk-css "</style>"
-       cljc/clerk-katex
+       "<style>" clove/clerk-css "</style>"
+       clove/clerk-katex
        "</head><body><main>" cells-html "</main>"
-       (if live? cljc/clerk-sse-js "")
+       (if live? clove/clerk-sse-js "")
        "</body></html>"))
 
 (defn clerk/render-file [path live?]
@@ -501,14 +501,14 @@ th{background:#efeeea}
 ;; The 250ms accept timeout doubles as the file-watch tick; SSE clients are
 ;; kept as raw fds and receive \"data: reload\" when the notebook changes.
 
-(defn cljc/clerk-respond [fd status ctype body]
+(defn clove/clerk-respond [fd status ctype body]
   (tcp/send fd (str "HTTP/1.1 " status
                     "\r\nContent-Type: " ctype
                     "\r\nContent-Length: " (count body)
                     "\r\nConnection: close\r\n\r\n" body))
   (tcp/close fd))
 
-(defn cljc/clerk-handle
+(defn clove/clerk-handle
   "Serve one request; returns the (possibly grown) SSE client vector."
   [fd html sse]
   (let [req (or (tcp/recv fd) "")
@@ -521,76 +521,76 @@ th{background:#efeeea}
                             "\r\n\r\nretry: 500\n\n"))
           (conj sse fd))
       (= path "/")
-      (do (cljc/clerk-respond fd "200 OK" "text/html; charset=utf-8" html) sse)
+      (do (clove/clerk-respond fd "200 OK" "text/html; charset=utf-8" html) sse)
       :else
-      (do (cljc/clerk-respond fd "404 Not Found" "text/plain" "not found") sse))))
+      (do (clove/clerk-respond fd "404 Not Found" "text/plain" "not found") sse))))
 
-(defn cljc/clerk-render-safe [path old-html]
+(defn clove/clerk-render-safe [path old-html]
   (try (clerk/render-file path true)
        (catch Throwable e
          (println "clerk: render failed:" (ex-message e))
          old-html)))
 
-(defn cljc/clerk-broadcast
+(defn clove/clerk-broadcast
   "Send a reload to every SSE client; returns the survivors."
   [sse]
   (filterv (fn [c] (tcp/send c "data: reload\n\n")) sse))
 
-(defn cljc/clerk-serve-file [path port]
+(defn clove/clerk-serve-file [path port]
   (let [srv (tcp/listen port)]
     (println (str "clerk: " path " → http://127.0.0.1:" port "  (ctrl-c to stop)"))
-    (loop [html (cljc/clerk-render-safe path "") mt (cljc/mtime* path) sse []]
+    (loop [html (clove/clerk-render-safe path "") mt (clove/mtime* path) sse []]
       (let [fd (tcp/accept srv 250)
-            sse (if fd (cljc/clerk-handle fd html sse) sse)
-            nmt (cljc/mtime* path)]
+            sse (if fd (clove/clerk-handle fd html sse) sse)
+            nmt (clove/mtime* path)]
         (if (and nmt (not= nmt mt))
-          (recur (cljc/clerk-render-safe path html) nmt (cljc/clerk-broadcast sse))
+          (recur (clove/clerk-render-safe path html) nmt (clove/clerk-broadcast sse))
           (recur html mt sse))))))
 
 ;; ── directory mode: watch the whole tree, show whichever file changed ──
 
-(defn cljc/clerk-walk
+(defn clove/clerk-walk
   "All .clj files under dir, recursive; skips dot-directories."
   [dir]
   (mapcat (fn [n]
             (let [p (str dir "/" n)]
               (cond
                 (str/starts-with? n ".") []
-                (cljc/dir?* p) (cljc/clerk-walk p)
+                (clove/dir?* p) (clove/clerk-walk p)
                 (str/ends-with? n ".clj") [p]
                 :else [])))
-          (or (cljc/list-dir* dir) [])))
+          (or (clove/list-dir* dir) [])))
 
-(defn cljc/clerk-snapshot
+(defn clove/clerk-snapshot
   "Map of path → mtime for every .clj under dir."
   [dir]
-  (reduce (fn [m p] (assoc m p (cljc/mtime* p))) {} (cljc/clerk-walk dir)))
+  (reduce (fn [m p] (assoc m p (clove/mtime* p))) {} (clove/clerk-walk dir)))
 
-(defn cljc/clerk-changed
+(defn clove/clerk-changed
   "Some path that is new or has a different mtime than in old, else nil."
   [old new]
   (some (fn [[p t]] (when (not= t (get old p)) p)) (seq new)))
 
-(defn cljc/clerk-newest [snap]
+(defn clove/clerk-newest [snap]
   (first (last (sort-by (fn [[_ t]] t) (seq snap)))))
 
-(defn cljc/clerk-serve-dir [dir port]
+(defn clove/clerk-serve-dir [dir port]
   (let [srv (tcp/listen port)
-        snap (cljc/clerk-snapshot dir)
-        cur (cljc/clerk-newest snap)
+        snap (clove/clerk-snapshot dir)
+        cur (clove/clerk-newest snap)
         empty-page (clerk/page dir "<p>no .clj files here yet — save one and it will appear.</p>" true)]
     (println (str "clerk: " dir "/ (" (count snap) " files) → http://127.0.0.1:" port "  (ctrl-c to stop)"))
     (when cur (println (str "clerk: showing " cur)))
     (loop [cur cur
-           html (if cur (cljc/clerk-render-safe cur empty-page) empty-page)
+           html (if cur (clove/clerk-render-safe cur empty-page) empty-page)
            snap snap sse []]
       (let [fd (tcp/accept srv 250)
-            sse (if fd (cljc/clerk-handle fd html sse) sse)
-            nsnap (cljc/clerk-snapshot dir)
-            chg (cljc/clerk-changed snap nsnap)]
+            sse (if fd (clove/clerk-handle fd html sse) sse)
+            nsnap (clove/clerk-snapshot dir)
+            chg (clove/clerk-changed snap nsnap)]
         (if chg
           (do (when (not= chg cur) (println (str "clerk: showing " chg)))
-              (recur chg (cljc/clerk-render-safe chg html) nsnap (cljc/clerk-broadcast sse)))
+              (recur chg (clove/clerk-render-safe chg html) nsnap (clove/clerk-broadcast sse)))
           (recur cur html nsnap sse))))))
 
 (defn clerk/serve
@@ -598,21 +598,21 @@ th{background:#efeeea}
   the tree is watched and saving any of them switches the view to it."
   ([path] (clerk/serve path 7878))
   ([path port]
-   (if (cljc/dir?* path)
-     (cljc/clerk-serve-dir path port)
-     (cljc/clerk-serve-file path port))))
+   (if (clove/dir?* path)
+     (clove/clerk-serve-dir path port)
+     (clove/clerk-serve-file path port))))
 
-;; ── CLI entry (invoked by `cljc clerk ...`) ──
+;; ── CLI entry (invoked by `clove clerk ...`) ──
 
 (defn clerk/main []
   (let [args *args*
         file (first args)]
     (cond
       (nil? file)
-      (println "usage: cljc notebook <file.clj | dir> [port] [-o out.html]")
+      (println "usage: clove notebook <file.clj | dir> [port] [-o out.html]")
       (= (second args) "-o")
       (if-let [out (nth args 2 nil)]
         (println "clerk: wrote" (clerk/build file out))
-        (println "usage: cljc clerk <notebook.clj> -o out.html"))
+        (println "usage: clove clerk <notebook.clj> -o out.html"))
       :else
       (clerk/serve file (or (when (second args) (parse-long (second args))) 7878)))))

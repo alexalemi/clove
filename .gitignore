@@ -1,4 +1,4 @@
-cljc
+clove
 *.o
 examples/host
 .nrepl-port

@@ -1,4 +1,4 @@
-;; peg.clj — Janet-style Parsing Expression Grammars for cljc.
+;; peg.clj — Janet-style Parsing Expression Grammars for clove.
 ;; Load with: (require '[peg :as peg])
 ;;
 ;;   (peg/match '(* (<- :d+) "-" (<- :d+)) "12-34")        => ["12" "34"]
@@ -85,7 +85,7 @@
 (defn- lit-matcher [lit]
   (let [n (count lit) s* (str lit)]
     (fn [ctx i]
-      (when (and (<= (+ i n) (:len ctx)) (cljc/str-starts-at? (:s ctx) s* i))
+      (when (and (<= (+ i n) (:len ctx)) (clove/str-starts-at? (:s ctx) s* i))
         (+ i n)))))
 
 (defn- count-matcher [n]

@@ -4,8 +4,8 @@
 ;; structured text output, and `spit` to produce a real file artifact you can
 ;; open in any browser.
 ;;
-;; Run:  cljc examples/fractal-svg.clj            ; writes /tmp/tree.svg
-;;       cljc examples/fractal-svg.clj out.svg 11 ; custom path + recursion depth
+;; Run:  clove examples/fractal-svg.clj            ; writes /tmp/tree.svg
+;;       clove examples/fractal-svg.clj out.svg 11 ; custom path + recursion depth
 
 (def deg (/ Math/PI 180.0))   ; degrees -> radians
 

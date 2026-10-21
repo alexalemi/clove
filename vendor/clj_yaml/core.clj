@@ -1,5 +1,5 @@
 (ns clj-yaml.core
-  "A pure-Clojure YAML subset (cljc has no SnakeYAML). Covers the common
+  "A pure-Clojure YAML subset (clove has no SnakeYAML). Covers the common
    config-file surface: block mappings/sequences with indentation, the
    compact `- key: val` form, plain/quoted scalars, flow collections
    ([a, b] / {a: 1}), `#` comments, `---`/`...` document markers, and the
@@ -197,7 +197,7 @@
 
 (defn- fold-lines
   "Folded (`>`) scalar joining: lines within a paragraph join with a space,
-   a blank line becomes a paragraph break. No regex lookahead — cljc's
+   a blank line becomes a paragraph break. No regex lookahead — clove's
    engine doesn't support it."
   [lines]
   (reduce (fn [acc l]

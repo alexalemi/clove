@@ -1,10 +1,10 @@
-;; http-app.clj — a small routed web app on cljc's async HTTP battery.
+;; http-app.clj — a small routed web app on clove's async HTTP battery.
 ;;
 ;; Showcases http.clj's router (path params), response maps (custom status &
 ;; headers), and concurrent-safe shared state (an atom hit counter touched by
 ;; many connections) — all on the single-threaded coroutine event loop.
 ;;
-;; Run:    cljc examples/http-app.clj            (port 8080, all interfaces)
+;; Run:    clove examples/http-app.clj            (port 8080, all interfaces)
 ;; Visit:  http://localhost:8080/   (also over LAN/tailscale on this host's IP)
 
 (def *load-path* (into [".." "."] *load-path*))
@@ -14,9 +14,9 @@
 (def guestbook (atom []))               ; in-memory state shared across requests
 
 (defn home [_]
-  (str "<!doctype html><meta charset=utf-8><title>cljc web app</title>"
+  (str "<!doctype html><meta charset=utf-8><title>clove web app</title>"
        "<body style='font:16px system-ui;max-width:40em;margin:3em auto'>"
-       "<h1>cljc async web app</h1>"
+       "<h1>clove async web app</h1>"
        "<p>Served by a <code>go</code> block on the coroutine event loop. "
        "This page has been served <b>" (swap! hits inc) "</b> times.</p>"
        "<ul>"

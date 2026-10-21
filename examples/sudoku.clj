@@ -4,7 +4,7 @@
 ;; candidates for a cell, the "most-constrained cell first" heuristic, and
 ;; recursion that returns a solved board or nil (failure unwinds naturally).
 
-(require '[clojure.set])   ; cljc loads the real upstream clojure.set
+(require '[clojure.set])   ; clove loads the real upstream clojure.set
 
 ;; The board is a vector of 81 ints, 0 = blank, row-major.
 (def puzzle

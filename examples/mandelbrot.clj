@@ -3,8 +3,8 @@
 ;; Showcases: double arithmetic, loop/recur as the hot inner loop, and
 ;; building a big string with seq comprehensions instead of mutation.
 ;;
-;; Run:  cljc examples/mandelbrot.clj
-;;       cljc examples/mandelbrot.clj 100      ; max-iterations override
+;; Run:  clove examples/mandelbrot.clj
+;;       clove examples/mandelbrot.clj 100      ; max-iterations override
 
 (def width  78)
 (def height 30)

@@ -1,13 +1,13 @@
-;; shapes.clj — polymorphism in cljc: protocols, records, and multimethods.
+;; shapes.clj — polymorphism in clove: protocols, records, and multimethods.
 ;;
-;; Showcases all three dispatch mechanisms cljc supports, and how they differ.
+;; Showcases all three dispatch mechanisms clove supports, and how they differ.
 ;; A note on the dialect: dispatch is on `type`, which returns a *keyword*
 ;; (e.g. :Circle for a record) rather than a Java class. Records are
 ;; tagged maps, so they print and destructure like maps.
 
 ;; --- Protocols + records --------------------------------------------------
 ;; A protocol is a named set of functions; records implement them. Under the
-;; hood cljc compiles protocol methods to multimethods that dispatch on the
+;; hood clove compiles protocol methods to multimethods that dispatch on the
 ;; record's type keyword.
 (defprotocol Shape
   (area [s])
@@ -16,7 +16,7 @@
 (defrecord Circle [r])
 (defrecord Rectangle [w h])
 
-;; DIALECT NOTE: cljc's extend-type takes the type KEYWORD and method impls
+;; DIALECT NOTE: clove's extend-type takes the type KEYWORD and method impls
 ;; directly — there is no protocol-name argument like Clojure's
 ;; (extend-type T Proto (m [..] ..)). Records get type keywords like
 ;; :Circle automatically. Math/PI is a real constant (a bare symbol — don't

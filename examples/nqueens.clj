@@ -4,8 +4,8 @@
 ;; search (each level filters candidate columns), and representing a board
 ;; as a vector where index = row, value = column.
 ;;
-;; Run:  cljc examples/nqueens.clj          ; defaults to 8
-;;       cljc examples/nqueens.clj 6
+;; Run:  clove examples/nqueens.clj          ; defaults to 8
+;;       clove examples/nqueens.clj 6
 
 ;; A placement is safe if no earlier queen shares the column or a diagonal.
 ;; `queens` is the column already chosen for each previous row, so the new

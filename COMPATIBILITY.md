@@ -1,6 +1,6 @@
 # Library compatibility
 
-Tested with `cljc vendor` / `(vendor! …)` on 2026-07-07 (v0.2.0+). "Works"
+Tested with `clove vendor` / `(vendor! …)` on 2026-07-07 (v0.2.0+). "Works"
 means a functional smoke test passed, not just loading. Transitive
 dependencies are not auto-resolved — vendor them too (listed where needed).
 
@@ -33,7 +33,7 @@ borkdude/deflet.
 |---|---|
 | org.clojure/core.match | wildcards, multi-column, nested vectors, maps, seq patterns, `:or`, `:guard`, `:as`, rest patterns, clause ordering (13/13 battery) |
 | markdown-clj | `md-to-html-string`: headings, emphasis, lists, links, code blocks, tables, YAML front-matter metadata |
-| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet: meander registers its `with`/`$` parsers under syntax-quoted bare symbols, which cljc's syntax-quote leaves unqualified (documented divergence) while lookups use the qualified name |
+| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet: meander registers its `with`/`$` parsers under syntax-quoted bare symbols, which clove's syntax-quote leaves unqualified (documented divergence) while lookups use the qualified name |
 
 ## Works — verified functionally (bring-up round, 2026-08-27)
 
@@ -51,7 +51,7 @@ borkdude/deflet.
 
 Anything wrapping Java libraries directly: clj-http (Apache HTTP),
 data.xml (SAX), next.jdbc, tools.namespace (java.io scanning), aleph/netty,
-… Use cljc's batteries (`http.clj`, `json.clj`, `fs.clj`, `process.clj`)
+… Use clove's batteries (`http.clj`, `json.clj`, `fs.clj`, `process.clj`)
 for those needs.
 
 ## Notes

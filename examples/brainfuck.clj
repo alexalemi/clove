@@ -1,15 +1,15 @@
-;; brainfuck.clj — a complete Brainfuck interpreter in cljc.
+;; brainfuck.clj — a complete Brainfuck interpreter in clove.
 ;;
 ;; Showcases: hosting another language, mutable arrays (int-array/aget/aset —
-;; cljc's transient-vector-backed arrays), precomputing jump tables, and
+;; clove's transient-vector-backed arrays), precomputing jump tables, and
 ;; with-out-str-free streaming output via `print`.
 ;;
 ;; Brainfuck has 8 commands operating on a tape of byte cells:
 ;;   > <  move the data pointer       + -  inc/dec the current cell
 ;;   . ,  output / input a byte        [ ]  loop while current cell != 0
 ;;
-;; Run:  cljc examples/brainfuck.clj            ; runs the built-in "Hello"
-;;       cljc examples/brainfuck.clj prog.bf    ; run a program from a file
+;; Run:  clove examples/brainfuck.clj            ; runs the built-in "Hello"
+;;       clove examples/brainfuck.clj prog.bf    ; run a program from a file
 
 ;; Precompute matching-bracket targets so `[` / `]` are O(1) jumps instead of
 ;; rescanning. A stack of `[` positions pairs each with its closing `]`.

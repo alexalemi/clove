@@ -2,26 +2,26 @@
   (:refer-clojure :exclude [test])      ; `test` is our macro, not clojure.core/test
   (:require [clojure.string :as str]))
 ;; judge.cljc — inline snapshot testing, in the spirit of ianthehenry/judge.
-;; A .cljc so the WHOLE tool runs under cljc AND babashka/Clojure:
-;;   cljc judge file.clj ...      ; the cljc subcommand
+;; A .cljc so the WHOLE tool runs under clove AND babashka/Clojure:
+;;   clove judge file.clj ...      ; the clove subcommand
 ;;   bb judge.cljc file.clj ...   ; bb runs it as a script (auto-invokes -main)
 ;;   bb -m judge file.clj ...     ; or via -m
 ;; And a solution file that does (require '[judge :refer [test ...]]) gets the
 ;; no-op macros under both, so it runs unchanged with bb/clj and is testable
-;; with cljc judge / bb judge.cljc.
+;; with clove judge / bb judge.cljc.
 ;;
 ;;   (require '[judge])             ; or just write the forms — see below
-;;   (test (+ 1 2))                 ; cljc judge fills in => (test (+ 1 2) 3)
+;;   (test (+ 1 2))                 ; clove judge fills in => (test (+ 1 2) 3)
 ;;   (test (+ 1 2) 3)               ; verified; corrected when wrong
 ;;   (test-error (/ 1 0))           ; snapshot of the error message
 ;;   (test-stdout (println "hi"))   ; snapshot of printed output (+ value)
 ;;   (trust (rand))                 ; filled once, never re-run
 ;;
-;;   cljc judge file.clj [...]      ; check; corrections → file.clj.tested
-;;   cljc judge -a file.clj         ; apply corrections to the source
-;;   cljc judge -i file.clj         ; review each correction (y/n/q)
+;;   clove judge file.clj [...]      ; check; corrections → file.clj.tested
+;;   clove judge -a file.clj         ; apply corrections to the source
+;;   clove judge -i file.clj         ; review each correction (y/n/q)
 ;;
-;; In a normal run (cljc file.clj) the test macros are no-ops, so files
+;; In a normal run (clove file.clj) the test macros are no-ops, so files
 ;; carrying tests execute at full speed with zero side effects. Only the
 ;; judge runner gives them meaning: it reads the source, tracks each
 ;; top-level form's text extent, and splices corrected values into the
@@ -36,7 +36,7 @@
 (defmacro trust [& _] nil)
 
 ;; ── the runner (portable: bare names, str/ required above, the only
-;; cljc-specific bit — tty detection — guarded with a reader conditional). ──
+;; clove-specific bit — tty detection — guarded with a reader conditional). ──
 
 ;; ── source scanning: top-level forms with [start end] char extents ──
 
@@ -225,7 +225,7 @@
 
 ;; ── diff display + application ──
 
-(def judge-tty? #?(:cljc (cljc/isatty*) :default false))
+(def judge-tty? #?(:clove (clove/isatty*) :default false))
 
 (defn judge-color [code s]
   (if judge-tty? (str "[" code "m" s "[0m") s))
@@ -264,7 +264,7 @@
         interactive? (contains? (set args) "-i")
         files (remove #{"-a" "-i"} args)]
     (if (empty? files)
-      (do (println "usage: cljc judge [-a | -i] <files...>") 1)
+      (do (println "usage: clove judge [-a | -i] <files...>") 1)
       (let [load-err (atom false)]
         (doseq [f files]
           (when (= :load-error (judge-run-file f))

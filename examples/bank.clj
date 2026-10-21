@@ -1,6 +1,6 @@
 ;; bank.clj — mutable state with atoms, plus error handling.
 ;;
-;; Showcases: atoms (the one mutable cell cljc offers), swap!/reset!,
+;; Showcases: atoms (the one mutable cell clove offers), swap!/reset!,
 ;; ex-info/try/catch for domain errors, and validating updates inside swap!
 ;; so the state can never go negative.
 

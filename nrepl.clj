@@ -1,13 +1,13 @@
-;; nrepl.clj — a CONCURRENT, multi-client nREPL server in cljc, on the csp
-;; coroutine event loop. The built-in C nREPL (./cljc --nrepl) is single-client
+;; nrepl.clj — a CONCURRENT, multi-client nREPL server in clove, on the csp
+;; coroutine event loop. The built-in C nREPL (./clove --nrepl) is single-client
 ;; and serial; this one handles many editor sessions at once, each connection a
 ;; go block multiplexed on one thread.
 ;;
 ;; Speaks bencode nREPL (clone/describe/eval/load-file/close/ls-sessions), so
 ;; Conjure / CIDER / Calva can connect. All sessions share the one root env
-;; (cljc has a single global environment), so defs are visible across clients.
+;; (clove has a single global environment), so defs are visible across clients.
 ;;
-;; Run:  cljc -e "(require '[nrepl]) (nrepl/serve 7889)"
+;; Run:  clove -e "(require '[nrepl]) (nrepl/serve 7889)"
 ;;   or  add a wrapper script. Writes .nrepl-port for editor discovery.
 
 (require '[csp :as csp])
@@ -72,7 +72,7 @@
       (= op "describe") (reply conn {"id" id "session" sess "status" ["done"]
                                      "ops" {"eval" {} "clone" {} "close" {}
                                             "describe" {} "load-file" {} "ls-sessions" {}}
-                                     "versions" {"cljc" {"version-string" "0.1.0"}}})
+                                     "versions" {"clove" {"version-string" "0.1.0"}}})
       (= op "eval")     (do-eval conn id sess (or (msg "code") ""))
       (= op "load-file") (do-eval conn id sess (or (msg "file") ""))
       (= op "ls-sessions") (reply conn {"id" id "status" ["done"] "sessions" []})

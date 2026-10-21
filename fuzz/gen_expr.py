@@ -1,4 +1,4 @@
-"""Random TYPED Clojure expressions for differential fuzzing (cljc vs JVM/bb).
+"""Random TYPED Clojure expressions for differential fuzzing (clove vs JVM/bb).
 
     python3 gen_expr.py SEED N > exprs.txt
 
@@ -27,12 +27,12 @@ MAXD = 4
 KWS = [":a", ":b", ":c", ":d", ":e"]
 WORDS = ["", "a", "ab", "abc", "Hello", "foo bar", " pad ", "x,y,z", "42", "-7", "3.5", "zz"]
 # (fn ..) rather than #(..): these get spliced inside other fn literals, and
-# Clojure rejects nested #() (cljc accepts it)
+# Clojure rejects nested #() (clove accepts it)
 FNS = ["inc", "dec", "-", "abs", "(fn [x] (* x x))", "(fn [a] (+ a 3))", "(fn [a] (quot a 2))", "(partial * 2)"]
 PREDS = ["even?", "odd?", "pos?", "neg?", "zero?", "(fn [p] (> p 2))", "(fn [p] (< p 0))"]
 # No Long/MIN_VALUE: boxed JVM math computes (- x y) as (+ x (- y)), so
 # (- -1 Long/MIN_VALUE) throws in bb yet is Long/MAX_VALUE in compiled Clojure
-# (primitive path) and in cljc. A typing artifact, not a finding.
+# (primitive path) and in clove. A typing artifact, not a finding.
 EDGE_INTS = ["9223372036854775807", "-9223372036854775807", "4611686018427387904",
              "3037000500", "2147483647", "-2147483648", "1000000007"]
 
@@ -173,7 +173,7 @@ class Gen:
             return f"({pick(['+', '-', '*'])} {self.num(d)} {self.num(d)})"
         if r == 2:
             # literal non-zero divisor: float division by an exact zero is a
-            # known divergence (cljc: ##Inf; boxed JVM math and bb: throw)
+            # known divergence (clove: ##Inf; boxed JVM math and bb: throw)
             return f"(/ {self.num(d)} {pick(['2', '-3', '0.5', '7/2', '10'])})"
         if r == 3:
             return f"(double {self.int(d)})"

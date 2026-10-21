@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — build and install cljc from a source checkout.
+# install.sh — build and install clove from a source checkout.
 #
 #   ./install.sh                 # install to ~/.local (no sudo)
 #   PREFIX=/usr/local ./install.sh   # system-wide (may need sudo)
@@ -16,7 +16,7 @@ fi
 
 cd "$(dirname "$0")"
 
-echo "building cljc (PREFIX=$PREFIX)..."
+echo "building clove (PREFIX=$PREFIX)..."
 make clean >/dev/null 2>&1 || true
 make PREFIX="$PREFIX"
 
@@ -26,11 +26,11 @@ make test
 make PREFIX="$PREFIX" install
 
 echo
-echo "cljc installed."
-echo "  binary:    $PREFIX/bin/cljc"
-echo "  batteries: $PREFIX/share/cljc  (load-file/require find them anywhere)"
+echo "clove installed."
+echo "  binary:    $PREFIX/bin/clove"
+echo "  batteries: $PREFIX/share/clove  (load-file/require find them anywhere)"
 case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
     *) echo "  NOTE: $PREFIX/bin is not on your PATH" ;;
 esac
-"$PREFIX/bin/cljc" --version
+"$PREFIX/bin/clove" --version

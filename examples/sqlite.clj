@@ -1,14 +1,14 @@
-;; sqlite.clj — talk to a real SQLite database from cljc, through the FFI.
+;; sqlite.clj — talk to a real SQLite database from clove, through the FFI.
 ;;
 ;; Showcases: binding a substantial C library (libsqlite3) with zero glue code
 ;; checked in. SQLite's API uses out-parameters (sqlite3**) that a scalar FFI
 ;; can't express, so we emit a handful of `static inline` shim functions into a
-;; header and bind those — the standard pattern for adapting a C API to cljc's
+;; header and bind those — the standard pattern for adapting a C API to clove's
 ;; FFI. Handles travel as integers; the prepare/step/column loop reads rows.
 ;;
 ;; Requires libsqlite3-dev (the sqlite3.h header) and a C compiler.
 ;;
-;; Run:  cljc examples/sqlite.clj
+;; Run:  clove examples/sqlite.clj
 
 ;; ── the C shim: flatten sqlite3's out-params into handle-returning calls ──
 (def shim "
@@ -28,7 +28,7 @@ static inline const char*sl_err(long long db){return sqlite3_errmsg((sqlite3*)db
 static inline int sl_close(long long db){return sqlite3_close((sqlite3*)db);}
 ")
 
-(def shim-path "/tmp/cljc_sqlite_shim.h")
+(def shim-path "/tmp/clove_sqlite_shim.h")
 (spit shim-path shim)
 
 (declare sl_open sl_prep sl_step sl_ncol sl_ctype sl_cname
@@ -48,7 +48,7 @@ static inline int sl_close(long long db){return sqlite3_close((sqlite3*)db);}
    [:int    "sl_exec"  [:int :string]]
    [:string "sl_err"   [:int]]
    [:int    "sl_close" [:int]]]
-  {:headers ["cljc_sqlite_shim.h"] :libs "-I/tmp -lsqlite3"})
+  {:headers ["clove_sqlite_shim.h"] :libs "-I/tmp -lsqlite3"})
 
 ;; ── a small Clojure-flavored wrapper over the shim ──
 (defn open [path]
@@ -82,7 +82,7 @@ static inline int sl_close(long long db){return sqlite3_close((sqlite3*)db);}
 (let [db (open ":memory:")]
   (exec! db "CREATE TABLE langs (name TEXT, year INTEGER, lines REAL)")
   (doseq [[n y l] [["C" 1972 0.0] ["Clojure" 2007 0.0]
-                   ["cljc" 2026 8500.0] ["Janet" 2017 0.0]]]
+                   ["clove" 2026 8500.0] ["Janet" 2017 0.0]]]
     (exec! db (format "INSERT INTO langs VALUES ('%s', %d, %f)" n y l)))
 
   (println "All rows, newest first:")

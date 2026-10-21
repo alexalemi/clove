@@ -1,27 +1,27 @@
-; cljc regression tests — each (assert= expected actual) prints PASS/FAIL.
-; Run: ./cljc tests.clj   (or: make test)
+; clove regression tests — each (assert= expected actual) prints PASS/FAIL.
+; Run: ./clove tests.clj   (or: make test)
 ;
 ; The verdict is the EXIT STATUS plus the last line ("tests complete: N passed,
 ; M failed"), not a grep of the output: tests are free to print words like
 ; "error". A script-mode abort exits non-zero before the summary is reached.
 
-(def cljc-test-passed (atom 0))
-(def cljc-test-failed (atom 0))
+(def clove-test-passed (atom 0))
+(def clove-test-failed (atom 0))
 (defn assert= [expected actual]
   (if (= expected actual)
-    (do (swap! cljc-test-passed inc) (println "PASS"))
-    (do (swap! cljc-test-failed inc)
+    (do (swap! clove-test-passed inc) (println "PASS"))
+    (do (swap! clove-test-failed inc)
         (println "FAIL: expected" (pr-str expected) "got" (pr-str actual)))))
 
 ; Platform capability probes — sections that need a POSIX shell + cc (FFI,
 ; JIT, subprocess e2e) or coroutines (csp, futures, core.async) self-skip
 ; where those are absent (Windows; coro-less builds). Skipped sections print
 ; a SKIP marker so a sweep can tell "passed" from "not attempted".
-(def cljc-test-unix? (not= :windows (cljc/os*)))
-(def cljc-test-coro? (try (coro/alive? (coro/new (fn [] nil)))
+(def clove-test-unix? (not= :windows (clove/os*)))
+(def clove-test-coro? (try (coro/alive? (coro/new (fn [] nil)))
                           (catch Exception e false)))
-(when-not cljc-test-unix? (println "SKIP: unix-only sections (FFI/JIT/shell)"))
-(when-not cljc-test-coro? (println "SKIP: coroutine sections (coro/csp/futures/core.async)"))
+(when-not clove-test-unix? (println "SKIP: unix-only sections (FFI/JIT/shell)"))
+(when-not clove-test-coro? (println "SKIP: coroutine sections (coro/csp/futures/core.async)"))
 
 ; arithmetic & numbers
 (assert= 6 (+ 1 2 3))
@@ -450,9 +450,9 @@
 ; (checked manually: {:a 1 :a 2} => error: duplicate key in map literal)
 
 ; ── file IO round trip ──
-(when cljc-test-unix?
-(spit "/tmp/cljc-test.txt" "hello file")
-(assert= "hello file" (slurp "/tmp/cljc-test.txt"))
+(when clove-test-unix?
+(spit "/tmp/clove-test.txt" "hello file")
+(assert= "hello file" (slurp "/tmp/clove-test.txt"))
 ) ; end when-unix
 
 
@@ -674,7 +674,7 @@
 (assert= nil (ns my.ns (:require [clojure.string :as str])))
 ; (ns ...) now ENTERS the namespace (defs land under my.ns/) — leave it
 ; again so the rest of this suite stays in the flat globals
-(cljc/in-ns* nil)
+(clove/in-ns* nil)
 (assert= nil (require '[clojure.string :as str]))
 (defn docd "has a docstring" [x] (* x 2))
 (assert= 42 (docd 21))
@@ -702,7 +702,8 @@
 (assert= nil (keyword \a))                            ; (keyword char) => nil, like Clojure
 (assert= [1 2] ^:private [1 2])
 (assert= {:private true} (meta ^:private [1 2]))
-(assert= :ours #?(:clj :jvm :cljc :ours :default :other))
+(assert= :ours #?(:clj :jvm :clove :ours :default :other))
+(assert= :ours #?(:clj :jvm :cljc :ours :default :other))   ; the pre-rename feature name still works
 (assert= :fallback #?(:clj :jvm :default :fallback))
 (assert= 1 #?(:clj 1 :cljs 2))                       ; :clj is a last resort (load clj-only .cljc)
 (assert= :p #?(:clj :j :default :p))                 ; but :default still beats :clj
@@ -803,7 +804,7 @@
 (assert= (list 1 1 2 2) (mapcat (fn [x] [x x]) [1 2]))
 
 ; ── FFI (s7 cload model: generate glue, compile, dlopen) ──
-(when cljc-test-unix?  ; FFI/sh sections need cc + dlopen + a POSIX shell
+(when clove-test-unix?  ; FFI/sh sections need cc + dlopen + a POSIX shell
 (assert= 0 (:exit (sh "true")))
 (assert= 1 (:exit (sh "false")))
 (assert= "ping\n" (:out (sh "echo ping")))
@@ -820,12 +821,12 @@
 ; ── libc.clj batteries + FFI :pointer/caching/NULL safety ──
 (load-file "libc.clj")
 (assert= true (> (getpid) 0))
-(assert= true (file-exists? "cljc.c"))
+(assert= true (file-exists? "clove.c"))
 (assert= false (file-exists? "/no/such/path"))
-(assert= nil (getenv "CLJC_DEFINITELY_UNSET"))      ; NULL char* => nil
-(assert= "fb" (env "CLJC_DEFINITELY_UNSET" "fb"))
-(setenv "CLJC_T" "v" 1)
-(assert= "v" (getenv "CLJC_T"))
+(assert= nil (getenv "CLOVE_DEFINITELY_UNSET"))      ; NULL char* => nil
+(assert= "fb" (env "CLOVE_DEFINITELY_UNSET" "fb"))
+(setenv "CLOVE_T" "v" 1)
+(assert= "v" (getenv "CLOVE_T"))
 (assert= true (> (now-epoch) 1700000000))           ; :pointer arg (NULL) + ret
 (assert= true (string? (cwd)))
 (load-file "libc.clj")                              ; reload: cached, idempotent
@@ -849,19 +850,19 @@
 (assert= 4.0 (sqrtf 16.0))
 (assert= 8.0 (powf 2.0 3.0))
 ; struct RETURN by value: div() returns div_t {int quot; int rem;} — comes
-; back as a cljc vector of the declared fields.
+; back as a clove vector of the declared fields.
 (ffi/define [["div_t" div [:int :int]]]
             {:headers ["stdlib.h"]
              :structs {"div_t" [[:int "quot"] [:int "rem"]]}})
 (assert= [3 2] (div 17 5))
 ; struct ARG by value (via a temp header): a vector is destructured into the
 ; struct fields with nth_elem. Covers both struct arg and struct return.
-(spit "/tmp/cljc_test_ffi.h"
+(spit "/tmp/clove_test_ffi.h"
       (str "typedef struct { int r,g,b,a; } TColor;\n"
            "static inline int tc_luma(TColor c){ return (c.r+c.g+c.b)/3; }\n"
            "static inline TColor tc_gray(int v){ return (TColor){v,v,v,255}; }\n"))
 (ffi/define [[:int "tc_luma" ["TColor"]] ["TColor" "tc_gray" [:int]]]
-            {:headers ["cljc_test_ffi.h"] :libs "-I/tmp"
+            {:headers ["clove_test_ffi.h"] :libs "-I/tmp"
              :structs {"TColor" [[:int "r"] [:int "g"] [:int "b"] [:int "a"]]}})
 (assert= 100 (tc_luma [90 100 110 255]))
 (assert= [42 42 42 255] (tc_gray 42))
@@ -881,153 +882,153 @@
 ; Every (pattern, text) pair below was run through the real Janet binary
 ; (scratch differential harness, 2026-09-07); expected strings are Janet's
 ; answers re-encoded in Clojure print syntax. Only ASCII inputs here since
-; Janet indexes bytes and cljc indexes codepoints (checked separately).
+; Janet indexes bytes and clove indexes codepoints (checked separately).
 (require '[peg :as peg])
-(defn cljc-peg-try [f] (try (pr-str (f)) (catch Exception e (str "ERR " (ex-message e)))))
-(assert= "[\"12\" \"34\"]" (cljc-peg-try (fn [] (peg/match '(* (<- :d+) "-" (<- :d+)) "12-34" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (<- :d+) "-" (<- :d+)) "12-x" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(+ "foo" "bar" "qux") "quxxy" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(+ "foo" "bar" "qux") "spaz" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(* "f" "oo" "bar") "foobar" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(set "abc") "bar" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(set "abc") "foobar" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '3 "foobar" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '3 "fo" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '-3 "foo" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '-3 "fo" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(range "az") "apple" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(range "az") "0apple" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(range "af" "AF") "Fapple" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(any :d) "1234abc" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(some :d) "a1234abc" 0 1 :z))))
-(assert= "[3]" (cljc-peg-try (fn [] (peg/match '(* (repeat 3 :d) ($)) "122342" 0 1 :z))))
-(assert= "[3]" (cljc-peg-try (fn [] (peg/match '(* (3 :d) ($)) "122342" 0 1 :z))))
-(assert= "[8]" (cljc-peg-try (fn [] (peg/match '(* (at-least 3 :d) ($)) "12345678" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(at-least 3 :d) "12" 0 1 :z))))
-(assert= "[3]" (cljc-peg-try (fn [] (peg/match '(* (at-most 3 :d) ($)) "12345678" 0 1 :z))))
-(assert= "[2]" (cljc-peg-try (fn [] (peg/match '(* (at-most 3 :d) ($)) "12asdf" 0 1 :z))))
-(assert= "[5]" (cljc-peg-try (fn [] (peg/match '(* (between 3 5 :d) ($)) "123456a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(between 3 5 :d) "12a3456" 0 1 :z))))
-(assert= "[0]" (cljc-peg-try (fn [] (peg/match '(* (opt :d) ($)) "a122342" 0 1 :z))))
-(assert= "[1]" (cljc-peg-try (fn [] (peg/match '(* (? :d) ($)) "122342" 0 1 :z))))
-(assert= "[4]" (cljc-peg-try (fn [] (peg/match '(* (if :d :d+) ($)) "1234" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(if :a :d+) "1234" 0 1 :z))))
-(assert= "[4]" (cljc-peg-try (fn [] (peg/match '(* (if "12" :d+) ($)) "1234" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(if "12" :d+) "01234" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(if-not :d :d+) "1234" 0 1 :z))))
-(assert= "[4]" (cljc-peg-try (fn [] (peg/match '(* (if-not :a :d+) ($)) "1234" 0 1 :z))))
-(assert= "[5]" (cljc-peg-try (fn [] (peg/match '(* (if-not "12" :d+) ($)) "01234" 0 1 :z))))
-(assert= "[0]" (cljc-peg-try (fn [] (peg/match '(* (look 4 :d) ($)) "123456" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(look 4 :d) "1234a6" 0 1 :z))))
-(assert= "[0]" (cljc-peg-try (fn [] (peg/match '(* (> 4 :d) ($)) "abcd1e" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(to :d) "abcde" 0 1 :z))))
-(assert= "[5]" (cljc-peg-try (fn [] (peg/match '(* (to :d) ($)) "abcde1234" 0 1 :z))))
-(assert= "[0]" (cljc-peg-try (fn [] (peg/match '(* (to :d) ($)) "1" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(thru :d) "abcde" 0 1 :z))))
-(assert= "[6]" (cljc-peg-try (fn [] (peg/match '(* (thru :d) ($)) "abcde1234" 0 1 :z))))
-(assert= "[1]" (cljc-peg-try (fn [] (peg/match '(* (thru :d) ($)) "1" 0 1 :z))))
-(assert= "[\"1\" \"5\"]" (cljc-peg-try (fn [] (peg/match '(* (<- :d) :a+ (<- :d)) "1abc5" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* :a+ (<- :d) :a+) "abc12def" 0 1 :z))))
-(assert= "[[\"1\" \"a\"]]" (cljc-peg-try (fn [] (peg/match '(group (* (<- :d) (<- :a))) "1a" 0 1 :z))))
-(assert= "[[\"a\" [\"b\"]]]" (cljc-peg-try (fn [] (peg/match '(group (* (<- "a") (group (<- "b")))) "ab" 0 1 :z))))
-(assert= "[[]]" (cljc-peg-try (fn [] (peg/match '(group (any (<- 1))) "" 0 1 :z))))
-(assert= "[[]]" (cljc-peg-try (fn [] (peg/match '(group "a" :g) "a" 0 1 :z))))
-(assert= "[[] []]" (cljc-peg-try (fn [] (peg/match '(* (group "a" :g) (-> :g)) "a" 0 1 :z))))
-(assert= "[\"lit\"]" (cljc-peg-try (fn [] (peg/match '(replace (* (<- :d) (<- :a)) "lit") "1a" 0 1 :z))))
-(assert= "[nil]" (cljc-peg-try (fn [] (peg/match '(replace (<- :d) {"1" :x}) "2" 0 1 :z))))
-(assert= "[:x]" (cljc-peg-try (fn [] (peg/match '(replace (<- :d) {"1" :x}) "1" 0 1 :z))))
-(assert= "[\"b\"]" (cljc-peg-try (fn [] (peg/match '(replace "a" "b") "a" 0 1 :z))))
-(assert= "[\"z\" \"z\"]" (cljc-peg-try (fn [] (peg/match '(* (replace (<- "a") "z" :t) (-> :t)) "a" 0 1 :z))))
-(assert= "[1]" (cljc-peg-try (fn [] (peg/match '(constant 1) "12" 0 1 :z))))
-(assert= "[:foo 0]" (cljc-peg-try (fn [] (peg/match '(* (constant :foo) ($)) "12" 0 1 :z))))
-(assert= "[2]" (cljc-peg-try (fn [] (peg/match '(* :d+ (position)) "12" 0 1 :z))))
-(assert= "[9]" (cljc-peg-try (fn [] (peg/match '(* (some (* :d :a :d)) ($)) "1a23a45a5foo" 0 1 :z))))
-(assert= "[1 2 1 2]" (cljc-peg-try (fn [] (peg/match '(* (line) "\n" (line) (column) "x" (column)) "\nx" 0 1 :z))))
-(assert= "[2 3]" (cljc-peg-try (fn [] (peg/match '(* (any 1) (line) (column)) "a\nbc" 0 1 :z))))
-(assert= "[4 1]" (cljc-peg-try (fn [] (peg/match '(* (some (+ :d :s)) (line) (column)) "1\n2\n345\n" 0 1 :z))))
-(assert= "[1]" (cljc-peg-try (fn [] (peg/match '(column) "ab" 0 1 :z))))
-(assert= "[\"15a\"]" (cljc-peg-try (fn [] (peg/match '(accumulate (* (<- :d) (constant 5) (<- :a))) "1a" 0 1 :z))))
-(assert= "[\"1a\"]" (cljc-peg-try (fn [] (peg/match '(% (* (<- :d) (<- :a))) "1a" 0 1 :z))))
-(assert= "[\"\"]" (cljc-peg-try (fn [] (peg/match '(accumulate "a") "a" 0 1 :z))))
-(assert= "[\"15a\" \"15a\"]" (cljc-peg-try (fn [] (peg/match '(* (accumulate (* (<- :d) (constant 5) (<- :a)) :t) (-> :t)) "1a" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(* (drop (<- :d)) (<- :a)) "1a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (drop (<- "a" :x)) (-> :x)) "a" 0 1 :z))))
-(assert= "[\"1\" \"1\" \"1\"]" (cljc-peg-try (fn [] (peg/match '(* (<- :d :x) (backref :x) (-> :x)) "1" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(-> :x) "" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(* (<- 1 :t) (backmatch :t)) "aa" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (<- 1 :t) (backmatch :t)) "ab" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (<- 1) (<- 1) (backmatch)) "aba" 0 1 :z))))
-(assert= "[\"a\" \"b\"]" (cljc-peg-try (fn [] (peg/match '(* (<- 1) (<- 1) (backmatch)) "abb" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(backmatch) "a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (constant 5) (backmatch)) "5" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(* (<- (any (if-not "b" 1))) "b" (backmatch)) "aba" 0 1 :z))))
-(assert= "[42]" (cljc-peg-try (fn [] (peg/match '(number :d+) "42" 0 1 :z))))
-(assert= "[1.5]" (cljc-peg-try (fn [] (peg/match '(number (* :d+ "." :d+)) "1.5" 0 1 :z))))
-(assert= "[255]" (cljc-peg-try (fn [] (peg/match '(number :h+ 16) "ff" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(number :h+ 16) "-1a" 0 1 :z))))
-(assert= "[12]" (cljc-peg-try (fn [] (peg/match '(number :d+ nil :t) "12" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(number :a+) "abc" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(nth 1 (* (<- :d) (<- :a))) "1a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(nth 5 (<- "a")) "a" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(only-tags (* (<- "a" :x) (<- "b"))) "ab" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(* (only-tags (* (<- "a" :x) (<- "b"))) (-> :x)) "ab" 0 1 :z))))
-(assert= "[\"a\" \"a\"]" (cljc-peg-try (fn [] (peg/match '(unref (* (<- "a" :x) (-> :x))) "a" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"a\"]" (cljc-peg-try (fn [] (peg/match '(* (<- "a" :x) (unref (<- "b" :x)) (-> :x)) "ab" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"b\"]" (cljc-peg-try (fn [] (peg/match '(* (unref (* (<- "a" :x) (<- "b" :y)) :x) (-> :y)) "ab" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"c\" \"a\" \"c\"]" (cljc-peg-try (fn [] (peg/match '(* (<- "a" :x) (unref (* (<- "b" :x) (<- "c" :y)) :x) (-> :x) (-> :y)) "abc" 0 1 :z))))
-(assert= "[1]" (cljc-peg-try (fn [] (peg/match '(argument 0) "" 0 1 :z))))
-(assert= "[:z :z]" (cljc-peg-try (fn [] (peg/match '(* (argument 1 :q) (-> :q)) "" 0 1 :z))))
-(assert= "[nil]" (cljc-peg-try (fn [] (peg/match '(argument 3) "" 0 1 :z))))
-(assert= "[\"abc\" \"a\" \"bc\"]" (cljc-peg-try (fn [] (peg/match '(sub (<- :a+) (* (<- 1) (<- (any 1)))) "abc1" 0 1 :z))))
-(assert= "[3]" (cljc-peg-try (fn [] (peg/match '(* (sub "abc" "a") ($)) "abcd" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(sub "abc" "x") "abcd" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"\" \"c\"]" (cljc-peg-try (fn [] (peg/match '(split "," (<- (any (if-not "," 1)))) "a,b,,c" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"\"]" (cljc-peg-try (fn [] (peg/match '(split "," (<- (any 1))) "a,b," 0 1 :z))))
-(assert= "[\"\"]" (cljc-peg-try (fn [] (peg/match '(split "," (<- (any 1))) "" 0 1 :z))))
-(assert= "[\"a\" \"b\" \"c\" 6]" (cljc-peg-try (fn [] (peg/match '(* (split "," (<- :a)) ($)) "a,b,cd" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(split "," (<- :a)) "a,1" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(some (any "a")) "" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(some (any "a")) "aaa" 0 1 :z))))
-(assert= "[\"aaa\"]" (cljc-peg-try (fn [] (peg/match '(some (<- (any "a"))) "aaa" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(repeat 2 "") "x" 0 1 :z))))
-(assert= "[\"aa\" \"\" 2]" (cljc-peg-try (fn [] (peg/match '(* (repeat 2 (<- (any "a"))) ($)) "aax" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(at-most 0 "a") "a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(between 2 1 "a") "aaa" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(any "") "aaa" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(* "a" -1) "a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* "a" -1) "ab" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '"" "" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(not "a") "" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(! "a") "a" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(* (not (<- "b")) (<- "a")) "a" 0 1 :z))))
-(assert= "[\"a\" \"a\"]" (cljc-peg-try (fn [] (peg/match '(* (look 0 (<- "a")) (<- "a")) "a" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(if (<- "a") "a") "a" 0 1 :z))))
-(assert= "[\"a\"]" (cljc-peg-try (fn [] (peg/match '(if-not (<- "b") (<- "a")) "a" 0 1 :z))))
-(assert= "[\"a\" \"a\"]" (cljc-peg-try (fn [] (peg/match '(* (if-not "b" (<- "a" :t)) (-> :t)) "a" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '(thru -1) "ab" 0 1 :z))))
-(assert= "[\"ab\"]" (cljc-peg-try (fn [] (peg/match '(<- (to -1)) "ab" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '{:main (* :x -1) :x (any (+ "a" :y)) :y "b"} "abab" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '{:main (* :x -1) :x (any (+ "a" :y)) :y "b"} "abac" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '{:main (some :x) :x {:main "a"}} "aa" 0 1 :z))))
-(assert= "[]" (cljc-peg-try (fn [] (peg/match '{:main (* :d :s+ :w+ :S -1)} "1 ab!" 0 1 :z))))
-(assert= "[1 2 2]" (cljc-peg-try (fn [] (peg/match '(* (constant 1 :t) (constant 2 :t) (-> :t)) "" 0 1 :z))))
-(assert= "[\"a\" \"bc\"]" (cljc-peg-try (fn [] (peg/match '(* (<- "a") (+ (* (<- "b") "z") (<- "bc"))) "abc" 0 1 :z))))
-(assert= "[\"a\" \"a\"]" (cljc-peg-try (fn [] (peg/match '(* (<- "a" :x) (+ (* (<- "b" :x) "z") (-> :x))) "ab" 0 1 :z))))
-(assert= "[\"b1\"]" (cljc-peg-try (fn [] (peg/match `(cmt (* (<- :d) (<- :a)) ~(fn [d a] (str a d))) "1b" 0 1 :z))))
-(assert= "[0]" (cljc-peg-try (fn [] (peg/match `(cmt "a" ~(fn [] 0)) "a" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match `(cmt "a" ~(fn [] nil)) "a" 0 1 :z))))
-(assert= "[:r]" (cljc-peg-try (fn [] (peg/match `(replace :d ~(fn [] :r)) "2" 0 1 :z))))
-(assert= "[\"2+a\"]" (cljc-peg-try (fn [] (peg/match `(replace (* (<- :d) (<- :a)) ~(fn [d a] (str d "+" a))) "2a" 0 1 :z))))
-(assert= "[\"key\" \"value\"]" (cljc-peg-try (fn [] (peg/match '(* (<- :w+) :s* "=" :s* (<- :w+)) "key = value" 0 1 :z))))
-(assert= "[[\"a\" [\"b\" \"c\"] \"d\"]]" (cljc-peg-try (fn [] (peg/match '{:main (* :ws :expr -1) :ws :s* :expr (+ :list :atom) :atom (* (<- :w+) :ws) :list (group (* "(" :ws (any :expr) ")" :ws))} "(a (b c) d)" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '{:main (* :ws :expr -1) :ws :s* :expr (+ :list :atom) :atom (* (<- :w+) :ws) :list (group (* "(" :ws (any :expr) ")" :ws))} "(a (b c d)" 0 1 :z))))
-(assert= "[\"12\"]" (cljc-peg-try (fn [] (peg/match '(* (<- :d+ :n) "," (backmatch :n)) "12,12" 0 1 :z))))
-(assert= "nil" (cljc-peg-try (fn [] (peg/match '(* (<- :d+ :n) "," (backmatch :n)) "12,13" 0 1 :z))))
-(assert= "[\"1\" \"22\"]" (cljc-peg-try (fn [] (peg/match '(any (+ (<- :d+) 1)) "a1b22c" 0 1 :z))))
-(assert= "[\"END\"]" (cljc-peg-try (fn [] (peg/match '(* (any (* (not "END") 1)) (<- "END")) "xx END" 0 1 :z))))
-(assert= "ERR a" (cljc-peg-try (fn [] (peg/match '(error (<- "a")) "a" 0 1 :z))))
-(assert= "ERR match error at line 1, column 2" (cljc-peg-try (fn [] (peg/match '(* "a" (error)) "ab" 0 1 :z))))
-(assert= "ERR match error at line 1, column 1" (cljc-peg-try (fn [] (peg/match '(error) "" 0 1 :z))))
+(defn clove-peg-try [f] (try (pr-str (f)) (catch Exception e (str "ERR " (ex-message e)))))
+(assert= "[\"12\" \"34\"]" (clove-peg-try (fn [] (peg/match '(* (<- :d+) "-" (<- :d+)) "12-34" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (<- :d+) "-" (<- :d+)) "12-x" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(+ "foo" "bar" "qux") "quxxy" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(+ "foo" "bar" "qux") "spaz" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(* "f" "oo" "bar") "foobar" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(set "abc") "bar" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(set "abc") "foobar" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '3 "foobar" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '3 "fo" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '-3 "foo" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '-3 "fo" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(range "az") "apple" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(range "az") "0apple" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(range "af" "AF") "Fapple" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(any :d) "1234abc" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(some :d) "a1234abc" 0 1 :z))))
+(assert= "[3]" (clove-peg-try (fn [] (peg/match '(* (repeat 3 :d) ($)) "122342" 0 1 :z))))
+(assert= "[3]" (clove-peg-try (fn [] (peg/match '(* (3 :d) ($)) "122342" 0 1 :z))))
+(assert= "[8]" (clove-peg-try (fn [] (peg/match '(* (at-least 3 :d) ($)) "12345678" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(at-least 3 :d) "12" 0 1 :z))))
+(assert= "[3]" (clove-peg-try (fn [] (peg/match '(* (at-most 3 :d) ($)) "12345678" 0 1 :z))))
+(assert= "[2]" (clove-peg-try (fn [] (peg/match '(* (at-most 3 :d) ($)) "12asdf" 0 1 :z))))
+(assert= "[5]" (clove-peg-try (fn [] (peg/match '(* (between 3 5 :d) ($)) "123456a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(between 3 5 :d) "12a3456" 0 1 :z))))
+(assert= "[0]" (clove-peg-try (fn [] (peg/match '(* (opt :d) ($)) "a122342" 0 1 :z))))
+(assert= "[1]" (clove-peg-try (fn [] (peg/match '(* (? :d) ($)) "122342" 0 1 :z))))
+(assert= "[4]" (clove-peg-try (fn [] (peg/match '(* (if :d :d+) ($)) "1234" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(if :a :d+) "1234" 0 1 :z))))
+(assert= "[4]" (clove-peg-try (fn [] (peg/match '(* (if "12" :d+) ($)) "1234" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(if "12" :d+) "01234" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(if-not :d :d+) "1234" 0 1 :z))))
+(assert= "[4]" (clove-peg-try (fn [] (peg/match '(* (if-not :a :d+) ($)) "1234" 0 1 :z))))
+(assert= "[5]" (clove-peg-try (fn [] (peg/match '(* (if-not "12" :d+) ($)) "01234" 0 1 :z))))
+(assert= "[0]" (clove-peg-try (fn [] (peg/match '(* (look 4 :d) ($)) "123456" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(look 4 :d) "1234a6" 0 1 :z))))
+(assert= "[0]" (clove-peg-try (fn [] (peg/match '(* (> 4 :d) ($)) "abcd1e" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(to :d) "abcde" 0 1 :z))))
+(assert= "[5]" (clove-peg-try (fn [] (peg/match '(* (to :d) ($)) "abcde1234" 0 1 :z))))
+(assert= "[0]" (clove-peg-try (fn [] (peg/match '(* (to :d) ($)) "1" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(thru :d) "abcde" 0 1 :z))))
+(assert= "[6]" (clove-peg-try (fn [] (peg/match '(* (thru :d) ($)) "abcde1234" 0 1 :z))))
+(assert= "[1]" (clove-peg-try (fn [] (peg/match '(* (thru :d) ($)) "1" 0 1 :z))))
+(assert= "[\"1\" \"5\"]" (clove-peg-try (fn [] (peg/match '(* (<- :d) :a+ (<- :d)) "1abc5" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* :a+ (<- :d) :a+) "abc12def" 0 1 :z))))
+(assert= "[[\"1\" \"a\"]]" (clove-peg-try (fn [] (peg/match '(group (* (<- :d) (<- :a))) "1a" 0 1 :z))))
+(assert= "[[\"a\" [\"b\"]]]" (clove-peg-try (fn [] (peg/match '(group (* (<- "a") (group (<- "b")))) "ab" 0 1 :z))))
+(assert= "[[]]" (clove-peg-try (fn [] (peg/match '(group (any (<- 1))) "" 0 1 :z))))
+(assert= "[[]]" (clove-peg-try (fn [] (peg/match '(group "a" :g) "a" 0 1 :z))))
+(assert= "[[] []]" (clove-peg-try (fn [] (peg/match '(* (group "a" :g) (-> :g)) "a" 0 1 :z))))
+(assert= "[\"lit\"]" (clove-peg-try (fn [] (peg/match '(replace (* (<- :d) (<- :a)) "lit") "1a" 0 1 :z))))
+(assert= "[nil]" (clove-peg-try (fn [] (peg/match '(replace (<- :d) {"1" :x}) "2" 0 1 :z))))
+(assert= "[:x]" (clove-peg-try (fn [] (peg/match '(replace (<- :d) {"1" :x}) "1" 0 1 :z))))
+(assert= "[\"b\"]" (clove-peg-try (fn [] (peg/match '(replace "a" "b") "a" 0 1 :z))))
+(assert= "[\"z\" \"z\"]" (clove-peg-try (fn [] (peg/match '(* (replace (<- "a") "z" :t) (-> :t)) "a" 0 1 :z))))
+(assert= "[1]" (clove-peg-try (fn [] (peg/match '(constant 1) "12" 0 1 :z))))
+(assert= "[:foo 0]" (clove-peg-try (fn [] (peg/match '(* (constant :foo) ($)) "12" 0 1 :z))))
+(assert= "[2]" (clove-peg-try (fn [] (peg/match '(* :d+ (position)) "12" 0 1 :z))))
+(assert= "[9]" (clove-peg-try (fn [] (peg/match '(* (some (* :d :a :d)) ($)) "1a23a45a5foo" 0 1 :z))))
+(assert= "[1 2 1 2]" (clove-peg-try (fn [] (peg/match '(* (line) "\n" (line) (column) "x" (column)) "\nx" 0 1 :z))))
+(assert= "[2 3]" (clove-peg-try (fn [] (peg/match '(* (any 1) (line) (column)) "a\nbc" 0 1 :z))))
+(assert= "[4 1]" (clove-peg-try (fn [] (peg/match '(* (some (+ :d :s)) (line) (column)) "1\n2\n345\n" 0 1 :z))))
+(assert= "[1]" (clove-peg-try (fn [] (peg/match '(column) "ab" 0 1 :z))))
+(assert= "[\"15a\"]" (clove-peg-try (fn [] (peg/match '(accumulate (* (<- :d) (constant 5) (<- :a))) "1a" 0 1 :z))))
+(assert= "[\"1a\"]" (clove-peg-try (fn [] (peg/match '(% (* (<- :d) (<- :a))) "1a" 0 1 :z))))
+(assert= "[\"\"]" (clove-peg-try (fn [] (peg/match '(accumulate "a") "a" 0 1 :z))))
+(assert= "[\"15a\" \"15a\"]" (clove-peg-try (fn [] (peg/match '(* (accumulate (* (<- :d) (constant 5) (<- :a)) :t) (-> :t)) "1a" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(* (drop (<- :d)) (<- :a)) "1a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (drop (<- "a" :x)) (-> :x)) "a" 0 1 :z))))
+(assert= "[\"1\" \"1\" \"1\"]" (clove-peg-try (fn [] (peg/match '(* (<- :d :x) (backref :x) (-> :x)) "1" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(-> :x) "" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(* (<- 1 :t) (backmatch :t)) "aa" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (<- 1 :t) (backmatch :t)) "ab" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (<- 1) (<- 1) (backmatch)) "aba" 0 1 :z))))
+(assert= "[\"a\" \"b\"]" (clove-peg-try (fn [] (peg/match '(* (<- 1) (<- 1) (backmatch)) "abb" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(backmatch) "a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (constant 5) (backmatch)) "5" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(* (<- (any (if-not "b" 1))) "b" (backmatch)) "aba" 0 1 :z))))
+(assert= "[42]" (clove-peg-try (fn [] (peg/match '(number :d+) "42" 0 1 :z))))
+(assert= "[1.5]" (clove-peg-try (fn [] (peg/match '(number (* :d+ "." :d+)) "1.5" 0 1 :z))))
+(assert= "[255]" (clove-peg-try (fn [] (peg/match '(number :h+ 16) "ff" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(number :h+ 16) "-1a" 0 1 :z))))
+(assert= "[12]" (clove-peg-try (fn [] (peg/match '(number :d+ nil :t) "12" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(number :a+) "abc" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(nth 1 (* (<- :d) (<- :a))) "1a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(nth 5 (<- "a")) "a" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(only-tags (* (<- "a" :x) (<- "b"))) "ab" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(* (only-tags (* (<- "a" :x) (<- "b"))) (-> :x)) "ab" 0 1 :z))))
+(assert= "[\"a\" \"a\"]" (clove-peg-try (fn [] (peg/match '(unref (* (<- "a" :x) (-> :x))) "a" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"a\"]" (clove-peg-try (fn [] (peg/match '(* (<- "a" :x) (unref (<- "b" :x)) (-> :x)) "ab" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"b\"]" (clove-peg-try (fn [] (peg/match '(* (unref (* (<- "a" :x) (<- "b" :y)) :x) (-> :y)) "ab" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"c\" \"a\" \"c\"]" (clove-peg-try (fn [] (peg/match '(* (<- "a" :x) (unref (* (<- "b" :x) (<- "c" :y)) :x) (-> :x) (-> :y)) "abc" 0 1 :z))))
+(assert= "[1]" (clove-peg-try (fn [] (peg/match '(argument 0) "" 0 1 :z))))
+(assert= "[:z :z]" (clove-peg-try (fn [] (peg/match '(* (argument 1 :q) (-> :q)) "" 0 1 :z))))
+(assert= "[nil]" (clove-peg-try (fn [] (peg/match '(argument 3) "" 0 1 :z))))
+(assert= "[\"abc\" \"a\" \"bc\"]" (clove-peg-try (fn [] (peg/match '(sub (<- :a+) (* (<- 1) (<- (any 1)))) "abc1" 0 1 :z))))
+(assert= "[3]" (clove-peg-try (fn [] (peg/match '(* (sub "abc" "a") ($)) "abcd" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(sub "abc" "x") "abcd" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"\" \"c\"]" (clove-peg-try (fn [] (peg/match '(split "," (<- (any (if-not "," 1)))) "a,b,,c" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"\"]" (clove-peg-try (fn [] (peg/match '(split "," (<- (any 1))) "a,b," 0 1 :z))))
+(assert= "[\"\"]" (clove-peg-try (fn [] (peg/match '(split "," (<- (any 1))) "" 0 1 :z))))
+(assert= "[\"a\" \"b\" \"c\" 6]" (clove-peg-try (fn [] (peg/match '(* (split "," (<- :a)) ($)) "a,b,cd" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(split "," (<- :a)) "a,1" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(some (any "a")) "" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(some (any "a")) "aaa" 0 1 :z))))
+(assert= "[\"aaa\"]" (clove-peg-try (fn [] (peg/match '(some (<- (any "a"))) "aaa" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(repeat 2 "") "x" 0 1 :z))))
+(assert= "[\"aa\" \"\" 2]" (clove-peg-try (fn [] (peg/match '(* (repeat 2 (<- (any "a"))) ($)) "aax" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(at-most 0 "a") "a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(between 2 1 "a") "aaa" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(any "") "aaa" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(* "a" -1) "a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* "a" -1) "ab" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '"" "" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(not "a") "" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(! "a") "a" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(* (not (<- "b")) (<- "a")) "a" 0 1 :z))))
+(assert= "[\"a\" \"a\"]" (clove-peg-try (fn [] (peg/match '(* (look 0 (<- "a")) (<- "a")) "a" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(if (<- "a") "a") "a" 0 1 :z))))
+(assert= "[\"a\"]" (clove-peg-try (fn [] (peg/match '(if-not (<- "b") (<- "a")) "a" 0 1 :z))))
+(assert= "[\"a\" \"a\"]" (clove-peg-try (fn [] (peg/match '(* (if-not "b" (<- "a" :t)) (-> :t)) "a" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '(thru -1) "ab" 0 1 :z))))
+(assert= "[\"ab\"]" (clove-peg-try (fn [] (peg/match '(<- (to -1)) "ab" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '{:main (* :x -1) :x (any (+ "a" :y)) :y "b"} "abab" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '{:main (* :x -1) :x (any (+ "a" :y)) :y "b"} "abac" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '{:main (some :x) :x {:main "a"}} "aa" 0 1 :z))))
+(assert= "[]" (clove-peg-try (fn [] (peg/match '{:main (* :d :s+ :w+ :S -1)} "1 ab!" 0 1 :z))))
+(assert= "[1 2 2]" (clove-peg-try (fn [] (peg/match '(* (constant 1 :t) (constant 2 :t) (-> :t)) "" 0 1 :z))))
+(assert= "[\"a\" \"bc\"]" (clove-peg-try (fn [] (peg/match '(* (<- "a") (+ (* (<- "b") "z") (<- "bc"))) "abc" 0 1 :z))))
+(assert= "[\"a\" \"a\"]" (clove-peg-try (fn [] (peg/match '(* (<- "a" :x) (+ (* (<- "b" :x) "z") (-> :x))) "ab" 0 1 :z))))
+(assert= "[\"b1\"]" (clove-peg-try (fn [] (peg/match `(cmt (* (<- :d) (<- :a)) ~(fn [d a] (str a d))) "1b" 0 1 :z))))
+(assert= "[0]" (clove-peg-try (fn [] (peg/match `(cmt "a" ~(fn [] 0)) "a" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match `(cmt "a" ~(fn [] nil)) "a" 0 1 :z))))
+(assert= "[:r]" (clove-peg-try (fn [] (peg/match `(replace :d ~(fn [] :r)) "2" 0 1 :z))))
+(assert= "[\"2+a\"]" (clove-peg-try (fn [] (peg/match `(replace (* (<- :d) (<- :a)) ~(fn [d a] (str d "+" a))) "2a" 0 1 :z))))
+(assert= "[\"key\" \"value\"]" (clove-peg-try (fn [] (peg/match '(* (<- :w+) :s* "=" :s* (<- :w+)) "key = value" 0 1 :z))))
+(assert= "[[\"a\" [\"b\" \"c\"] \"d\"]]" (clove-peg-try (fn [] (peg/match '{:main (* :ws :expr -1) :ws :s* :expr (+ :list :atom) :atom (* (<- :w+) :ws) :list (group (* "(" :ws (any :expr) ")" :ws))} "(a (b c) d)" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '{:main (* :ws :expr -1) :ws :s* :expr (+ :list :atom) :atom (* (<- :w+) :ws) :list (group (* "(" :ws (any :expr) ")" :ws))} "(a (b c d)" 0 1 :z))))
+(assert= "[\"12\"]" (clove-peg-try (fn [] (peg/match '(* (<- :d+ :n) "," (backmatch :n)) "12,12" 0 1 :z))))
+(assert= "nil" (clove-peg-try (fn [] (peg/match '(* (<- :d+ :n) "," (backmatch :n)) "12,13" 0 1 :z))))
+(assert= "[\"1\" \"22\"]" (clove-peg-try (fn [] (peg/match '(any (+ (<- :d+) 1)) "a1b22c" 0 1 :z))))
+(assert= "[\"END\"]" (clove-peg-try (fn [] (peg/match '(* (any (* (not "END") 1)) (<- "END")) "xx END" 0 1 :z))))
+(assert= "ERR a" (clove-peg-try (fn [] (peg/match '(error (<- "a")) "a" 0 1 :z))))
+(assert= "ERR match error at line 1, column 2" (clove-peg-try (fn [] (peg/match '(* "a" (error)) "ab" 0 1 :z))))
+(assert= "ERR match error at line 1, column 1" (clove-peg-try (fn [] (peg/match '(error) "" 0 1 :z))))
 ; API surface beyond match
 (assert= 2 (peg/find "na" "banana"))
 (assert= nil (peg/find "z" "banana"))
@@ -1058,9 +1059,9 @@
 ; error reporting: (error) carries position data; bad patterns fail at compile
 (assert= {:type :peg/error :position 1 :line 1 :column 2 :capture nil}
          (try (peg/match '(* "a" (error)) "ab") (catch Exception e (ex-data e))))
-(assert= "ERR unknown peg combinator: frob" (cljc-peg-try (fn [] (peg/match '(frob 1) "x"))))
-(assert= "ERR (any ...): expected 1 arguments, got 2" (cljc-peg-try (fn [] (peg/match '(any 1 2) "x"))))
-(assert= "ERR grammar: no :main rule" (cljc-peg-try (fn [] (peg/match '{:x 1} "x"))))
+(assert= "ERR unknown peg combinator: frob" (clove-peg-try (fn [] (peg/match '(frob 1) "x"))))
+(assert= "ERR (any ...): expected 1 arguments, got 2" (clove-peg-try (fn [] (peg/match '(any 1 2) "x"))))
+(assert= "ERR grammar: no :main rule" (clove-peg-try (fn [] (peg/match '{:x 1} "x"))))
 ; a recursive grammar over deep input (no C-stack recursion per repetition)
 (assert= 20000 (count (peg/match '(any (<- :d)) (apply str (repeat 20000 "7")))))
 (assert= [[[[]]]] (peg/match '{:main :l :l (group (* "(" (any :l) ")"))} "((()))"))
@@ -1068,8 +1069,8 @@
 (assert= true (.startsWith "héllo" "llo" 2))
 (assert= false (.startsWith "héllo" "llo" 1))
 (assert= false (.startsWith "ab" "b" 5))
-(assert= true (cljc/str-starts-at? "héllo" "" 5))
-(assert= false (cljc/str-starts-at? "héllo" "" 6))
+(assert= true (clove/str-starts-at? "héllo" "" 5))
+(assert= false (clove/str-starts-at? "héllo" "" 6))
 ; non-ASCII string indexing walks a cursor (forward, backward, dirty bytes)
 (let [u "aébé"]
   (assert= [\a \é \b \é] (mapv #(nth u %) (range 4)))
@@ -1135,7 +1136,7 @@
 (assert= "abc" (str/join "" (map (fn [c] c) (seq "abc"))))
 
 ; ── JIT: numeric functions compiled to native C ──
-(when cljc-test-unix?  ; jit/compile! shells out to cc
+(when clove-test-unix?  ; jit/compile! shells out to cc
 (load-file "jit.clj")
 (jit/defn jit-fib [n] (if (< n 2) n (+ (jit-fib (- n 1)) (jit-fib (- n 2)))))
 (def jit-interp-answer (jit-fib 20))
@@ -1191,15 +1192,15 @@
 ) ; end when-unix
 
 ; ── vendor: deps.edn resolution against local fixtures (no network) ──
-(def cljc-test-vendor?
-  (and cljc-test-unix?
+(def clove-test-vendor?
+  (and clove-test-unix?
        (zero? (:exit (sh "command -v git && command -v zip && command -v unzip && command -v curl")))))
-(when-not cljc-test-vendor? (println "SKIP: vendor deps.edn section (needs git/zip/unzip/curl)"))
-(when cljc-test-vendor?
+(when-not clove-test-vendor? (println "SKIP: vendor deps.edn section (needs git/zip/unzip/curl)"))
+(when clove-test-vendor?
 (require 'fs)
 ; pure pom parsing: compile+runtime kept; test/optional/property-versioned/clojure skipped
 (assert= '[[g/a {:mvn/version "1"}] [g/r {:mvn/version "2"}]]
-         (vec (cljc/pom-parse-deps* (str "<project><dependencies>"
+         (vec (clove/pom-parse-deps* (str "<project><dependencies>"
               "<dependency><groupId>g</groupId><artifactId>a</artifactId><version>1</version></dependency>"
               "<dependency><groupId>g</groupId><artifactId>t</artifactId><version>1</version><scope>test</scope></dependency>"
               "<dependency><groupId>g</groupId><artifactId>o</artifactId><version>1</version><optional>true</optional></dependency>"
@@ -1207,12 +1208,12 @@
               "<dependency><groupId>org.clojure</groupId><artifactId>clojure</artifactId><version>1.12.0</version></dependency>"
               "<dependency><groupId>g</groupId><artifactId>r</artifactId><version>2</version><scope>runtime</scope></dependency>"
               "</dependencies></project>"))))
-(assert= nil (cljc/pom-parse-deps* "<project></project>"))
+(assert= nil (clove/pom-parse-deps* "<project></project>"))
 ; end-to-end in a subprocess (so ./vendor of this repo stays untouched):
 ; file:// maven repo with a pom-transitive chain, a git dep carrying its own
 ; deps.edn, and a :local/root dep
-(let [T (str (fs/temp-dir) "/cljc-vendor-selftest")
-      exe (str (cljc/exe-dir*) "/cljc")]
+(let [T (str (fs/temp-dir) "/clove-vendor-selftest")
+      exe (str (clove/exe-dir*) "/clove")]
   (sh (str "rm -rf " (pr-str T)))
   (fs/create-dir (str T "/build/liba/liba"))
   (spit (str T "/build/liba/liba/core.clj")
@@ -1248,8 +1249,8 @@
                " local/x {:local/root \"../localproj\"}}}"))
     (spit (str T "/proj/run.clj")
           (str "(require 'fs) (require 'process)"
-               "(reset! cljc/vendor-repos* [[\"file://" T "/m2/\" \"local-m2\"]])"
-               "(cljc/vendor-deps! \"deps.edn\")"))
+               "(reset! clove/vendor-repos* [[\"file://" T "/m2/\" \"local-m2\"]])"
+               "(clove/vendor-deps! \"deps.edn\")"))
     (let [r (sh (str "cd " T "/proj && " exe " run.clj"))]
       (assert= 0 (:exit r))
       (assert= true (str/includes? (:out r) "(require 'gitlib.core)   ; loads OK"))
@@ -1259,39 +1260,39 @@
       (assert= true (fs/exists? (str T "/proj/vendor/liba/core.clj")))
       (assert= true (fs/exists? (str T "/proj/vendor/gitlib/core.clj")))))
   (sh (str "rm -rf " (pr-str T))))
-) ; end when cljc-test-vendor?
+) ; end when clove-test-vendor?
 
 ; ── bundle --library: C-ABI shared library round-trip ──
-; Compiles all of cljc.c once (-O0 keeps it quick); unix-only, needs cc and
-; the cljc.c source in cwd. CLJC_GC_STRESS is cleared for the subprocesses:
+; Compiles all of clove.c once (-O0 keeps it quick); unix-only, needs cc and
+; the clove.c source in cwd. CLOVE_GC_STRESS is cleared for the subprocesses:
 ; the generated C is a megabyte-scale string and stress-GC'ing its assembly
 ; tests nothing this section is about.
-(when (and cljc-test-unix? (cljc/slurp-maybe "cljc.c"))
+(when (and clove-test-unix? (clove/slurp-maybe "clove.c"))
 (require 'fs)
-(let [T (str (fs/temp-dir) "/cljc-libtest")
-      exe (str (cljc/exe-dir*) "/cljc")]
+(let [T (str (fs/temp-dir) "/clove-libtest")
+      exe (str (clove/exe-dir*) "/clove")]
   (sh (str "rm -rf " (pr-str T)))
   (fs/create-dir T)
   (spit (str T "/greet.clj") "(defn greet [n] (str \"hello, \" n \"!\"))")
   (spit (str T "/host.c")
         (str "#include <stdio.h>\n"
-             "int cljc_lib_init(void);\n"
-             "const char *cljc_lib_eval(const char *src);\n"
-             "const char *cljc_lib_last_error(void);\n"
+             "int clove_lib_init(void);\n"
+             "const char *clove_lib_eval(const char *src);\n"
+             "const char *clove_lib_last_error(void);\n"
              "int main(void) {\n"
-             "  if (cljc_lib_init() != 0) return 1;\n"
-             "  printf(\"%s\\n\", cljc_lib_eval(\"(greet \\\"lib\\\")\"));\n"
-             "  const char *bad = cljc_lib_eval(\"(nope)\");\n"
+             "  if (clove_lib_init() != 0) return 1;\n"
+             "  printf(\"%s\\n\", clove_lib_eval(\"(greet \\\"lib\\\")\"));\n"
+             "  const char *bad = clove_lib_eval(\"(nope)\");\n"
              "  printf(\"%s\\n\", bad ? \"BAD\" : \"got-error\");\n"
-             "  printf(\"%s\\n\", cljc_lib_eval(\"(+ 1 2)\"));\n"
+             "  printf(\"%s\\n\", clove_lib_eval(\"(+ 1 2)\"));\n"
              "  return 0;\n}\n"))
-  (let [rb (sh (str "env -u CLJC_GC_STRESS " exe " bundle --library --cflags=-O0 "
+  (let [rb (sh (str "env -u CLOVE_GC_STRESS " exe " bundle --library --cflags=-O0 "
                     T "/greet.clj " T "/libgreet.so"))]
     (assert= 0 (:exit rb))
     (assert= true (fs/exists? (str T "/libgreet.so.h")))
     (let [rc (sh (str "cd " T " && cc -O0 host.c ./libgreet.so -o host 2>&1"))]
       (assert= 0 (:exit rc))
-      ; subshell: cljc's sh appends 2>&1, which would override a bare
+      ; subshell: clove's sh appends 2>&1, which would override a bare
       ; 2>/dev/null and pull the expected eval-error print into :out
       (let [r (sh (str "(cd " T " && LD_LIBRARY_PATH=. ./host 2>/dev/null)"))]
         (assert= 0 (:exit r))
@@ -1318,7 +1319,7 @@
 (assert= #{:x} (persistent! (conj! (transient #{}) :x)))      ; set shim
 
 ; ── library survey round 2: medley + clojure.walk + enabling compat ──
-(assert= [1 2 3 4] [1 #?@(:cljc [2 3]) 4])          ; #?@ splicing
+(assert= [1 2 3 4] [1 #?@(:clove [2 3]) 4])          ; #?@ splicing
 (assert= [1 2] [1 #_(ignored junk) 2])               ; #_ discard
 (def coll' [1 2])                                    ; apostrophe in symbols
 (assert= 2 (count coll'))
@@ -1384,7 +1385,7 @@
     `(do ~@(map (fn [[m params & body]]
                   `(defmethod ~m ~t ~(vec params) ~@body))
                 impls)
-         {:cljc/type ~t})))
+         {:clove/type ~t})))
 (defprotocol LTP (lt-go [x]) (lt-go2 [x]))
 (def lt-obj (lt-reify LTP (lt-go [_] :a) (lt-go2 [_] :b)))
 (assert= :a (lt-go lt-obj))
@@ -1414,20 +1415,20 @@
 (assert= {:a [1 2]} (edn/read-string "{:a [1 2]}"))
 
 ; ── fs.clj / process.clj batteries ──
-(when cljc-test-unix?  ; fs.clj is FFI-built; process tests use POSIX tools
+(when clove-test-unix?  ; fs.clj is FFI-built; process tests use POSIX tools
 (load-file "fs.clj")
 (load-file "process.clj")
-(assert= true (fs/exists? "cljc.c"))
+(assert= true (fs/exists? "clove.c"))
 (assert= true (fs/directory? "vendor"))
-(assert= false (fs/directory? "cljc.c"))
+(assert= false (fs/directory? "clove.c"))
 (assert= true (contains? (set (fs/list-dir "vendor")) "clojure"))
 (assert= "c.clj" (fs/file-name "/a/b/c.clj"))
 (assert= "/a/b" (fs/parent "/a/b/c.clj"))
 (assert= "gz" (fs/extension "x.tar.gz"))
-(fs/create-dir "/tmp/cljc-fs-suite")
-(assert= true (fs/directory? "/tmp/cljc-fs-suite"))
-(fs/delete "/tmp/cljc-fs-suite")
-(assert= false (fs/exists? "/tmp/cljc-fs-suite"))
+(fs/create-dir "/tmp/clove-fs-suite")
+(assert= true (fs/directory? "/tmp/clove-fs-suite"))
+(fs/delete "/tmp/clove-fs-suite")
+(assert= false (fs/exists? "/tmp/clove-fs-suite"))
 (assert= "hello world's" (process/out "echo" "hello world's"))
 (assert= 0 (:exit (process/sh "true")))
 (assert= :threw (try (process/shell "false") (catch Exception e :threw)))
@@ -1436,9 +1437,9 @@
 (require 'process)
 (assert= 0 (:exit (process/sh "true")))
 ;; regression: mkdir-p creates PARENTS (it was a bare one-level mkdir)
-(assert= true (fs/create-dir "/tmp/cljc-fs-suite/deep/nested"))
-(assert= true (fs/directory? "/tmp/cljc-fs-suite/deep/nested"))
-(sh "rm -rf /tmp/cljc-fs-suite")
+(assert= true (fs/create-dir "/tmp/clove-fs-suite/deep/nested"))
+(assert= true (fs/directory? "/tmp/clove-fs-suite/deep/nested"))
+(sh "rm -rf /tmp/clove-fs-suite")
 ) ; end when-unix
 
 ; str/index-of
@@ -1455,9 +1456,9 @@
                         (with-out-str (print "restored"))))
 (assert= "ab" (with-out-str (print "a") (with-out-str (print "hidden")) (print "b")))
 
-; cljc/mtime* — milliseconds since epoch, nil when missing
-(assert= true (> (cljc/mtime* "tests.clj") 1500000000000))
-(assert= nil (cljc/mtime* "/no/such/file/anywhere"))
+; clove/mtime* — milliseconds since epoch, nil when missing
+(assert= true (> (clove/mtime* "tests.clj") 1500000000000))
+(assert= nil (clove/mtime* "/no/such/file/anywhere"))
 
 ; tcp primitives — listen + accept timeout + close (loopback)
 (assert= true (let [srv (tcp/listen 17893)]
@@ -1493,64 +1494,64 @@
 (assert= true (str/includes? (clerk/render-value [{:a 1} {:a 2}]) "<th>"))
 (assert= "<div class=\"raw\"><b>x</b></div>" (clerk/render-value "<b>x</b>"))
 (assert= true (str/includes? (clerk/render-value [1 2 3]) "class=\"value\""))
-(when cljc-test-unix?  ; notebook render tests write under /tmp
+(when clove-test-unix?  ; notebook render tests write under /tmp
 ; incremental render cache: re-render evaluates only changed cells + dependents
 (def clerk-log (atom []))
-(spit "/tmp/cljc-nb.clj"
+(spit "/tmp/clove-nb.clj"
       ";; # t\n(def na 1)\n(def nb (do (swap! clerk-log conj :b) (* na 10)))\n(def nc (do (swap! clerk-log conj :c) 9))\n")
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= [:b :c] @clerk-log)                          ; first render: both cells run
 (reset! clerk-log [])
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= [] @clerk-log)                               ; unchanged: nothing re-runs
-(spit "/tmp/cljc-nb.clj"
+(spit "/tmp/clove-nb.clj"
       ";; # t\n(def na 2)\n(def nb (do (swap! clerk-log conj :b) (* na 10)))\n(def nc (do (swap! clerk-log conj :c) 9))\n")
 (reset! clerk-log [])
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= [:b] @clerk-log)                             ; edit na: only dependent nb re-runs
-(sh "rm -f /tmp/cljc-nb.clj")
+(sh "rm -f /tmp/clove-nb.clj")
 ; redefinition ordering across renders: a later cell's redef wins; editing the
 ; earlier def keeps the later one winning; removing the redef falls back
-(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 1)\n(defn rf [] 2)\n(def rres (rf))\n")
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(spit "/tmp/clove-nb.clj" ";; #\n(defn rf [] 1)\n(defn rf [] 2)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= 2 rres)                                      ; B's redef wins
-(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 5)\n(defn rf [] 2)\n(def rres (rf))\n")
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(spit "/tmp/clove-nb.clj" ";; #\n(defn rf [] 5)\n(defn rf [] 2)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= 2 rres)                                      ; edit A: B's redef still wins (not 5)
-(spit "/tmp/cljc-nb.clj" ";; #\n(defn rf [] 5)\n(def junk 7)\n(def rres (rf))\n")
-(clerk/render-file "/tmp/cljc-nb.clj" false)
+(spit "/tmp/clove-nb.clj" ";; #\n(defn rf [] 5)\n(def junk 7)\n(def rres (rf))\n")
+(clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= 5 rres)                                      ; remove B's redef: falls back to A
-(sh "rm -f /tmp/cljc-nb.clj")
+(sh "rm -f /tmp/clove-nb.clj")
 ) ; end when-unix
 
 ; defonce
-(defonce cljc-defonce-probe (atom 0))
-(swap! cljc-defonce-probe inc)
-(defonce cljc-defonce-probe (atom 0))
-(assert= 1 @cljc-defonce-probe)
+(defonce clove-defonce-probe (atom 0))
+(swap! clove-defonce-probe inc)
+(defonce clove-defonce-probe (atom 0))
+(assert= 1 @clove-defonce-probe)
 
 ; dir natives + clerk directory walking
-(assert= true (cljc/dir?* "vendor"))
-(assert= false (cljc/dir?* "cljc.c"))
-(assert= false (cljc/dir?* "/no/such/dir"))
-(assert= true (vector? (cljc/list-dir* "vendor")))
-(assert= nil (cljc/list-dir* "/no/such/dir"))
-(when cljc-test-unix?  ; clerk dir walking builds a /tmp tree via fs.clj
-(fs/create-dir "/tmp/cljc-clerk-walk")
-(fs/create-dir "/tmp/cljc-clerk-walk/sub")
-(fs/create-dir "/tmp/cljc-clerk-walk/.git")
-(spit "/tmp/cljc-clerk-walk/a.clj" "(+ 1 1)")
-(spit "/tmp/cljc-clerk-walk/sub/b.clj" "(+ 2 2)")
-(spit "/tmp/cljc-clerk-walk/.git/c.clj" "(+ 3 3)")
-(spit "/tmp/cljc-clerk-walk/notes.txt" "hi")
-(assert= #{"/tmp/cljc-clerk-walk/a.clj" "/tmp/cljc-clerk-walk/sub/b.clj"}
-         (set (cljc/clerk-walk "/tmp/cljc-clerk-walk")))
-(assert= "/tmp/cljc-clerk-walk/sub/b.clj"
-         (cljc/clerk-changed (dissoc (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")
-                                     "/tmp/cljc-clerk-walk/sub/b.clj")
-                             (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")))
-(assert= nil (let [s (cljc/clerk-snapshot "/tmp/cljc-clerk-walk")] (cljc/clerk-changed s s)))
-(sh "rm -rf /tmp/cljc-clerk-walk")
+(assert= true (clove/dir?* "vendor"))
+(assert= false (clove/dir?* "clove.c"))
+(assert= false (clove/dir?* "/no/such/dir"))
+(assert= true (vector? (clove/list-dir* "vendor")))
+(assert= nil (clove/list-dir* "/no/such/dir"))
+(when clove-test-unix?  ; clerk dir walking builds a /tmp tree via fs.clj
+(fs/create-dir "/tmp/clove-clerk-walk")
+(fs/create-dir "/tmp/clove-clerk-walk/sub")
+(fs/create-dir "/tmp/clove-clerk-walk/.git")
+(spit "/tmp/clove-clerk-walk/a.clj" "(+ 1 1)")
+(spit "/tmp/clove-clerk-walk/sub/b.clj" "(+ 2 2)")
+(spit "/tmp/clove-clerk-walk/.git/c.clj" "(+ 3 3)")
+(spit "/tmp/clove-clerk-walk/notes.txt" "hi")
+(assert= #{"/tmp/clove-clerk-walk/a.clj" "/tmp/clove-clerk-walk/sub/b.clj"}
+         (set (clove/clerk-walk "/tmp/clove-clerk-walk")))
+(assert= "/tmp/clove-clerk-walk/sub/b.clj"
+         (clove/clerk-changed (dissoc (clove/clerk-snapshot "/tmp/clove-clerk-walk")
+                                     "/tmp/clove-clerk-walk/sub/b.clj")
+                             (clove/clerk-snapshot "/tmp/clove-clerk-walk")))
+(assert= nil (let [s (clove/clerk-snapshot "/tmp/clove-clerk-walk")] (clove/clerk-changed s s)))
+(sh "rm -rf /tmp/clove-clerk-walk")
 ) ; end when-unix
 
 ; transducer arities — (map f) etc. are transducers
@@ -1640,9 +1641,9 @@
 (assert= 3 (count (cons 0 (lazy-seq (list 1 2)))))
 
 ; clojure.test + clojure.string shims; ns with [:require ...] vectors
-(ns cljc-test-shim-probe [:require [clojure.test :as ctest]
+(ns clove-test-shim-probe [:require [clojure.test :as ctest]
                           [clojure.string :as string]])
-(ctest/deftest cljc-shim-works (ctest/is (= 4 (+ 2 2))) (ctest/are [x y] (= x y) 1 1 2 2))
+(ctest/deftest clove-shim-works (ctest/is (= 4 (+ 2 2))) (ctest/are [x y] (= x y) 1 1 2 2))
 (assert= true (fn? ctest/run-tests))
 (assert= ["a" "b"] (string/split "a b" #" "))
 (assert= "HI" (clojure.string/upper-case "hi"))
@@ -1658,8 +1659,8 @@
 (assert= {:m 1} (meta (with-meta "s" {:m 1})))
 
 ; def with meta on the name; ## literals; assert with message
-(def ^:dynamic cljc-dyn-probe 7)
-(assert= 7 cljc-dyn-probe)
+(def ^:dynamic clove-dyn-probe 7)
+(assert= 7 clove-dyn-probe)
 (assert= true (< 1e300 ##Inf))
 (assert= true (> -1e300 ##-Inf))
 (assert= false (= ##NaN ##NaN))
@@ -1671,8 +1672,8 @@
 (assert= true (== 1 1.0))
 (assert= true (distinct? 1 2 3))
 (assert= false (distinct? 1 1))
-(deftype CljcProbeT [a b])                            ; plain (immutable) deftype
-(assert= [1 2 :CljcProbeT] [(:a (CljcProbeT. 1 2)) (:b (CljcProbeT. 1 2)) (type (CljcProbeT. 1 2))])
+(deftype CloveProbeT [a b])                            ; plain (immutable) deftype
+(assert= [1 2 :CloveProbeT] [(:a (CloveProbeT. 1 2)) (:b (CloveProbeT. 1 2)) (type (CloveProbeT. 1 2))])
 (assert= [] clojure.lang.PersistentQueue/EMPTY)
 (assert= [:b 2] (peek {:a 5 :b 2 :c 9}))
 (assert= {:a 5} (pop {:a 5 :b 2}))
@@ -1711,14 +1712,14 @@
 (assert= "x" (re-find #"x|xy" "xy"))               ; re-find stays unanchored
 
 ; md5 native + the canonical Java digest idiom verbatim
-(assert= "d41d8cd98f00b204e9800998ecf8427e" (cljc/md5* ""))
-(assert= "900150983cd24fb0d6963f7d28e17f72" (cljc/md5* "abc"))
-(assert= "9e107d9d372bb6826bd81d3542a419d6" (cljc/md5* "The quick brown fox jumps over the lazy dog"))
-(defn cljc-test-md5 [s]
+(assert= "d41d8cd98f00b204e9800998ecf8427e" (clove/md5* ""))
+(assert= "900150983cd24fb0d6963f7d28e17f72" (clove/md5* "abc"))
+(assert= "9e107d9d372bb6826bd81d3542a419d6" (clove/md5* "The quick brown fox jumps over the lazy dog"))
+(defn clove-test-md5 [s]
   (let [algorithm (MessageDigest/getInstance "MD5")
         raw (.digest algorithm (.getBytes s))]
     (format "%032x" (BigInteger. 1 raw))))
-(assert= "000001dbbfa3a5c83a2d506429c7b00e" (cljc-test-md5 "abcdef609043"))
+(assert= "000001dbbfa3a5c83a2d506429c7b00e" (clove-test-md5 "abcdef609043"))
 
 ; interop shims
 (assert= 2 (.indexOf "hello" "llo"))
@@ -1742,24 +1743,24 @@
 (assert= nil (re-find #"a(?!b)" "ab"))
 
 ; (ns x) enters x: defs land under x/, syntax-quote qualifies defined syms
-(ns cljc.nstest)
+(ns clove.nstest)
 (defn nstest-fn [v] v)
 (def nstest-form `(nstest-fn 1))
-(assert= 'cljc.nstest/nstest-fn (first nstest-form))
-(assert= :ok (case (first nstest-form) cljc.nstest/nstest-fn :ok :nope))
+(assert= 'clove.nstest/nstest-fn (first nstest-form))
+(assert= :ok (case (first nstest-form) clove.nstest/nstest-fn :ok :nope))
 (assert= 5 (nstest-fn 5))                  ; home-ns resolution
 (assert= 6 (+ 1 5))                        ; core fns still reachable
-(cljc/in-ns* nil)
+(clove/in-ns* nil)
 
 ; batch 7: conj on lazy seqs, dynamic vars under ns, variadic set ops,
 ; mapv n-coll, sort-by comparator, alias-over-bare precedence
 (assert= '(:x 0 1) (conj (take 2 (range 5)) :x))
 (assert= '(:y :x 0) (conj (take 1 (range 5)) :x :y))
-(ns cljc.bindns)
+(ns clove.bindns)
 (def ^:dynamic *bindns-probe* 1)
 (assert= 9 (binding [*bindns-probe* 9] *bindns-probe*))
 (assert= 1 *bindns-probe*)
-(cljc/in-ns* nil)
+(clove/in-ns* nil)
 (assert= #{2} (set/intersection #{1 2} #{2 3} #{2}))
 (assert= #{3} (set/difference #{1 2 3} #{1} #{2}))
 (assert= #{1 2 3} (set/union #{1} #{2} #{3}))
@@ -1790,58 +1791,58 @@
 (assert= "\"s\"" (judge/judge-pr "s"))
 (assert= 1 (judge/judge-line-of "abc" 2))            ; line counting (char-aware)
 (assert= 2 (judge/judge-line-of "a\nb\nc" 2))
-(when cljc-test-unix?  ; judge e2e + deps.edn walk-up run ./cljc as a subprocess
+(when clove-test-unix?  ; judge e2e + deps.edn walk-up run ./clove as a subprocess
 ; end-to-end: fill, apply, recheck green; normal run is a no-op
-(spit "/tmp/cljc-judge-e2e.clj"
+(spit "/tmp/clove-judge-e2e.clj"
       "(require '[judge :refer [test trust]])\n(defn dbl [x] (* 2 x))\n(test (dbl 21))\n(test (dbl 2) 5)\n")
-(assert= 1 (:exit (sh "./cljc judge /tmp/cljc-judge-e2e.clj")))
-(assert= 0 (:exit (sh "./cljc judge -a /tmp/cljc-judge-e2e.clj")))
-(assert= 0 (:exit (sh "./cljc judge /tmp/cljc-judge-e2e.clj")))
-(assert= true (str/includes? (slurp "/tmp/cljc-judge-e2e.clj") "(test (dbl 21) 42)"))
-(assert= true (str/includes? (slurp "/tmp/cljc-judge-e2e.clj") "(test (dbl 2) 4)"))
-(assert= 0 (:exit (sh "./cljc /tmp/cljc-judge-e2e.clj")))
-(sh "rm -f /tmp/cljc-judge-e2e.clj /tmp/cljc-judge-e2e.clj.tested")
+(assert= 1 (:exit (sh "./clove judge /tmp/clove-judge-e2e.clj")))
+(assert= 0 (:exit (sh "./clove judge -a /tmp/clove-judge-e2e.clj")))
+(assert= 0 (:exit (sh "./clove judge /tmp/clove-judge-e2e.clj")))
+(assert= true (str/includes? (slurp "/tmp/clove-judge-e2e.clj") "(test (dbl 21) 42)"))
+(assert= true (str/includes? (slurp "/tmp/clove-judge-e2e.clj") "(test (dbl 2) 4)"))
+(assert= 0 (:exit (sh "./clove /tmp/clove-judge-e2e.clj")))
+(sh "rm -f /tmp/clove-judge-e2e.clj /tmp/clove-judge-e2e.clj.tested")
 
 ; bundle e2e: flags reach bundle.clj (the C gate used to reject anything but
 ; exactly 2 args), a script's -main is auto-called with argv, its int return
 ; is the exit status, and -m <ns> bundles a namespace + its transitive
 ; requires from *load-path*. --cflags=-O0 keeps the cc step fast AND
 ; regression-tests the flag path itself.
-(sh "rm -rf /tmp/cljc-bundle-e2e && mkdir -p /tmp/cljc-bundle-e2e/src")
-(spit "/tmp/cljc-bundle-e2e/app.clj"
+(sh "rm -rf /tmp/clove-bundle-e2e && mkdir -p /tmp/clove-bundle-e2e/src")
+(spit "/tmp/clove-bundle-e2e/app.clj"
       "(defn -main [& args]\n  (println \"got\" (count args))\n  (if (= (first args) \"fail\") 3 0))\n")
-(assert= 0 (:exit (sh "./cljc bundle --cflags=-O0 /tmp/cljc-bundle-e2e/app.clj /tmp/cljc-bundle-e2e/app")))
-(assert= "got 2\n" (:out (sh "/tmp/cljc-bundle-e2e/app a b")))
-(assert= 3 (:exit (sh "/tmp/cljc-bundle-e2e/app fail")))
-(spit "/tmp/cljc-bundle-e2e/src/bndl_lib.clj" "(ns bndl-lib)\n(defn shout [s] (clojure.string/upper-case s))\n")
-(spit "/tmp/cljc-bundle-e2e/src/bndl_app.clj"
+(assert= 0 (:exit (sh "./clove bundle --cflags=-O0 /tmp/clove-bundle-e2e/app.clj /tmp/clove-bundle-e2e/app")))
+(assert= "got 2\n" (:out (sh "/tmp/clove-bundle-e2e/app a b")))
+(assert= 3 (:exit (sh "/tmp/clove-bundle-e2e/app fail")))
+(spit "/tmp/clove-bundle-e2e/src/bndl_lib.clj" "(ns bndl-lib)\n(defn shout [s] (clojure.string/upper-case s))\n")
+(spit "/tmp/clove-bundle-e2e/src/bndl_app.clj"
       "(ns bndl-app (:require [bndl-lib] [clojure.string :as str]))\n(defn -main [& args]\n  (println (bndl-lib/shout (str/join \"-\" args)))\n  0)\n")
-(assert= 0 (:exit (sh "CLJC_PATH=/tmp/cljc-bundle-e2e/src ./cljc bundle -m bndl-app --cflags=-O0 /tmp/cljc-bundle-e2e/bapp")))
-(assert= "X-Y\n" (:out (sh "/tmp/cljc-bundle-e2e/bapp x y")))   ; runs w/o CLJC_PATH: deps embedded
-(sh "rm -rf /tmp/cljc-bundle-e2e")
+(assert= 0 (:exit (sh "CLOVE_PATH=/tmp/clove-bundle-e2e/src ./clove bundle -m bndl-app --cflags=-O0 /tmp/clove-bundle-e2e/bapp")))
+(assert= "X-Y\n" (:out (sh "/tmp/clove-bundle-e2e/bapp x y")))   ; runs w/o CLOVE_PATH: deps embedded
+(sh "rm -rf /tmp/clove-bundle-e2e")
 
 ; project config: :paths from deps.edn/bb.edn feed *load-path*
-(spit "/tmp/cljc-deps-test.edn" "{:paths [\"a\" \"b\"] :deps {x {:mvn/version \"1\"}}}")
-(assert= ["a" "b"] (cljc/edn-paths "/tmp/cljc-deps-test.edn"))
-(assert= nil (cljc/edn-paths "/tmp/cljc-no-such-file.edn"))      ; missing -> nil
-(spit "/tmp/cljc-deps-test.edn" "{:deps {x {:mvn/version \"1\"}}}")
-(assert= nil (cljc/edn-paths "/tmp/cljc-deps-test.edn"))         ; no :paths -> nil
-(sh "rm -f /tmp/cljc-deps-test.edn")
+(spit "/tmp/clove-deps-test.edn" "{:paths [\"a\" \"b\"] :deps {x {:mvn/version \"1\"}}}")
+(assert= ["a" "b"] (clove/edn-paths "/tmp/clove-deps-test.edn"))
+(assert= nil (clove/edn-paths "/tmp/clove-no-such-file.edn"))      ; missing -> nil
+(spit "/tmp/clove-deps-test.edn" "{:deps {x {:mvn/version \"1\"}}}")
+(assert= nil (clove/edn-paths "/tmp/clove-deps-test.edn"))         ; no :paths -> nil
+(sh "rm -f /tmp/clove-deps-test.edn")
 ; walk-up: a deps.edn at the project root is found from a nested subdir, and
 ; its :paths resolve so `require` locates the lib (verified via a subprocess;
-; $PWD captures this repo's cljc before we cd into the temp project).
-(sh "rm -rf /tmp/cljc-wu && mkdir -p /tmp/cljc-wu/p/lib /tmp/cljc-wu/p/a/b")
-(spit "/tmp/cljc-wu/p/deps.edn" "{:paths [\"lib\"]}")
-(spit "/tmp/cljc-wu/p/lib/wu.clj" "(ns wu)\n(defn ping [] :pong)\n")
-(assert= ":pong" (:out (sh "C=\"$PWD/cljc\"; cd /tmp/cljc-wu/p/a/b && \"$C\" -e \"(require '[wu]) (print (wu/ping))\"")))
-(sh "rm -rf /tmp/cljc-wu")
+; $PWD captures this repo's clove before we cd into the temp project).
+(sh "rm -rf /tmp/clove-wu && mkdir -p /tmp/clove-wu/p/lib /tmp/clove-wu/p/a/b")
+(spit "/tmp/clove-wu/p/deps.edn" "{:paths [\"lib\"]}")
+(spit "/tmp/clove-wu/p/lib/wu.clj" "(ns wu)\n(defn ping [] :pong)\n")
+(assert= ":pong" (:out (sh "C=\"$PWD/clove\"; cd /tmp/clove-wu/p/a/b && \"$C\" -e \"(require '[wu]) (print (wu/ping))\"")))
+(sh "rm -rf /tmp/clove-wu")
 ) ; end when-unix
 
 ; def docstrings, get-on-string, FIFO queue, lazy n-coll mapcat
-(def cljc-doc-probe "the docstring" 42)
-(assert= 42 cljc-doc-probe)
-(def cljc-str-probe "just-a-value")
-(assert= "just-a-value" cljc-str-probe)
+(def clove-doc-probe "the docstring" 42)
+(assert= 42 clove-doc-probe)
+(def clove-str-probe "just-a-value")
+(assert= "just-a-value" clove-str-probe)
 (assert= \b (get "abc" 1))
 (assert= nil (get "abc" 9))
 (assert= :d (get "abc" 9 :d))
@@ -1852,10 +1853,10 @@
 (assert= '(:r :u) (take 2 (mapcat (fn [a b] (repeat b a)) (cycle [:r :u]) (range 1 99))))
 ; chunked map/filter must not force unrealized lazy tails (iterate +
 ; take-while over-realization); iterate defers (f x)
-(def cljc-halt-seq
+(def clove-halt-seq
   (iterate (fn [x] (if (keyword? x) (throw (ex-info "forced past halt" {}))
                        (if (= x 3) :halted (inc x)))) 0))
-(assert= '(0 1 2 3) (take-while (fn [x] (not= x :halted)) (map identity cljc-halt-seq)))
+(assert= '(0 1 2 3) (take-while (fn [x] (not= x :halted)) (map identity clove-halt-seq)))
 (assert= '(0 2 4) (filter even? (take 6 (iterate inc 0))))
 ; multi-binding doseq; into low arities; transients callable
 (assert= [[1 :x] [1 :y] [2 :x] [2 :y]]
@@ -1908,48 +1909,48 @@
                   (Long/toBinaryString (bit-shift-left 1 54))))
 
 ; lazy param destructuring (was: to_seq realized infinite seqs — 17GB)
-(defn cljc-lazy-destructure-probe [[x & xs]] (cons x (lazy-seq (cljc-lazy-destructure-probe xs))))
-(assert= '(0 1 2) (take 3 (cljc-lazy-destructure-probe (range))))
+(defn clove-lazy-destructure-probe [[x & xs]] (cons x (lazy-seq (clove-lazy-destructure-probe xs))))
+(assert= '(0 1 2) (take 3 (clove-lazy-destructure-probe (range))))
 (assert= [1 2 '(3 4)] (let [[a b & c] [1 2 3 4]] [a b c]))
 (assert= [1 nil] (let [[a b] [1]] [a b]))
 
 ; mutable arrays as transients
-(def cljc-arr (int-array 5))
-(assert= 0 (aget cljc-arr 3))
-(assert= 99 (aset cljc-arr 2 99))
-(assert= 99 (aget cljc-arr 2))
-(assert= 5 (alength cljc-arr))
+(def clove-arr (int-array 5))
+(assert= 0 (aget clove-arr 3))
+(assert= 99 (aset clove-arr 2 99))
+(assert= 99 (aget clove-arr 2))
+(assert= 5 (alength clove-arr))
 (assert= '(2 3 4) (map inc (byte-array [1 2 3])))
 (assert= [7 8] (vec (int-array [7 8])))
 
 ; VM bughunt regressions (vm branch review, 2026-06-12)
-(defmacro cljc-vmtest-mym [a] :macro)
-(def cljc-vmtest-f (let [cljc-vmtest-mym (fn [a] :local)] (fn [] (cljc-vmtest-mym 1))))
-(assert= :local (cljc-vmtest-f))                       ; closure local shadows macro
-(defn cljc-vmtest-g [] (loop [x 0] (if (< x 3) (try (recur (inc x)) (catch Exception e :c)) x)))
-(assert= 3 (cljc-vmtest-g))                            ; recur through try in loop
-(defn cljc-vmtest-h [a] (loop [x 0] (if (< x 3) (try (recur (inc x))) [a x])))
-(assert= [5 3] (cljc-vmtest-h 5))      ; fn params not rebound by escaped recur
-(defn cljc-vmtest-fwd [x] (if x (cljc-vmtest-mm 1 2) :no))
-(assert= :no (cljc-vmtest-fwd false))                  ; compiles the chunk
-(defmacro cljc-vmtest-mm [a b] (list '+ a b 100))
-(assert= 103 (cljc-vmtest-fwd true))                   ; late macro deopts to eval
-(def cljc-vmtest-r1 (let [cljc-vmtest-twice (fn [x] (* 10 x))] (fn [y] (cljc-vmtest-twice y))))
-(defmacro cljc-vmtest-twice [x] (list '* 5 x))
-(assert= 50 (cljc-vmtest-r1 5))                        ; captured local beats root macro
-(defn cljc-vmtest-or [or] (or 1 2))
-(assert= 1 (cljc-vmtest-or (fn [a b] :param)))         ; special form beats param (eval parity)
+(defmacro clove-vmtest-mym [a] :macro)
+(def clove-vmtest-f (let [clove-vmtest-mym (fn [a] :local)] (fn [] (clove-vmtest-mym 1))))
+(assert= :local (clove-vmtest-f))                       ; closure local shadows macro
+(defn clove-vmtest-g [] (loop [x 0] (if (< x 3) (try (recur (inc x)) (catch Exception e :c)) x)))
+(assert= 3 (clove-vmtest-g))                            ; recur through try in loop
+(defn clove-vmtest-h [a] (loop [x 0] (if (< x 3) (try (recur (inc x))) [a x])))
+(assert= [5 3] (clove-vmtest-h 5))      ; fn params not rebound by escaped recur
+(defn clove-vmtest-fwd [x] (if x (clove-vmtest-mm 1 2) :no))
+(assert= :no (clove-vmtest-fwd false))                  ; compiles the chunk
+(defmacro clove-vmtest-mm [a b] (list '+ a b 100))
+(assert= 103 (clove-vmtest-fwd true))                   ; late macro deopts to eval
+(def clove-vmtest-r1 (let [clove-vmtest-twice (fn [x] (* 10 x))] (fn [y] (clove-vmtest-twice y))))
+(defmacro clove-vmtest-twice [x] (list '* 5 x))
+(assert= 50 (clove-vmtest-r1 5))                        ; captured local beats root macro
+(defn clove-vmtest-or [or] (or 1 2))
+(assert= 1 (clove-vmtest-or (fn [a b] :param)))         ; special form beats param (eval parity)
 (assert= :threw (try (do ((fn [] (cond :x)))) (catch Exception e :threw)))  ; odd cond errors
 
 ; ── coroutines (the C primitive) + csp.clj (core.async) ──
 ; ── STM basics (no fibers needed): tx isolation, ops, guards ──
-(def cljc-stm-r1 (ref 100)) (def cljc-stm-r2 (ref 0))
-(assert= 30 (dosync (alter cljc-stm-r1 - 30) (alter cljc-stm-r2 + 30)))
-(assert= [70 30] [@cljc-stm-r1 @cljc-stm-r2])
-(assert= 7 (dosync (ref-set cljc-stm-r2 7)))          ; ref-set returns the value
+(def clove-stm-r1 (ref 100)) (def clove-stm-r2 (ref 0))
+(assert= 30 (dosync (alter clove-stm-r1 - 30) (alter clove-stm-r2 + 30)))
+(assert= [70 30] [@clove-stm-r1 @clove-stm-r2])
+(assert= 7 (dosync (ref-set clove-stm-r2 7)))          ; ref-set returns the value
 (assert= 2 (let [c (ref 0)] (dosync (commute c inc) (commute c inc))))
-(assert= :threw (try (alter cljc-stm-r1 inc) (catch Exception e :threw)))  ; no tx
-(assert= :threw (try (ref-set cljc-stm-r1 0) (catch Exception e :threw)))
+(assert= :threw (try (alter clove-stm-r1 inc) (catch Exception e :threw)))  ; no tx
+(assert= :threw (try (ref-set clove-stm-r1 0) (catch Exception e :threw)))
 (assert= :threw (try (dosync (io! :x)) (catch Exception e :threw)))  ; io! in tx
 (assert= :ok (io! :ok))
 (assert= 42 (sync nil 42))
@@ -1968,63 +1969,63 @@
 (assert (nil? (get (int-array 4) 4294967296)))                ; get: 64-bit index must not truncate
 (assert= :d (get (int-array 4) 4294967296 :d))
 
-(when cljc-test-coro?  ; coro through futures: all need the ucontext engine
-(def cljc-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))
-(assert= :new (coro/status cljc-coro-g))
-(assert= 1 (coro/resume cljc-coro-g))
-(assert= 2 (coro/resume cljc-coro-g))
-(assert= :suspended (coro/status cljc-coro-g))
-(assert= :done (coro/resume cljc-coro-g))
-(assert= :dead (coro/status cljc-coro-g))
+(when clove-test-coro?  ; coro through futures: all need the ucontext engine
+(def clove-coro-g (coro/new (fn [] (coro/yield 1) (coro/yield 2) :done)))
+(assert= :new (coro/status clove-coro-g))
+(assert= 1 (coro/resume clove-coro-g))
+(assert= 2 (coro/resume clove-coro-g))
+(assert= :suspended (coro/status clove-coro-g))
+(assert= :done (coro/resume clove-coro-g))
+(assert= :dead (coro/status clove-coro-g))
 ; value passing + operands live on the vstack across a yield (segment save)
-(def cljc-coro-vp (coro/new (fn [] (+ 100 (* 2 (coro/yield :a))))))
-(assert= :a (coro/resume cljc-coro-vp))
-(assert= 110 (coro/resume cljc-coro-vp 5))             ; 100 + 2*5, partials survived
+(def clove-coro-vp (coro/new (fn [] (+ 100 (* 2 (coro/yield :a))))))
+(assert= :a (coro/resume clove-coro-vp))
+(assert= 110 (coro/resume clove-coro-vp 5))             ; 100 + 2*5, partials survived
 ; a suspended coro holds the only refs to heap data across a GC
-(def cljc-coro-gc (coro/new (fn [] (let [v (vec (range 64))] (coro/yield :built) (reduce + v)))))
-(coro/resume cljc-coro-gc)
+(def clove-coro-gc (coro/new (fn [] (let [v (vec (range 64))] (coro/yield :built) (reduce + v)))))
+(coro/resume clove-coro-gc)
 (gc)
-(assert= 2016 (coro/resume cljc-coro-gc))              ; sum 0..63, survived collection
+(assert= 2016 (coro/resume clove-coro-gc))              ; sum 0..63, survived collection
 ; exceptions escape the body and propagate to the resumer
-(def cljc-coro-boom (coro/new (fn [] (coro/yield :ok) (throw (ex-info "x" {:n 9})))))
-(assert= :ok (coro/resume cljc-coro-boom))
-(assert= 9 (try (coro/resume cljc-coro-boom) (catch Exception e (:n (ex-data e)))))
+(def clove-coro-boom (coro/new (fn [] (coro/yield :ok) (throw (ex-info "x" {:n 9})))))
+(assert= :ok (coro/resume clove-coro-boom))
+(assert= 9 (try (coro/resume clove-coro-boom) (catch Exception e (:n (ex-data e)))))
 ; per-coro vstack: yield DEEP inside nested calls, with sibling coros resumed
 ; from separate top-level calls (caches absolute argv pointers — segment
 ; relocation used to corrupt this; each coro now keeps its own value stack)
-(defn cljc-coro-y3 [m] (coro/yield m))
-(defn cljc-coro-y2 [m] (+ 0 (cljc-coro-y3 m)))
-(defn cljc-coro-y1 [m] (* 1 (cljc-coro-y2 m)))
-(def cljc-coro-da (coro/new (fn [] (+ 100 (cljc-coro-y1 :a1) (cljc-coro-y1 :a2)))))
-(def cljc-coro-db (coro/new (fn [] (+ 200 (cljc-coro-y1 :b1)))))
-(coro/resume cljc-coro-da)
-(coro/resume cljc-coro-db)
-(assert= :a2 (coro/resume cljc-coro-da 5))     ; sibling interleave, separate pump
-(assert= 207 (coro/resume cljc-coro-db 7))
-(assert= 114 (coro/resume cljc-coro-da 9))     ; 100 + 5 + 9, operands intact
+(defn clove-coro-y3 [m] (coro/yield m))
+(defn clove-coro-y2 [m] (+ 0 (clove-coro-y3 m)))
+(defn clove-coro-y1 [m] (* 1 (clove-coro-y2 m)))
+(def clove-coro-da (coro/new (fn [] (+ 100 (clove-coro-y1 :a1) (clove-coro-y1 :a2)))))
+(def clove-coro-db (coro/new (fn [] (+ 200 (clove-coro-y1 :b1)))))
+(coro/resume clove-coro-da)
+(coro/resume clove-coro-db)
+(assert= :a2 (coro/resume clove-coro-da 5))     ; sibling interleave, separate pump
+(assert= 207 (coro/resume clove-coro-db 7))
+(assert= 114 (coro/resume clove-coro-da 9))     ; 100 + 5 + 9, operands intact
 
-(require '[csp :as cljc-a])
+(require '[csp :as clove-a])
 ; producer/consumer over a buffered channel
-(def cljc-csp-out (atom nil))
-(let [ch (cljc-a/chan 4)]
-  (cljc-a/go (dotimes [i 5] (cljc-a/>! ch (* i i))) (cljc-a/close! ch))
-  (reset! cljc-csp-out
-    (cljc-a/<!! (cljc-a/go-loop [acc []]
-                  (let [v (cljc-a/<! ch)]
+(def clove-csp-out (atom nil))
+(let [ch (clove-a/chan 4)]
+  (clove-a/go (dotimes [i 5] (clove-a/>! ch (* i i))) (clove-a/close! ch))
+  (reset! clove-csp-out
+    (clove-a/<!! (clove-a/go-loop [acc []]
+                  (let [v (clove-a/<! ch)]
                     (if (nil? v) acc (recur (conj acc v))))))))
-(assert= [0 1 4 9 16] @cljc-csp-out)
+(assert= [0 1 4 9 16] @clove-csp-out)
 ; <!! of a go's return value
-(assert= 4950 (cljc-a/<!! (cljc-a/go (reduce + (range 100)))))
+(assert= 4950 (clove-a/<!! (clove-a/go (reduce + (range 100)))))
 ; unbuffered rendezvous between two go blocks
-(def cljc-csp-pp (atom []))
-(let [ping (cljc-a/chan) pong (cljc-a/chan)]
-  (cljc-a/go (dotimes [i 3] (cljc-a/>! ping i) (swap! cljc-csp-pp conj (cljc-a/<! pong))))
-  (cljc-a/go-loop [] (let [v (cljc-a/<! ping)] (cljc-a/>! pong (* v 10)) (recur)))
-  (cljc-a/run!))
-(assert= [0 10 20] @cljc-csp-pp)
+(def clove-csp-pp (atom []))
+(let [ping (clove-a/chan) pong (clove-a/chan)]
+  (clove-a/go (dotimes [i 3] (clove-a/>! ping i) (swap! clove-csp-pp conj (clove-a/<! pong))))
+  (clove-a/go-loop [] (let [v (clove-a/<! ping)] (clove-a/>! pong (* v 10)) (recur)))
+  (clove-a/run!))
+(assert= [0 10 20] @clove-csp-pp)
 ; alts! picks a ready channel
-(assert= :hit (let [r (cljc-a/chan 1)]
-                (cljc-a/<!! (cljc-a/go (cljc-a/>! r :hit) (first (cljc-a/alts! [r]))))))
+(assert= :hit (let [r (clove-a/chan 1)]
+                (clove-a/<!! (clove-a/go (clove-a/>! r :hit) (first (clove-a/alts! [r]))))))
 
 ; ── futures & promises (fiber-scheduler-backed, blocking deref) ──
 ; NOTE: these run BEFORE any server test — the bare-@(promise) deadlock check
@@ -2056,150 +2057,150 @@
 ; runners (75ms and 350ms both did), so measure a single-future baseline and
 ; require the dual run to stay well under the 2x a serializing scheduler
 ; would take. (Skipped under GC stress, per file convention.)
-(when-not (cljc/env* "CLJC_GC_STRESS")
-  (assert= true (let [b0 (cljc/now-ms*)
+(when-not (clove/env* "CLOVE_GC_STRESS")
+  (assert= true (let [b0 (clove/now-ms*)
                       _ @(future (Thread/sleep 200) :warm)
-                      base (max 1 (- (cljc/now-ms*) b0))
-                      t0 (cljc/now-ms*)
+                      base (max 1 (- (clove/now-ms*) b0))
+                      t0 (clove/now-ms*)
                       f1 (future (Thread/sleep 200) :one)
                       f2 (future (Thread/sleep 200) :two)
                       ok (and (= :one @f1) (= :two @f2))
-                      dual (- (cljc/now-ms*) t0)]
+                      dual (- (clove/now-ms*) t0)]
                   (and ok (< dual (* 1.7 base))))))
 ; one shared scheduler: csp go blocks and futures pump each other
-(assert= :from-future (let [ch (cljc-a/chan 1)]
-                        (future (cljc-a/go (cljc-a/>! ch :from-future)))
-                        (cljc-a/<!! ch)))
+(assert= :from-future (let [ch (clove-a/chan 1)]
+                        (future (clove-a/go (clove-a/>! ch :from-future)))
+                        (clove-a/<!! ch)))
 (assert= :from-go (let [p (promise)]
-                    (cljc-a/go (cljc-a/<! (cljc-a/timeout 15)) (deliver p :from-go))
+                    (clove-a/go (clove-a/<! (clove-a/timeout 15)) (deliver p :from-go))
                     @p))
 ; clojure.core.async on the shared scheduler: sleep in a go block parks the
 ; fiber (doesn't stall the loop), and @future inside a go block parks too
-(require '[clojure.core.async :as cljc-ca])
-(when-not (cljc/env* "CLJC_GC_STRESS")
-  (assert= true (let [b0 (cljc/now-ms*)
-                      _ (cljc-ca/<!! (cljc-ca/go (Thread/sleep 200) :warm))
-                      base (max 1 (- (cljc/now-ms*) b0))
-                      t0 (cljc/now-ms*)
-                      c1 (cljc-ca/go (Thread/sleep 200) :a)
-                      c2 (cljc-ca/go (Thread/sleep 200) :b)
-                      ok (and (= :a (cljc-ca/<!! c1)) (= :b (cljc-ca/<!! c2)))
-                      dual (- (cljc/now-ms*) t0)]
+(require '[clojure.core.async :as clove-ca])
+(when-not (clove/env* "CLOVE_GC_STRESS")
+  (assert= true (let [b0 (clove/now-ms*)
+                      _ (clove-ca/<!! (clove-ca/go (Thread/sleep 200) :warm))
+                      base (max 1 (- (clove/now-ms*) b0))
+                      t0 (clove/now-ms*)
+                      c1 (clove-ca/go (Thread/sleep 200) :a)
+                      c2 (clove-ca/go (Thread/sleep 200) :b)
+                      ok (and (= :a (clove-ca/<!! c1)) (= :b (clove-ca/<!! c2)))
+                      dual (- (clove/now-ms*) t0)]
                   (and ok (< dual (* 1.7 base))))))
 (assert= 43 (let [f (future (Thread/sleep 10) 42)]
-              (cljc-ca/<!! (cljc-ca/go (+ 1 @f)))))
-(assert= :threaded (cljc-ca/<!! (cljc-ca/thread (Thread/sleep 10) :threaded)))
+              (clove-ca/<!! (clove-ca/go (+ 1 @f)))))
+(assert= :threaded (clove-ca/<!! (clove-ca/thread (Thread/sleep 10) :threaded)))
 
 ; async I/O event loop: a loopback echo server + client, both go blocks, served
 ; through poll() — no blocking, one thread
-(def cljc-csp-srv (tcp/listen 8094 "127.0.0.1"))
-(cljc-a/go (let [c (cljc-a/accept! cljc-csp-srv)]
-             (cljc-a/send! c (str "echo:" (cljc-a/recv! c)))
+(def clove-csp-srv (tcp/listen 8094 "127.0.0.1"))
+(clove-a/go (let [c (clove-a/accept! clove-csp-srv)]
+             (clove-a/send! c (str "echo:" (clove-a/recv! c)))
              (tcp/close c)))
 (assert= "echo:ping"
-  (cljc-a/<!! (cljc-a/go (let [fd (tcp/connect "127.0.0.1" 8094)]
-                           (cljc-a/send! fd "ping")
-                           (let [r (cljc-a/recv! fd)] (tcp/close fd) r)))))
-(tcp/close cljc-csp-srv)
+  (clove-a/<!! (clove-a/go (let [fd (tcp/connect "127.0.0.1" 8094)]
+                           (clove-a/send! fd "ping")
+                           (let [r (clove-a/recv! fd)] (tcp/close fd) r)))))
+(tcp/close clove-csp-srv)
 ; combinators: merge (fan-in) + into (drain)
-(assert= 136 (reduce + (cljc-a/<!! (cljc-a/into []
-                         (cljc-a/merge [(cljc-a/to-chan! [1 2 3])
-                                        (cljc-a/to-chan! [10 20])
-                                        (cljc-a/to-chan! [100])])))))
+(assert= 136 (reduce + (clove-a/<!! (clove-a/into []
+                         (clove-a/merge [(clove-a/to-chan! [1 2 3])
+                                        (clove-a/to-chan! [10 20])
+                                        (clove-a/to-chan! [100])])))))
 ; mult/tap: one source broadcast to two taps
-(let [src (cljc-a/chan) m (cljc-a/mult src) t1 (cljc-a/chan 8) t2 (cljc-a/chan 8)]
-  (cljc-a/tap m t1) (cljc-a/tap m t2)
-  (cljc-a/onto-chan! src [:a :b :c])
-  (assert= [:a :b :c] (cljc-a/<!! (cljc-a/into [] t1)))
-  (assert= [:a :b :c] (cljc-a/<!! (cljc-a/into [] t2))))
+(let [src (clove-a/chan) m (clove-a/mult src) t1 (clove-a/chan 8) t2 (clove-a/chan 8)]
+  (clove-a/tap m t1) (clove-a/tap m t2)
+  (clove-a/onto-chan! src [:a :b :c])
+  (assert= [:a :b :c] (clove-a/<!! (clove-a/into [] t1)))
+  (assert= [:a :b :c] (clove-a/<!! (clove-a/into [] t2))))
 ; pipe + take-n
 (assert= [0 1 2 3 4]
-  (let [to (cljc-a/chan 4)] (cljc-a/pipe (cljc-a/to-chan! (range 50)) to)
-       (cljc-a/<!! (cljc-a/take-n 5 to))))
+  (let [to (clove-a/chan 4)] (clove-a/pipe (clove-a/to-chan! (range 50)) to)
+       (clove-a/<!! (clove-a/take-n 5 to))))
 ; transducer channel: inc then keep evens
 (assert= [2 4 6 8]
-  (let [ch (cljc-a/chan 16 (comp (map-xf inc) (filter-xf even?)))]
-    (cljc-a/go (dotimes [i 8] (cljc-a/>! ch i)) (cljc-a/close! ch))
-    (cljc-a/<!! (cljc-a/into [] ch))))
+  (let [ch (clove-a/chan 16 (comp (map-xf inc) (filter-xf even?)))]
+    (clove-a/go (dotimes [i 8] (clove-a/>! ch i)) (clove-a/close! ch))
+    (clove-a/<!! (clove-a/into [] ch))))
 ; transducer channel: mapcat (one in, many out) + completion flush on close
 (assert= [[0 1] [2 3] [4]]
-  (let [ch (cljc-a/chan 8 (partition-all 2))]
-    (cljc-a/go (dotimes [i 5] (cljc-a/>! ch i)) (cljc-a/close! ch))
-    (cljc-a/<!! (cljc-a/into [] ch))))
+  (let [ch (clove-a/chan 8 (partition-all 2))]
+    (clove-a/go (dotimes [i 5] (clove-a/>! ch i)) (clove-a/close! ch))
+    (clove-a/<!! (clove-a/into [] ch))))
 ; pub/sub: route by topic; non-subscribed topics are dropped
-(let [in (cljc-a/chan) p (cljc-a/pub in :t) ca (cljc-a/chan 8) da (cljc-a/chan 8)]
-  (cljc-a/sub p :cat ca) (cljc-a/sub p :dog da)
-  (cljc-a/go (doseq [m [{:t :cat :n 1} {:t :dog :n 2} {:t :cat :n 3} {:t :fish}]]
-               (cljc-a/>! in m)) (cljc-a/close! in))
-  (assert= [1 3] (mapv :n (cljc-a/<!! (cljc-a/into [] ca))))
-  (assert= [2]   (mapv :n (cljc-a/<!! (cljc-a/into [] da)))))
+(let [in (clove-a/chan) p (clove-a/pub in :t) ca (clove-a/chan 8) da (clove-a/chan 8)]
+  (clove-a/sub p :cat ca) (clove-a/sub p :dog da)
+  (clove-a/go (doseq [m [{:t :cat :n 1} {:t :dog :n 2} {:t :cat :n 3} {:t :fish}]]
+               (clove-a/>! in m)) (clove-a/close! in))
+  (assert= [1 3] (mapv :n (clove-a/<!! (clove-a/into [] ca))))
+  (assert= [2]   (mapv :n (clove-a/<!! (clove-a/into [] da)))))
 ; ── agents (Tier 3.6): serial actions on a drain fiber, error modes, watches ──
-(def cljc-ag (agent 0))
-(send cljc-ag inc) (send cljc-ag inc) (send cljc-ag + 5)
-(assert= nil (await cljc-ag))
-(assert= 7 @cljc-ag)
-(assert= true (await-for 1000 cljc-ag))
+(def clove-ag (agent 0))
+(send clove-ag inc) (send clove-ag inc) (send clove-ag + 5)
+(assert= nil (await clove-ag))
+(assert= 7 @clove-ag)
+(assert= true (await-for 1000 clove-ag))
 ; :fail mode (default): deref keeps last value, send throws, restart reruns held queue
-(def cljc-agf (agent 10))
-(send cljc-agf (fn [_] (throw (ex-info "boom" {}))))
-(send cljc-agf inc)                       ; queued behind the failure -> held
+(def clove-agf (agent 10))
+(send clove-agf (fn [_] (throw (ex-info "boom" {}))))
+(send clove-agf inc)                       ; queued behind the failure -> held
 (Thread/sleep 5)
-(assert= true (some? (agent-error cljc-agf)))
-(assert= 10 @cljc-agf)
-(assert= :threw (try (send cljc-agf inc) :sent (catch Exception e :threw)))
-(restart-agent cljc-agf 99)
-(await cljc-agf)
-(assert= 100 @cljc-agf)                   ; the held inc ran after restart
-(assert= nil (agent-error cljc-agf))
+(assert= true (some? (agent-error clove-agf)))
+(assert= 10 @clove-agf)
+(assert= :threw (try (send clove-agf inc) :sent (catch Exception e :threw)))
+(restart-agent clove-agf 99)
+(await clove-agf)
+(assert= 100 @clove-agf)                   ; the held inc ran after restart
+(assert= nil (agent-error clove-agf))
 ; :continue via error-handler: errors reported, queue keeps going
-(def cljc-ag-errs (atom 0))
-(def cljc-agc (agent 0 :error-handler (fn [a e] (swap! cljc-ag-errs inc))))
-(send cljc-agc (fn [_] (throw (ex-info "x" {})))) (send cljc-agc + 3)
-(await cljc-agc)
-(assert= [3 1 :continue] [@cljc-agc @cljc-ag-errs (error-mode cljc-agc)])
+(def clove-ag-errs (atom 0))
+(def clove-agc (agent 0 :error-handler (fn [a e] (swap! clove-ag-errs inc))))
+(send clove-agc (fn [_] (throw (ex-info "x" {})))) (send clove-agc + 3)
+(await clove-agc)
+(assert= [3 1 :continue] [@clove-agc @clove-ag-errs (error-mode clove-agc)])
 ; watches are real on agents (fire per action, like ARef.notifyWatches)
-(def cljc-ag-log (atom []))
-(def cljc-agw (agent 1))
-(add-watch cljc-agw :w (fn [k r o n] (swap! cljc-ag-log conj [o n])))
-(send cljc-agw inc) (await cljc-agw)
-(assert= [1 2] (first @cljc-ag-log))
+(def clove-ag-log (atom []))
+(def clove-agw (agent 1))
+(add-watch clove-agw :w (fn [k r o n] (swap! clove-ag-log conj [o n])))
+(send clove-agw inc) (await clove-agw)
+(assert= [1 2] (first @clove-ag-log))
 ; ── STM refs: real conflict detection across fiber yields ──
 ; a tx that parks mid-body while the main thread commits under it RETRIES
-(def cljc-r (ref 0))
-(def cljc-tx-tries (atom 0))
-(def cljc-tx-f (future (dosync (swap! cljc-tx-tries inc)
-                               (let [v (alter cljc-r inc)] (Thread/sleep 20) v))))
+(def clove-r (ref 0))
+(def clove-tx-tries (atom 0))
+(def clove-tx-f (future (dosync (swap! clove-tx-tries inc)
+                               (let [v (alter clove-r inc)] (Thread/sleep 20) v))))
 (Thread/sleep 5)
-(dosync (alter cljc-r + 100))             ; commit under the parked tx
-(assert= 101 @cljc-tx-f)                  ; retried: re-read 100, inc
-(assert= 101 @cljc-r)
-(assert= 2 @cljc-tx-tries)
+(dosync (alter clove-r + 100))             ; commit under the parked tx
+(assert= 101 @clove-tx-f)                  ; retried: re-read 100, inc
+(assert= 101 @clove-r)
+(assert= 2 @clove-tx-tries)
 ; ensure participates in conflict detection (read-only retry)
-(def cljc-er (ref 1))
-(def cljc-er-f (future (dosync (let [v (ensure cljc-er)] (Thread/sleep 20) v))))
+(def clove-er (ref 1))
+(def clove-er-f (future (dosync (let [v (ensure clove-er)] (Thread/sleep 20) v))))
 (Thread/sleep 5)
-(dosync (ref-set cljc-er 2))
-(assert= 2 @cljc-er-f)
+(dosync (ref-set clove-er 2))
+(assert= 2 @clove-er-f)
 ; commute never conflicts: re-applied on the latest value at commit
-(def cljc-cr (ref 0))
-(def cljc-cr-tries (atom 0))
-(def cljc-cr-f (future (dosync (swap! cljc-cr-tries inc)
-                               (commute cljc-cr inc) (Thread/sleep 20) :done)))
+(def clove-cr (ref 0))
+(def clove-cr-tries (atom 0))
+(def clove-cr-f (future (dosync (swap! clove-cr-tries inc)
+                               (commute clove-cr inc) (Thread/sleep 20) :done)))
 (Thread/sleep 5)
-(dosync (alter cljc-cr + 100))
-(assert= [:done 101 1] [@cljc-cr-f @cljc-cr @cljc-cr-tries])
+(dosync (alter clove-cr + 100))
+(assert= [:done 101 1] [@clove-cr-f @clove-cr @clove-cr-tries])
 ; sends inside a transaction are held until commit
-(def cljc-ag-tx (agent 0))
-(dosync (send cljc-ag-tx + 10) (send cljc-ag-tx + 1))
-(await cljc-ag-tx)
-(assert= 11 @cljc-ag-tx)
+(def clove-ag-tx (agent 0))
+(dosync (send clove-ag-tx + 10) (send clove-ag-tx + 1))
+(await clove-ag-tx)
+(assert= 11 @clove-ag-tx)
 ; http.clj: a routed server + the client, full round-trip through the event loop
-(require '[http :as cljc-h])
-(cljc-h/serve 8093
-  (cljc-h/router [[:get  "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]
+(require '[http :as clove-h])
+(clove-h/serve 8093
+  (clove-h/router [[:get  "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]
                   [:post "/echo"    (fn [req] {:status 201 :body (:body req)})]]))
-(assert= "hi bob" (:body (cljc-a/<!! (cljc-h/get "http://127.0.0.1:8093/hi/bob"))))
-(let [r (cljc-a/<!! (cljc-h/post "http://127.0.0.1:8093/echo" "payload"))]
+(assert= "hi bob" (:body (clove-a/<!! (clove-h/get "http://127.0.0.1:8093/hi/bob"))))
+(let [r (clove-a/<!! (clove-h/post "http://127.0.0.1:8093/echo" "payload"))]
   (assert= 201 (:status r))
   (assert= "payload" (:body r)))
 ; http/serve binds LOOPBACK by default; it used to hardcode "0.0.0.0", exposing
@@ -2216,22 +2217,22 @@
       (assert= true  (some? (re-find #"127\.0\.0\.1[.:]8093" out)))   ; loopback
       (assert= false (some? (re-find #"0\.0\.0\.0[.:]8093" out)))))) ; NOT all-interfaces
 ; the host argument still opts in explicitly
-(cljc-h/serve 8094
-  (cljc-h/router [[:get "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]])
+(clove-h/serve 8094
+  (clove-h/router [[:get "/hi/:who" (fn [req] (str "hi " (:who (:params req))))]])
   "127.0.0.1")
-(assert= "hi bob" (:body (cljc-a/<!! (cljc-h/get "http://127.0.0.1:8094/hi/bob"))))
+(assert= "hi bob" (:body (clove-a/<!! (clove-h/get "http://127.0.0.1:8094/hi/bob"))))
 ; nrepl.clj: bencode round-trip + a concurrent server eval through the loop
-(require '[nrepl :as cljc-n])
+(require '[nrepl :as clove-n])
 (assert= [{"op" "eval" "id" "1" "code" "(+ 2 3)"} ""]      ; bencode encode/decode round-trip
-         (cljc-n/bdecode (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"})))
-(cljc-n/start 8092)
+         (clove-n/bdecode (clove-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"})))
+(clove-n/start 8092)
 ; The read loop parks on POLLIN with no deadline. If the server fiber ever
 ; dies without closing the socket, recv! never returns, "done" never arrives,
 ; and the suite wedges at 100% CPU -- taking ./install.sh down with it. Race
 ; the reader against a timer so a stall FAILs loudly instead of hanging.
-(let [reader (cljc-a/go
+(let [reader (clove-a/go
                (let [fd (tcp/connect "127.0.0.1" 8092)]
-                 (csp/send! fd (cljc-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"}))
+                 (csp/send! fd (clove-n/bencode {"op" "eval" "id" "1" "code" "(+ 2 3)"}))
                  (loop [b ""]
                    (let [m (csp/recv! fd)]
                      (if (or (nil? m) (str/includes? (str b m) "done"))
@@ -2239,8 +2240,8 @@
                        (recur (str b m)))))))
       ; timeout wins -> its closed chan delivers nil; the reader can only
       ; ever deliver a string, so nil? tells the two apart.
-      resp (cljc-a/<!! (cljc-a/go
-                         (let [[v _] (cljc-a/alts! [reader (cljc-a/timeout 10000)])]
+      resp (clove-a/<!! (clove-a/go
+                         (let [[v _] (clove-a/alts! [reader (clove-a/timeout 10000)])]
                            (if (nil? v) ::nrepl-timeout v))))]
   (assert= false (= ::nrepl-timeout resp))                 ; reader stalled, not a protocol bug
   (assert= true (and (string? resp) (str/includes? resp "5:value1:5")))   ; value 5 came back
@@ -2267,28 +2268,28 @@
 (assert= 256 (+ 0xff 1))
 (assert= 100000.0 1e5)                                     ; float reader unaffected
 ; trampoline: stack-safe mutual recursion (Clojure's escape hatch, no TCO)
-(defn cljc-tramp-ev? [n] (if (zero? n) true #(cljc-tramp-od? (dec n))))
-(defn cljc-tramp-od? [n] (if (zero? n) false #(cljc-tramp-ev? (dec n))))
-(assert= true  (trampoline cljc-tramp-ev? 100000))
-(assert= false (trampoline cljc-tramp-ev? 100001))
+(defn clove-tramp-ev? [n] (if (zero? n) true #(clove-tramp-od? (dec n))))
+(defn clove-tramp-od? [n] (if (zero? n) false #(clove-tramp-ev? (dec n))))
+(assert= true  (trampoline clove-tramp-ev? 100000))
+(assert= false (trampoline clove-tramp-ev? 100001))
 (assert= 42 (trampoline (fn [] 42)))                       ; non-fn result returned as-is
 ; ── general tail-call optimization (beyond Clojure) ──
 ; non-tail calls must NOT be mis-TCO'd (value is processed after the call)
-(defn cljc-tco-h [n] (if (zero? n) 0 (inc (cljc-tco-h (dec n)))))
-(assert= 100 (cljc-tco-h 100))                             ; (inc (h …)) — not tail
-(defn cljc-tco-ten [x] (* x 10))
-(assert= 24 (+ 1 (cljc-tco-ten 2) 3))                      ; call value used in +
-(assert= 100 (cljc-tco-ten (cljc-tco-ten 1)))              ; nested
-(assert= 30 (and (cljc-tco-ten 1) (cljc-tco-ten 2) (cljc-tco-ten 3)))
+(defn clove-tco-h [n] (if (zero? n) 0 (inc (clove-tco-h (dec n)))))
+(assert= 100 (clove-tco-h 100))                             ; (inc (h …)) — not tail
+(defn clove-tco-ten [x] (* x 10))
+(assert= 24 (+ 1 (clove-tco-ten 2) 3))                      ; call value used in +
+(assert= 100 (clove-tco-ten (clove-tco-ten 1)))              ; nested
+(assert= 30 (and (clove-tco-ten 1) (clove-tco-ten 2) (clove-tco-ten 3)))
 ; deep proper tail calls (would overflow the C stack without TCO) — skip GC-stress
-(defn cljc-tco-ev? [n] (if (zero? n) true  (cljc-tco-od? (dec n))))
-(defn cljc-tco-od? [n] (if (zero? n) false (cljc-tco-ev? (dec n))))
-(defn cljc-tco-sum ([n] (cljc-tco-sum n 0))                ; multi-arity self tail-call
-  ([n acc] (if (zero? n) acc (cljc-tco-sum (dec n) (+ acc n)))))
-(when-not (cljc/env* "CLJC_GC_STRESS")
-  (assert= true  (cljc-tco-ev? 3000000))                   ; mutual recursion, 3M deep
-  (assert= false (cljc-tco-ev? 3000001))
-  (assert= 500000500000 (cljc-tco-sum 1000000)))           ; self tail-call, 1M deep
+(defn clove-tco-ev? [n] (if (zero? n) true  (clove-tco-od? (dec n))))
+(defn clove-tco-od? [n] (if (zero? n) false (clove-tco-ev? (dec n))))
+(defn clove-tco-sum ([n] (clove-tco-sum n 0))                ; multi-arity self tail-call
+  ([n acc] (if (zero? n) acc (clove-tco-sum (dec n) (+ acc n)))))
+(when-not (clove/env* "CLOVE_GC_STRESS")
+  (assert= true  (clove-tco-ev? 3000000))                   ; mutual recursion, 3M deep
+  (assert= false (clove-tco-ev? 3000001))
+  (assert= 500000500000 (clove-tco-sum 1000000)))           ; self tail-call, 1M deep
 ; nested tail call through a native: reduce → fn body (into s x) → into-impl.
 ; the sentinel owning the args must stay GC-rooted across the native dispatch
 ; (a `return apply(...)` would let -O2 free it mid-call) — AoC 2015 d18.
@@ -2296,19 +2297,19 @@
 ; lazy-seq consumers (first/reduce/nth) advance their arg slot, so realizing a
 ; deep prefix stays O(1) live instead of O(n) — these would crawl/OOM before the
 ; seq1_slot fix. Skip GC-stress (realizes millions of cells). AoC 2015 d11.
-(when-not (cljc/env* "CLJC_GC_STRESS")
+(when-not (clove/env* "CLOVE_GC_STRESS")
   (assert= 3000000 (first (filter #(= % 3000000) (iterate inc 0))))
   (assert= 2000000 (nth (iterate inc 0) 2000000))
   (assert= 4499998500000 (reduce + 0 (take 3000000 (iterate inc 0)))))
 ; huge apply: splicing > vstack-cap args must not overflow (heap argv path) —
 ; AoC 2016 d16 / 2021 d20. Skip under GC stress (too slow with 1.1M elements).
-(when-not (cljc/env* "CLJC_GC_STRESS")
+(when-not (clove/env* "CLOVE_GC_STRESS")
   (assert= 1100000 (count (apply str (repeat 1100000 "x"))))        ; native, lazy seq
   (assert= 1100000 (apply + (repeat 1100000 1)))                    ; native +
   (assert= 1100000 (count (apply concat (repeat 1100000 [1]))))     ; lazy concat fn
   (assert= 1100000 (apply (fn [& xs] (count xs)) (repeat 1100000 1)))) ; user variadic fn
 
-; ── sorted collections (comparator-ordered set/map: CLJC_SORTED) ──
+; ── sorted collections (comparator-ordered set/map: CLOVE_SORTED) ──
 (assert= [1 2 3] (vec (sorted-set 3 1 2 1)))            ; ordered + deduped
 (assert= [3 2 1] (vec (sorted-set-by > 1 2 3)))         ; custom comparator
 (assert= [[:a 1] [:b 2] [:c 3]] (vec (sorted-map :c 3 :a 1 :b 2)))
@@ -2348,7 +2349,7 @@
 (assert= true (sorted? (merge (sorted-map :a 1) {:b 2})))
 ; weight-balanced tree stays balanced: 50k ASCENDING inserts (worst case for a
 ; naive BST) + deletes must be O(n log n), not O(n^2). Skip under GC stress.
-(when-not (cljc/env* "CLJC_GC_STRESS")
+(when-not (clove/env* "CLOVE_GC_STRESS")
   (let [n 50000
         s (reduce conj (sorted-set) (range n))]
     (assert= n (count s))
@@ -2358,7 +2359,7 @@
     (assert= (range 1 n 2) (seq (reduce disj s (range 0 n 2))))))
 
 ; ── clojure.core.async (vendored, coroutine-backed) ──
-(when cljc-test-coro?
+(when clove-test-coro?
 (require '[clojure.core.async :as async])
 (assert= 3 (async/<!! (async/go (+ 1 2))))                  ; go + blocking take
 (let [c (async/chan)]                                       ; unbuffered rendezvous
@@ -2380,9 +2381,9 @@
 (assert= [:nothing :default]                                ; alts! :default
          (async/<!! (async/go (async/alts! [(async/chan)] :default :nothing))))
 (assert= (range 5) (async/<!! (async/into [] (async/to-chan! (range 5)))))  ; combinators
-(let [t0 (cljc/now-ms*)]                                    ; timeout actually waits
+(let [t0 (clove/now-ms*)]                                    ; timeout actually waits
   (async/<!! (async/timeout 30))
-  (assert= true (>= (- (cljc/now-ms*) t0) 25)))
+  (assert= true (>= (- (clove/now-ms*) t0) 25)))
 
 ; ── refer of a core-shadowing name is a per-ns (user) alias, NOT a global clobber ──
 (assert= 6 (clojure.core/reduce + [1 2 3]))            ; core reduce intact before
@@ -2679,46 +2680,46 @@
 ; ── load-file evaluates top-level forms in the ROOT env ──
 ; A required file defining (defn paths ...) used to resolve its own call sites
 ; to require-one's `paths` let-local (the candidate-file lazy seq) instead.
-(spit "cljc_shadowtest.clj"   ; require munges - to _ when resolving files
-      "(ns cljc-shadowtest)\n(defn paths [a b] [(str a b)])\n(def result (first (paths \"x\" \"y\")))\n")
-(require 'cljc-shadowtest)
-(assert= "xy" cljc-shadowtest/result)
-(sh "rm -f cljc_shadowtest.clj")
+(spit "clove_shadowtest.clj"   ; require munges - to _ when resolving files
+      "(ns clove-shadowtest)\n(defn paths [a b] [(str a b)])\n(def result (first (paths \"x\" \"y\")))\n")
+(require 'clove-shadowtest)
+(assert= "xy" clove-shadowtest/result)
+(sh "rm -f clove_shadowtest.clj")
 
 ; ── namespace-object layer: *ns*/find-ns/all-ns/ns-publics + private vars ──
-(spit "cljc_nstest_a.clj"
-      (str "(ns cljc-nstest-a)\n"
+(spit "clove_nstest_a.clj"
+      (str "(ns clove-nstest-a)\n"
            "(def pub 1)\n"
            "(def ^:private hidden 2)\n"
            "(defn- phelper [] :ph)\n"
            "(defn caller [] (phelper))\n"))   ; same-ns private use
-(spit "cljc_nstest_b.clj"
-      (str "(ns cljc-nstest-b (:require [cljc-nstest-a :as na :refer [pub]]))\n"
+(spit "clove_nstest_b.clj"
+      (str "(ns clove-nstest-b (:require [clove-nstest-a :as na :refer [pub]]))\n"
            "(def saw-ns (str *ns*))\n"        ; *ns* tracks the ns form
            "(def refer-val pub)\n"            ; :refer from a ns form
            "(def alias-val na/pub)\n"
-           "(def own-aliases (ns-aliases 'cljc-nstest-b))\n"
+           "(def own-aliases (ns-aliases 'clove-nstest-b))\n"
            "(def denied (try (na/phelper) (catch Exception e :denied)))\n"
-           "(def via-var @#'cljc-nstest-a/hidden)\n"  ; var access bypasses privacy
+           "(def via-var @#'clove-nstest-a/hidden)\n"  ; var access bypasses privacy
            "(def same-ns-priv (na/caller))\n"))
-(require 'cljc-nstest-b)
-(assert= "cljc-nstest-b" cljc-nstest-b/saw-ns)
-(assert= 1 cljc-nstest-b/refer-val)
-(assert= 1 cljc-nstest-b/alias-val)
-(assert= '{na cljc-nstest-a} cljc-nstest-b/own-aliases)
-(assert= :denied cljc-nstest-b/denied)
-(assert= 2 cljc-nstest-b/via-var)
-(assert= :ph cljc-nstest-b/same-ns-priv)
-(assert= 'cljc-nstest-a (find-ns 'cljc-nstest-a))
+(require 'clove-nstest-b)
+(assert= "clove-nstest-b" clove-nstest-b/saw-ns)
+(assert= 1 clove-nstest-b/refer-val)
+(assert= 1 clove-nstest-b/alias-val)
+(assert= '{na clove-nstest-a} clove-nstest-b/own-aliases)
+(assert= :denied clove-nstest-b/denied)
+(assert= 2 clove-nstest-b/via-var)
+(assert= :ph clove-nstest-b/same-ns-priv)
+(assert= 'clove-nstest-a (find-ns 'clove-nstest-a))
 (assert= nil (find-ns 'no.such.ns))
-(assert= true (contains? (set (all-ns)) 'cljc-nstest-b))
-(assert= ["caller" "pub"] (vec (sort (map str (keys (ns-publics 'cljc-nstest-a))))))
+(assert= true (contains? (set (all-ns)) 'clove-nstest-b))
+(assert= ["caller" "pub"] (vec (sort (map str (keys (ns-publics 'clove-nstest-a))))))
 (assert= ["caller" "hidden" "phelper" "pub"]
-         (vec (sort (map str (keys (ns-interns 'cljc-nstest-a))))))
+         (vec (sort (map str (keys (ns-interns 'clove-nstest-a))))))
 (assert= "user" (str *ns*))                   ; require didn't leak its ns
 (assert= 'x.y (create-ns 'x.y))
 (assert= 'x.y (find-ns 'x.y))
-(sh "rm -f cljc_nstest_a.clj cljc_nstest_b.clj")
+(sh "rm -f clove_nstest_a.clj clove_nstest_b.clj")
 
 ; ── closures created in a loop capture THAT iteration's bindings ──
 ; VOP_REBIND used to mutate the loop frame's slots in place, so a closure
@@ -2741,30 +2742,30 @@
          (loop [i 0] (if (< i 10000) (recur (inc i)) i)))
 
 ; ── docs / source / reader-error QoL ──
-(defn- doc-str [sym] (with-out-str (cljc/print-doc* sym)))
+(defn- doc-str [sym] (with-out-str (clove/print-doc* sym)))
 (assert= true (clojure.string/includes? (doc-str 'map) "lazy sequence"))       ; core docstring
 (assert= true (clojure.string/includes? (doc-str 'str/join) "separated"))     ; flat str/ alias doc
 (defn docqol-f "My test doc." [x] (* x 2))
 (assert= true (clojure.string/includes? (doc-str 'docqol-f) "My test doc."))  ; user docstring
 (assert= true (clojure.string/includes?                                        ; source reconstructs
-               (with-out-str (cljc/print-source* 'docqol-f)) "(* x 2)"))
+               (with-out-str (clove/print-source* 'docqol-f)) "(* x 2)"))
 (assert= true (clojure.string/includes?                                        ; reader errors carry a line
                (ex-message (try (read-string "(def a\n  (let [x 1\n") (catch Exception e e)))
                "(line 3)"))
 
 ; ── #! shebang lines are reader comments (Clojure's dispatch comment reader) ──
-;; An executable script starts with #!/usr/bin/env cljc; the reader must skip
+;; An executable script starts with #!/usr/bin/env clove; the reader must skip
 ;; that line WITHOUT consuming its newline, so error line numbers stay honest.
-(assert= 42 (read-string "#!/usr/bin/env cljc\n42"))
+(assert= 42 (read-string "#!/usr/bin/env clove\n42"))
 (assert= [1 2] (read-string "[1 #! inline comment\n 2]"))   ; comment anywhere, not just line 1
-(spit "cljc_shebang_test.clj"
-      "#!/usr/bin/env cljc\n(def sheb-x 7)\n(defn sheb-f [n] (nth [1 2 3] n))\n")
-(load-file "cljc_shebang_test.clj")
+(spit "clove_shebang_test.clj"
+      "#!/usr/bin/env clove\n(def sheb-x 7)\n(defn sheb-f [n] (nth [1 2 3] n))\n")
+(load-file "clove_shebang_test.clj")
 (assert= 7 sheb-x)
 (try (sheb-f 99) (catch Exception e nil))
 ;; line 3, not line 2: the shebang consumed a line but not its terminator
-(assert= true (clojure.string/includes? (cljc/last-trace*) "cljc_shebang_test.clj:3"))
-(sh "rm -f cljc_shebang_test.clj")
+(assert= true (clojure.string/includes? (clove/last-trace*) "clove_shebang_test.clj:3"))
+(sh "rm -f clove_shebang_test.clj")
 
 ; ── host-interop + numeric-tower gaps found bringing up minijax (2026-09-13) ──
 ;; Clojure coerces at integer positions (RT.intCast): truncation toward zero.
@@ -2804,7 +2805,7 @@
 
 ;; Math/signum: NaN and both zeros pass through unchanged
 (assert= [-1.0 1.0 0.0] [(Math/signum -3.0) (Math/signum 2.5) (Math/signum 0.0)])
-(assert= true (cljc/nan?* (Math/signum ##NaN)))
+(assert= true (clove/nan?* (Math/signum ##NaN)))
 
 ;; java.util.Random is the JVM's 48-bit LCG, value-for-value
 (let [r (java.util.Random. 42)]
@@ -2841,7 +2842,7 @@
 (assert= 1 (.compareTo (BigDecimal. "1.005") (BigDecimal. "1")))
 (assert= 2.5 (double (BigDecimal. "2.5")))
 
-;; BigDecimal is a real number type (CLJC_BIGDEC), not a tagged map: the core
+;; BigDecimal is a real number type (CLOVE_BIGDEC), not a tagged map: the core
 ;; numeric ops, =, hash, compare and the printer all know it
 (assert= 3.0M (+ 1.5M 1.5M))
 (assert= 3.0M (let [b (BigDecimal. "1.5")] (+ b b)))
@@ -2893,33 +2894,33 @@
   (assert= 'docqol-f (:name m))
   (assert= "My test doc." (:doc m))
   (assert= '([x]) (:arglists m)))
-(spit "cljc_tracetest.clj"
+(spit "clove_tracetest.clj"
       "(defn tt-f [x]\n  (nth [1 2 3] x))\n(defn tt-g [y]\n  (tt-f (+ y 90)))\n(tt-g 9)\n")
-(let [tr (do (try (load-file "cljc_tracetest.clj") (catch Exception e nil))
-             (cljc/last-trace*))]
+(let [tr (do (try (load-file "clove_tracetest.clj") (catch Exception e nil))
+             (clove/last-trace*))]
   ;; frames from a loaded file carry file:line (main-script frames stay bare "line N")
-  (assert= true (clojure.string/includes? tr "at (nth ...) cljc_tracetest.clj:2"))
+  (assert= true (clojure.string/includes? tr "at (nth ...) clove_tracetest.clj:2"))
   ;; tt-f tail-calls the NATIVE nth: a native does not reuse the caller's frame,
   ;; so (tt-f ...) must still be in the trace (it used to be overwritten)
-  (assert= true (clojure.string/includes? tr "at (tt-f ...) cljc_tracetest.clj:4"))
-  (assert= true (clojure.string/includes? tr "at (tt-g ...) cljc_tracetest.clj:5")))
-(sh "rm -f cljc_tracetest.clj")
+  (assert= true (clojure.string/includes? tr "at (tt-f ...) clove_tracetest.clj:4"))
+  (assert= true (clojure.string/includes? tr "at (tt-g ...) clove_tracetest.clj:5")))
+(sh "rm -f clove_tracetest.clj")
 
 ; ── QoL round 3: pprint, native arglists, exe-dir ──
-(assert= "{:a 1}" (cljc/pprint-str* {:a 1} 80))
-(let [pp (cljc/pprint-str* (vec (range 40)) 40)]
+(assert= "{:a 1}" (clove/pprint-str* {:a 1} 80))
+(let [pp (clove/pprint-str* (vec (range 40)) 40)]
   (assert= true (clojure.string/includes? pp "\n"))     ; wide vector breaks across lines
   (assert= (vec (range 40)) (read-string pp)))          ; and still reads back
-(let [pp (cljc/pprint-str* {:k (vec (range 30)) :other "x"} 50)]
+(let [pp (clove/pprint-str* {:k (vec (range 30)) :other "x"} 50)]
   (assert= {:k (vec (range 30)) :other "x"} (read-string pp)))
 (assert= true (clojure.string/includes? (doc-str 'conj) "[coll x & xs]"))  ; native arglists in doc
 (assert= '([map key] [map key not-found]) (:arglists (meta (var get))))
-(assert= true (string? (cljc/exe-dir*)))
+(assert= true (string? (clove/exe-dir*)))
 
 ; ── QoL round 4: special-form docs, dir, dbg/#p, named fn printing, pst ──
 (assert= true (clojure.string/includes? (doc-str 'if) "Special form"))
 (assert= true (clojure.string/includes? (doc-str 'when) "truthy"))
-(assert= true (clojure.string/includes? (with-out-str (cljc/dir* 'clojure.set)) "union"))
+(assert= true (clojure.string/includes? (with-out-str (clove/dir* 'clojure.set)) "union"))
 (assert= true (clojure.string/includes? (pr-str (fn [ab cd] ab)) "[ab cd]"))
 (defn qol4-named [x] x)
 (assert= true (clojure.string/includes? (pr-str qol4-named) "qol4-named"))
@@ -2957,25 +2958,25 @@
 (assert= -1  (compare 'a 'aa))
 (assert= ["" "a" "aa" "abc" "b"] (vec (sorted-set "b" "a" "aa" "" "abc")))
 (assert= "20" (subs (str (java.time.Instant/now)) 0 2))       ; 21st century, not 1970
-(let [us (quot (cljc/now-us*) 1000)                           ; read first, so ms >= us
+(let [us (quot (clove/now-us*) 1000)                           ; read first, so ms >= us
       ms (System/currentTimeMillis)]
   (assert= true (and (<= us ms) (< (- ms us) 5000))))         ; one clock, one epoch
 ; getpid: native, so no require and no FFI (libc.clj also binds it, but that
 ; needs dlopen and self-skips on Windows). Bounds only -- the value varies.
-(assert= true (pos? (cljc/getpid)))
-(assert= :int (type (cljc/getpid)))
-(assert= true (= (cljc/getpid) (cljc/getpid)))               ; stable within a process
-(assert= :int (type (cljc/getuid)))
-(assert= true (>= (cljc/getuid) 0))
+(assert= true (pos? (clove/getpid)))
+(assert= :int (type (clove/getpid)))
+(assert= true (= (clove/getpid) (clove/getpid)))               ; stable within a process
+(assert= :int (type (clove/getuid)))
+(assert= true (>= (clove/getuid) 0))
 
 ; The FFI module cache is dlopen'd, so it must not sit at a path shared with
 ; other users in a world-writable /tmp: anyone could plant a .so there and get
 ; it executed in this process. It lives in a private 0700 per-user dir, and is
 ; loaded only when `test -O` says this user owns it. (ls, not stat -c: BSD stat
 ; takes different flags and CI runs macOS.)
-(when cljc-test-unix?
-(let [d (cljc/user-tmp-dir*)]
-  (assert= true (str/includes? d (str "cljc-" (cljc/getuid))))     ; per-user path
+(when clove-test-unix?
+(let [d (clove/user-tmp-dir*)]
+  (assert= true (str/includes? d (str "clove-" (clove/getuid))))     ; per-user path
   (assert= 0 (:exit (sh (str "test -d " d " && test -O " d))))     ; exists, ours
   (assert= true (str/starts-with? (:out (sh (str "ls -ld " d))) "drwx------")))
 ) ; end when-unix
@@ -2984,11 +2985,11 @@
 ; no-op stub: it returned nil and the script ran on, so `cmd || echo failed`
 ; never fired. Needs a subprocess -- calling it here would end this run --
 ; so it is unix-gated like the other exe-spawning sections: the binary is
-; cljc.exe on Windows, and the temp path must not be an absolute POSIX one
+; clove.exe on Windows, and the temp path must not be an absolute POSIX one
 ; (a mingw build resolves /tmp against the current drive root).
-(when cljc-test-unix?
-(let [exe (str (cljc/exe-dir*) "/cljc")
-      f   (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-exit-" (cljc/getpid) ".clj")]
+(when clove-test-unix?
+(let [exe (str (clove/exe-dir*) "/clove")
+      f   (str (or (System/getenv "TMPDIR") "/tmp") "/clove-exit-" (clove/getpid) ".clj")]
   (spit f "(println \"before\")(System/exit 3)(println \"after\")")
   (let [r (sh (str exe " " f))]
     (assert= 3 (:exit r))
@@ -3002,42 +3003,42 @@
 
 ; ── TUI natives: raw-mode* / read-key* / term-size* ──
 ; term-size* is portable: a real ioctl when there is a tty, [24 80] otherwise.
-(let [sz (cljc/term-size*)]
+(let [sz (clove/term-size*)]
   (assert= 2 (count sz))
   (assert= :int (type (first sz)))
   (assert= true (and (pos? (first sz)) (pos? (second sz)))))
 
-(when cljc-test-unix?
+(when clove-test-unix?
 ; read-key* reads fd 0 with read()/select(), which do not require a tty -- so
 ; these drive it from a pipe, with no pty and no sleeps to go flaky. Escape
 ; sequences must arrive whole, a lone ESC must fall out of the 30ms window,
 ; and multi-byte UTF-8 must be gathered into ONE character (count 1, not 2).
-(let [exe (str (cljc/exe-dir*) "/cljc")
-      f   (str "/tmp/cljc-key-" (cljc/getpid) ".clj")
+(let [exe (str (clove/exe-dir*) "/clove")
+      f   (str "/tmp/clove-key-" (clove/getpid) ".clj")
       run (fn [in] (str/trim (:out (sh (str "printf '" in "' | " exe " " f)))))]
-  (spit f "(println (str/join \",\" (map int (seq (cljc/read-key*)))))")
+  (spit f "(println (str/join \",\" (map int (seq (clove/read-key*)))))")
   (assert= "27,91,65"           (run "\\033[A"))        ; Up arrow: whole CSI
   (assert= "113"                (run "q"))               ; plain key
   (assert= "27"                 (run "\\033"))          ; lone Esc, not a prefix
   (assert= "233"                (run "\\303\\251"))    ; é: one char, not two bytes
   (assert= "27,91,49,59,53,65"  (run "\\033[1;5A"))     ; CSI with parameters
-  (spit f "(prn (cljc/read-key*))")
+  (spit f "(prn (clove/read-key*))")
   (assert= "nil" (run ""))                               ; EOF
   ; raw-mode* declines when stdin is not a tty, rather than erroring
-  (spit f "(prn (cljc/raw-mode* true))")
+  (spit f "(prn (clove/raw-mode* true))")
   (assert= "false" (str/trim (:out (sh (str exe " " f " < /dev/null")))))
   (sh (str "rm -f " f)))
 ) ; end when-unix
 
-; `cljc test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
-; Uses the native cljc/list-dir* (nil for a non-dir, [] -- truthy -- for an
+; `clove test` discovery: recursive, sorted, skips vendor/target/hidden dirs.
+; Uses the native clove/list-dir* (nil for a non-dir, [] -- truthy -- for an
 ; empty one), so it needs no FFI. Exercised against a temp tree.
 ; Unix-gated: builds the tree with mkdir -p / rm -rf, and an absolute POSIX
 ; temp path is meaningless to a mingw build. find-test-files itself is portable.
 (load-file "test.clj")   ; explicit: otherwise bound only via the clojure.test
                          ; shim required far above, which is cached/idempotent
-(when cljc-test-unix?
-(let [root (str (or (System/getenv "TMPDIR") "/tmp") "/cljc-disc-" (cljc/getpid))]
+(when clove-test-unix?
+(let [root (str (or (System/getenv "TMPDIR") "/tmp") "/clove-disc-" (clove/getpid))]
   (sh (str "rm -rf " root "; mkdir -p " root "/test/sub " root "/vendor " root "/.hid"))
   (spit (str root "/a_test.clj") "")
   (spit (str root "/test/sub/b_test.cljc") "")
@@ -3046,7 +3047,7 @@
   (spit (str root "/notatest.clj") "")                    ; wrong suffix
   (assert= ["a_test.clj" "test/sub/b_test.cljc"]
            (mapv #(subs % (inc (count root)))
-                 (cljc/find-test-files root)))
+                 (clove/find-test-files root)))
   (sh (str "rm -rf " root)))
 ) ; end when-unix
 (assert= "2025-07-02T23:46:40Z"
@@ -3124,14 +3125,14 @@
 (assert= true (fn? vendor!))                       ; vendor! callable from the REPL
 
 ; ── ecosystem-sweep round: #^ metadata, regex escape pairs, new, with-open ──
-(cljc/eval-forms* "(ns #^{:author \"a\"} sweep.metans2) (def in-ns-val 7)")
+(clove/eval-forms* "(ns #^{:author \"a\"} sweep.metans2) (def in-ns-val 7)")
 (assert= true (some? (find-ns 'sweep.metans2)))       ; ns registers despite name meta
 (assert= 7 sweep.metans2/in-ns-val)
 (assert= "aQb" (str/replace "a\\b" #"\\" "Q"))       ; #"\\" = one literal backslash...
 (assert= "Q" (str/replace "\\\\" #"\\\\" "Q"))      ; ...#"\\\\" = two (escape PAIRS)
 (assert= "x" (re-find #"\"|x" "axb"))                 ; \" inside a pattern
 (assert= "ok" (str (new StringBuilder) "ok"))         ; (new Cls args*) sugar
-(assert= 3 (with-open [r {:cljc/type :NopCloseable}] 3))  ; with-open runs + closes
+(assert= 3 (with-open [r {:clove/type :NopCloseable}] 3))  ; with-open runs + closes
 (in-ns 'user)
 
 ; ── prim_sort GC pinning: sorting a MAP's entries with an allocating
@@ -3163,7 +3164,7 @@
 (assert= [1 2] (vec (sort (vals (sort-by key {:a 1 :b 2})))))
 (assert= [:a :b] (vec (sort (keys (seq {:a 1 :b 2})))))
 ;; syntax-quote resolves ALIAS-qualified symbols to the full ns
-(cljc/eval-forms* "(ns sq.provider) (defn pfn [] :from-provider)
+(clove/eval-forms* "(ns sq.provider) (defn pfn [] :from-provider)
 (ns sq.consumer (:require [sq.provider :as sqp]))
 (defmacro emit-call [] `(sqp/pfn))" "sqtest")
 (in-ns 'user)
@@ -3211,7 +3212,7 @@
     `(do ~@(map (fn [[m params & body]]
                   `(defmethod ~m ~t ~(vec params) ~@body))
                 impls)
-         {:cljc/type ~t})))
+         {:clove/type ~t})))
 (def i26-a (i26-reify (i26-area [s] 25)))
 (def i26-b (i26-reify (i26-area [s] 49)))
 (assert= 25 (i26-area i26-a))
@@ -3248,7 +3249,7 @@
 (assert= '(inc 3) (macroexpand-1 '(s50-m2 3)))
 (defn s50-in-fn [] (s50-m2 10))          ; VM-compiled body path
 (assert= 11 (s50-in-fn))
-;; :bb reader-conditional feature: priority cljc > bb > default > clj
+;; :bb reader-conditional feature: priority clove > bb > default > clj
 (assert= :bb #?(:bb :bb :clj :clj))
 (assert= :bb #?(:clj :clj :bb :bb))
 (assert= :bb #?(:bb :bb :default :d))
@@ -3293,25 +3294,25 @@
 (assert= true (instance? clojure.lang.Cons (list 1 2)))
 
 ;; macros expand under the namespace the form was WRITTEN in (JVM: definition-
-;; time expansion), not the caller's: cljc expands lazily at first call, so
+;; time expansion), not the caller's: clove expands lazily at first call, so
 ;; a macro reading *ns* / (ns-aliases *ns*) inside a library fn called from
 ;; user saw `user` (meander's alias-qualified operator symbols). *ns* is
 ;; restored afterwards, including when the expansion throws (ErrFrame).
-(spit "cljc_s50_nslib.clj" "(ns s50ns.lib (:require [clojure.string :as s50str]))
+(spit "clove_s50_nslib.clj" "(ns s50ns.lib (:require [clojure.string :as s50str]))
 (defmacro s50-ns-now [] (list 'quote *ns*))
 (defmacro s50-alias-of [a] (list 'quote (get (ns-aliases *ns*) a)))
 (defn s50-ns-probe [] (s50-ns-now))
 (defn s50-alias-probe [] (s50-alias-of s50str))
 (defmacro s50-boom [] (throw (ex-info \"boom\" {})))
 (defn s50-boom-fn [] (s50-boom))")
-(load-file "cljc_s50_nslib.clj")
+(load-file "clove_s50_nslib.clj")
 (assert= 'user *ns*)
 (assert= 's50ns.lib (s50ns.lib/s50-ns-probe))
 (assert= 'clojure.string (s50ns.lib/s50-alias-probe))
 (assert= 'user *ns*)
 (assert= "boom" (try (s50ns.lib/s50-boom-fn) (catch Exception e (ex-message e))))
 (assert= 'user *ns*)
-(sh "rm -f cljc_s50_nslib.clj")
+(sh "rm -f clove_s50_nslib.clj")
 
 ; ── int64 overflow: + - * inc dec throw "long overflow" (they used to wrap
 ;    silently); +' -' *' promote; unchecked-* are the ones that wrap ──
@@ -3396,7 +3397,7 @@
 (assert= :nfe (try (Double/parseDouble "x") (catch NumberFormatException e :nfe)))
 (assert= [42 1.5 nil] [(Integer/parseInt "42") (Double/parseDouble "1.5") (parse-long "zz")])
 (assert= :iae (try (case 3 1 :one) (catch IllegalArgumentException e :iae)))
-(when cljc-test-coro?
+(when clove-test-coro?
   (assert= "f" (try @(future (throw (IllegalStateException. "f")))
                     (catch IllegalArgumentException e :wrong)
                     (catch IllegalStateException e (ex-message e)))))
@@ -3424,9 +3425,9 @@
 (assert= "custom" (str (reify Object (toString [_] "custom"))))    ; toString dispatch intact
 (assert= "abc" (str (StringBuilder. "abc")))
 
-; ── `cljc -e A -e B`: a repeated -e separates expressions ──
-(when cljc-test-unix?
-  (let [exe (str (cljc/exe-dir*) "/cljc")]
+; ── `clove -e A -e B`: a repeated -e separates expressions ──
+(when clove-test-unix?
+  (let [exe (str (clove/exe-dir*) "/clove")]
     (assert= "3" (str/trim (:out (sh (str exe " -e '(def a 1)' -e '(+ a 2)'")))))))
 
 
@@ -3458,14 +3459,14 @@
 (assert= :cce (try (+ 1 "a") (catch NullPointerException e :wrong) (catch ClassCastException e :cce)))
 (assert= :npe (try (quot nil 2) (catch ArithmeticException e :wrong) (catch NullPointerException e :npe)))
 
-;; claude.clj (`? question` at the REPL): request shape + the cljc_eval tool, no network
+;; claude.clj (`? question` at the REPL): request shape + the clove_eval tool, no network
 (require '[claude])
-(let [m (claude/first-message "why?" "cljc[1]> (+ 1 2)\n[1] 3\n")
+(let [m (claude/first-message "why?" "clove[1]> (+ 1 2)\n[1] 3\n")
       body (claude/request [m])]
   (assert= "user" (get m "role"))
   (assert= true (str/ends-with? (get m "content") "</repl-transcript>\n\nwhy?"))
   (assert= "why?" (get (claude/first-message "why?" "") "content"))
-  (assert= ["claude-opus-5-5" "adaptive" true ["cljc_lookup" "propose_form"]]
+  (assert= ["claude-opus-5-5" "adaptive" true ["clove_lookup" "propose_form"]]
            [(get body "model") (get-in body ["thinking" "type"]) (get body "stream") (mapv #(get % "name") (get body "tools"))])
   (assert= true (map? (json/parse (json/write body)))))
 (assert= ":x\n=> 3" (#'claude/eval-code "(println :x) (+ 1 2)"))
@@ -3488,11 +3489,11 @@
   (assert= "tool_use" (:stop st))
   (assert= [{"type" "text" "text" "hi"} {"type" "tool_use" "id" "t" "name" "propose_form" "input" {"code" "(inc 1)"}}]
            (vec (vals (:blocks st)))))
-;; cljc/sh-lines*: one call per output line, exit status back; a throw closes the pipe
+;; clove/sh-lines*: one call per output line, exit status back; a throw closes the pipe
 (let [ls (atom [])]
-  (assert= 3 (cljc/sh-lines* "printf 'a\\nb\\n'; exit 3" #(swap! ls conj %)))
+  (assert= 3 (clove/sh-lines* "printf 'a\\nb\\n'; exit 3" #(swap! ls conj %)))
   (assert= ["a" "b"] @ls))
-(assert= "stop" (try (cljc/sh-lines* "yes" (fn [_] (throw (ex-info "stop" {})))) (catch Exception e (ex-message e))))
+(assert= "stop" (try (clove/sh-lines* "yes" (fn [_] (throw (ex-info "stop" {})))) (catch Exception e (ex-message e))))
 
-(println (str "tests complete: " @cljc-test-passed " passed, " @cljc-test-failed " failed"))
-(when (pos? @cljc-test-failed) (System/exit 1))
+(println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
+(when (pos? @clove-test-failed) (System/exit 1))

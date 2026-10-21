@@ -1,14 +1,14 @@
-;; ffi-demo.clj — call real C functions from cljc through the FFI.
+;; ffi-demo.clj — call real C functions from clove through the FFI.
 ;;
-;; Showcases cljc's signature feature: you declare C function signatures as
+;; Showcases clove's signature feature: you declare C function signatures as
 ;; DATA, and (ffi/define ...) generates the marshalling glue, compiles a tiny
-;; shared library with `cc`, dlopens it, and binds each name as a cljc fn.
+;; shared library with `cc`, dlopens it, and binds each name as a clove fn.
 ;; Modules are cached by content hash, so the first run compiles (~100ms) and
 ;; later runs just dlopen.
 ;;
 ;; Requires a C compiler (cc) on PATH at runtime — that's the FFI's trade.
 ;;
-;; Run:  cljc examples/ffi-demo.clj
+;; Run:  clove examples/ffi-demo.clj
 
 ;; clj-kondo can't see runtime-defined FFI names; declare them like libc.clj.
 (declare c-hypot c-tgamma c-pow getpid strlen)
@@ -31,7 +31,7 @@
 (println (format "  pow(2, 10)    = %.0f    (native libm)" (pow 2.0 10.0)))
 (println (format "  tgamma(6)     = %.0f     (== 5! = 120)" (tgamma 6.0)))
 (println (format "  getpid()      = %d   (this process, from libc)" (getpid)))
-(println (format "  strlen(\"cljc\") = %d        (libc counted the bytes)" (strlen "cljc")))
+(println (format "  strlen(\"clove\") = %d        (libc counted the bytes)" (strlen "clove")))
 
 (println)
 (println "Each name above is a real C symbol the runtime compiled glue for and")

@@ -1,4 +1,4 @@
-;; csp-http-server.clj — a concurrent async HTTP server on cljc's coroutine
+;; csp-http-server.clj — a concurrent async HTTP server on clove's coroutine
 ;; event loop. Every connection is handled by its own `go` block; the scheduler
 ;; multiplexes them all over a single thread with poll() — no threads, no locks.
 ;;
@@ -7,8 +7,8 @@
 ;; state (a hit counter) mutated safely across concurrent handlers because the
 ;; scheduler is cooperative.
 ;;
-;; Run:  cljc examples/csp-http-server.clj          (port 8090, all interfaces)
-;;       cljc examples/csp-http-server.clj 9000
+;; Run:  clove examples/csp-http-server.clj          (port 8090, all interfaces)
+;;       clove examples/csp-http-server.clj 9000
 ;; Then: curl localhost:8090   (or open it in a browser, also over tailscale)
 
 (def *load-path* (into [".." "."] *load-path*))
@@ -18,9 +18,9 @@
 
 (defn page [n]
   (str "<!doctype html><meta charset=utf-8>"
-       "<title>cljc async server</title>"
+       "<title>clove async server</title>"
        "<body style='font:16px system-ui;max-width:40em;margin:3em auto'>"
-       "<h1>Served by cljc 🧵</h1>"
+       "<h1>Served by clove 🧵</h1>"
        "<p>This response came from a <code>go</code> block, one of possibly many"
        " running concurrently on a <b>single thread</b> — multiplexed by a"
        " poll()-driven event loop built on stackful coroutines.</p>"

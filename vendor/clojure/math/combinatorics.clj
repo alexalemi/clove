@@ -1,4 +1,4 @@
-;; clojure.math.combinatorics — the commonly used subset, pure cljc.
+;; clojure.math.combinatorics — the commonly used subset, pure clove.
 
 (ns clojure.math.combinatorics)
 

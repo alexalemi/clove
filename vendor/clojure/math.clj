@@ -1,5 +1,5 @@
 (ns clojure.math
-  "Wrappers over cljc's Math/* host primitives (clojure.math, Clojure 1.11).")
+  "Wrappers over clove's Math/* host primitives (clojure.math, Clojure 1.11).")
 
 (def PI Math/PI)
 (def E  2.718281828459045)

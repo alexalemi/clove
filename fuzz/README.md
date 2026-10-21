@@ -33,12 +33,12 @@ differently from `Ratio.doubleValue`, `(str/replace s "" r)` erroring,
 
 What it deliberately steers around (see the comments in the generator):
 - hash order: sets and maps only reach the printer through sorted views
-- in-range BigInts print without `N` in cljc (they demote to longs);
+- in-range BigInts print without `N` in clove (they demote to longs);
   `fuzz.sh` strips the suffix from both sides before diffing
-- float division by an exact zero: cljc gives `##Inf`, as compiled Clojure
+- float division by an exact zero: clove gives `##Inf`, as compiled Clojure
   does with primitive doubles; boxed JVM math and bb throw
 - `Long/MIN_VALUE` as an operand: boxed JVM math computes `(- x y)` as
-  `(+ x (- y))` and overflows where the primitive path and cljc do not
+  `(+ x (- y))` and overflows where the primitive path and clove do not
 - exception messages: only the class of a throw is compared
 
 ## String/regex fuzzing
@@ -46,19 +46,19 @@ What it deliberately steers around (see the comments in the generator):
 String/regex-focused fuzzer used to validate the codepoint-strings work.
 
 ```sh
-python3 gen_str.py 42 400 bmp > bmp.txt     # BMP corpus: cljc must match bb exactly
+python3 gen_str.py 42 400 bmp > bmp.txt     # BMP corpus: clove must match bb exactly
 python3 gen_str.py 43 400 inv > inv.txt     # invariants: every line must print true
 
-cljc runner_cljc.clj bmp.txt > a.txt
+clove runner_clove.clj bmp.txt > a.txt
 bb -f runner.clj -- bmp.txt > b.txt
 diff a.txt b.txt                             # empty = no divergences
 
-cljc runner_cljc.clj inv.txt | grep -v '^true$'          # empty = all hold
-CLJC_GC_STRESS=1 cljc runner_cljc.clj inv.txt | grep -v '^true$'
+clove runner_clove.clj inv.txt | grep -v '^true$'          # empty = all hold
+CLOVE_GC_STRESS=1 clove runner_clove.clj inv.txt | grep -v '^true$'
 ```
 
 The BMP corpus stays below U+10000 because JVM strings index UTF-16 code
-units — astral chars legitimately count as 2 there and 1 in cljc — so
+units — astral chars legitimately count as 2 there and 1 in clove — so
 astral inputs are exercised by the self-consistency invariants instead.
 
 ## Conformance corpus
@@ -70,11 +70,11 @@ ratios/bignums/double printing, strings/regex, collections, seq library,
 destructuring, transducers, multimethods, error handling) rather than
 generated strings. `conformance_expected.txt` is the golden output; every
 line was verified against JVM Clojure semantics. `make conformance` (also
-part of `make test`) diffs cljc against the golden, and re-derives the
+part of `make test`) diffs clove against the golden, and re-derives the
 golden live when `bb` is on PATH:
 
 ```sh
-cljc runner_cljc.clj conformance.txt | diff - conformance_expected.txt
+clove runner_clove.clj conformance.txt | diff - conformance_expected.txt
 bb -f runner.clj -- conformance.txt > conformance_expected.txt   # regenerate golden
 ```
 

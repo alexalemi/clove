@@ -1,11 +1,11 @@
-;; csp.clj — a core.async-flavored CSP library for cljc, built on the C
+;; csp.clj — a core.async-flavored CSP library for clove, built on the C
 ;; coroutine primitive (coro/new, coro/resume, coro/yield).
 ;;
 ;; This is the ClojureScript model of core.async, not the JVM one: single-
 ;; threaded and cooperative. A `go` block is a coroutine; `<!`/`>!` suspend it
 ;; (coro/yield) back to a scheduler when they'd block, and the scheduler
 ;; resumes it when the matching op arrives. No locks, no threads — and because
-;; cljc owns the main loop we can also offer `<!!` (blocking take), which the
+;; clove owns the main loop we can also offer `<!!` (blocking take), which the
 ;; JS flavor cannot.
 ;;
 ;; Load with: (require '[csp :as a])  or  (load-file "csp.clj")
@@ -150,7 +150,7 @@
 ;; A timeout is a channel closed by the shared timer wheel at its deadline.
 (defn timeout [ms]
   (let [ch (chan)]
-    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (close! ch)))
+    (fiber/timer! (+ (clove/now-ms*) ms) (fn [] (close! ch)))
     ch))
 
 ;; ── the async I/O event loop ────────────────────────────────────────────────
@@ -187,7 +187,7 @@
 (defn run! []                           ; pump until everything is idle
   (loop [] (when (fiber/pump!) (recur))))
 
-;; <!! — BLOCKING take from outside a go (pumps the scheduler). cljc's bonus
+;; <!! — BLOCKING take from outside a go (pumps the scheduler). clove's bonus
 ;; over JS core.async. Throws on deadlock.
 (defn <!! [ch]
   (loop []

@@ -1,7 +1,7 @@
 ;; macros.clj — writing your own syntax with defmacro + quasiquote.
 ;;
 ;; Showcases: code-as-data, quasiquote/unquote (` ~ ~@), explicit gensym for
-;; hygiene (cljc has no auto-gensym `x#`), and recursive macros that rewrite
+;; hygiene (clove has no auto-gensym `x#`), and recursive macros that rewrite
 ;; whole expression trees.
 
 ;; 1. `unless` — the mirror of `when`. The simplest useful macro: it receives

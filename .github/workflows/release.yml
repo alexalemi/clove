@@ -1,6 +1,6 @@
 # Release: on a v* tag, build portable archives for each platform and attach
 # them to a GitHub release. Archives are the `make install` layout
-# (bin/cljc + share/cljc/...), so exe-relative sharedir resolution makes them
+# (bin/clove + share/clove/...), so exe-relative sharedir resolution makes them
 # runnable from any unpack location; Windows ships a flat dir (exe-dir is on
 # the load path).
 name: Release
@@ -24,7 +24,7 @@ jobs:
           make test-full
       - name: Package
         run: |
-          D=cljc-${GITHUB_REF_NAME}-linux-x86_64
+          D=clove-${GITHUB_REF_NAME}-linux-x86_64
           make install PREFIX=/ DESTDIR="$PWD/$D"
           cp README.md CHANGELOG.md "$D/"
           tar czf "$D.tar.gz" "$D"
@@ -41,10 +41,10 @@ jobs:
       - name: Build (arm64) + smoke
         run: |
           make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
-          ./cljc -e '(println :ok)'
+          ./clove -e '(println :ok)'
       - name: Package arm64
         run: |
-          D=cljc-${GITHUB_REF_NAME}-macos-arm64
+          D=clove-${GITHUB_REF_NAME}-macos-arm64
           make install PREFIX=/ DESTDIR="$PWD/$D"
           cp README.md CHANGELOG.md "$D/"
           tar czf "$D.tar.gz" "$D"
@@ -52,9 +52,9 @@ jobs:
         run: |
           cc -arch x86_64 -O2 -Wall -Wextra -Werror \
              -Wno-unused-parameter -Wno-unused-function \
-             -DCLJC_SHAREDIR='"/usr/local/share/cljc"' \
-             -o cljc cljc.c -lm -ldl
-          D=cljc-${GITHUB_REF_NAME}-macos-x86_64
+             -DCLOVE_SHAREDIR='"/usr/local/share/clove"' \
+             -o clove clove.c -lm -ldl
+          D=clove-${GITHUB_REF_NAME}-macos-x86_64
           make install PREFIX=/ DESTDIR="$PWD/$D"
           cp README.md CHANGELOG.md "$D/"
           tar czf "$D.tar.gz" "$D"
@@ -64,7 +64,7 @@ jobs:
           path: "*.tar.gz"
 
   windows:
-    # cross-compile from Linux: mingw-w64 is verified to build cljc.exe, and
+    # cross-compile from Linux: mingw-w64 is verified to build clove.exe, and
     # the CI matrix already runs the suite on a real Windows runner
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -75,12 +75,12 @@ jobs:
       - name: Build
         run: |
           x86_64-w64-mingw32-gcc -O2 -Wall -Wno-unused-parameter -Wno-unused-function \
-            -DCLJC_SHAREDIR='"c:/cljc"' -o cljc.exe cljc.c -lm -lws2_32
+            -DCLOVE_SHAREDIR='"c:/clove"' -o clove.exe clove.c -lm -lws2_32
       - name: Package (flat dir — exe-dir is on the load path)
         run: |
-          D=cljc-${GITHUB_REF_NAME}-windows-x86_64
+          D=clove-${GITHUB_REF_NAME}-windows-x86_64
           mkdir "$D"
-          cp cljc.exe cljc.c README.md CHANGELOG.md "$D/"
+          cp clove.exe clove.c README.md CHANGELOG.md "$D/"
           cp docs.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj \
              bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj "$D/"
           cp -r vendor "$D/vendor"
@@ -103,6 +103,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "cljc $GITHUB_REF_NAME" \
+            --title "clove $GITHUB_REF_NAME" \
             --generate-notes \
             *.tar.gz *.zip

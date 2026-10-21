@@ -1,8 +1,8 @@
-# CI: build + full regression suite on every platform cljc claims to support.
+# CI: build + full regression suite on every platform clove claims to support.
 # The suite self-skips platform-dependent sections (see the capability probes
 # at the top of tests.clj), so one tests.clj runs everywhere.
 #
-# Pass/fail is cljc's exit status plus the suite's last line ("tests complete:
+# Pass/fail is clove's exit status plus the suite's last line ("tests complete:
 # N passed, 0 failed") -- tests.clj exits 1 on any failed assertion, and a
 # script-mode abort exits non-zero before that line prints. Never grep the
 # output for "fail|error": tests legitimately print those words.
@@ -32,19 +32,19 @@ jobs:
       # and the conservative stack scan then roots values that -O1 drops --
       # which hides exactly the missing-GC-root bugs this job exists to find.
       # -fno-sanitize-recover: a UBSan report fails the run via exit status.
-      # Named ./cljc, not cljc-asan: the suite re-invokes "<exe-dir>/cljc" and
-      # "./cljc" for its subprocess tests (exit codes, bundle, judge, TUI
+      # Named ./clove, not clove-asan: the suite re-invokes "<exe-dir>/clove" and
+      # "./clove" for its subprocess tests (exit codes, bundle, judge, TUI
       # natives), so the sanitizer build has to BE that binary -- otherwise
       # those tests fail with "not found", and they run uninstrumented anyway.
       - name: Build with ASan/UBSan
-        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o cljc cljc.c -lm -ldl
+        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o clove clove.c -lm -ldl
       - name: Test under sanitizers
         env:
           # conservative stack scanning reads the whole stack range and never
           # frees pool blocks — leak/UAR checkers must be off (same as Boehm)
           ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
         run: |
-          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          rc=0; ./clove tests.clj > out.txt 2>&1 || rc=$?
           tail -1 out.txt
           if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS$' out.txt | tail -60; exit 1; fi
@@ -58,13 +58,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build with ASan/UBSan
-        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o cljc cljc.c -lm -ldl
+        run: cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o clove clove.c -lm -ldl
       - name: Test under sanitizers (GC stress)
         env:
           ASAN_OPTIONS: detect_leaks=0:detect_stack_use_after_return=0
-          CLJC_GC_STRESS: "1"
+          CLOVE_GC_STRESS: "1"
         run: |
-          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          rc=0; ./clove tests.clj > out.txt 2>&1 || rc=$?
           tail -1 out.txt
           if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS$' out.txt | tail -60; exit 1; fi
@@ -78,19 +78,19 @@ jobs:
         run: make CFLAGS='-O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function'
       - name: Timing probe
         run: |
-          time ./cljc -e '(Thread/sleep 100)'
-          time ./cljc -e '(let [f1 (future (Thread/sleep 50)) f2 (future (Thread/sleep 50))] @f1 @f2 (println :ok))'
+          time ./clove -e '(Thread/sleep 100)'
+          time ./clove -e '(let [f1 (future (Thread/sleep 50)) f2 (future (Thread/sleep 50))] @f1 @f2 (println :ok))'
       - name: Test (normal)
         env:
-          CLJC_UNBUFFERED: "1"
+          CLOVE_UNBUFFERED: "1"
         run: |
-          rc=0; time ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          rc=0; time ./clove tests.clj > out.txt 2>&1 || rc=$?
           echo "suite rc=$rc: $(tail -1 out.txt)"
           if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS$' out.txt | tail -60; exit 1; fi
       - name: Test (GC stress)
         run: |
-          rc=0; CLJC_GC_STRESS=1 ./cljc tests.clj > out2.txt 2>&1 || rc=$?
+          rc=0; CLOVE_GC_STRESS=1 ./clove tests.clj > out2.txt 2>&1 || rc=$?
           echo "suite rc=$rc: $(tail -1 out2.txt)"
           if [ $rc -ne 0 ] || ! tail -1 out2.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS$' out2.txt | tail -60; exit 1; fi
@@ -108,16 +108,16 @@ jobs:
         run: |
           cc -arch x86_64 -O2 -Wall -Wextra -Werror \
              -Wno-unused-parameter -Wno-unused-function \
-             -DCLJC_SHAREDIR='"/usr/local/share/cljc"' \
-             -o cljc cljc.c -lm -ldl
-          file cljc
+             -DCLOVE_SHAREDIR='"/usr/local/share/clove"' \
+             -o clove clove.c -lm -ldl
+          file clove
       - name: Test under Rosetta
         env:
-          CLJC_UNBUFFERED: "1"
+          CLOVE_UNBUFFERED: "1"
           # FFI glue must match the emulated arch, not the host's
-          CLJC_CC: "cc -arch x86_64"
+          CLOVE_CC: "cc -arch x86_64"
         run: |
-          rc=0; ./cljc tests.clj > out.txt 2>&1 || rc=$?
+          rc=0; ./clove tests.clj > out.txt 2>&1 || rc=$?
           echo "suite rc=$rc: $(tail -1 out.txt)"
           if [ $rc -ne 0 ] || ! tail -1 out.txt | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS$' out.txt | tail -60; exit 1; fi
@@ -138,25 +138,25 @@ jobs:
       - name: Build (zero warnings enforced)
         run: |
           gcc -O2 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function \
-              -static -o cljc.exe cljc.c -lm -lws2_32
+              -static -o clove.exe clove.c -lm -lws2_32
       - name: Smoke test
         run: |
-          ls -la cljc.exe
-          ./cljc.exe -e '(println :hello-windows)' || { echo "launch rc=$?"; exit 1; }
+          ls -la clove.exe
+          ./clove.exe -e '(println :hello-windows)' || { echo "launch rc=$?"; exit 1; }
       - name: Test (platform-dependent sections self-skip)
         env:
-          CLJC_UNBUFFERED: "1"
+          CLOVE_UNBUFFERED: "1"
         run: |
-          rc=0; ./cljc.exe tests.clj > out.txt 2>&1 || rc=$?
+          rc=0; ./clove.exe tests.clj > out.txt 2>&1 || rc=$?
           echo "suite rc=$rc: $(tail -1 out.txt | tr -d '\r'), lines: $(wc -l < out.txt)"
           if [ $rc -ne 0 ] || ! tail -1 out.txt | tr -d '\r' | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS' out.txt | tail -60; exit 1; fi
           grep SKIP out.txt
       - name: Test (GC stress)
         env:
-          CLJC_UNBUFFERED: "1"
+          CLOVE_UNBUFFERED: "1"
         run: |
-          rc=0; CLJC_GC_STRESS=1 ./cljc.exe tests.clj > out2.txt 2>&1 || rc=$?
+          rc=0; CLOVE_GC_STRESS=1 ./clove.exe tests.clj > out2.txt 2>&1 || rc=$?
           echo "suite rc=$rc: $(tail -1 out2.txt | tr -d '\r')"
           if [ $rc -ne 0 ] || ! tail -1 out2.txt | tr -d '\r' | grep -q '^tests complete: [0-9]* passed, 0 failed$'; then
             grep -v '^PASS' out2.txt | tail -60; exit 1; fi

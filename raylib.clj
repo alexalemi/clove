@@ -1,21 +1,21 @@
-;; raylib.clj — a cljc binding for raylib (https://www.raylib.com), built on the
+;; raylib.clj — a clove binding for raylib (https://www.raylib.com), built on the
 ;; FFI's :float and struct-by-value support.
 ;;
 ;; raylib's API is full of `float` arguments and by-value structs (Color,
 ;; Vector2, Rectangle), so this module is the headline test of those FFI
-;; features. Structs cross the boundary as plain cljc vectors:
+;; features. Structs cross the boundary as plain clove vectors:
 ;;   Color     -> [r g b a]      Vector2   -> [x y]
 ;;   Rectangle -> [x y w h]
 ;;
 ;; Link configuration is machine-specific. Override via env vars; the defaults
 ;; point at a from-source build (zig-out). For a system install (apt/brew),
-;; set:  CLJC_RAYLIB_INC=/usr/include  CLJC_RAYLIB_LIBS="-lraylib -lm"
+;; set:  CLOVE_RAYLIB_INC=/usr/include  CLOVE_RAYLIB_LIBS="-lraylib -lm"
 ;;
 ;; Load with: (require '[raylib :as rl])  or  (load-file "raylib.clj")
 
-(def rl-inc  (or (cljc/env* "CLJC_RAYLIB_INC")
+(def rl-inc  (or (clove/env* "CLOVE_RAYLIB_INC")
                  "/home/alemi/build/raylib/zig-out/include"))
-(def rl-libs (or (cljc/env* "CLJC_RAYLIB_LIBS")
+(def rl-libs (or (clove/env* "CLOVE_RAYLIB_LIBS")
                  (str "/home/alemi/build/raylib/zig-out/lib/libraylib.a "
                       "-fsanitize=undefined -lGL -lm -lpthread -ldl -lrt -lX11")))
 

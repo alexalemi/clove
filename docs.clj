@@ -1,9 +1,9 @@
 ;; docs.clj — docstrings for the core vocabulary, bulk-loaded on the first
-;; (doc ...) / (find-doc ...) via cljc/ensure-docs!. Entries are keyed by the
+;; (doc ...) / (find-doc ...) via clove/ensure-docs!. Entries are keyed by the
 ;; flat root-binding name (bare for core, "str/x" for clojure.string).
 ;; Texts are condensed from the official Clojure docstrings.
 
-(run! (fn [[n d a]] (cljc/doc-put* n d a))
+(run! (fn [[n d a]] (clove/doc-put* n d a))
  [;; ── sequences ──
   ["map" "Returns a lazy sequence of applying f to each item of coll (or to the items of multiple colls in parallel, stopping at the shortest). (map f) returns a transducer." "([f] [f coll] [f c1 c2] [f c1 c2 & colls])"]
   ["filter" "Returns a lazy sequence of the items in coll for which (pred item) is logical true. (filter pred) returns a transducer." "([pred] [pred coll])"]
@@ -56,13 +56,13 @@
   ["reverse" "The items in reverse order (eager)." "([coll])"]
   ["sort" "Sorted seq of coll; (sort comp coll) with a comparator." "([coll] [comp coll])"]
   ["sort-by" "Sorts by (keyfn item), optionally with a comparator." "([keyfn coll] [keyfn comp coll])"]
-  ["shuffle" "A random permutation of coll (note: cljc's is currently identity)." "([coll])"]
+  ["shuffle" "A random permutation of coll (note: clove's is currently identity)." "([coll])"]
   ["frequencies" "Map from distinct item to number of occurrences." "([coll])"]
   ["group-by" "Map from (f item) to vector of items with that key." "([f coll])"]
   ["doall" "Forces a lazy sequence completely; returns it. Use for side effects held in a lazy seq." "([coll] [n coll])"]
   ["dorun" "Forces a lazy sequence for side effects; returns nil." "([coll] [n coll])"]
   ["lazy-seq" "Wraps body so it is evaluated only when the seq is consumed, once." "([& body])"]
-  ["realized?" "Whether a delay/lazy value has been forced (cljc: coarse)."]
+  ["realized?" "Whether a delay/lazy value has been forced (clove: coarse)."]
   ["some" "The first logical-true value of (pred item), else nil." "([pred coll])"]
   ["every?" "True if (pred item) is true for every item." "([pred coll])"]
   ["not-every?" "Complement of every?." "([pred coll])"]
@@ -86,7 +86,7 @@
   ["vals" "Sequence of the map's values." "([map])"]
   ["contains?" "Whether the key (or index) is present — NOT a value search; use `some` for that." "([coll key])"]
   ["find" "The map entry [k v] for key, or nil." "([map key])"]
-  ["peek" "Vectors: last item. Lists/queues: first. Maps (cljc): the min-priority entry." "([coll])"]
+  ["peek" "Vectors: last item. Lists/queues: first. Maps (clove): the min-priority entry." "([coll])"]
   ["pop" "The collection without its peek item." "([coll])"]
   ["subvec" "A vector view of v from start (to end), O(1)." "([v start] [v start end])"]
   ["vec" "An eager vector of the items of coll." "([coll])"]
@@ -101,8 +101,8 @@
   ["transient" "A mutable-in-place edition of a vector/map/set for batch building; finish with persistent!." "([coll])"]
   ["persistent!" "Seals a transient back into an immutable collection." "([coll])"]
   ["conj!" "conj onto a transient." "([coll x])"]
-  ["assoc!" "assoc onto a transient (or set an int-array slot in cljc)." "([coll key val])"]
-  ["int-array" "(int-array n), (int-array n init), (int-array coll): a flat mutable int64 array (cljc native). Use aget/aset/alength." "([size] [size init-or-seq])"]
+  ["assoc!" "assoc onto a transient (or set an int-array slot in clove)." "([coll key val])"]
+  ["int-array" "(int-array n), (int-array n init), (int-array coll): a flat mutable int64 array (clove native). Use aget/aset/alength." "([size] [size init-or-seq])"]
   ["aget" "Reads array slot i, O(1)." "([array idx])"]
   ["aset" "Writes array slot i, returning the value." "([array idx val])"]
   ["alength" "The array's length." "([array])"]
@@ -149,7 +149,7 @@
   ["max" "The greatest argument." "([x] [x y] [x y & more])"]
   ["min" "The least argument." "([x] [x y] [x y & more])"]
   ["abs" "Absolute value." "([a])"]
-  ["gcd" "Greatest common divisor (cljc extension)."]
+  ["gcd" "Greatest common divisor (clove extension)."]
   ["even?" "Whether n is even." "([n])"]
   ["odd?" "Whether n is odd." "([n])"]
   ["zero?" "Whether x is zero." "([num])"]
@@ -192,7 +192,7 @@
   ["re-matches" "Like re-find but the pattern must match the ENTIRE string." "([re s])"]
   ["re-seq" "Lazy sequence of successive matches." "([re s])"]
   ["re-pattern" "Compiles a string into a regex pattern." "([s])"]
-  ["re-replace" "cljc: replace all matches, with $1..$9 group refs in the replacement."]
+  ["re-replace" "clove: replace all matches, with $1..$9 group refs in the replacement."]
   ;; ── state ──
   ["atom" "A mutable reference; read with @, update with swap!/reset!." "([x])"]
   ["swap!" "Sets an atom to (f current args...); returns the new value." "([atom f] [atom f x] [atom f x y] [atom f x y & args])"]
@@ -232,7 +232,7 @@
   ["name" "The name part of a keyword/symbol/string." "([x])"]
   ["namespace" "The namespace part of a qualified keyword/symbol, or nil." "([x])"]
   ["gensym" "A unique symbol, optionally with a prefix." "([] [prefix-string])"]
-  ["type" "The value's type (cljc: a keyword like :vector, :string)." "([x])"]
+  ["type" "The value's type (clove: a keyword like :vector, :string)." "([x])"]
   ["instance?" "Whether x is of the given type/protocol." "([c x])"]
   ["identical?" "Pointer equality — same object."]
   ["hash" "The value's hash code (consistent with =)."]
@@ -261,7 +261,7 @@
   ["defmethod" "Adds a method implementation for a dispatch value."]
   ["defprotocol" "Declares a named set of methods dispatched on the first argument's type."]
   ["defrecord" "Defines a named map-like type with fixed fields and protocol support."]
-  ["deftype" "Defines a named type with fields (cljc: represented as a tagged map)."]
+  ["deftype" "Defines a named type with fields (clove: represented as a tagged map)."]
   ["derive" "Adds a parent relationship in the (global) hierarchy."]
   ["isa?" "Hierarchy-aware type/tag relation (vectors compare element-wise)."]
   ;; ── batteries (fs.clj / http.clj / json.clj / peg.clj / process.clj) ──
@@ -299,14 +299,14 @@
 
 ;; ── special forms & core macros (not bindings — served straight from the
 ;;    registry; the third slot holds a usage form instead of fn arglists) ──
-(run! (fn [[n d a]] (cljc/doc-put* n d a))
+(run! (fn [[n d a]] (clove/doc-put* n d a))
  [["if" "Special form. Evaluates test; if truthy (anything but nil/false), evaluates and returns then, otherwise else (or nil)." "((if test then else?))"]
   ["do" "Special form. Evaluates the exprs in order, returns the last (nil when empty)." "((do exprs*))"]
   ["let" "Special form. Binds names to values in order (later bindings see earlier ones); evaluates body with them in scope. Destructuring supported." "((let [bindings*] exprs*))"]
   ["fn" "Special form. An anonymous function; multiple arity clauses allowed, & gathers rest args. #(...) is shorthand with % %1 %2." "((fn name? [params*] exprs*) (fn name? ([params*] exprs*)+))"]
   ["def" "Special form. Interns a root binding for the symbol, optionally with a docstring and init value." "((def symbol doc-string? init?))"]
   ["loop" "Special form. Like let, but marks a recur target: (recur ...) rebinds the loop bindings and jumps back without consuming stack." "((loop [bindings*] exprs*))"]
-  ["recur" "Special form. Rebinds the enclosing loop/fn bindings to the given values and jumps back — cljc's tail call. Must be in tail position." "((recur exprs*))"]
+  ["recur" "Special form. Rebinds the enclosing loop/fn bindings to the given values and jumps back — clove's tail call. Must be in tail position." "((recur exprs*))"]
   ["quote" "Special form. Returns the form unevaluated. 'x reads as (quote x)." "((quote form))"]
   ["var" "Special form. Returns the Var named by the symbol (also #'sym). Its meta carries :name/:doc/:arglists." "((var symbol))"]
   ["throw" "Special form. Throws a value; catch it with try/catch. Use ex-info to build data-carrying exceptions." "((throw expr))"]

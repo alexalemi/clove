@@ -2,14 +2,14 @@
 ;;
 ;; At the REPL, start a line with `? ` (question mark, space):
 ;;
-;;   cljc[3]> ? why did that throw
+;;   clove[3]> ? why did that throw
 ;;
 ;; The question goes to Claude together with this session's transcript (inputs,
-;; results, errors, earlier Q&A) and a standing prompt about cljc. The answer
+;; results, errors, earlier Q&A) and a standing prompt about clove. The answer
 ;; streams in as it is written, and is a result like any other: *1 holds it.
 ;;
 ;; Claude has two tools:
-;;   cljc_lookup   read-only: doc / source / dir / apropos / find-doc / a var's
+;;   clove_lookup   read-only: doc / source / dir / apropos / find-doc / a var's
 ;;                 value. Runs without asking — it evaluates no code.
 ;;   propose_form  Claude writes a line into your prompt; edit it, Enter runs
 ;;                 it, ^C (an empty line) declines. Claude sees what you ran and
@@ -19,7 +19,7 @@
 ;; Tuning: (swap! claude/config assoc :effort "low")
 ;;
 ;; Needs curl and ANTHROPIC_API_KEY. The key is expanded by the shell inside the
-;; curl command, so it never passes through cljc values.
+;; curl command, so it never passes through clove values.
 
 (require '[json] '[process])
 
@@ -31,9 +31,9 @@
          :max-result 8000}))    ; chars of tool output sent back
 
 (def system-prompt
-  "You are embedded in the REPL of cljc, a Clojure interpreter written in a single C file (no JVM). The user typed a question at the REPL prompt; you see their session transcript and answer as a knowledgeable pair programmer.
+  "You are embedded in the REPL of clove, a Clojure interpreter written in a single C file (no JVM). The user typed a question at the REPL prompt; you see their session transcript and answer as a knowledgeable pair programmer.
 
-About cljc:
+About clove:
 - Clojure semantics: persistent collections, lazy seqs, macros, destructuring, protocols/records, multimethods, ratios, BigInt/BigDecimal, namespaces, transients, regex (own engine, Java-ish syntax), try/catch with typed catch.
 - No JVM: Java interop is limited to a shimmed subset (common String/Math/System/Integer statics, StringBuilder, StringWriter, ...). JVM-only libraries do not work.
 - Concurrency is cooperative: future/promise/agents/STM run on a fiber scheduler, core.async runs on coroutines. There is a single global environment.
@@ -42,14 +42,14 @@ About cljc:
 - Behavior can diverge from JVM Clojure in edge cases; when it matters, check rather than assume.
 
 Tools:
-- cljc_lookup is read-only and runs immediately: use it freely for docs, source, namespace contents, and the current value of the user's vars.
+- clove_lookup is read-only and runs immediately: use it freely for docs, source, namespace contents, and the current value of the user's vars.
 - propose_form puts ONE line of code in the user's prompt. They decide: run it as is, edit it first, or decline. Use it when running code would settle the question (testing a claim, computing something from their data) or when the answer is a line they will want to run. You get back the line they actually ran and its output. If they decline, do not propose it again; answer from what you know. Propose side-effecting forms (def, spit, sh) only when the user asked for that effect.
 
 Answering: the reply streams into a terminal REPL, so be brief and concrete — a few sentences and maybe a snippet. Plain text with light markdown (backticks, fenced blocks for multi-line code); no headings or tables. Refer to transcript entries by prompt number, e.g. [3]. After a proposed form has run, add at most a sentence; say nothing more if the output speaks for itself.")
 
 (def tools
-  [{"name" "cljc_lookup"
-    "description" "Read-only lookup in the user's live cljc session. kind: doc (docstring+arglists), source (definition), dir (a namespace's public vars), apropos (vars whose name contains the string), find-doc (vars whose doc mentions the string), value (the current value of a var, printed with length limits)."
+  [{"name" "clove_lookup"
+    "description" "Read-only lookup in the user's live clove session. kind: doc (docstring+arglists), source (definition), dir (a namespace's public vars), apropos (vars whose name contains the string), find-doc (vars whose doc mentions the string), value (the current value of a var, printed with length limits)."
     "input_schema" {"type" "object"
                     "properties" {"kind" {"type" "string"
                                           "enum" ["doc" "source" "dir" "apropos" "find-doc" "value"]}
@@ -152,7 +152,7 @@ Answering: the reply streams into a terminal REPL, so be brief and concrete — 
         _   (spit tmp (json/write body))
         st  (atom {:blocks (sorted-map)})
         ex  (try
-              (cljc/sh-lines*
+              (clove/sh-lines*
                (str "curl -sS -N https://api.anthropic.com/v1/messages"
                     " -H 'content-type: application/json'"
                     " -H \"x-api-key: $ANTHROPIC_API_KEY\""
@@ -199,12 +199,12 @@ Answering: the reply streams into a terminal REPL, so be brief and concrete — 
   (str/trim (str/replace code #"\s*\n\s*" " ")))
 
 (defn- propose [code]
-  (if-not (cljc/isatty*)
+  (if-not (clove/isatty*)
     "Not an interactive terminal; the form was not shown or run."
-    (if-let [line (cljc/repl-edit* (dim "claude⟩ ") (one-line code))]
+    (if-let [line (clove/repl-edit* (dim "claude⟩ ") (one-line code))]
       (let [r (eval-code line)]
         (println r)
-        (cljc/repl-log* (str "claude> " line "\n" r))
+        (clove/repl-log* (str "claude> " line "\n" r))
         (str "The user ran: " line "\n" r))
       (do (println (dim "  (declined)"))
           "The user declined to run it."))))
@@ -217,7 +217,7 @@ Answering: the reply streams into a terminal REPL, so be brief and concrete — 
     (cond
       (not (or (contains? in "code") (contains? in "kind")))
       (res "Invalid or incomplete tool input; send the call again." true)
-      (= "cljc_lookup" (get block "name"))
+      (= "clove_lookup" (get block "name"))
       (do (println (dim (str "  ⟩ " (get in "kind") " " (get in "name"))))
           (res (lookup (get in "kind") (get in "name" ""))))
       (= "propose_form" (get block "name"))

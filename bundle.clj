@@ -1,18 +1,18 @@
-;; bundle.clj — build a self-contained native binary from a cljc script.
+;; bundle.clj — build a self-contained native binary from a clove script.
 ;;
-;; Usage: cljc bundle [flags] <script.clj> <output>
-;;        cljc bundle -m <namespace> [flags] <output>
+;; Usage: clove bundle [flags] <script.clj> <output>
+;;        clove bundle -m <namespace> [flags] <output>
 ;;   -m <namespace>    bundle a namespace from *load-path* instead of a script;
 ;;                     the binary requires it and calls its -main with argv
 ;;                     (like `jolt build -m` / `bb -m`)
 ;;   --library         build a shared library (.so/.dylib/.dll) with a C ABI
-;;                     instead of an executable: exports cljc_lib_init /
-;;                     cljc_lib_eval / cljc_lib_last_error and writes a
+;;                     instead of an executable: exports clove_lib_init /
+;;                     clove_lib_eval / clove_lib_last_error and writes a
 ;;                     matching <output>.h header for C/C++/Rust hosts
 ;;   --static          link statically (no glibc dependency; best for sharing)
 ;;   --windows         cross-compile a Windows .exe via mingw-w64
 ;;                     (shorthand for --cc=x86_64-w64-mingw32-gcc --libs="-lm -lws2_32")
-;;   --cc=<compiler>   compiler to use (default: $CLJC_CC or "cc")
+;;   --cc=<compiler>   compiler to use (default: $CLOVE_CC or "cc")
 ;;   --libs=<libs>     link libraries (default: "-lm -ldl")
 ;;   --cflags=<flags>  extra compiler flags (e.g. a cross --target)
 ;;
@@ -21,19 +21,19 @@
 ;; executable, zero dependencies, the same ~2ms startup. After the top-level
 ;; forms run, the binary calls -main (script's own, or <ns>/-main with -m)
 ;; with the command-line args; an integer return becomes the exit status,
-;; matching `cljc -m`. A script with no -main just runs top-to-bottom as
+;; matching `clove -m`. A script with no -main just runs top-to-bottom as
 ;; before. Embedded files are
 ;; resolved by slurp/require/load-file at runtime, so a script that uses
 ;; clojure.test, clojure.set, csp, etc. runs standalone anywhere. (Bundling,
 ;; not compilation — the script still runs on the interpreter inside.)
 ;;
-;; Needs the cljc.c source: looked up in the cwd first (a source checkout),
+;; Needs the clove.c source: looked up in the cwd first (a source checkout),
 ;; then in the install's share dir.
 ;;
 ;; Cross-compiling: point --cc at a cross toolchain. Examples:
-;;   cljc bundle --cc=x86_64-w64-mingw32-gcc --libs="-lm" app.clj app.exe
-;;   cljc bundle --cc=aarch64-linux-gnu-gcc --static app.clj app-arm64
-;;   cljc bundle --cc="zig cc" --cflags="-target aarch64-linux-musl" \
+;;   clove bundle --cc=x86_64-w64-mingw32-gcc --libs="-lm" app.clj app.exe
+;;   clove bundle --cc=aarch64-linux-gnu-gcc --static app.clj app-arm64
+;;   clove bundle --cc="zig cc" --cflags="-target aarch64-linux-musl" \
 ;;               --static app.clj app-arm64
 ;; (musl/mingw fold dlopen into libc, so drop -ldl via --libs="-lm".)
 
@@ -72,14 +72,14 @@
   (some (fn [ext]
           (some (fn [d]
                   (let [p (str d "/" rel ext)
-                        c (cljc/slurp-maybe p)]
+                        c (clove/slurp-maybe p)]
                     (when c [(str rel ext) c])))
                 *load-path*))
         [".clj" ".cljc"]))
 
 (defn find-file [path]                  ; load-file path → [embedded-name content] or nil
-  (let [c (or (cljc/slurp-maybe path)
-              (some (fn [d] (cljc/slurp-maybe (str d "/" path))) *load-path*))]
+  (let [c (or (clove/slurp-maybe path)
+              (some (fn [d] (clove/slurp-maybe (str d "/" path))) *load-path*))]
     (when c [path c])))
 
 (def deps (atom {}))                    ; embedded-name → content
@@ -118,11 +118,11 @@
       ;; synthesized require, and the ns file itself rides as a dependency.
       [script-path out-path] (if main-ns [nil (first pos)] pos)]
   (when-not (if main-ns out-path (and script-path out-path))
-    (throw (ex-info "usage: cljc bundle [-m <ns>] [--static] [--cc=CC] [--libs=...] [--cflags=...] [<script.clj>] <output>" {})))
+    (throw (ex-info "usage: clove bundle [-m <ns>] [--static] [--cc=CC] [--libs=...] [--cflags=...] [<script.clj>] <output>" {})))
   (let [srcdir (cond
-                 (cljc/slurp-maybe "cljc.c") "."
-                 (cljc/slurp-maybe (str (cljc/sharedir*) "/cljc.c")) (cljc/sharedir*)
-                 :else (throw (ex-info "bundle: cljc.c not found (looked in . and the share dir)" {})))
+                 (clove/slurp-maybe "clove.c") "."
+                 (clove/slurp-maybe (str (clove/sharedir*) "/clove.c")) (clove/sharedir*)
+                 :else (throw (ex-info "bundle: clove.c not found (looked in . and the share dir)" {})))
         code   (if main-ns
                  (let [[nm c] (or (find-on-path (ns->rel main-ns))
                                   (throw (ex-info (str "bundle: namespace " main-ns
@@ -133,7 +133,7 @@
         _      (when-not main-ns (walk-source code))  ; collect transitive .clj dependencies
         dep-list (vec @deps)             ; [[name content] ...]
         cfile  (str out-path ".gen.c")
-        cc     (or (:cc flags) (cljc/env* "CLJC_CC") (if (:windows flags) "x86_64-w64-mingw32-gcc" "cc"))
+        cc     (or (:cc flags) (clove/env* "CLOVE_CC") (if (:windows flags) "x86_64-w64-mingw32-gcc" "cc"))
         libs   (or (:libs flags) (if (:windows flags) "-lm -lws2_32" "-lm -ldl"))
         static (if (:static flags) " -static" "")
         extra  (if (:cflags flags) (str " " (:cflags flags)) "")
@@ -141,28 +141,28 @@
         ;; -main (missing one is an error); a plain script gets auto-detect —
         ;; call -main if defining one, otherwise stay a pure top-level script.
         entry  (if main-ns
-                 (str "(let [m (or (cljc/resolve-maybe \"" main-ns "/-main\")"
-                      "            (cljc/resolve-maybe \"-main\"))]"
+                 (str "(let [m (or (clove/resolve-maybe \"" main-ns "/-main\")"
+                      "            (clove/resolve-maybe \"-main\"))]"
                       "  (if m (apply m *args*)"
                       "    (throw (ex-info \"no -main found in " main-ns "\" {}))))")
-                 "(when-let [m (cljc/resolve-maybe \"-main\")] (apply m *args*))")]
+                 "(when-let [m (clove/resolve-maybe \"-main\")] (apply m *args*))")]
     (when (seq dep-list)
       (println (str "  embedding " (count dep-list) " dependency file(s): "
                     (str/join " " (map first dep-list)))))
     (spit cfile
-      (str "#define CLJC_NO_MAIN\n"
-           "#include \"cljc.c\"\n"
+      (str "#define CLOVE_NO_MAIN\n"
+           "#include \"clove.c\"\n"
            "static const unsigned char script[] = {"
            ;; raw UTF-8 bytes, not codepoints — non-ASCII must round-trip
-           (str/join "," (cljc/str-bytes* code))
+           (str/join "," (clove/str-bytes* code))
            ",0};\n"
            ;; embedded dependency files, each a NUL-terminated byte array
            (str/join "" (map-indexed
                           (fn [i [_ content]]
                             (str "static const unsigned char dep" i "[] = {"
-                                 (str/join "," (cljc/str-bytes* content)) ",0};\n"))
+                                 (str/join "," (clove/str-bytes* content)) ",0};\n"))
                           dep-list))
-           "static const CljcEmbeddedFile bundled[] = {\n"
+           "static const CloveEmbeddedFile bundled[] = {\n"
            (str/join "" (map-indexed
                           (fn [i [name _]]
                             (str "    {\"" name "\", (const char *)dep" i "},\n"))
@@ -170,75 +170,75 @@
            "    {0,0}\n};\n"           ; sentinel keeps the array non-empty in C
            ;; entrypoint glue as bytes too — sidesteps C string escaping
            "static const unsigned char entry[] = {"
-           (str/join "," (cljc/str-bytes* entry))
+           (str/join "," (clove/str-bytes* entry))
            ",0};\n"
            (if-not (:library flags)
              (str
                "int main(int argc, char **argv) {\n"
-               "    cljc_set_stack_base(&argc);\n"
-               "    CljcEnv *env = cljc_new_env();\n"
-               "    cljc_set_embedded_files(bundled, " (count dep-list) ");\n"
-               "    Cljc *as = mk_empty_vec();\n"
+               "    clove_set_stack_base(&argc);\n"
+               "    CloveEnv *env = clove_new_env();\n"
+               "    clove_set_embedded_files(bundled, " (count dep-list) ");\n"
+               "    Clove *as = mk_empty_vec();\n"
                "    for (int i = 1; i < argc; i++)\n"
                "        as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));\n"
                "    env_define_root(env, intern(\"*args*\", 6), as);\n"
-               "    cljc_eval_string(env, (const char *)script);\n"
-               "    if (cljc_eval_errored) return 1;\n"
-               ;; -main's integer return is the exit status, same rule as `cljc -m`
-               "    Cljc *r = cljc_eval_string(env, (const char *)entry);\n"
-               "    if (cljc_eval_errored) return 1;\n"
-               "    return (r && r->tag == CLJC_INT) ? (int)r->as.i : 0;\n"
+               "    clove_eval_string(env, (const char *)script);\n"
+               "    if (clove_eval_errored) return 1;\n"
+               ;; -main's integer return is the exit status, same rule as `clove -m`
+               "    Clove *r = clove_eval_string(env, (const char *)entry);\n"
+               "    if (clove_eval_errored) return 1;\n"
+               "    return (r && r->tag == CLOVE_INT) ? (int)r->as.i : 0;\n"
                "}\n")
              ;; --library: a minimal C ABI over the embedded interpreter.
-             ;; cljc_eval_string anchors the conservative GC at its own frame
+             ;; clove_eval_string anchors the conservative GC at its own frame
              ;; per call, so hosts may call from any stack depth; returned
-             ;; strings stay valid until the next cljc_lib_* call.
+             ;; strings stay valid until the next clove_lib_* call.
              (str
                "#if defined(_WIN32)\n"
-               "#define CLJC_LIB_EXPORT __declspec(dllexport)\n"
+               "#define CLOVE_LIB_EXPORT __declspec(dllexport)\n"
                "#else\n"
-               "#define CLJC_LIB_EXPORT\n"
+               "#define CLOVE_LIB_EXPORT\n"
                "#endif\n"
-               "static CljcEnv *cljc_lib_env;\n"
-               "static char *cljc_lib_out;   /* last result, freed on next call */\n"
-               "static char *cljc_lib_err;   /* last error, freed on next call */\n"
-               "static void cljc_lib_seterr_(void) {\n"
+               "static CloveEnv *clove_lib_env;\n"
+               "static char *clove_lib_out;   /* last result, freed on next call */\n"
+               "static char *clove_lib_err;   /* last error, freed on next call */\n"
+               "static void clove_lib_seterr_(void) {\n"
                "    SBuf sb = {0}; sb_grow(&sb, 1); sb.data[0] = '\\0';\n"
                "    if (cur_exc && cur_exc != NIL) print_to(&sb, cur_exc, true);\n"
                "    else { for (const char *p = err_msg; *p; p++) sb_putc(&sb, *p); }\n"
-               "    free(cljc_lib_err); cljc_lib_err = sb.data;\n"
+               "    free(clove_lib_err); clove_lib_err = sb.data;\n"
                "}\n"
-               "CLJC_LIB_EXPORT const char *cljc_lib_last_error(void) { return cljc_lib_err; }\n"
-               "CLJC_LIB_EXPORT int cljc_lib_init(void) {\n"
-               "    if (cljc_lib_env) return 0;\n"
-               "    CljcEnv *env = cljc_new_env();\n"
-               "    cljc_set_embedded_files(bundled, " (count dep-list) ");\n"
+               "CLOVE_LIB_EXPORT const char *clove_lib_last_error(void) { return clove_lib_err; }\n"
+               "CLOVE_LIB_EXPORT int clove_lib_init(void) {\n"
+               "    if (clove_lib_env) return 0;\n"
+               "    CloveEnv *env = clove_new_env();\n"
+               "    clove_set_embedded_files(bundled, " (count dep-list) ");\n"
                "    env_define_root(env, intern(\"*args*\", 6), mk_empty_vec());\n"
-               "    cljc_eval_string(env, (const char *)script);\n"
-               "    if (cljc_eval_errored) { cljc_lib_seterr_(); return 1; }\n"
-               "    cljc_lib_env = env;\n"
+               "    clove_eval_string(env, (const char *)script);\n"
+               "    if (clove_eval_errored) { clove_lib_seterr_(); return 1; }\n"
+               "    clove_lib_env = env;\n"
                "    return 0;\n"
                "}\n"
-               "CLJC_LIB_EXPORT const char *cljc_lib_eval(const char *src) {\n"
-               "    if (!cljc_lib_env && cljc_lib_init() != 0) return NULL;\n"
-               "    Cljc *v = cljc_eval_string(cljc_lib_env, src);\n"
-               "    if (cljc_eval_errored) { cljc_lib_seterr_(); return NULL; }\n"
+               "CLOVE_LIB_EXPORT const char *clove_lib_eval(const char *src) {\n"
+               "    if (!clove_lib_env && clove_lib_init() != 0) return NULL;\n"
+               "    Clove *v = clove_eval_string(clove_lib_env, src);\n"
+               "    if (clove_eval_errored) { clove_lib_seterr_(); return NULL; }\n"
                "    SBuf sb = {0}; sb_grow(&sb, 1); sb.data[0] = '\\0';\n"
                "    print_to(&sb, v, true);\n"
-               "    free(cljc_lib_out); cljc_lib_out = sb.data;\n"
-               "    return cljc_lib_out;\n"
+               "    free(clove_lib_out); clove_lib_out = sb.data;\n"
+               "    return clove_lib_out;\n"
                "}\n"))))
     (when (:library flags)
       (spit (str out-path ".h")
-        (str "/* Generated by `cljc bundle --library`. Link against " out-path ".\n"
+        (str "/* Generated by `clove bundle --library`. Link against " out-path ".\n"
              " * All returned strings are owned by the library and valid until the\n"
-             " * next cljc_lib_* call. Functions are not thread-safe: one\n"
+             " * next clove_lib_* call. Functions are not thread-safe: one\n"
              " * interpreter per process, single-threaded. */\n"
-             "#ifndef CLJC_LIB_H\n#define CLJC_LIB_H\n"
+             "#ifndef CLOVE_LIB_H\n#define CLOVE_LIB_H\n"
              "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
-             "int cljc_lib_init(void);              /* 0 = ok (runs the embedded script; idempotent) */\n"
-             "const char *cljc_lib_eval(const char *src);  /* pr-str of the last form; NULL on error */\n"
-             "const char *cljc_lib_last_error(void);       /* message for the last failed call */\n"
+             "int clove_lib_init(void);              /* 0 = ok (runs the embedded script; idempotent) */\n"
+             "const char *clove_lib_eval(const char *src);  /* pr-str of the last form; NULL on error */\n"
+             "const char *clove_lib_last_error(void);       /* message for the last failed call */\n"
              "#ifdef __cplusplus\n}\n#endif\n"
              "#endif\n")))
     (let [shared (if (:library flags) (if (:windows flags) " -shared" " -shared -fPIC") "")

@@ -1,5 +1,5 @@
 ;; raylib-bounce.clj — an interactive GUI demo: bouncing balls you can scatter
-;; with the mouse. Driven entirely from cljc through the FFI raylib binding.
+;; with the mouse. Driven entirely from clove through the FFI raylib binding.
 ;;
 ;; Showcases: the FFI's :float + struct-by-value support (every draw call passes
 ;; a Color [r g b a] and Vector2 [x y] by value), immutable game state threaded
@@ -7,15 +7,15 @@
 ;;
 ;; PREREQUISITES
 ;;   - raylib installed (header + lib). Configure paths if not in the defaults:
-;;       CLJC_RAYLIB_INC=/usr/include  CLJC_RAYLIB_LIBS="-lraylib -lm"
+;;       CLOVE_RAYLIB_INC=/usr/include  CLOVE_RAYLIB_LIBS="-lraylib -lm"
 ;;   - a display. Locally that's your desktop. Headless / over SSH / tailscale,
 ;;     run under a virtual framebuffer so it doesn't need a real screen:
-;;       xvfb-run -s "-screen 0 800x600x24" cljc examples/raylib-bounce.clj --shot
+;;       xvfb-run -s "-screen 0 800x600x24" clove examples/raylib-bounce.clj --shot
 ;;     (--shot renders a few frames and writes raylib-bounce.png you can view
 ;;     or copy back; without it, the window runs interactively.)
 ;;
-;; Run:  cljc examples/raylib-bounce.clj          ; interactive window
-;;       cljc examples/raylib-bounce.clj --shot    ; render + screenshot, then exit
+;; Run:  clove examples/raylib-bounce.clj          ; interactive window
+;;       clove examples/raylib-bounce.clj --shot    ; render + screenshot, then exit
 
 ;; raylib.clj is a battery in the repo ROOT, but this example lives in
 ;; examples/. require searches *load-path* (which includes "."), so add ".." so
@@ -24,12 +24,12 @@
 (require '[raylib :as rl])
 
 ;; If the binding didn't load (raylib.clj not on the path), require silently
-;; no-ops in cljc's flat-global model — so probe and fail with a clear message
+;; no-ops in clove's flat-global model — so probe and fail with a clear message
 ;; instead of a baffling "unknown rl/RED".
 (when-not (try (fn? rl/InitWindow) (catch Exception _ false))
-  (throw (ex-info (str "couldn't load raylib.clj — run from the cljc repo root or "
-                       "its examples/ dir (e.g. `cljc examples/raylib-bounce.clj`), "
-                       "or set CLJC_PATH to the directory containing raylib.clj.") {})))
+  (throw (ex-info (str "couldn't load raylib.clj — run from the clove repo root or "
+                       "its examples/ dir (e.g. `clove examples/raylib-bounce.clj`), "
+                       "or set CLOVE_PATH to the directory containing raylib.clj.") {})))
 
 (def W 800)
 (def H 600)
@@ -56,12 +56,12 @@
   (doseq [{:keys [x y r color]} balls]
     (rl/DrawCircleV [(* 1.0 x) (* 1.0 y)] (* 1.0 r) color)
     (rl/DrawCircleLines (int x) (int y) (* 1.0 r) rl/RAYWHITE))
-  (rl/DrawText "cljc + raylib  —  click to scatter, ESC to quit" 20 20 20 rl/RAYWHITE)
+  (rl/DrawText "clove + raylib  —  click to scatter, ESC to quit" 20 20 20 rl/RAYWHITE)
   (rl/DrawFPS (- W 90) 20)
   (rl/EndDrawing))
 
 (let [shot? (some #(= % "--shot") *args*)]
-  (rl/InitWindow W H "cljc bouncing balls")
+  (rl/InitWindow W H "clove bouncing balls")
   (rl/SetTargetFPS 60)
   (loop [balls (mapv make-ball (range 24))
          frame 0]

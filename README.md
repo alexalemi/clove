@@ -1,4 +1,4 @@
-# cljc
+# clove
 
 A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
 embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
@@ -28,22 +28,22 @@ built-in namespaces. See [Running real libraries](#running-real-libraries).
 ## Quick start
 
 ```sh
-make            # builds ./cljc (cc, -lm -ldl, nothing else)
-./cljc          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
-./cljc file.clj # run a script
+make            # builds ./clove (cc, -lm -ldl, nothing else)
+./clove          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
+./clove file.clj # run a script
 make test       # 1000+ assertions + conformance corpus (~20s)
-make test-full  # adds the CLJC_GC_STRESS=1 pass (~8x slower; CI/pre-release)
+make test-full  # adds the CLOVE_GC_STRESS=1 pass (~8x slower; CI/pre-release)
 
 ./install.sh                      # install to ~/.local (no sudo)
 PREFIX=/usr/local ./install.sh    # system-wide
 ```
 
-Installed, `cljc` works from anywhere: batteries (`json.clj`, `fs.clj`,
+Installed, `clove` works from anywhere: batteries (`json.clj`, `fs.clj`,
 `process.clj`, `peg.clj`, …) and vendored libraries (`clojure.set`, `clojure.tools.logging`,
-`nextjournal.markdown`, medley, …) resolve through `$PREFIX/share/cljc`, with
-`CLJC_PATH` (colon-separated) for extra roots. An uninstalled `./cljc` also
+`nextjournal.markdown`, medley, …) resolve through `$PREFIX/share/clove`, with
+`CLOVE_PATH` (colon-separated) for extra roots. An uninstalled `./clove` also
 works from any directory (its own directory joins the load path). When requires
-misbehave, `cljc doctor` prints the resolved load path and where the batteries
+misbehave, `clove doctor` prints the resolved load path and where the batteries
 were found.
 
 ## Day-to-day niceties
@@ -65,7 +65,7 @@ is a real pretty-printer (fill layout, aligned map values).
 **Ask Claude, in the REPL.** A line starting with `? ` goes to Claude instead
 of the evaluator: `? why did [3] throw` sends the question with this session's
 transcript (inputs, results, errors, earlier answers) and a standing prompt
-about cljc, and the answer streams in as it's written. Claude can look things
+about clove, and the answer streams in as it's written. Claude can look things
 up on its own — `doc`, `source`, `dir`, `apropos`, `find-doc`, a var's value —
 but never runs code itself: when running something would help, it writes the
 line into your prompt (`claude⟩ (reduce + (filter odd? xs))`), and you edit
@@ -84,14 +84,14 @@ the actual fix: `try (require 'clojure.set) first`. Stack overflows say
 **Workflow subcommands.**
 
 ```sh
-cljc watch script.clj    # rerun on every save (fresh process each run)
-cljc vendor weavejester/medley                  # or a full git URL:
-cljc vendor https://github.com/clojure/data.json
-cljc vendor              # resolve ./deps.edn's :deps, transitively
-cljc doctor              # why isn't my require finding anything?
+clove watch script.clj    # rerun on every save (fresh process each run)
+clove vendor weavejester/medley                  # or a full git URL:
+clove vendor https://github.com/clojure/data.json
+clove vendor              # resolve ./deps.edn's :deps, transitively
+clove doctor              # why isn't my require finding anything?
 ```
 
-`cljc vendor` resolves `group/artifact` against Clojars first (latest release
+`clove vendor` resolves `group/artifact` against Clojars first (latest release
 jar, extracted with `unzip`/`bsdtar`), falling back to a GitHub shallow clone;
 sources land in `./vendor/` (already on the load path), then it *tries each
 namespace* and reports which load cleanly. With no argument (or a deps.edn
@@ -113,7 +113,7 @@ UTF-8-native `json.clj` battery). Heavier interop may still need porting.
 script can name its own interpreter and be run directly:
 
 ```clojure
-#!/usr/bin/env cljc
+#!/usr/bin/env clove
 (println "hello," (or (first *args*) "world"))
 ```
 
@@ -121,20 +121,20 @@ script can name its own interpreter and be run directly:
 chmod +x hello && ./hello there      #=> hello, there
 ```
 
-`*args*` holds the arguments after the script path, and `cljc bundle hello out`
+`*args*` holds the arguments after the script path, and `clove bundle hello out`
 compiles the same file — shebang and all — into a standalone binary. Since `#!`
 comments run to end of line *anywhere*, not just on line 1, a shebang survives
-`load-file`, `require`, `cljc lint`, and piping through stdin.
+`load-file`, `require`, `clove lint`, and piping through stdin.
 
 `/usr/bin/env` accepts no interpreter arguments on Linux. When the script needs
-to choose its own interpreter — a repo-local `./cljc`, a wrapper, an env var —
+to choose its own interpreter — a repo-local `./clove`, a wrapper, an env var —
 use the `sh` trampoline: `sh` sees `#_(` as a comment and reaches the `exec`;
 the reader sees a discarded form and reaches the code.
 
 ```clojure
 #!/bin/sh
 #_(
-   exec "${CLJC:-cljc}" "$0" "$@"
+   exec "${CLOVE:-clove}" "$0" "$@"
    )
 (println "args:" (vec *args*))
 ```
@@ -150,8 +150,8 @@ CI builds and runs the full suite (normal + GC-stress) on every push:
 | macOS arm64 + x86_64 | full, including coroutines/csp (ucontext) |
 | Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets, full line-editing REPL (Windows 10+ VT console; plain-line fallback); **no** coroutines/`csp`/`core.async`/nREPL |
 
-The test suite probes capabilities at startup (`cljc-test-unix?`,
-`cljc-test-coro?` in `tests.clj`) and self-skips what a platform lacks, so the
+The test suite probes capabilities at startup (`clove-test-unix?`,
+`clove-test-coro?` in `tests.clj`) and self-skips what a platform lacks, so the
 same `tests.clj` runs everywhere.
 
 ## What's inside
@@ -162,7 +162,7 @@ same `tests.clj` runs everywhere.
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
 | **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
-| **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in cljc itself (the prelude) |
+| **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in clove itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
 | **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
@@ -180,8 +180,8 @@ same `tests.clj` runs everywhere.
 ## Editor integration (nREPL)
 
 ```sh
-./cljc --nrepl        # serves nREPL on 127.0.0.1:7888, writes .nrepl-port
-./cljc --nrepl 7999   # custom port
+./clove --nrepl        # serves nREPL on 127.0.0.1:7888, writes .nrepl-port
+./clove --nrepl 7999   # custom port
 ```
 
 Speaks bencode nREPL (`clone` `describe` `eval` `load-file` `close`
@@ -202,7 +202,7 @@ auto-detect):
 - **vim-iced** — `iced connect <port>`.
 
 Expect eval/load-file to work everywhere; completion/introspection middleware
-varies by client (cljc answers the core ops, not the full CIDER middleware
+varies by client (clove answers the core ops, not the full CIDER middleware
 set).
 
 ## JIT: compile hot functions to native C
@@ -214,7 +214,7 @@ set).
 (fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~250 lines of cljc) compiles a numeric subset — `if`, `let`,
+`jit.clj` (~250 lines of clove) compiles a numeric subset — `if`, `let`,
 `loop`/`recur`, self-recursion, arithmetic/comparisons, `Math/sqrt`, casts —
 to unboxed C through the same generate→`cc`→`dlopen`→rebind pipeline as the
 FFI. Types default to `long long`; JVM-style `^long`/`^double` hints on
@@ -240,8 +240,8 @@ version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
 (cos 0.0)   ;=> 1.0
 ```
 
-s7/cload-style: declare C signatures as data, cljc generates glue, compiles a
-`.so` at runtime, `dlopen`s it, and the C function becomes a cljc fn. Modules
+s7/cload-style: declare C signatures as data, clove generates glue, compiles a
+`.so` at runtime, `dlopen`s it, and the C function becomes a clove fn. Modules
 cache by content hash; `ffi/defstruct` generates struct accessors. The battery
 shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
 `fs.clj` (babashka.fs-flavored, `list-dir` via real `readdir`), `process.clj`
@@ -251,9 +251,9 @@ shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
 ## Standalone binaries
 
 ```sh
-./cljc bundle.clj myscript.clj mybinary       # one ~300 KB executable, no deps
-./cljc bundle.clj --static myscript.clj out   # static: no glibc dep, best to share
-./cljc bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
+./clove bundle.clj myscript.clj mybinary       # one ~300 KB executable, no deps
+./clove bundle.clj --static myscript.clj out   # static: no glibc dep, best to share
+./clove bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
 ```
 
 `bundle.clj` embeds your script — plus every `.clj` it transitively `require`s
@@ -273,7 +273,7 @@ machine. Flags steer the compiler:
 | Linux ARM64 | `bundle --cc=aarch64-linux-gnu-gcc --static script out` | `gcc-aarch64-linux-gnu` |
 | Windows | `bundle --windows script out.exe` | `mingw-w64` (`x86_64-w64-mingw32-gcc`) |
 
-`--cc=`, `--libs=`, and `--cflags=` (plus the `CLJC_CC` env var) expose the
+`--cc=`, `--libs=`, and `--cflags=` (plus the `CLOVE_CC` env var) expose the
 compiler directly for any other cross toolchain, e.g. `zig cc`. On Windows the
 interactive REPL drops to plain line input and the nREPL server is unavailable —
 script execution and bundles are unaffected.
@@ -283,13 +283,13 @@ script as a `.so`/`.dylib`/`.dll` with a C ABI, callable from C, C++, Rust,
 Zig — anything that can link C:
 
 ```sh
-cljc bundle --library greet.clj libgreet.so   # + generated libgreet.so.h
+clove bundle --library greet.clj libgreet.so   # + generated libgreet.so.h
 cc -O2 examples/libhost.c ./libgreet.so -o libhost
 ```
 
-The library exports `cljc_lib_init()` (runs the embedded script, idempotent),
-`cljc_lib_eval(src)` (returns `pr-str` of the last form, or `NULL` on error —
-the interpreter survives and keeps state), and `cljc_lib_last_error()`.
+The library exports `clove_lib_init()` (runs the embedded script, idempotent),
+`clove_lib_eval(src)` (returns `pr-str` of the last form, or `NULL` on error —
+the interpreter survives and keeps state), and `clove_lib_last_error()`.
 Returned strings stay valid until the next call; the usual embedding rules
 apply (one interpreter per process, single-threaded). See
 `examples/libhost.c`.
@@ -297,7 +297,7 @@ apply (one interpreter per process, single-threaded). See
 ## Running real libraries
 
 `require` resolves namespaces against `*load-path*` (`.`, `vendor/`, the share
-dir) and `CLJC_PATH`, loads `.clj`/`.cljc` files once, and registers per-namespace
+dir) and `CLOVE_PATH`, loads `.clj`/`.cljc` files once, and registers per-namespace
 `:as`/`:refer` aliases. Each namespace's defs resolve own-namespace-first, so
 multi-file libraries with internal cross-references load in isolation — `deftype`,
 `defrecord`, and protocols are real, which is what unlocks the heavy hitters.
@@ -318,7 +318,7 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | `babashka.fs` `babashka.process` `babashka.cli` `bencode.core` | scripting batteries |
 | medley, camel-snake-kebab, edamame | |
 
-**Runs with the library's own source on `CLJC_PATH`** (clone it, point cljc at
+**Runs with the library's own source on `CLOVE_PATH`** (clone it, point clove at
 `src`) — these exercise deftype, multimethods, multi-file graphs, the lot:
 
 | library | what runs |
@@ -328,7 +328,7 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | **core.logic** | `run*`/`conde`/`membero`/`appendo` — relational/logic programming |
 | **hiccup** / **hiccup2** | HTML generation, CSS sugar, escaping |
 | **instaparse** | context-free grammars → parse trees |
-| **SCI** | a Clojure interpreter, running *inside* cljc |
+| **SCI** | a Clojure interpreter, running *inside* clove |
 | **clojure.data.csv** / **clojure.tools.cli** | CSV, command-line parsing |
 | **test.check** | generative property testing |
 | **minijax** | JAX-style composable function transforms — `grad`/`jvp`/`jet`/`vmap`, symbolic + interval + arbitrary-precision tracing (74/74 tests) |
@@ -339,7 +339,7 @@ parser, a host serializer): `clojure.data.xml` (StAX), `cognitect.transit`,
 big, multi-file, deftype-heavy ones — are reachable; libraries that lean on a
 specific Java library for their core work are not, until that library is ported.
 
-**Advent of Code as a stress test**: cljc runs a complete set of Clojure
+**Advent of Code as a stress test**: clove runs a complete set of Clojure
 solutions for **every Advent of Code day, 2015–2025 (262 puzzles)** on real
 inputs, each producing answers verified against an independent reference
 (Python/Janet/JVM Clojure). The campaign doubled as a bug hunt — it surfaced
@@ -351,37 +351,37 @@ reference private puzzle inputs, so they live outside this repo.)
 
 - **Linting**: ships a `.clj-kondo/config.edn` tuned for the dialect.
   `clj-kondo --lint your.clj` works in this repo; name files `.cljc` if they use
-  `#?(:cljc …)` reader conditionals. For runtime-defined vars (`ffi/define`), add
+  `#?(:clove …)` reader conditionals. For runtime-defined vars (`ffi/define`), add
   a `(declare …)` like `libc.clj` does.
 - **Tests**: `clojure.test` is bundled — `deftest`, `is` (with `thrown?`),
   `testing`, `run-tests`.
-- **Dependencies**: `cljc vendor <git-url|github-user/repo>` copies a
+- **Dependencies**: `clove vendor <git-url|github-user/repo>` copies a
   pure-Clojure library's sources into `./vendor/` and reports which of its
   namespaces load.
-- **Editor/LSP**: `./cljc --nrepl` for eval (Conjure/CIDER/Calva); clojure-lsp's
-  static features work on cljc files via the same clj-kondo analysis.
+- **Editor/LSP**: `./clove --nrepl` for eval (Conjure/CIDER/Calva); clojure-lsp's
+  static features work on clove files via the same clj-kondo analysis.
 
 ## Embedding
 
-The model is stb-style: define `CLJC_NO_MAIN` and `#include "cljc.c"` into one
+The model is stb-style: define `CLOVE_NO_MAIN` and `#include "clove.c"` into one
 translation unit. Your native functions then have the interpreter's value
 constructors in scope, which is what you need to exchange data:
 
 ```c
-#define CLJC_NO_MAIN
-#include "cljc.c"
+#define CLOVE_NO_MAIN
+#include "clove.c"
 
-static Cljc *native_add(CljcEnv *env, Cljc *args) {
+static Clove *native_add(CloveEnv *env, Clove *args) {
     int64_t a = as_int(args->as.cons.head, "host-add");
     int64_t b = as_int(args->as.cons.tail->as.cons.head, "host-add");
     return mk_int(a + b);
 }
 
 int main(int argc, char **argv) {
-    cljc_set_stack_base(&argc);          /* GC scans the C stack for roots */
-    CljcEnv *env = cljc_new_env();
-    cljc_define_native(env, "host-add", native_add);
-    cljc_eval_string(env, "(println (host-add 2 40))");
+    clove_set_stack_base(&argc);          /* GC scans the C stack for roots */
+    CloveEnv *env = clove_new_env();
+    clove_define_native(env, "host-add", native_add);
+    clove_eval_string(env, "(println (host-add 2 40))");
 }
 ```
 
@@ -389,20 +389,20 @@ See `examples/host.c` for a fuller demo (C-side state mutated from scripts,
 maps built in C, results consumed back). Build it with `make example`.
 
 Embedding rules:
-- Call `cljc_set_stack_base` with an address near the top of the thread's
+- Call `clove_set_stack_base` with an address near the top of the thread's
   stack **before** evaluating anything (the conservative GC scans from there).
-- Don't hold `Cljc *` across `cljc_eval_string` calls unless the value is
+- Don't hold `Clove *` across `clove_eval_string` calls unless the value is
   reachable from the root env (e.g. `def`'d) — the GC doesn't know about
   C globals.
 - One interpreter per process (global state); single-threaded.
 
 ## Performance
 
-Benchmarks in `benchmarks/` run unmodified on cljc, [babashka](https://babashka.org/),
+Benchmarks in `benchmarks/` run unmodified on clove, [babashka](https://babashka.org/),
 and JVM Clojure, producing identical output (mean wall time, hyperfine, one machine —
 treat as orders of magnitude):
 
-| benchmark | cljc | babashka 1.12 | Clojure / JDK 21 |
+| benchmark | clove | babashka 1.12 | Clojure / JDK 21 |
 |---|---|---|---|
 | startup (hello world) | **2 ms** | 10 ms | 440 ms |
 | fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
@@ -415,11 +415,11 @@ treat as orders of magnitude):
 | fib(32), ~1 s of compute | 1.00 s | **0.54 s** | 0.63 s |
 
 Honest reading: babashka wins most compute because its `clojure.core` is
-AOT-compiled native code — SCI only interprets your glue, while cljc interprets
-*everything*. That cljc stays within ~1.5–4× of bb (and beats it on sort and
+AOT-compiled native code — SCI only interprets your glue, while clove interprets
+*everything*. That clove stays within ~1.5–4× of bb (and beats it on sort and
 startup) is the trade we wanted. JVM Clojure pays ~440 ms of startup, which
 dominates at script scale; for long-running compute the JIT inverts everything.
-Use cljc where its 2 ms startup, ~325 KB binary, zero dependencies, and
+Use clove where its 2 ms startup, ~325 KB binary, zero dependencies, and
 embeddability matter; use bb/JVM where throughput does.
 
 ## Deliberate divergences from Clojure
@@ -456,7 +456,7 @@ embeddability matter; use bb/JVM where throughput does.
   them); `Math/sqrt` resolves as a host-method symbol
 - Metadata works (`with-meta`/`meta`/`^{}`) and propagates through collection
   ops (`conj`/`assoc`/`into`, incl. transient roundtrips)
-- `#?(:cljc …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported
+- `#?(:clove …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported
 
 The live plan (open threads, GC invariants) is in [PLAN.md](PLAN.md); the full
 milestone log is in [HISTORY.md](HISTORY.md).
@@ -465,14 +465,14 @@ milestone log is in [HISTORY.md](HISTORY.md).
 
 ```sh
 make test                      # normal suite + conformance
-make test-full                 # adds CLJC_GC_STRESS=1 (slow; shakes out GC roots)
+make test-full                 # adds CLOVE_GC_STRESS=1 (slow; shakes out GC roots)
 make fuzz                      # differential fuzz vs babashka (needs bb + python3)
 # sanitizers (flags required by conservative stack scanning, as with Boehm GC):
 # -O1 on purpose: at -O0 stale stack slots root values and hide missing GC roots
-# built AS ./cljc: the suite's subprocess tests re-invoke "<exe-dir>/cljc"
-cc -g -O1 -fsanitize=address,undefined -o cljc cljc.c -lm -ldl
-ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 ./cljc tests.clj
-make -B cljc                   # back to the normal build
+# built AS ./clove: the suite's subprocess tests re-invoke "<exe-dir>/clove"
+cc -g -O1 -fsanitize=address,undefined -o clove clove.c -lm -ldl
+ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 ./clove tests.clj
+make -B clove                   # back to the normal build
 ```
 
 Every bug fix lands with a regression assertion in `tests.clj`.
@@ -480,7 +480,7 @@ Every bug fix lands with a regression assertion in `tests.clj`.
 ## License
 
 [Eclipse Public License 1.0](LICENSE) — the same license as Clojure itself.
-You can embed cljc in any program, including closed-source ones; only
-modifications to cljc's own code must be shared under the EPL if distributed.
+You can embed clove in any program, including closed-source ones; only
+modifications to clove's own code must be shared under the EPL if distributed.
 Vendored libraries under `vendor/` retain their upstream licenses (EPL-1.0,
 notices preserved in each file).

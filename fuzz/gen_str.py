@@ -52,7 +52,7 @@ def gen_bmp(out):
         out.write(random.choice(exprs) + "\n")
 
 def gen_inv(out):
-    """self-consistency corpus: any bytes incl. astral; cljc-only asserts"""
+    """self-consistency corpus: any bytes incl. astral; clove-only asserts"""
     for _ in range(n):
         s = rstr([ASCII, BMP2, BMP3, AST]); S = clj_str(s)
         invs = [

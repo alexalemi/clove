@@ -1,5 +1,5 @@
-;; AoC 2017 day 4 — portable across cljc / babashka / clojure.
-(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on cljc
+;; AoC 2017 day 4 — portable across clove / babashka / clojure.
+(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on clove
 (def lines (str/split-lines (slurp "input/04.txt")))
 
 (defn wordlist [line] (re-seq #"\w+" line))

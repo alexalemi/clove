@@ -1,14 +1,14 @@
-;; clojure.data.priority-map — real O(log n) implementation for cljc.
+;; clojure.data.priority-map — real O(log n) implementation for clove.
 ;; Two indexes, like the upstream library: a sorted-map priority -> #{keys}
-;; (cljc's weight-balanced tree) and a hash-map key -> priority. Represented
-;; as a cljc deftype-style tagged map; assoc/get/count/seq dispatch through
+;; (clove's weight-balanced tree) and a hash-map key -> priority. Represented
+;; as a clove deftype-style tagged map; assoc/get/count/seq dispatch through
 ;; the deftype method machinery, and core peek/pop consult the methods first
 ;; (previously peek did an O(n) min-scan over a plain map — quadratic Dijkstra).
 
 (ns clojure.data.priority-map)
 
 (defn- pm-cell [p->ks k->p]
-  {:cljc/type :PriorityMap :p->ks p->ks :k->p k->p})
+  {:clove/type :PriorityMap :p->ks p->ks :k->p k->p})
 
 (defn- pm-assoc [this k v]
   (let [k->p (:k->p this)
@@ -43,15 +43,15 @@
 (defn- pm-seq [this]
   (for [[p ks] (seq (:p->ks this)) k ks] [k p]))
 
-(cljc/reg-method! 'assoc  :PriorityMap pm-assoc)
-(cljc/reg-method! 'valAt  :PriorityMap (fn ([this k] (get (:k->p this) k))
+(clove/reg-method! 'assoc  :PriorityMap pm-assoc)
+(clove/reg-method! 'valAt  :PriorityMap (fn ([this k] (get (:k->p this) k))
                                          ([this k nf] (get (:k->p this) k nf))))
-(cljc/reg-method! 'count  :PriorityMap (fn [this] (count (:k->p this))))
-(cljc/reg-method! 'seq    :PriorityMap (fn [this] (seq (pm-seq this))))
-(cljc/reg-method! 'peek   :PriorityMap pm-peek)
-(cljc/reg-method! 'pop    :PriorityMap pm-pop)
-(cljc/reg-method! 'dissoc :PriorityMap pm-dissoc)
-(cljc/reg-method! 'containsKey :PriorityMap (fn [this k] (contains? (:k->p this) k)))
+(clove/reg-method! 'count  :PriorityMap (fn [this] (count (:k->p this))))
+(clove/reg-method! 'seq    :PriorityMap (fn [this] (seq (pm-seq this))))
+(clove/reg-method! 'peek   :PriorityMap pm-peek)
+(clove/reg-method! 'pop    :PriorityMap pm-pop)
+(clove/reg-method! 'dissoc :PriorityMap pm-dissoc)
+(clove/reg-method! 'containsKey :PriorityMap (fn [this k] (contains? (:k->p this) k)))
 
 (defn priority-map [& kvs]
   (reduce (fn [m [k v]] (pm-assoc m k v))

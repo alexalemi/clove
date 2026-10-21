@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Renamed: cljc is now clove
+The old name collided with the `.cljc` file extension. The binary is `clove`,
+the source is `clove.c`, the share dir is `$PREFIX/share/clove`, and the
+environment variables are `CLOVE_PATH`, `CLOVE_CC`, `CLOVE_GC_STRESS`, … The
+REPL prompt is `clove[n]>`. `~/.cljc_history` moves to `~/.clove_history` the
+first time the REPL starts. Internal helpers moved from `cljc/…` to `clove/…`,
+and the C embedding API from `cljc_*`/`Cljc` to `clove_*`/`Clove`. The
+reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
+`#?(:cljc …)` code keeps working. `.cljc` files load as before.
+
 ### Changed — behavior that used to diverge silently from Clojure
 - **Integer overflow throws.** `+`, `-`, `*`, `inc` and `dec` raise
   `ArithmeticException` "long overflow" when the result leaves the int64
@@ -44,22 +54,22 @@
 ### Added
 - **`? question` at the REPL asks Claude.** The question goes out with the
   session transcript (inputs, results, errors, earlier answers; last 32 KB)
-  and a system prompt describing cljc; the answer streams in. Claude's tools:
-  `cljc_lookup` (doc/source/dir/apropos/find-doc/var value — read-only, runs
+  and a system prompt describing clove; the answer streams in. Claude's tools:
+  `clove_lookup` (doc/source/dir/apropos/find-doc/var value — read-only, runs
   without asking) and `propose_form`, which writes one line into your prompt
   to edit, run with Enter, or decline with `^C` — Claude never runs code
   itself. The answer is numbered like a result and held in `*1`. Implemented in
   the new `claude.clj` battery (`(claude/ask "...")` works from code too) over
   `curl`; needs `ANTHROPIC_API_KEY`. Uses `claude-opus-5-5` with server-side
   refusal fallbacks. POSIX shells only for now (the key is expanded as `$VAR`).
-- **`cljc/sh-lines*`** runs a shell command and calls a fn on each output line
+- **`clove/sh-lines*`** runs a shell command and calls a fn on each output line
   as it arrives (what the streaming above is built on).
 - **`make fuzz` / nightly fuzz workflow.** `fuzz/gen_expr.py` generates random
   typed core expressions and `fuzz/fuzz.sh` runs them (plus the string
-  corpora) through cljc and babashka and diffs the output; a GitHub workflow
+  corpora) through clove and babashka and diffs the output; a GitHub workflow
   runs it nightly with fresh, printed seeds. Its first runs found the six
   divergences listed under Fixed below.
-- `cljc -e A -e B` — a repeated `-e` separates expressions (it was read as a
+- `clove -e A -e B` — a repeated `-e` separates expressions (it was read as a
   symbol).
 - **`java.math.BigDecimal`**, as a real numeric type: unscaled integer +
   decimal scale, so the arithmetic is exact. `1.5M` literals; `+ - * /`,

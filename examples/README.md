@@ -1,22 +1,22 @@
-# cljc examples
+# clove examples
 
 A suite of small, self-contained programs that each exercise a different
 corner of the language. Run any of them from the repo root:
 
 ```sh
-cljc examples/mandelbrot.clj
+clove examples/mandelbrot.clj
 ```
 
 For a browsable gallery (every example run, output captured, source
 syntax-highlighted) served over HTTP:
 
 ```sh
-cljc examples/serve.clj        # → http://127.0.0.1:8088
-cljc examples/serve.clj 9000   # custom port
+clove examples/serve.clj        # → http://127.0.0.1:8088
+clove examples/serve.clj 9000   # custom port
 ```
 
-The gallery server is itself a cljc program — it uses the built-in `tcp/*`
-primitives and shells out to `cljc` to run each example.
+The gallery server is itself a clove program — it uses the built-in `tcp/*`
+primitives and shells out to `clove` to run each example.
 
 ## The programs
 
@@ -43,8 +43,8 @@ Plus two that aren't scripts:
 
 | File | What it is |
 |---|---|
-| `host.c` | Embedding cljc in a C program (`#define CLJC_NO_MAIN`); build with `make example` |
-| `hello-bundle.clj` | A script meant for `cljc bundle.clj` → a standalone binary |
+| `host.c` | Embedding clove in a C program (`#define CLOVE_NO_MAIN`); build with `make example` |
+| `hello-bundle.clj` | A script meant for `clove bundle.clj` → a standalone binary |
 
 ## Notes on the dialect
 

@@ -1,29 +1,29 @@
-/* cljc.c — a small Clojure-in-C, single-file embeddable interpreter.
+/* clove.c — a small Clojure-in-C, single-file embeddable interpreter.
  *
  * Copyright (c) 2026 Alex Alemi and contributors.
  * SPDX-License-Identifier: EPL-1.0
  * Distributed under the Eclipse Public License 1.0 (see LICENSE).
  *
- * Build REPL:   cc -O2 -Wall -o cljc cljc.c
- * Embed:        compile with -DCLJC_NO_MAIN and link cljc.o into your program;
+ * Build REPL:   cc -O2 -Wall -o clove clove.c
+ * Embed:        compile with -DCLOVE_NO_MAIN and link clove.o into your program;
  *               see the public API block below.
  *
  * Memory: mark-and-sweep GC over block-pooled cells and environments, with
  * conservative C-stack scanning for roots (so interpreter C locals are safe
- * without explicit root registration). Embedders: call cljc_set_stack_base
- * near the top of the thread's stack before evaluating, and do not hold Cljc
+ * without explicit root registration). Embedders: call clove_set_stack_base
+ * near the top of the thread's stack before evaluating, and do not hold Clove
  * pointers across evaluations unless they are reachable from the root env.
  * Assumes a downward-growing stack (x86/ARM/RISC-V).
  *
  * MAP OF THIS FILE — top-level sections, in order. Each is a banner you can
  * jump to; list them all with line numbers via
- *     grep -n '^/\* ───── ' cljc.c        (major)
- *     grep -n '^/\* ── ' cljc.c           (minor, within a major section)
+ *     grep -n '^/\* ───── ' clove.c        (major)
+ *     grep -n '^/\* ── ' clove.c           (minor, within a major section)
  *
- *   Value representation ......... the Cljc cell, tags, the union
+ *   Value representation ......... the Clove cell, tags, the union
  *   Environment .................. lexical frames, root bindings
  *   Forward declarations
- *   Error handling ............... ErrFrame/longjmp, cljc_error, traces
+ *   Error handling ............... ErrFrame/longjmp, clove_error, traces
  *   Coroutines ................... stackful ucontext fibers
  *   C-stack depth guard
  *   Constructors ................. mk_int/mk_str/mk_cons..., codepoint strings
@@ -48,7 +48,7 @@
  *   Public C API ................. the embedding surface
  *   Prelude ...................... core fns/macros as Clojure source
  *   Runtime init ................. native registration, later prelude tiers
- *   REPL, line editor, nREPL server, subcommands (main)   [#ifndef CLJC_NO_MAIN]
+ *   REPL, line editor, nREPL server, subcommands (main)   [#ifndef CLOVE_NO_MAIN]
  */
 
 #ifdef __APPLE__
@@ -90,14 +90,14 @@
  * setrlimit, or dlopen families. Map them onto winsock2 and the Win32
  * loader so the whole file compiles; features that can't be emulated
  * cheaply (nREPL fd-as-socket, raw-mode line editor) degrade at their
- * call sites. Bundles (-DCLJC_NO_MAIN) only need the socket + dlopen
- * shims; the rest is for a native cljc.exe build. */
+ * call sites. Bundles (-DCLOVE_NO_MAIN) only need the socket + dlopen
+ * shims; the rest is for a native clove.exe build. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>    /* WSAPoll, inet_pton */
 #include <windows.h>     /* LoadLibraryA / GetProcAddress for ffi-load* */
-#undef TRUE              /* windows.h defines these as 1/0; cljc uses them */
+#undef TRUE              /* windows.h defines these as 1/0; clove uses them */
 #undef FALSE             /* as the names of its boolean singleton globals  */
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0   /* no SIGPIPE on Windows; nothing to suppress */
@@ -118,7 +118,7 @@ static void *dlsym(void *h, const char *sym) {
 }
 static int dlclose(void *h) { return FreeLibrary((HMODULE)h) ? 0 : -1; }
 static const char *dlerror(void) { return "dynamic load failed"; }
-static int cljc_wsa_init(void) {   /* idempotent winsock startup */
+static int clove_wsa_init(void) {   /* idempotent winsock startup */
     static int done = 0;
     if (!done) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return -1; done = 1; }
     return 0;
@@ -131,16 +131,16 @@ static int cljc_wsa_init(void) {   /* idempotent winsock startup */
 #include <sys/resource.h>  /* setrlimit — main() raises the stack ceiling */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
 #include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
-#define CLJC_HAVE_CORO 1
+#define CLOVE_HAVE_CORO 1
 #define sock_close close
-#define cljc_wsa_init() 0
+#define clove_wsa_init() 0
 #ifdef __APPLE__
 /* mach-o/dyld.h can't be included: its enum DYLD_BOOL { FALSE, TRUE } collides
- * with cljc's boolean singleton globals. Declare the one stable function. */
+ * with clove's boolean singleton globals. Declare the one stable function. */
 extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 #define st_mtim st_mtimespec  /* Darwin spells the POSIX-2008 stat field its own way */
 #ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0      /* absent on macOS; cljc_no_sigpipe covers the sockets */
+#define MSG_NOSIGNAL 0      /* absent on macOS; clove_no_sigpipe covers the sockets */
 #endif
 #endif
 #endif  /* _WIN32 */
@@ -148,7 +148,7 @@ extern int _NSGetExecutablePath(char *buf, uint32_t *bufsize);
 /* macOS lacks MSG_NOSIGNAL, so sockets are marked SO_NOSIGPIPE at creation:
  * a peer hangup then surfaces as EPIPE instead of a process-killing signal.
  * No-op on Linux/Windows (MSG_NOSIGNAL / no SIGPIPE respectively). */
-static void cljc_no_sigpipe(int fd) {
+static void clove_no_sigpipe(int fd) {
 #ifdef SO_NOSIGPIPE
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
@@ -157,81 +157,81 @@ static void cljc_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLJC_VERSION "0.5.1"
-#ifndef CLJC_SHAREDIR
-#define CLJC_SHAREDIR "/usr/local/share/cljc"
+#define CLOVE_VERSION "0.5.1"
+#ifndef CLOVE_SHAREDIR
+#define CLOVE_SHAREDIR "/usr/local/share/clove"
 #endif
 
 /* Interpreter output streams — swappable so the nREPL server can capture
  * println/error output into protocol messages. NULL means stdout/stderr. */
-static FILE *cljc_out, *cljc_err;
-#define COUT (cljc_out ? cljc_out : stdout)
-#define CERR (cljc_err ? cljc_err : stderr)
+static FILE *clove_out, *clove_err;
+#define COUT (clove_out ? clove_out : stdout)
+#define CERR (clove_err ? clove_err : stderr)
 
 /* ───── Value representation ─────────────────────────────────────────── */
 
 typedef enum {
-    CLJC_NIL,
-    CLJC_BOOL,
-    CLJC_INT,
-    CLJC_DOUBLE,
-    CLJC_SYMBOL,    /* interned */
-    CLJC_KEYWORD,   /* interned, stored without leading ':' */
-    CLJC_STRING,
-    CLJC_CHAR,      /* a single character — codepoint in as.chr (immediate, no GC) */
-    CLJC_LIST,      /* singly-linked cons; CLJC_NIL terminates */
-    CLJC_VECTOR,
-    CLJC_MAP,       /* v0: assoc-array with copy-on-write; HAMT later */
-    CLJC_FN,        /* interpreted */
-    CLJC_NATIVE,    /* C function */
-    CLJC_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
-    CLJC_LAZY,      /* lazy seq: thunk forced once, result cached */
-    CLJC_TVEC,      /* transient vector: in-place edits, finalized by persistent! */
-    CLJC_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
-    CLJC_HNODE,     /* internal: HAMT tree node — never user-visible */
-    CLJC_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
-    CLJC_CHUNK,     /* internal: compiled bytecode for one fn arity body */
-    CLJC_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
-    CLJC_IARRAY,    /* mutable flat array of int64 or double: (int-array n) /
+    CLOVE_NIL,
+    CLOVE_BOOL,
+    CLOVE_INT,
+    CLOVE_DOUBLE,
+    CLOVE_SYMBOL,    /* interned */
+    CLOVE_KEYWORD,   /* interned, stored without leading ':' */
+    CLOVE_STRING,
+    CLOVE_CHAR,      /* a single character — codepoint in as.chr (immediate, no GC) */
+    CLOVE_LIST,      /* singly-linked cons; CLOVE_NIL terminates */
+    CLOVE_VECTOR,
+    CLOVE_MAP,       /* v0: assoc-array with copy-on-write; HAMT later */
+    CLOVE_FN,        /* interpreted */
+    CLOVE_NATIVE,    /* C function */
+    CLOVE_ATOM,      /* mutable box: (atom x), @a, swap!, reset! */
+    CLOVE_LAZY,      /* lazy seq: thunk forced once, result cached */
+    CLOVE_TVEC,      /* transient vector: in-place edits, finalized by persistent! */
+    CLOVE_SET,       /* persistent set: a HAMT keyed by its elements (uses as.map) */
+    CLOVE_HNODE,     /* internal: HAMT tree node — never user-visible */
+    CLOVE_RECUR,     /* sentinel: (recur args...) — bubbles to enclosing loop */
+    CLOVE_CHUNK,     /* internal: compiled bytecode for one fn arity body */
+    CLOVE_CORO,      /* stackful coroutine (coro/new): own C stack + vstack segment */
+    CLOVE_IARRAY,    /* mutable flat array of int64 or double: (int-array n) /
                      * (double-array n) — no per-element boxing */
-    CLJC_FREE,      /* internal: swept cell on the free list — never user-visible */
-    CLJC_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
+    CLOVE_FREE,      /* internal: swept cell on the free list — never user-visible */
+    CLOVE_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
                      * true, (= () nil) false, but seq/to_seq of it is NIL so the
                      * seq machinery and cons-traversal still terminate cleanly */
-    CLJC_BIGINT,    /* arbitrary-precision integer: sign + base-2^32 magnitude.
+    CLOVE_BIGINT,    /* arbitrary-precision integer: sign + base-2^32 magnitude.
                      * Only exists when a value exceeds int64 — results that fit
-                     * demote back to CLJC_INT, so the common case never allocates */
-    CLJC_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
+                     * demote back to CLOVE_INT, so the common case never allocates */
+    CLOVE_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
                      * reduced, den!=1 (den==1 demotes to the integer) */
-    CLJC_BIGDEC,    /* java.math.BigDecimal: unscaled (INT or BIGINT) x 10^-scale.
+    CLOVE_BIGDEC,    /* java.math.BigDecimal: unscaled (INT or BIGINT) x 10^-scale.
                      * Never normalized -- 1.0M and 1.00M keep their scales, as in
                      * Java -- but = and hash compare by value (compareTo == 0) */
-    CLJC_VAR,       /* a Var: a named reference to a global binding. Derefs to the
+    CLOVE_VAR,       /* a Var: a named reference to a global binding. Derefs to the
                      * binding's current value, is IFn (calls the value), and
                      * carries {:name :ns} metadata — what (resolve sym) returns */
-    CLJC_SORTED,    /* sorted set/map: comparator-ordered. A persistent weight-
-                     * balanced tree (CLJC_TNODE root) + the comparator (NIL =
+    CLOVE_SORTED,    /* sorted set/map: comparator-ordered. A persistent weight-
+                     * balanced tree (CLOVE_TNODE root) + the comparator (NIL =
                      * default). Key identity is "cmp == 0", not =, so custom
                      * comparators collapse cmp-equal keys. O(log n) everything. */
-    CLJC_TNODE,     /* internal: a node of a sorted collection's weight-balanced
+    CLOVE_TNODE,     /* internal: a node of a sorted collection's weight-balanced
                      * tree (Adams' tree). Holds key, val (set: val==key; map: the
                      * value), left/right subtrees, and subtree size. Not user-
                      * visible. */
-} CljcTag;
+} CloveTag;
 
-typedef struct Cljc Cljc;
-typedef struct CljcEnv CljcEnv;
+typedef struct Clove Clove;
+typedef struct CloveEnv CloveEnv;
 typedef struct Binding Binding;
-typedef Cljc *(*CljcNativeFn)(CljcEnv *env, Cljc **argv, int nargs);
+typedef Clove *(*CloveNativeFn)(CloveEnv *env, Clove **argv, int nargs);
 
-struct Cljc {
-    CljcTag tag;
+struct Clove {
+    CloveTag tag;
     uint8_t gcmark;
-    Cljc *meta;     /* metadata map or NULL; ignored by equality/hash */
+    Clove *meta;     /* metadata map or NULL; ignored by equality/hash */
     union {
         bool b;
         int64_t i;
-        int32_t chr;    /* CLJC_CHAR codepoint */
+        int32_t chr;    /* CLOVE_CHAR codepoint */
         double d;
         const char *sym;
         /* Wider view of the same symbol cell: name aliases .sym; root_cache
@@ -251,54 +251,54 @@ struct Cljc {
                   * multibyte sequence is well-formed (set with ncp), which is
                   * what makes stepping the cursor BACKWARD exact. */
                  uint32_t cur_cp, cur_byte; bool clean; } strx;
-        struct { Cljc *head; Cljc *tail; } cons;
+        struct { Clove *head; Clove *tail; } cons;
         /* Persistent vector: 32-way position trie + tail of the last ≤32
          * elements. tail is owned by THIS cell (copied per derived vector);
-         * tree nodes are shared CLJC_HNODE cells. root NULL → all in tail. */
-        /* vec doubles as the transient view (CLJC_TVEC): edit_id marks tree
+         * tree nodes are shared CLOVE_HNODE cells. root NULL → all in tail. */
+        /* vec doubles as the transient view (CLOVE_TVEC): edit_id marks tree
          * nodes this transient owns (may mutate); alive flips off at
          * persistent!. Transient tails are full 32-cap chunk buffers. */
-        struct { Cljc *root; Cljc **tail; uint32_t count; uint32_t edit_id;
+        struct { Clove *root; Clove **tail; uint32_t count; uint32_t edit_id;
                  uint8_t shift; uint8_t taillen; bool alive; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         /* lit_order is set only on a map LITERAL as read: the reader's
          * original (k1 v1 k2 v2 ...) form list, kept so eval can evaluate
          * entries in source order (a HAMT has none). NULL on every map built
          * at runtime -- map_assoc allocates a fresh zeroed cell. */
-        struct { Cljc *root; size_t count; Cljc *lit_order; } map;
+        struct { Clove *root; size_t count; Clove *lit_order; } map;
         /* sorted set/map: root of a weight-balanced tree (NIL when empty); cmp is
          * the comparator fn (NIL = default cmp_values). */
-        struct { Cljc *root; Cljc *cmp; bool is_map; } sorted;
+        struct { Clove *root; Clove *cmp; bool is_map; } sorted;
         /* a weight-balanced tree node: left/right subtrees, the comparison key,
          * its value (set: == key; map: the value), and subtree node count. */
-        struct { Cljc *left; Cljc *right; Cljc *key; Cljc *val; uint32_t size; } tnode;
+        struct { Clove *left; Clove *right; Clove *key; Clove *val; uint32_t size; } tnode;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
          * subnode. Collision nodes hold same-hash entries linearly. */
-        struct { Cljc **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
+        struct { Clove **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
                  bool collision; uint32_t edit_id; } hnode;
         /* arities: list of (params-list . body-list) pairs; dispatch by argc.
          * fast-call cache (lazy, filled on first apply): fc_arity is the lone
          * fixed arity whose params are all simple symbols, count fc_n <=
          * ENV_SLOTS — lets apply skip arity_info + bind_params/destructure and
          * fill the call frame's slots directly. NULL => always use slow path. */
-        struct { Cljc *arities; CljcEnv *env; bool is_macro;
-                 bool fc_ready; uint8_t fc_n; Cljc *fc_arity; } fn;
-        CljcNativeFn native;
-        struct { Cljc *value; } atom;
-        /* CLJC_BIGINT: sign in {-1,+1}; mag is n little-endian base-2^32 limbs,
-         * mag[n-1] != 0 (never stored as zero — zero demotes to CLJC_INT). */
+        struct { Clove *arities; CloveEnv *env; bool is_macro;
+                 bool fc_ready; uint8_t fc_n; Clove *fc_arity; } fn;
+        CloveNativeFn native;
+        struct { Clove *value; } atom;
+        /* CLOVE_BIGINT: sign in {-1,+1}; mag is n little-endian base-2^32 limbs,
+         * mag[n-1] != 0 (never stored as zero — zero demotes to CLOVE_INT). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
-        struct { Cljc *num; Cljc *den; } ratio;   /* CLJC_RATIO */
-        struct { Cljc *u; int64_t s; } bigdec;     /* CLJC_BIGDEC: u * 10^-s */
-        struct { const char *name; } var;          /* CLJC_VAR: canonical binding name */
-        struct { Cljc *thunk; Cljc *cached; bool done; } lazy;
+        struct { Clove *num; Clove *den; } ratio;   /* CLOVE_RATIO */
+        struct { Clove *u; int64_t s; } bigdec;     /* CLOVE_BIGDEC: u * 10^-s */
+        struct { const char *name; } var;          /* CLOVE_VAR: canonical binding name */
+        struct { Clove *thunk; Clove *cached; bool done; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
-        struct { Cljc *iv[3]; uint8_t n; bool spill; } recur;
-        struct { uint32_t *code; Cljc **consts;
+        struct { Clove *iv[3]; uint8_t n; bool spill; } recur;
+        struct { uint32_t *code; Clove **consts;
                  uint32_t ncode; uint16_t nconst; } chunk;
-        struct Coro *coro;   /* CLJC_CORO: heap-allocated coroutine state */
-        /* CLJC_IARRAY: cell-owned flat buffer (freed on sweep); no GC children.
+        struct Coro *coro;   /* CLOVE_CORO: heap-allocated coroutine state */
+        /* CLOVE_IARRAY: cell-owned flat buffer (freed on sweep); no GC children.
          * dbl=true marks a double-array: the same 8-byte slots hold IEEE bit
          * patterns instead of integers. Same element size, same allocation and
          * sweep path, and still nothing for the GC to trace -- only the read
@@ -311,7 +311,7 @@ struct Cljc {
 
 struct Binding {
     const char *name;   /* interned symbol pointer — compare by == */
-    Cljc *value;
+    Clove *value;
     struct Binding *next;
 };
 
@@ -320,59 +320,59 @@ struct Binding {
  * ROOT env never uses slots: root Binding* must stay stable for the
  * per-symbol root_cache, and def mutates bindings in place. */
 #define ENV_SLOTS 4
-struct CljcEnv {
+struct CloveEnv {
     Binding *bindings;  /* overflow chain — and ALL root bindings */
-    CljcEnv *parent;    /* doubles as the free-list next pointer when swept */
+    CloveEnv *parent;    /* doubles as the free-list next pointer when swept */
     uint8_t gcmark;
     uint8_t gcfree;
     uint8_t nslots;
     uint8_t captured;   /* a closure holds (a descendant of) this frame:
                          * VOP_REBIND must not mutate its slots in place */
     const char *sname[ENV_SLOTS];
-    Cljc *sval[ENV_SLOTS];
+    Clove *sval[ENV_SLOTS];
 };
 
 /* ───── Forward declarations ─────────────────────────────────────────── */
 
-static Cljc *eval(CljcEnv *env, Cljc *form);
-static Cljc *read_form(const char **src);
-static void print(Cljc *v);
+static Clove *eval(CloveEnv *env, Clove *form);
+static Clove *read_form(const char **src);
+static void print(Clove *v);
 static const char *intern(const char *s, size_t n);
-static bool cljc_eq(Cljc *a, Cljc *b);
-static bool map_find(Cljc *m, Cljc *key, Cljc **out);
-static double as_num(Cljc *v);
-static Cljc *iarr_get(Cljc *a, int64_t i);
-static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs);
-static void iarr_set(Cljc *a, int64_t i, Cljc *v, const char *what);
-static Cljc *big_from_decimal(const char *s);
-static char *big_to_decimal(Cljc *v);
-static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R);
-static bool big_is_zero(Cljc *A);
-static Cljc *bd_parse(const char *t, size_t n);
-static Cljc *make_ratio(Cljc *num, Cljc *den);
-static Cljc *to_seq(Cljc *v);
-static Cljc *seq1(Cljc *v);
-static Cljc *seq1_slot(Cljc **slot);
-static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs);
-static Cljc *sorted_entry_list(Cljc *coll);
-static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out);
-static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *val);
-static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key);
-static bool sorted_contains(CljcEnv *env, Cljc *coll, Cljc *key);
-static uint32_t sorted_count(Cljc *coll);
-static Cljc *mk_map_entry(Cljc *k, Cljc *v);
-static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs);
-static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs);
-static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs);
-static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs);
+static bool clove_eq(Clove *a, Clove *b);
+static bool map_find(Clove *m, Clove *key, Clove **out);
+static double as_num(Clove *v);
+static Clove *iarr_get(Clove *a, int64_t i);
+static Clove *prim_get(CloveEnv *env, Clove **argv, int nargs);
+static void iarr_set(Clove *a, int64_t i, Clove *v, const char *what);
+static Clove *big_from_decimal(const char *s);
+static char *big_to_decimal(Clove *v);
+static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R);
+static bool big_is_zero(Clove *A);
+static Clove *bd_parse(const char *t, size_t n);
+static Clove *make_ratio(Clove *num, Clove *den);
+static Clove *to_seq(Clove *v);
+static Clove *seq1(Clove *v);
+static Clove *seq1_slot(Clove **slot);
+static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
+static Clove *sorted_entry_list(Clove *coll);
+static bool sorted_get(CloveEnv *env, Clove *coll, Clove *key, Clove **out);
+static Clove *sorted_put(CloveEnv *env, Clove *coll, Clove *key, Clove *val);
+static Clove *sorted_remove(CloveEnv *env, Clove *coll, Clove *key);
+static bool sorted_contains(CloveEnv *env, Clove *coll, Clove *key);
+static uint32_t sorted_count(Clove *coll);
+static Clove *mk_map_entry(Clove *k, Clove *v);
+static Clove *prim_conj(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_assoc(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_dissoc(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_disj(CloveEnv *env, Clove **argv, int nargs);
 /* GC-rooted value stack: call arguments live here (heap argv buffers would
  * be invisible to the conservative stack scan). Frames push, call, restore. */
 #define VSTACK_CAP (1u << 20)
-static Cljc **vstack;
+static Clove **vstack;
 static size_t vsp;
 static size_t vstack_cap = VSTACK_CAP;   /* swapped to the active coro's cap */
-static void vpush(Cljc *v);
-void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
+static void vpush(Clove *v);
+void clove_define_native(CloveEnv *env, const char *name, CloveNativeFn fn);
 /* Namespace aliases for the flat-global model: (require '[x.y :as m])
  * registers "m"; on lookup miss, m/foo retries as bare foo. */
 #define MAX_ALIASES 8192
@@ -405,7 +405,7 @@ static int n_refers;
 
 /* The namespace-object layer over the flat-global model: every ns entered
  * via (ns ..)/in-ns/require/create-ns is recorded here — find-ns/all-ns
- * consult it, and *ns* tracks the current one (as a SYMBOL: cljc has no
+ * consult it, and *ns* tracks the current one (as a SYMBOL: clove has no
  * Namespace type, and (str *ns*)/(ns-name *ns*) are what code relies on). */
 #define MAX_NAMESPACES 1024
 static const char *ns_registry[MAX_NAMESPACES];  /* interned ns names */
@@ -488,17 +488,17 @@ static const char *doc_args_get(const char *name) {
     return NULL;
 }
 
-static Cljc *cell_alloc(bool zero);
-static CljcEnv *env_alloc(void);
-static Cljc **chunk32_alloc(void);
-static void chunk32_free(Cljc **p);
-static Cljc **tail_alloc(uint8_t n);
-static void tail_free(Cljc **p, uint8_t n);
-static size_t vec_len(Cljc *v);
-static Cljc *vec_nth(Cljc *v, size_t i);
-static char *as_str(Cljc *v, const char *what);
-static int64_t as_int(Cljc *v, const char *what);
-static Cljc *NIL, *TRUE, *FALSE, *EMPTY, *EMPTY_VEC;
+static Clove *cell_alloc(bool zero);
+static CloveEnv *env_alloc(void);
+static Clove **chunk32_alloc(void);
+static void chunk32_free(Clove **p);
+static Clove **tail_alloc(uint8_t n);
+static void tail_free(Clove **p, uint8_t n);
+static size_t vec_len(Clove *v);
+static Clove *vec_nth(Clove *v, size_t i);
+static char *as_str(Clove *v, const char *what);
+static int64_t as_int(Clove *v, const char *what);
+static Clove *NIL, *TRUE, *FALSE, *EMPTY, *EMPTY_VEC;
 
 /* ───── Error handling ───────────────────────────────────────────────── */
 
@@ -518,7 +518,7 @@ static Cljc *NIL, *TRUE, *FALSE, *EMPTY, *EMPTY_VEC;
  * the chunk's const pool at throw time. `esp` is eval_sp at vm_run entry:
  * it interleaves these frames with the tree-walker's eval_stack frames. */
 typedef struct VmTraceFrame {
-    Cljc *chunk;
+    Clove *chunk;
     uint32_t pc;          /* index PAST the in-flight call op; 0 = none */
     int esp;
 } VmTraceFrame;
@@ -533,21 +533,21 @@ typedef struct ErrFrame { jmp_buf jb; struct ErrFrame *prev; size_t vsp_save; in
                            * nested source (stale :file/:line meta on every
                            * later form) */
                           int rd_line_save; const char *rd_start_save;
-                          Cljc *rd_file_save;
+                          Clove *rd_file_save;
                           /* current namespace: macro_expand1 switches it to the
                            * call site's home ns; a throw mid-expansion must not
                            * leave the caller in the library's namespace */
-                          const char *ns_save; Cljc *nsvar_save; } ErrFrame;
+                          const char *ns_save; Clove *nsvar_save; } ErrFrame;
 #define EVAL_STACK_MAX 4096
-static Cljc *eval_stack[EVAL_STACK_MAX];
+static Clove *eval_stack[EVAL_STACK_MAX];
 static int eval_sp;
 /* Call-site form of an in-flight VOP_TAILCALL sentinel. Set by the VM just
  * before it returns the sentinel (only VOP_RET runs in between), consumed by
  * the trampoline that dispatches it — an airtight handoff, so a single slot
  * suffices. Lets tail-call trace frames carry the source form without
  * growing the pooled recur cell. */
-static Cljc *g_tc_form;
-static Cljc *rd_file_cell;   /* display name of the file being read (one string
+static Clove *g_tc_form;
+static Clove *rd_file_cell;   /* display name of the file being read (one string
                               * cell per load, shared by every form's :file
                               * meta); NULL = unnamed source. GC-rooted. */
 static int rd_line;                 /* 1-based; 0 = no tracking */
@@ -557,12 +557,12 @@ static char err_file[160];         /* :file of the innermost located frame ("" =
 /* Ctrl-C during a REPL evaluation: the SIGINT handler sets this; eval() and
  * VOP_CALL raise a catchable "interrupted" error at the next call boundary.
  * Only the REPL installs the handler — scripts keep default-die semantics
- * (cljc watch relies on WIFSIGNALED to stop its loop). */
+ * (clove watch relies on WIFSIGNALED to stop its loop). */
 static volatile sig_atomic_t g_interrupt;
-static void cljc_on_sigint(int sig) { (void)sig; g_interrupt = 1; }
+static void clove_on_sigint(int sig) { (void)sig; g_interrupt = 1; }
 #ifdef _WIN32
-static BOOL WINAPI cljc_ctrl_handler(DWORD t) {
-    /* 1/0, not TRUE/FALSE: those names are cljc's boolean singletons here */
+static BOOL WINAPI clove_ctrl_handler(DWORD t) {
+    /* 1/0, not TRUE/FALSE: those names are clove's boolean singletons here */
     if (t == CTRL_C_EVENT) { g_interrupt = 1; return 1; }
     return 0;   /* CTRL_BREAK etc: default handling */
 }
@@ -575,10 +575,10 @@ static long long err_col = -1;
 static ErrFrame *err_top;
 static jmp_buf err_jmp;
 static char err_msg[256];
-static Cljc *cur_exc;   /* exception value in flight; a GC root */
+static Clove *cur_exc;   /* exception value in flight; a GC root */
 /* Class of a message-style error in flight: a simple JVM class name such as
- * "ArithmeticException" (set by cljc_error_cls), or NULL for the untyped
- * majority raised through plain cljc_error. See "Exception classes" below. */
+ * "ArithmeticException" (set by clove_error_cls), or NULL for the untyped
+ * majority raised through plain clove_error. See "Exception classes" below. */
 static const char *err_class;
 
 /* ───── Coroutines (stackful, ucontext-backed) ───────────────────────────
@@ -595,13 +595,13 @@ static const char *err_class;
  *     installs its own base ErrFrame so a throw never longjmps across stacks.
  *   - the conservative GC scans each reachable suspended coro's live C-stack
  *     range + its saved register blob (the ucontext) + its own vstack. */
-#ifdef CLJC_HAVE_CORO
+#ifdef CLOVE_HAVE_CORO
 typedef enum { CORO_NEW, CORO_SUSPENDED, CORO_RUNNING, CORO_NORMAL, CORO_DEAD } CoroStatus;
 typedef struct Coro {
-    Cljc *self;            /* the CLJC_CORO cell wrapping this (GC back-ref) */
-    Cljc *thunk;           /* zero-arg fn run by the body (GC root) */
-    Cljc *xfer;            /* value handed across resume/yield (GC root) */
-    Cljc *error;           /* value of an uncaught throw, else NULL (GC root) */
+    Clove *self;            /* the CLOVE_CORO cell wrapping this (GC back-ref) */
+    Clove *thunk;           /* zero-arg fn run by the body (GC root) */
+    Clove *xfer;            /* value handed across resume/yield (GC root) */
+    Clove *error;           /* value of an uncaught throw, else NULL (GC root) */
     ucontext_t ctx;        /* machine context saved while suspended */
     char *stack;           /* malloc'd stack (low address) */
     size_t stack_size;
@@ -614,11 +614,11 @@ typedef struct Coro {
      * so a coro must always resume onto the SAME array; sharing one vstack and
      * relocating segments broke those pointers. We swap the global vstack/vsp/
      * vstack_cap to the active coro's on every context switch. */
-    Cljc **s_vstack;       /* the coro's vstack array (saved globals while away) */
+    Clove **s_vstack;       /* the coro's vstack array (saved globals while away) */
     size_t s_vsp;
     size_t s_vstack_cap;
     ErrFrame *s_err_top;   /* saved err_top while suspended */
-    Cljc *s_cur_exc;
+    Clove *s_cur_exc;
     int s_eval_sp;
     int s_vm_tsp;
 } Coro;
@@ -628,10 +628,10 @@ static ucontext_t coro_main_ctx;  /* main's context saved while a coro runs */
 static void *coro_main_saved_sp;  /* main's SP at the point it entered coro-land */
 /* main's execution state saved while a coro runs (see state_save/state_load) */
 static ErrFrame *main_s_err_top;
-static Cljc *main_s_cur_exc;
+static Clove *main_s_cur_exc;
 static int main_s_eval_sp;
 static int main_s_vm_tsp;
-static Cljc **main_s_vstack;
+static Clove **main_s_vstack;
 static size_t main_s_vsp;
 static size_t main_s_vstack_cap;
 static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
@@ -640,7 +640,7 @@ static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn))
 #endif
-static void cljc_raise(void) {
+static void clove_raise(void) {
     if (err_top) longjmp(err_top->jb, 1);
     longjmp(err_jmp, 1);
 }
@@ -656,7 +656,7 @@ __attribute__((noreturn, format(__MINGW_PRINTF_FORMAT, 1, 2)))
 __attribute__((noreturn, format(printf, 1, 2)))
 #endif
 #endif
-static void cljc_error(const char *fmt, ...) {
+static void clove_error(const char *fmt, ...) {
     cur_exc = NULL;  /* message-style error */
     err_class = NULL;   /* untyped: any (catch Class e) but ExceptionInfo takes it */
     /* err_token persists only when the caller set it just before */
@@ -664,10 +664,10 @@ static void cljc_error(const char *fmt, ...) {
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
     trace_snapshot();
-    cljc_raise();
+    clove_raise();
 }
 
-/* cljc_error with a JVM exception class attached, for the sites whose class
+/* clove_error with a JVM exception class attached, for the sites whose class
  * ported code actually dispatches on: (catch ArithmeticException e ...) around
  * a division, (catch IndexOutOfBoundsException e ...) around an nth. */
 #if defined(__GNUC__) || defined(__clang__)
@@ -677,42 +677,42 @@ __attribute__((noreturn, format(__MINGW_PRINTF_FORMAT, 2, 3)))
 __attribute__((noreturn, format(printf, 2, 3)))
 #endif
 #endif
-static void cljc_error_cls(const char *cls, const char *fmt, ...) {
+static void clove_error_cls(const char *cls, const char *fmt, ...) {
     cur_exc = NULL;
     err_class = cls;
     va_list ap; va_start(ap, fmt);
     vsnprintf(err_msg, sizeof err_msg, fmt, ap);
     va_end(ap);
     trace_snapshot();
-    cljc_raise();
+    clove_raise();
 }
 
 /* A short human description of a value's type, for friendlier error messages
  * ("expected a number, got a keyword"). */
-static const char *val_type_name(Cljc *v) {
+static const char *val_type_name(Clove *v) {
     if (v == NIL || v == NULL) return "nil";
     switch (v->tag) {
-        case CLJC_BOOL:    return "a boolean";
-        case CLJC_INT: case CLJC_BIGINT: return "an integer";
-        case CLJC_DOUBLE:  return "a float";
-        case CLJC_RATIO:   return "a ratio";
-        case CLJC_BIGDEC:  return "a decimal";
-        case CLJC_STRING:  return "a string";
-        case CLJC_CHAR:    return "a character";
-        case CLJC_KEYWORD: return "a keyword";
-        case CLJC_SYMBOL:  return "a symbol";
-        case CLJC_LIST: case CLJC_EMPTY: return "a list";
-        case CLJC_LAZY:    return "a lazy seq";
-        case CLJC_VECTOR:  return "a vector";
-        case CLJC_TVEC:    return "a transient vector";
-        case CLJC_MAP:     return "a map";
-        case CLJC_SET:     return "a set";
-        case CLJC_SORTED:  return v->as.sorted.is_map ? "a sorted map" : "a sorted set";
-        case CLJC_FN: case CLJC_NATIVE: return "a function";
-        case CLJC_ATOM:    return "an atom";
-        case CLJC_VAR:     return "a var";
-        case CLJC_CORO:    return "a coroutine";
-        case CLJC_IARRAY:  return v->as.iarr.dbl ? "a double-array" : "an int-array";
+        case CLOVE_BOOL:    return "a boolean";
+        case CLOVE_INT: case CLOVE_BIGINT: return "an integer";
+        case CLOVE_DOUBLE:  return "a float";
+        case CLOVE_RATIO:   return "a ratio";
+        case CLOVE_BIGDEC:  return "a decimal";
+        case CLOVE_STRING:  return "a string";
+        case CLOVE_CHAR:    return "a character";
+        case CLOVE_KEYWORD: return "a keyword";
+        case CLOVE_SYMBOL:  return "a symbol";
+        case CLOVE_LIST: case CLOVE_EMPTY: return "a list";
+        case CLOVE_LAZY:    return "a lazy seq";
+        case CLOVE_VECTOR:  return "a vector";
+        case CLOVE_TVEC:    return "a transient vector";
+        case CLOVE_MAP:     return "a map";
+        case CLOVE_SET:     return "a set";
+        case CLOVE_SORTED:  return v->as.sorted.is_map ? "a sorted map" : "a sorted set";
+        case CLOVE_FN: case CLOVE_NATIVE: return "a function";
+        case CLOVE_ATOM:    return "an atom";
+        case CLOVE_VAR:     return "a var";
+        case CLOVE_CORO:    return "a coroutine";
+        case CLOVE_IARRAY:  return v->as.iarr.dbl ? "a double-array" : "an int-array";
         default:           return "a value";
     }
 }
@@ -720,24 +720,24 @@ static const char *val_type_name(Cljc *v) {
 /* Like val_type_name but names the VALUE too when it's a scalar:
  * "a keyword: :foo" answers the question a bare type name only raises.
  * Two rotating buffers so one message can describe two values. */
-static const char *val_desc(Cljc *v) {
+static const char *val_desc(Clove *v) {
     static char bufs[2][96];
     static int which;
     if (v == NIL || v == NULL) return "nil";
     char *b = bufs[which ^= 1];
     const char *t = val_type_name(v);
     switch (v->tag) {
-        case CLJC_INT:     snprintf(b, 96, "%s: %lld", t, (long long)v->as.i); break;
-        case CLJC_DOUBLE:  snprintf(b, 96, "%s: %g", t, v->as.d); break;
-        case CLJC_KEYWORD: snprintf(b, 96, "%s: :%.60s", t, v->as.kw); break;
-        case CLJC_SYMBOL:  snprintf(b, 96, "%s: %.60s", t, v->as.sym); break;
-        case CLJC_BOOL:    snprintf(b, 96, "%s: %s", t, v->as.b ? "true" : "false"); break;
-        case CLJC_CHAR:
+        case CLOVE_INT:     snprintf(b, 96, "%s: %lld", t, (long long)v->as.i); break;
+        case CLOVE_DOUBLE:  snprintf(b, 96, "%s: %g", t, v->as.d); break;
+        case CLOVE_KEYWORD: snprintf(b, 96, "%s: :%.60s", t, v->as.kw); break;
+        case CLOVE_SYMBOL:  snprintf(b, 96, "%s: %.60s", t, v->as.sym); break;
+        case CLOVE_BOOL:    snprintf(b, 96, "%s: %s", t, v->as.b ? "true" : "false"); break;
+        case CLOVE_CHAR:
             if (v->as.chr >= 33 && v->as.chr < 127)
                 snprintf(b, 96, "%s: \\%c", t, (char)v->as.chr);
             else return t;
             break;
-        case CLJC_STRING:
+        case CLOVE_STRING:
             if (v->as.strx.nbytes > 40)
                 snprintf(b, 96, "%s: \"%.40s...\"", t, v->as.str);
             else
@@ -751,12 +751,12 @@ static const char *val_desc(Cljc *v) {
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn))
 #endif
-static void cljc_throw_value(Cljc *v) {
+static void clove_throw_value(Clove *v) {
     cur_exc = v;
     err_class = NULL;   /* a thrown value carries its class in its metadata */
     snprintf(err_msg, sizeof err_msg, "uncaught exception");
     trace_snapshot();
-    cljc_raise();
+    clove_raise();
 }
 
 /* ───── C-stack depth guard ──────────────────────────────────────────────
@@ -797,43 +797,43 @@ static void stack_floor_init(const char *base) {
     main_stack_floor = (const char *)((uintptr_t)base - budget + STACK_SAFETY_MARGIN);
 }
 
-static void cljc_check_stack(void) {
+static void clove_check_stack(void) {
     char probe;
     const char *sp = &probe;               /* approximate current stack pointer */
     const char *floor;
-#ifdef CLJC_HAVE_CORO
+#ifdef CLOVE_HAVE_CORO
     if (coro_current)                       /* coro: stack is [stack, stack_top) */
         floor = coro_current->stack + STACK_SAFETY_MARGIN;
     else
 #endif
         floor = main_stack_floor;
     if (floor && sp < floor)
-        cljc_error_cls("StackOverflowError", "stack overflow — usually deep non-tail recursion: "
+        clove_error_cls("StackOverflowError", "stack overflow — usually deep non-tail recursion: "
                    "use loop/recur (or reduce) instead of self-calls that grow the stack");
 }
 
-static void vpush(Cljc *v) {
+static void vpush(Clove *v) {
     if (vsp >= vstack_cap)
-        cljc_error_cls("StackOverflowError", "value stack overflow — usually deep non-tail recursion: "
+        clove_error_cls("StackOverflowError", "value stack overflow — usually deep non-tail recursion: "
                    "use loop/recur (or reduce) instead of self-calls that grow the stack");
     vstack[vsp++] = v;
 }
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
-    if (!p) cljc_error("out of memory");
+    if (!p) clove_error("out of memory");
     return p;
 }
 static void *xrealloc(void *p, size_t n) {
     void *q = realloc(p, n);   /* old block survives an OOM longjmp */
-    if (!q) { free(p); cljc_error("out of memory"); }
+    if (!q) { free(p); clove_error("out of memory"); }
     return q;
 }
 
 /* ───── Constructors ─────────────────────────────────────────────────── */
 
-static Cljc *alloc(CljcTag t) {
-    Cljc *v = cell_alloc(t != CLJC_INT && t != CLJC_DOUBLE && t != CLJC_CHAR);
+static Clove *alloc(CloveTag t) {
+    Clove *v = cell_alloc(t != CLOVE_INT && t != CLOVE_DOUBLE && t != CLOVE_CHAR);
     v->tag = t;
     return v;
 }
@@ -842,29 +842,29 @@ static Cljc *alloc(CljcTag t) {
  * never swept) — loop counters and small arithmetic allocate nothing. */
 #define SMALLINT_MIN (-128)
 #define SMALLINT_MAX 1023
-static Cljc smallints[SMALLINT_MAX - SMALLINT_MIN + 1];
+static Clove smallints[SMALLINT_MAX - SMALLINT_MIN + 1];
 
-static Cljc *mk_int(int64_t i) {
+static Clove *mk_int(int64_t i) {
     if (i >= SMALLINT_MIN && i <= SMALLINT_MAX) return &smallints[i - SMALLINT_MIN];
-    Cljc *v = alloc(CLJC_INT);
+    Clove *v = alloc(CLOVE_INT);
     v->as.i = i;
     return v;
 }
-static Cljc *mk_double(double d)     { Cljc *v = alloc(CLJC_DOUBLE); v->as.d = d; return v; }
+static Clove *mk_double(double d)     { Clove *v = alloc(CLOVE_DOUBLE); v->as.d = d; return v; }
 /* Byte-valued chars (0..255) are preallocated and immortal — string seqs
  * (which yield one char per byte) then allocate nothing. */
-static Cljc smallchars[256];
-static Cljc *mk_char(int32_t cp) {
+static Clove smallchars[256];
+static Clove *mk_char(int32_t cp) {
     if (cp >= 0 && cp < 256) return &smallchars[cp];
-    Cljc *v = alloc(CLJC_CHAR);
+    Clove *v = alloc(CLOVE_CHAR);
     v->as.chr = cp;
     return v;
 }
-static Cljc *mk_bool(bool b)         { return b ? TRUE : FALSE; }
+static Clove *mk_bool(bool b)         { return b ? TRUE : FALSE; }
 static const char *cur_reader_ns;   /* set while require loads a library */
 static Binding *g_ns_binding;       /* the *ns* var's root binding, once seen (ErrFrame restore) */
-static Cljc *mk_sym(const char *s) {
-    Cljc *v = alloc(CLJC_SYMBOL);
+static Clove *mk_sym(const char *s) {
+    Clove *v = alloc(CLOVE_SYMBOL);
     v->as.sym = s;
     v->as.symc.home_ns = cur_reader_ns;  /* NULL outside library loads */
     return v;
@@ -872,16 +872,16 @@ static Cljc *mk_sym(const char *s) {
 /* Keyword CELLS are interned too (like Clojure): one immortal cell per
  * name, allocated outside the GC pools — so (identical? :a :a) holds and
  * keyword-heavy code allocates nothing per read. */
-typedef struct KwNode { const char *name; Cljc *cell; struct KwNode *next; } KwNode;
+typedef struct KwNode { const char *name; Clove *cell; struct KwNode *next; } KwNode;
 static KwNode *kw_table[256];
 
-static Cljc *mk_kw(const char *s) {   /* s is already interned */
+static Clove *mk_kw(const char *s) {   /* s is already interned */
     uint32_t h = (uint32_t)((uintptr_t)s >> 4) & 255u;
     for (KwNode *n = kw_table[h]; n; n = n->next)
         if (n->name == s) return n->cell;
-    Cljc *v = xmalloc(sizeof *v);     /* immortal: never in a pool, never swept */
+    Clove *v = xmalloc(sizeof *v);     /* immortal: never in a pool, never swept */
     memset(v, 0, sizeof *v);
-    v->tag = CLJC_KEYWORD;
+    v->tag = CLOVE_KEYWORD;
     v->gcmark = 1;
     v->as.kw = s;
     KwNode *n = xmalloc(sizeof *n);
@@ -896,8 +896,8 @@ static size_t gc_extra_bytes;   /* string buffer bytes since last GC —
 
 #define STR_NCP_UNKNOWN 0xFFFFFFFFu
 
-static Cljc *mk_str(const char *s, size_t n) {
-    Cljc *v = alloc(CLJC_STRING);
+static Clove *mk_str(const char *s, size_t n) {
+    Clove *v = alloc(CLOVE_STRING);
     gc_extra_bytes += n;
     v->as.str = xmalloc(n + 1);
     memcpy(v->as.str, s, n);
@@ -940,7 +940,7 @@ static int32_t utf8_next(const char **p) {
     return b;                                /* invalid byte: latin-1 fallback */
 }
 
-static size_t str_cp_count(Cljc *v) {
+static size_t str_cp_count(Clove *v) {
     if (v->as.strx.ncp != STR_NCP_UNKNOWN) return v->as.strx.ncp;
     size_t n = 0;
     bool clean = true;
@@ -956,14 +956,14 @@ static size_t str_cp_count(Cljc *v) {
     v->as.strx.clean = clean;
     return n;
 }
-static bool str_ascii(Cljc *v) { return str_cp_count(v) == v->as.strx.nbytes; }
+static bool str_ascii(Clove *v) { return str_cp_count(v) == v->as.strx.nbytes; }
 
 /* Byte offset of codepoint i (i <= ncp) in a non-ASCII string, moving the
  * string's cursor there. Starts from whichever of {start, cursor} is nearer;
  * walks backward from the cursor only when the string is clean UTF-8 (then
  * skipping continuation bytes lands exactly on the forward-decode boundary;
  * on dirty input a stray 0x80..0xBF byte would desync, so restart from 0). */
-static size_t str_cp_seek(Cljc *v, size_t i) {
+static size_t str_cp_seek(Clove *v, size_t i) {
     const char *s = v->as.str;
     size_t ccp = v->as.strx.cur_cp, cb = v->as.strx.cur_byte;
     if (ccp > str_cp_count(v) || cb > v->as.strx.nbytes) ccp = cb = 0;
@@ -984,16 +984,16 @@ static size_t str_cp_seek(Cljc *v, size_t i) {
     v->as.strx.cur_byte = (uint32_t)(p - s);
     return (size_t)(p - s);
 }
-static size_t str_cp_to_byte(Cljc *v, size_t i) {  /* i <= ncp */
+static size_t str_cp_to_byte(Clove *v, size_t i) {  /* i <= ncp */
     if (str_ascii(v)) return i;
     return str_cp_seek(v, i);
 }
-static int32_t str_cp_at(Cljc *v, size_t i) {      /* i < ncp */
+static int32_t str_cp_at(Clove *v, size_t i) {      /* i < ncp */
     if (str_ascii(v)) return (unsigned char)v->as.str[i];
     const char *p = v->as.str + str_cp_seek(v, i);
     return utf8_next(&p);
 }
-static size_t str_byte_to_cp(Cljc *v, size_t off) {  /* off on a cp boundary */
+static size_t str_byte_to_cp(Clove *v, size_t off) {  /* off on a cp boundary */
     if (str_ascii(v)) return off;
     size_t n = 0;
     const char *p = v->as.str;
@@ -1006,28 +1006,28 @@ static size_t str_byte_to_cp(Cljc *v, size_t off) {  /* off on a cp boundary */
     v->as.strx.cur_byte = (uint32_t)off;
     return n;
 }
-static Cljc *mk_cons(Cljc *h, Cljc *t) {
-    Cljc *v = alloc(CLJC_LIST);
+static Clove *mk_cons(Clove *h, Clove *t) {
+    Clove *v = alloc(CLOVE_LIST);
     v->as.cons.head = h;
     v->as.cons.tail = t;
     return v;
 }
-static Cljc *mk_native(CljcNativeFn fn) {
-    Cljc *v = alloc(CLJC_NATIVE);
+static Clove *mk_native(CloveNativeFn fn) {
+    Clove *v = alloc(CLOVE_NATIVE);
     v->as.native = fn;
     return v;
 }
 
-static bool is_truthy(Cljc *v) {
+static bool is_truthy(Clove *v) {
     /* Clojure: only nil and false are falsy. */
     if (v == NIL) return false;
-    if (v->tag == CLJC_BOOL && !v->as.b) return false;
+    if (v->tag == CLOVE_BOOL && !v->as.b) return false;
     return true;
 }
 
-static size_t list_len(Cljc *l) {
+static size_t list_len(Clove *l) {
     size_t n = 0;
-    while (l && l->tag == CLJC_LIST) { n++; l = l->as.cons.tail; }
+    while (l && l->tag == CLOVE_LIST) { n++; l = l->as.cons.tail; }
     return n;
 }
 
@@ -1063,8 +1063,8 @@ static const char *intern(const char *s, size_t n) {
 
 /* ───── Environment ──────────────────────────────────────────────────── */
 
-static CljcEnv *env_new(CljcEnv *parent) {
-    CljcEnv *e = env_alloc();  /* pooled; may trigger a GC */
+static CloveEnv *env_new(CloveEnv *parent) {
+    CloveEnv *e = env_alloc();  /* pooled; may trigger a GC */
     e->bindings = NULL;
     e->parent = parent;
     e->nslots = 0;
@@ -1074,7 +1074,7 @@ static CljcEnv *env_new(CljcEnv *parent) {
 
 /* Find a local in ONE env frame: overflow chain first (newer than any
  * slot — sequential let rebinds shadow), then slots newest-first. */
-static inline Cljc **env_local_find(CljcEnv *e, const char *name) {
+static inline Clove **env_local_find(CloveEnv *e, const char *name) {
     for (Binding *b = e->bindings; b; b = b->next)
         if (b->name == name) return &b->value;
     for (int i = (int)e->nslots - 1; i >= 0; i--)
@@ -1098,7 +1098,7 @@ static Binding *binding_alloc(void) {
     } else {
         if (!binding_blocks || binding_blocks->used == BINDING_BLOCK_N) {
             BindingBlock *blk = malloc(sizeof *blk);
-            if (!blk) cljc_error("out of memory");
+            if (!blk) clove_error("out of memory");
             blk->used = 0;
             blk->next = binding_blocks;
             binding_blocks = blk;
@@ -1108,7 +1108,7 @@ static Binding *binding_alloc(void) {
     return b;
 }
 
-static void env_define(CljcEnv *env, const char *name, Cljc *value) {
+static void env_define(CloveEnv *env, const char *name, Clove *value) {
     if (env->parent && env->nslots < ENV_SLOTS) {  /* root: Bindings only */
         env->sname[env->nslots] = name;
         env->sval[env->nslots] = value;
@@ -1125,13 +1125,13 @@ static void env_define(CljcEnv *env, const char *name, Cljc *value) {
  * the lifetime of the interpreter, which is what makes the per-symbol
  * root_cache sound — a cached binding sees redefinitions through the
  * mutation instead of going stale. */
-static const char *env_define_root(CljcEnv *root, const char *name, Cljc *value) {
+static const char *env_define_root(CloveEnv *root, const char *name, Clove *value) {
     /* While a library loads, its BARE defs land under "ns/name" — isolation
      * from the flat globals (and from each other). An ALREADY-qualified name
-     * (e.g. (defn cljc/foo ...) inside an (ns bar) file) keeps its explicit
+     * (e.g. (defn clove/foo ...) inside an (ns bar) file) keeps its explicit
      * namespace — Clojure semantics — so we don't double-prefix it to
-     * bar/cljc/foo. This is what lets a battery carry an (ns ...) header (for
-     * babashka/clj compatibility) yet still define its cljc-prefixed helpers
+     * bar/clove/foo. This is what lets a battery carry an (ns ...) header (for
+     * babashka/clj compatibility) yet still define its clove-prefixed helpers
      * in place. */
     /* `/` (the division symbol) is itself a slash but is NOT namespace-qualified
      * — without this a library that redefines / (e.g. a generic-arithmetic ns
@@ -1150,16 +1150,16 @@ static const char *env_define_root(CljcEnv *root, const char *name, Cljc *value)
     return name;
 }
 
-static Cljc *env_lookup_maybe(CljcEnv *env, const char *raw) {
+static Clove *env_lookup_maybe(CloveEnv *env, const char *raw) {
     const char *name = intern(raw, strlen(raw));
-    for (CljcEnv *e = env; e; e = e->parent) {
-        Cljc **p = env_local_find(e, name);
+    for (CloveEnv *e = env; e; e = e->parent) {
+        Clove **p = env_local_find(e, name);
         if (p) return *p;
     }
     return NULL;
 }
 
-static Cljc *vm_frame_form(VmTraceFrame *vf);   /* needs the VOP enum, defined later */
+static Clove *vm_frame_form(VmTraceFrame *vf);   /* needs the VOP enum, defined later */
 
 static void trace_snapshot(void) {
     err_trace[0] = '\0';
@@ -1174,28 +1174,28 @@ static void trace_snapshot(void) {
     int v = (vm_tsp < VM_TRACE_MAX ? vm_tsp : VM_TRACE_MAX) - 1;
     int i = eval_sp - 1;
     while (shown < 8 && (v >= 0 || i >= 0)) {
-        Cljc *f;
+        Clove *f;
         if (v >= 0 && vm_trace[v].esp > i) f = vm_frame_form(&vm_trace[v--]);
         else f = eval_stack[i--];
-        if (f == NULL || f == NIL || f->tag != CLJC_LIST) continue;
-        const char *head = f->as.cons.head->tag == CLJC_SYMBOL
+        if (f == NULL || f == NIL || f->tag != CLOVE_LIST) continue;
+        const char *head = f->as.cons.head->tag == CLOVE_SYMBOL
             ? f->as.cons.head->as.sym : "...";
         long long line = -1;
         const char *file = NULL;
         if (f->meta) {
-            Cljc *lv;
-            if (map_find(f->meta, mk_kw(intern("line", 4)), &lv) && lv->tag == CLJC_INT)
+            Clove *lv;
+            if (map_find(f->meta, mk_kw(intern("line", 4)), &lv) && lv->tag == CLOVE_INT)
                 line = (long long)lv->as.i;
-            if (map_find(f->meta, mk_kw(intern("file", 4)), &lv) && lv->tag == CLJC_STRING)
+            if (map_find(f->meta, mk_kw(intern("file", 4)), &lv) && lv->tag == CLOVE_STRING)
                 file = lv->as.str;
         }
         int n;
         if (line >= 0 && err_line < 0) {
             err_line = line;
             snprintf(err_file, sizeof err_file, "%s", file ? file : "");
-            Cljc *cv;
+            Clove *cv;
             if (f->meta && map_find(f->meta, mk_kw(intern("col", 3)), &cv) &&
-                cv->tag == CLJC_INT)
+                cv->tag == CLOVE_INT)
                 err_col = (long long)cv->as.i;
         }
         /* name the file only when it isn't the main script — single-file runs
@@ -1216,7 +1216,7 @@ static void trace_snapshot(void) {
     }
 }
 
-static CljcEnv *env_root(CljcEnv *e) {
+static CloveEnv *env_root(CloveEnv *e) {
     while (e->parent) e = e->parent;
     return e;
 }
@@ -1224,7 +1224,7 @@ static CljcEnv *env_root(CljcEnv *e) {
 /* ───── Garbage collector ────────────────────────────────────────────── */
 
 /* Mark-and-sweep over two block pools (cells, envs). Roots:
- *   1. NIL/TRUE/FALSE and every registered root env (cljc_new_env)
+ *   1. NIL/TRUE/FALSE and every registered root env (clove_new_env)
  *   2. the C stack between the current frame and gc_stack_base, scanned
  *      conservatively — any word that points into a pool block (including
  *      interior pointers) marks the containing object
@@ -1234,14 +1234,14 @@ static CljcEnv *env_root(CljcEnv *e) {
  * are owned by the cell. Interned symbol text is immortal by design. */
 
 #define CELL_BLOCK_N 8192
-typedef struct CellBlock { struct CellBlock *next; size_t used; Cljc cells[CELL_BLOCK_N]; } CellBlock;
+typedef struct CellBlock { struct CellBlock *next; size_t used; Clove cells[CELL_BLOCK_N]; } CellBlock;
 static CellBlock *cell_blocks;
-static Cljc *cell_freelist;        /* linked through as.cons.head */
+static Clove *cell_freelist;        /* linked through as.cons.head */
 
 #define ENV_BLOCK_N 1024
-typedef struct EnvBlock { struct EnvBlock *next; size_t used; CljcEnv envs[ENV_BLOCK_N]; } EnvBlock;
+typedef struct EnvBlock { struct EnvBlock *next; size_t used; CloveEnv envs[ENV_BLOCK_N]; } EnvBlock;
 static EnvBlock *env_blocks;
-static CljcEnv *env_freelist;      /* linked through ->parent */
+static CloveEnv *env_freelist;      /* linked through ->parent */
 
 /* Floor on allocations between collections. Tight loops with small live
  * sets are collection-bound: at 64k this was thousands of collections on
@@ -1259,35 +1259,35 @@ static size_t gc_allocs, gc_threshold = GC_MIN_THRESHOLD;
 static size_t churn_floor = GC_MIN_THRESHOLD;   /* adaptive collection floor */
 static size_t gc_freed_last;
 /* True while a REPL prompt or an nREPL eval is driving evaluation. Guards
- * cljc/exit*: taking the process down would kill the session or the server
+ * clove/exit*: taking the process down would kill the session or the server
  * out from under the user, so it unwinds with an error there instead. */
-static bool cljc_interactive;
-static bool gc_stress;             /* CLJC_GC_STRESS=1: collect every 512 allocs */
+static bool clove_interactive;
+static bool gc_stress;             /* CLOVE_GC_STRESS=1: collect every 512 allocs */
 static void *gc_stack_base;
-static CljcEnv *gc_root_envs[8];
+static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
 
-static void gc_mark_env(CljcEnv *e);
+static void gc_mark_env(CloveEnv *e);
 
 /* Marking uses an explicit worklist, not C-stack recursion: a 10k-deep
  * closure/env chain (long reduce over lazy pipelines) overflowed the C
  * stack when gc_mark recursed (found by 2017 d16). Cells are marked when
  * PUSHED, so each enters the worklist at most once. */
-static Cljc **mark_stack;
+static Clove **mark_stack;
 static size_t mark_sp, mark_cap;
 
-static void mark_push(Cljc *v) {
-    if (!v || v->gcmark || v->tag == CLJC_FREE) return;
+static void mark_push(Clove *v) {
+    if (!v || v->gcmark || v->tag == CLOVE_FREE) return;
     v->gcmark = 1;
     if (mark_sp >= mark_cap) {
         mark_cap = mark_cap ? mark_cap * 2 : 4096;
-        mark_stack = realloc(mark_stack, sizeof(Cljc *) * mark_cap);
+        mark_stack = realloc(mark_stack, sizeof(Clove *) * mark_cap);
         if (!mark_stack) { fputs("gc: out of memory\n", stderr); exit(1); }
     }
     mark_stack[mark_sp++] = v;
 }
 
-static void mark_env_chain(CljcEnv *e) {
+static void mark_env_chain(CloveEnv *e) {
     while (e && !e->gcmark && !e->gcfree) {
         e->gcmark = 1;
         for (Binding *b = e->bindings; b; b = b->next) mark_push(b->value);
@@ -1298,66 +1298,66 @@ static void mark_env_chain(CljcEnv *e) {
 
 static void gc_drain(void) {
     while (mark_sp) {
-        Cljc *v = mark_stack[--mark_sp];
+        Clove *v = mark_stack[--mark_sp];
         if (v->meta) mark_push(v->meta);
         switch (v->tag) {
-            case CLJC_LIST:
+            case CLOVE_LIST:
                 mark_push(v->as.cons.head);
                 mark_push(v->as.cons.tail);
                 break;
-            case CLJC_RATIO:
+            case CLOVE_RATIO:
                 mark_push(v->as.ratio.num);
                 mark_push(v->as.ratio.den);
                 break;
-            case CLJC_BIGDEC:
+            case CLOVE_BIGDEC:
                 mark_push(v->as.bigdec.u);
                 break;
-            case CLJC_VECTOR:
-            case CLJC_TVEC:
+            case CLOVE_VECTOR:
+            case CLOVE_TVEC:
                 for (size_t i = 0; i < v->as.vec.taillen; i++) mark_push(v->as.vec.tail[i]);
                 mark_push(v->as.vec.root);          /* NULL-safe */
                 break;
-            case CLJC_MAP:
-            case CLJC_SET:
+            case CLOVE_MAP:
+            case CLOVE_SET:
                 mark_push(v->as.map.root);          /* NULL-safe */
                 mark_push(v->as.map.lit_order);     /* map literals only; NULL otherwise */
                 break;
-            case CLJC_SORTED:
+            case CLOVE_SORTED:
                 mark_push(v->as.sorted.root);
                 mark_push(v->as.sorted.cmp);
                 break;
-            case CLJC_TNODE:
+            case CLOVE_TNODE:
                 mark_push(v->as.tnode.left);
                 mark_push(v->as.tnode.right);
                 mark_push(v->as.tnode.key);
                 mark_push(v->as.tnode.val);
                 break;
-            case CLJC_HNODE:
+            case CLOVE_HNODE:
                 for (size_t i = 0; i < v->as.hnode.nkids; i++)
                     mark_push(v->as.hnode.kids[i]); /* NULL slots skip */
                 break;
-            case CLJC_RECUR: {
-                Cljc **vals = v->as.recur.spill ? (Cljc **)v->as.recur.iv[0] : v->as.recur.iv;
+            case CLOVE_RECUR: {
+                Clove **vals = v->as.recur.spill ? (Clove **)v->as.recur.iv[0] : v->as.recur.iv;
                 for (size_t i = 0; i < v->as.recur.n; i++) mark_push(vals[i]);
                 break;
             }
-            case CLJC_FN:
+            case CLOVE_FN:
                 mark_env_chain(v->as.fn.env);
                 mark_push(v->as.fn.arities);
                 break;
-            case CLJC_ATOM:
+            case CLOVE_ATOM:
                 mark_push(v->as.atom.value);
                 break;
-            case CLJC_LAZY:
+            case CLOVE_LAZY:
                 mark_push(v->as.lazy.thunk);
                 mark_push(v->as.lazy.cached);
                 break;
-            case CLJC_CHUNK:
+            case CLOVE_CHUNK:
                 for (uint16_t i = 0; i < v->as.chunk.nconst; i++)
                     mark_push(v->as.chunk.consts[i]);
                 break;
-#ifdef CLJC_HAVE_CORO
-            case CLJC_CORO:
+#ifdef CLOVE_HAVE_CORO
+            case CLOVE_CORO:
                 if (v->as.coro) coro_mark_scan(v->as.coro);
                 break;
 #endif
@@ -1367,12 +1367,12 @@ static void gc_drain(void) {
     }
 }
 
-static void gc_mark(Cljc *v) {
+static void gc_mark(Clove *v) {
     mark_push(v);
     gc_drain();
 }
 
-static void gc_mark_env(CljcEnv *e) {
+static void gc_mark_env(CloveEnv *e) {
     mark_env_chain(e);
     gc_drain();
 }
@@ -1403,15 +1403,15 @@ static void gc_mark_conservative(uintptr_t w) {
     if (w < gc_pool_lo || w >= gc_pool_hi) return;
     for (CellBlock *b = cell_blocks; b; b = b->next) {
         uintptr_t lo = (uintptr_t)b->cells, hi = (uintptr_t)(b->cells + b->used);
-        if (w >= lo && w < hi) { gc_mark(&b->cells[(w - lo) / sizeof(Cljc)]); return; }
+        if (w >= lo && w < hi) { gc_mark(&b->cells[(w - lo) / sizeof(Clove)]); return; }
     }
     for (EnvBlock *b = env_blocks; b; b = b->next) {
         uintptr_t lo = (uintptr_t)b->envs, hi = (uintptr_t)(b->envs + b->used);
-        if (w >= lo && w < hi) { gc_mark_env(&b->envs[(w - lo) / sizeof(CljcEnv)]); return; }
+        if (w >= lo && w < hi) { gc_mark_env(&b->envs[(w - lo) / sizeof(CloveEnv)]); return; }
     }
 }
 
-#ifdef CLJC_HAVE_CORO
+#ifdef CLOVE_HAVE_CORO
 /* Worklist-safe variants of the conservative scan: they PUSH found objects
  * instead of gc_mark'ing (which would re-enter gc_drain). Used to scan a
  * suspended coroutine's stack from inside the drain loop. */
@@ -1419,11 +1419,11 @@ static void mark_cons_word(uintptr_t w) {
     if (w < gc_pool_lo || w >= gc_pool_hi) return;
     for (CellBlock *b = cell_blocks; b; b = b->next) {
         uintptr_t lo = (uintptr_t)b->cells, hi = (uintptr_t)(b->cells + b->used);
-        if (w >= lo && w < hi) { mark_push(&b->cells[(w - lo) / sizeof(Cljc)]); return; }
+        if (w >= lo && w < hi) { mark_push(&b->cells[(w - lo) / sizeof(Clove)]); return; }
     }
     for (EnvBlock *b = env_blocks; b; b = b->next) {
         uintptr_t lo = (uintptr_t)b->envs, hi = (uintptr_t)(b->envs + b->used);
-        if (w >= lo && w < hi) { mark_env_chain(&b->envs[(w - lo) / sizeof(CljcEnv)]); return; }
+        if (w >= lo && w < hi) { mark_env_chain(&b->envs[(w - lo) / sizeof(CloveEnv)]); return; }
     }
 }
 static void scan_range_push(void *lo_, void *hi_) {
@@ -1494,7 +1494,7 @@ static void gc_collect(void) {
      * coro's, not main's — scan between the real SP and the active stack's
      * high bound (the coro's stack top, or main's gc_stack_base). */
     void *active_top = gc_stack_base;
-#ifdef CLJC_HAVE_CORO
+#ifdef CLOVE_HAVE_CORO
     if (coro_current) {
         active_top = coro_current->stack_top;
         gc_mark(coro_current->self);   /* root the running coro + its resume chain */
@@ -1524,28 +1524,28 @@ static void gc_collect(void) {
     cell_freelist = NULL;
     for (CellBlock *b = cell_blocks; b; b = b->next) {
         for (size_t i = 0; i < b->used; i++) {
-            Cljc *c = &b->cells[i];
+            Clove *c = &b->cells[i];
             if (c->gcmark) { c->gcmark = 0; live++; continue; }
-            if (c->tag != CLJC_FREE) {
+            if (c->tag != CLOVE_FREE) {
                 switch (c->tag) {
-                    case CLJC_STRING: free(c->as.str); break;
-                    case CLJC_IARRAY: free(c->as.iarr.data); break;
-                    case CLJC_BIGINT: free(c->as.big.mag); break;
-                    case CLJC_CHUNK:
+                    case CLOVE_STRING: free(c->as.str); break;
+                    case CLOVE_IARRAY: free(c->as.iarr.data); break;
+                    case CLOVE_BIGINT: free(c->as.big.mag); break;
+                    case CLOVE_CHUNK:
                         free(c->as.chunk.code);
                         free(c->as.chunk.consts);
                         break;
-                    case CLJC_VECTOR: tail_free(c->as.vec.tail, c->as.vec.taillen); break;
-                    case CLJC_TVEC:   chunk32_free(c->as.vec.tail); break;
-                    case CLJC_HNODE:
+                    case CLOVE_VECTOR: tail_free(c->as.vec.tail, c->as.vec.taillen); break;
+                    case CLOVE_TVEC:   chunk32_free(c->as.vec.tail); break;
+                    case CLOVE_HNODE:
                         if (c->as.hnode.nkids == 32) chunk32_free(c->as.hnode.kids);
                         else free(c->as.hnode.kids);
                         break;
-                    case CLJC_RECUR:
+                    case CLOVE_RECUR:
                         if (c->as.recur.spill) free(c->as.recur.iv[0]);
                         break;
-#ifdef CLJC_HAVE_CORO
-                    case CLJC_CORO:
+#ifdef CLOVE_HAVE_CORO
+                    case CLOVE_CORO:
                         if (c->as.coro) {
                             free(c->as.coro->stack);
                             free(c->as.coro->s_vstack);
@@ -1555,7 +1555,7 @@ static void gc_collect(void) {
 #endif
                     default: break;  /* maps own nothing — their root is a cell */
                 }
-                c->tag = CLJC_FREE;
+                c->tag = CLOVE_FREE;
                 freed++;
             }
             memset(&c->as, 0, sizeof c->as);
@@ -1568,7 +1568,7 @@ static void gc_collect(void) {
     env_freelist = NULL;
     for (EnvBlock *b = env_blocks; b; b = b->next) {
         for (size_t i = 0; i < b->used; i++) {
-            CljcEnv *e = &b->envs[i];
+            CloveEnv *e = &b->envs[i];
             if (e->gcmark) { e->gcmark = 0; live++; continue; }
             if (!e->gcfree) {
                 for (Binding *bn = e->bindings; bn; ) {
@@ -1587,11 +1587,11 @@ static void gc_collect(void) {
     }
 
     gc_freed_last = freed;
-    if (getenv("CLJC_GC_LOG")) {
+    if (getenv("CLOVE_GC_LOG")) {
         size_t tagn[24] = {0};
         for (CellBlock *b = cell_blocks; b; b = b->next)
             for (size_t i = 0; i < b->used; i++)
-                if (b->cells[i].tag != CLJC_FREE && b->cells[i].tag < 24)
+                if (b->cells[i].tag != CLOVE_FREE && b->cells[i].tag < 24)
                     tagn[b->cells[i].tag]++;
         fprintf(stderr, "[gc] live=%zu freed=%zu", live, freed);
         for (int t = 0; t < 24; t++)
@@ -1628,7 +1628,7 @@ static void maybe_gc(void) {
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
 
-/* Must agree with cljc_eq: (= 1 1.0) → same hash; (= [1 2] '(1 2)) → lists
+/* Must agree with clove_eq: (= 1 1.0) → same hash; (= [1 2] '(1 2)) → lists
  * and vectors hash identically (ordered); maps hash order-independently. */
 
 static uint32_t mix64(uint64_t x) {
@@ -1638,64 +1638,64 @@ static uint32_t mix64(uint64_t x) {
     return (uint32_t)x;
 }
 
-static Cljc *map_entry_list(Cljc *m);
+static Clove *map_entry_list(Clove *m);
 
-static uint32_t cljc_hash(Cljc *v) {
+static uint32_t clove_hash(Clove *v) {
     if (v == NULL || v == NIL) return 0x9e3779b9u;
     switch (v->tag) {
-        case CLJC_NIL:  return 0x9e3779b9u;
-        case CLJC_BOOL: return v->as.b ? 1231u : 1237u;
-        case CLJC_INT:  return mix64((uint64_t)v->as.i);
-        case CLJC_BIGINT: { uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
+        case CLOVE_NIL:  return 0x9e3779b9u;
+        case CLOVE_BOOL: return v->as.b ? 1231u : 1237u;
+        case CLOVE_INT:  return mix64((uint64_t)v->as.i);
+        case CLOVE_BIGINT: { uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
             for (uint32_t i = 0; i < v->as.big.n; i++) h = h * 31 + v->as.big.mag[i];
             return mix64(h); }
-        case CLJC_RATIO: return mix64(cljc_hash(v->as.ratio.num) * 31 + cljc_hash(v->as.ratio.den));
-        case CLJC_BIGDEC: {   /* = is by value, so hash the trailing-zero-stripped form */
-            Cljc *u = v->as.bigdec.u, *q, *r; int64_t sc = v->as.bigdec.s;
+        case CLOVE_RATIO: return mix64(clove_hash(v->as.ratio.num) * 31 + clove_hash(v->as.ratio.den));
+        case CLOVE_BIGDEC: {   /* = is by value, so hash the trailing-zero-stripped form */
+            Clove *u = v->as.bigdec.u, *q, *r; int64_t sc = v->as.bigdec.s;
             if (big_is_zero(u)) sc = 0;
             else for (;;) { big_divmod(u, mk_int(10), &q, &r); if (!big_is_zero(r)) break; u = q; sc--; }
-            return mix64(cljc_hash(u) * 31 + (uint64_t)sc + 0x9e3779b97f4a7c15ull);
+            return mix64(clove_hash(u) * 31 + (uint64_t)sc + 0x9e3779b97f4a7c15ull);
         }
-        case CLJC_DOUBLE: {
+        case CLOVE_DOUBLE: {
             double d = v->as.d;
             if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
             uint64_t bits;
             memcpy(&bits, &d, sizeof bits);
             return mix64(bits);
         }
-        case CLJC_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
-        case CLJC_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
-        case CLJC_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
-        case CLJC_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
-        case CLJC_LAZY:
-            return cljc_hash(to_seq(v));
-        case CLJC_EMPTY:   /* () hashes like an empty list/vector (= () []) */
-        case CLJC_LIST: {
+        case CLOVE_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
+        case CLOVE_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
+        case CLOVE_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
+        case CLOVE_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
+        case CLOVE_LAZY:
+            return clove_hash(to_seq(v));
+        case CLOVE_EMPTY:   /* () hashes like an empty list/vector (= () []) */
+        case CLOVE_LIST: {
             uint32_t h = 1;
-            for (Cljc *l = v; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
-                h = h * 31 + cljc_hash(l->as.cons.head);
+            for (Clove *l = v; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
+                h = h * 31 + clove_hash(l->as.cons.head);
             return h;
         }
-        case CLJC_VECTOR: {
+        case CLOVE_VECTOR: {
             uint32_t h = 1;  /* same scheme as lists — sequential equality */
             for (size_t i = 0; i < vec_len(v); i++)
-                h = h * 31 + cljc_hash(vec_nth(v, i));
+                h = h * 31 + clove_hash(vec_nth(v, i));
             return h;
         }
-        case CLJC_MAP: case CLJC_SET: {
-            uint32_t h = v->tag == CLJC_SET ? 0xa5e3u : 0;  /* order-independent sum */
-            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
-                h += cljc_hash(e->as.cons.head->as.cons.head) * 31
-                   + cljc_hash(e->as.cons.head->as.cons.tail);
+        case CLOVE_MAP: case CLOVE_SET: {
+            uint32_t h = v->tag == CLOVE_SET ? 0xa5e3u : 0;  /* order-independent sum */
+            for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+                h += clove_hash(e->as.cons.head->as.cons.head) * 31
+                   + clove_hash(e->as.cons.head->as.cons.tail);
             return h;
         }
-        case CLJC_SORTED: {  /* must match the hash of an equal hash set/map */
+        case CLOVE_SORTED: {  /* must match the hash of an equal hash set/map */
             bool is_map = v->as.sorted.is_map;
             uint32_t h = is_map ? 0 : 0xa5e3u;
-            for (Cljc *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
-                Cljc *ent = e->as.cons.head;
-                Cljc *k = is_map ? vec_nth(ent, 0) : ent;
-                h += cljc_hash(k) * 31 + cljc_hash(is_map ? vec_nth(ent, 1) : ent);
+            for (Clove *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
+                Clove *ent = e->as.cons.head;
+                Clove *k = is_map ? vec_nth(ent, 0) : ent;
+                h += clove_hash(k) * 31 + clove_hash(is_map ? vec_nth(ent, 1) : ent);
             }
             return h;
         }
@@ -1722,53 +1722,53 @@ static unsigned popcnt32(uint32_t x) {
 /* Pool of 32-pointer (256 B) chunks for vector tails and 32-slot trie
  * nodes — both die young, so a free list beats malloc/free churn. The
  * next-chunk pointer reuses the first slot. */
-static Cljc **chunk32_freelist;
+static Clove **chunk32_freelist;
 
-static Cljc **chunk32_alloc(void) {
+static Clove **chunk32_alloc(void) {
     if (chunk32_freelist) {
-        Cljc **p = chunk32_freelist;
-        chunk32_freelist = (Cljc **)p[0];
+        Clove **p = chunk32_freelist;
+        chunk32_freelist = (Clove **)p[0];
         return p;
     }
-    return xmalloc(sizeof(Cljc *) * 32);
+    return xmalloc(sizeof(Clove *) * 32);
 }
 
-static void chunk32_free(Cljc **p) {
-    p[0] = (Cljc *)chunk32_freelist;
+static void chunk32_free(Clove **p) {
+    p[0] = (Clove *)chunk32_freelist;
     chunk32_freelist = p;
 }
 
 /* Size-classed free lists for vector tails (1..32 pointers). Tail sizes
  * repeat heavily under conj churn, so exact-size recycling avoids both
  * malloc traffic and the memory inflation of always-32 chunks. */
-static Cljc **tail_freelist[33];
+static Clove **tail_freelist[33];
 
-static Cljc **tail_alloc(uint8_t n) {
+static Clove **tail_alloc(uint8_t n) {
     if (n == 0) n = 1;
-    gc_extra_bytes += sizeof(Cljc *) * n;   /* counted toward the byte cap */
+    gc_extra_bytes += sizeof(Clove *) * n;   /* counted toward the byte cap */
     if (tail_freelist[n]) {
-        Cljc **p = tail_freelist[n];
-        tail_freelist[n] = (Cljc **)p[0];
+        Clove **p = tail_freelist[n];
+        tail_freelist[n] = (Clove **)p[0];
         return p;
     }
-    return xmalloc(sizeof(Cljc *) * n);
+    return xmalloc(sizeof(Clove *) * n);
 }
 
-static void tail_free(Cljc **p, uint8_t n) {
+static void tail_free(Clove **p, uint8_t n) {
     if (n == 0) n = 1;
-    p[0] = (Cljc *)tail_freelist[n];
+    p[0] = (Clove *)tail_freelist[n];
     tail_freelist[n] = p;
 }
 
 /* Allocate a node with zeroed kid slots. Callers fill the slots immediately
  * (no allocation in between), so a mid-fill GC can never trace garbage. */
-static Cljc *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t chash) {
-    Cljc *n = alloc(CLJC_HNODE);
-    gc_extra_bytes += sizeof(Cljc *) * (nkids ? nkids : 1);  /* kid arrays
+static Clove *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t chash) {
+    Clove *n = alloc(CLOVE_HNODE);
+    gc_extra_bytes += sizeof(Clove *) * (nkids ? nkids : 1);  /* kid arrays
         dodge gc_allocs ticks — HAMT churn built 17GB of slack unseen */
     n->as.hnode.kids = nkids == 32 ? chunk32_alloc()
-                                   : xmalloc(sizeof(Cljc *) * (nkids ? nkids : 1));
-    memset(n->as.hnode.kids, 0, sizeof(Cljc *) * (nkids ? nkids : 1));
+                                   : xmalloc(sizeof(Clove *) * (nkids ? nkids : 1));
+    memset(n->as.hnode.kids, 0, sizeof(Clove *) * (nkids ? nkids : 1));
     n->as.hnode.bitmap = bitmap;
     n->as.hnode.nkids = nkids;
     n->as.hnode.collision = collision;
@@ -1776,12 +1776,12 @@ static Cljc *mk_hnode(uint32_t bitmap, uint16_t nkids, bool collision, uint32_t 
     return n;
 }
 
-static bool hamt_find(Cljc *node, uint32_t shift, uint32_t hash, Cljc *key, Cljc **out) {
+static bool hamt_find(Clove *node, uint32_t shift, uint32_t hash, Clove *key, Clove **out) {
     while (node) {
         if (node->as.hnode.collision) {
             if (hash != node->as.hnode.chash) return false;
             for (size_t i = 0; i < node->as.hnode.nkids; i += 2)
-                if (cljc_eq(node->as.hnode.kids[i], key)) {
+                if (clove_eq(node->as.hnode.kids[i], key)) {
                     if (out) *out = node->as.hnode.kids[i + 1];
                     return true;
                 }
@@ -1790,10 +1790,10 @@ static bool hamt_find(Cljc *node, uint32_t shift, uint32_t hash, Cljc *key, Cljc
         uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
         if (!(node->as.hnode.bitmap & bit)) return false;
         size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
-        Cljc *k = node->as.hnode.kids[2 * pos];
-        Cljc *v = node->as.hnode.kids[2 * pos + 1];
+        Clove *k = node->as.hnode.kids[2 * pos];
+        Clove *v = node->as.hnode.kids[2 * pos + 1];
         if (k) {
-            if (cljc_eq(k, key)) { if (out) *out = v; return true; }
+            if (clove_eq(k, key)) { if (out) *out = v; return true; }
             return false;
         }
         node = v;          /* descend into subnode */
@@ -1803,22 +1803,22 @@ static bool hamt_find(Cljc *node, uint32_t shift, uint32_t hash, Cljc *key, Cljc
 }
 
 /* Build the smallest tree holding two distinct-hash entries below `shift`. */
-static Cljc *hamt_two(uint32_t shift, uint32_t h1, Cljc *k1, Cljc *v1,
-                      uint32_t h2, Cljc *k2, Cljc *v2) {
+static Clove *hamt_two(uint32_t shift, uint32_t h1, Clove *k1, Clove *v1,
+                      uint32_t h2, Clove *k2, Clove *v2) {
     if (shift >= 32) {  /* full hash consumed: true collision */
-        Cljc *n = mk_hnode(0, 4, true, h1);
+        Clove *n = mk_hnode(0, 4, true, h1);
         n->as.hnode.kids[0] = k1; n->as.hnode.kids[1] = v1;
         n->as.hnode.kids[2] = k2; n->as.hnode.kids[3] = v2;
         return n;
     }
     uint32_t i1 = (h1 >> shift) & HAMT_MASK, i2 = (h2 >> shift) & HAMT_MASK;
     if (i1 == i2) {
-        Cljc *child = hamt_two(shift + HAMT_BITS, h1, k1, v1, h2, k2, v2);
-        Cljc *n = mk_hnode(1u << i1, 2, false, 0);
+        Clove *child = hamt_two(shift + HAMT_BITS, h1, k1, v1, h2, k2, v2);
+        Clove *n = mk_hnode(1u << i1, 2, false, 0);
         n->as.hnode.kids[0] = NULL; n->as.hnode.kids[1] = child;
         return n;
     }
-    Cljc *n = mk_hnode((1u << i1) | (1u << i2), 4, false, 0);
+    Clove *n = mk_hnode((1u << i1) | (1u << i2), 4, false, 0);
     if (i1 < i2) {
         n->as.hnode.kids[0] = k1; n->as.hnode.kids[1] = v1;
         n->as.hnode.kids[2] = k2; n->as.hnode.kids[3] = v2;
@@ -1831,10 +1831,10 @@ static Cljc *hamt_two(uint32_t shift, uint32_t h1, Cljc *k1, Cljc *v1,
 
 /* Path-copying insert. Children are computed before parents are allocated,
  * so every intermediate node is stack-reachable when a GC can fire. */
-static Cljc *hamt_assoc(Cljc *node, uint32_t shift, uint32_t hash,
-                        Cljc *key, Cljc *val, bool *added) {
+static Clove *hamt_assoc(Clove *node, uint32_t shift, uint32_t hash,
+                        Clove *key, Clove *val, bool *added) {
     if (!node) {
-        Cljc *n = mk_hnode(1u << ((hash >> shift) & HAMT_MASK), 2, false, 0);
+        Clove *n = mk_hnode(1u << ((hash >> shift) & HAMT_MASK), 2, false, 0);
         n->as.hnode.kids[0] = key; n->as.hnode.kids[1] = val;
         *added = true;
         return n;
@@ -1843,23 +1843,23 @@ static Cljc *hamt_assoc(Cljc *node, uint32_t shift, uint32_t hash,
         if (hash == node->as.hnode.chash) {
             uint16_t n_old = node->as.hnode.nkids;
             for (size_t i = 0; i < n_old; i += 2) {
-                if (cljc_eq(node->as.hnode.kids[i], key)) {
-                    Cljc *n = mk_hnode(0, n_old, true, hash);
-                    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+                if (clove_eq(node->as.hnode.kids[i], key)) {
+                    Clove *n = mk_hnode(0, n_old, true, hash);
+                    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * n_old);
                     n->as.hnode.kids[i + 1] = val;
                     *added = false;
                     return n;
                 }
             }
-            Cljc *n = mk_hnode(0, (uint16_t)(n_old + 2), true, hash);
-            memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+            Clove *n = mk_hnode(0, (uint16_t)(n_old + 2), true, hash);
+            memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * n_old);
             n->as.hnode.kids[n_old] = key;
             n->as.hnode.kids[n_old + 1] = val;
             *added = true;
             return n;
         }
         /* Different hash: wrap the collision node one level down and retry. */
-        Cljc *wrap = mk_hnode(1u << ((node->as.hnode.chash >> shift) & HAMT_MASK), 2, false, 0);
+        Clove *wrap = mk_hnode(1u << ((node->as.hnode.chash >> shift) & HAMT_MASK), 2, false, 0);
         wrap->as.hnode.kids[0] = NULL;
         wrap->as.hnode.kids[1] = node;
         return hamt_assoc(wrap, shift, hash, key, val, added);
@@ -1869,30 +1869,30 @@ static Cljc *hamt_assoc(Cljc *node, uint32_t shift, uint32_t hash,
     uint16_t n_old = node->as.hnode.nkids;
     if (!(node->as.hnode.bitmap & bit)) {
         /* New slot: copy with a 2-wide gap at the insertion point. */
-        Cljc *n = mk_hnode(node->as.hnode.bitmap | bit, (uint16_t)(n_old + 2), false, 0);
-        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        Clove *n = mk_hnode(node->as.hnode.bitmap | bit, (uint16_t)(n_old + 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 2 * pos);
         n->as.hnode.kids[2 * pos] = key;
         n->as.hnode.kids[2 * pos + 1] = val;
         memcpy(n->as.hnode.kids + 2 * pos + 2, node->as.hnode.kids + 2 * pos,
-               sizeof(Cljc *) * (n_old - 2 * pos));
+               sizeof(Clove *) * (n_old - 2 * pos));
         *added = true;
         return n;
     }
-    Cljc *ek = node->as.hnode.kids[2 * pos];
-    Cljc *ev = node->as.hnode.kids[2 * pos + 1];
-    Cljc *replacement_k, *replacement_v;
+    Clove *ek = node->as.hnode.kids[2 * pos];
+    Clove *ev = node->as.hnode.kids[2 * pos + 1];
+    Clove *replacement_k, *replacement_v;
     if (!ek) {                                   /* descend into subnode */
         replacement_k = NULL;
         replacement_v = hamt_assoc(ev, shift + HAMT_BITS, hash, key, val, added);
-    } else if (cljc_eq(ek, key)) {               /* replace value in place */
+    } else if (clove_eq(ek, key)) {               /* replace value in place */
         replacement_k = ek;
         replacement_v = val;
         *added = false;
     } else {                                     /* push both entries deeper */
-        uint32_t ehash = cljc_hash(ek);
+        uint32_t ehash = clove_hash(ek);
         replacement_k = NULL;
         if (ehash == hash) {
-            Cljc *coll = mk_hnode(0, 4, true, hash);
+            Clove *coll = mk_hnode(0, 4, true, hash);
             coll->as.hnode.kids[0] = ek;  coll->as.hnode.kids[1] = ev;
             coll->as.hnode.kids[2] = key; coll->as.hnode.kids[3] = val;
             replacement_v = coll;
@@ -1901,27 +1901,27 @@ static Cljc *hamt_assoc(Cljc *node, uint32_t shift, uint32_t hash,
         }
         *added = true;
     }
-    Cljc *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
-    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+    Clove *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
+    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * n_old);
     n->as.hnode.kids[2 * pos] = replacement_k;
     n->as.hnode.kids[2 * pos + 1] = replacement_v;
     return n;
 }
 
-static Cljc *hamt_dissoc(Cljc *node, uint32_t shift, uint32_t hash,
-                         Cljc *key, bool *removed) {
+static Clove *hamt_dissoc(Clove *node, uint32_t shift, uint32_t hash,
+                         Clove *key, bool *removed) {
     if (!node) { *removed = false; return NULL; }
     if (node->as.hnode.collision) {
         if (hash != node->as.hnode.chash) { *removed = false; return node; }
         uint16_t n_old = node->as.hnode.nkids;
         for (size_t i = 0; i < n_old; i += 2) {
-            if (cljc_eq(node->as.hnode.kids[i], key)) {
+            if (clove_eq(node->as.hnode.kids[i], key)) {
                 *removed = true;
                 if (n_old == 2) return NULL;
-                Cljc *n = mk_hnode(0, (uint16_t)(n_old - 2), true, hash);
-                memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * i);
+                Clove *n = mk_hnode(0, (uint16_t)(n_old - 2), true, hash);
+                memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * i);
                 memcpy(n->as.hnode.kids + i, node->as.hnode.kids + i + 2,
-                       sizeof(Cljc *) * (n_old - i - 2));
+                       sizeof(Clove *) * (n_old - i - 2));
                 return n;
             }
         }
@@ -1932,60 +1932,60 @@ static Cljc *hamt_dissoc(Cljc *node, uint32_t shift, uint32_t hash,
     if (!(node->as.hnode.bitmap & bit)) { *removed = false; return node; }
     size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
     uint16_t n_old = node->as.hnode.nkids;
-    Cljc *ek = node->as.hnode.kids[2 * pos];
-    Cljc *ev = node->as.hnode.kids[2 * pos + 1];
+    Clove *ek = node->as.hnode.kids[2 * pos];
+    Clove *ev = node->as.hnode.kids[2 * pos + 1];
     if (ek) {
-        if (!cljc_eq(ek, key)) { *removed = false; return node; }
+        if (!clove_eq(ek, key)) { *removed = false; return node; }
         *removed = true;
         if (n_old == 2) return NULL;
-        Cljc *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
-        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        Clove *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 2 * pos);
         memcpy(n->as.hnode.kids + 2 * pos, node->as.hnode.kids + 2 * pos + 2,
-               sizeof(Cljc *) * (n_old - 2 * pos - 2));
+               sizeof(Clove *) * (n_old - 2 * pos - 2));
         return n;
     }
-    Cljc *child = hamt_dissoc(ev, shift + HAMT_BITS, hash, key, removed);
+    Clove *child = hamt_dissoc(ev, shift + HAMT_BITS, hash, key, removed);
     if (!*removed) return node;
     if (child == NULL) {
         if (n_old == 2) return NULL;
-        Cljc *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
-        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 2 * pos);
+        Clove *n = mk_hnode(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
+        memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 2 * pos);
         memcpy(n->as.hnode.kids + 2 * pos, node->as.hnode.kids + 2 * pos + 2,
-               sizeof(Cljc *) * (n_old - 2 * pos - 2));
+               sizeof(Clove *) * (n_old - 2 * pos - 2));
         return n;
     }
-    Cljc *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
-    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * n_old);
+    Clove *n = mk_hnode(node->as.hnode.bitmap, n_old, false, 0);
+    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * n_old);
     n->as.hnode.kids[2 * pos + 1] = child;
     return n;
 }
 
 /* ── public map interface (same contract as the old assoc-array engine) ── */
 
-static Cljc *mk_map(void) {
-    return alloc(CLJC_MAP);  /* union zeroed: root NULL, count 0 */
+static Clove *mk_map(void) {
+    return alloc(CLOVE_MAP);  /* union zeroed: root NULL, count 0 */
 }
 
-static bool map_find(Cljc *m, Cljc *key, Cljc **out) {
+static bool map_find(Clove *m, Clove *key, Clove **out) {
     if (!m->as.map.root) return false;
-    return hamt_find(m->as.map.root, 0, cljc_hash(key), key, out);
+    return hamt_find(m->as.map.root, 0, clove_hash(key), key, out);
 }
 
-static Cljc *map_assoc(Cljc *m, Cljc *k, Cljc *v) {
+static Clove *map_assoc(Clove *m, Clove *k, Clove *v) {
     bool added = false;
-    Cljc *root = hamt_assoc(m->as.map.root, 0, cljc_hash(k), k, v, &added);
-    Cljc *nm = alloc(CLJC_MAP);  /* root is stack-rooted here */
+    Clove *root = hamt_assoc(m->as.map.root, 0, clove_hash(k), k, v, &added);
+    Clove *nm = alloc(CLOVE_MAP);  /* root is stack-rooted here */
     nm->as.map.root = root;
     nm->as.map.count = m->as.map.count + (added ? 1 : 0);
     nm->meta = m->meta;
     return nm;
 }
 
-static Cljc *map_dissoc_one(Cljc *m, Cljc *k) {
+static Clove *map_dissoc_one(Clove *m, Clove *k) {
     bool removed = false;
-    Cljc *root = hamt_dissoc(m->as.map.root, 0, cljc_hash(k), k, &removed);
+    Clove *root = hamt_dissoc(m->as.map.root, 0, clove_hash(k), k, &removed);
     if (!removed) return m;
-    Cljc *nm = alloc(CLJC_MAP);
+    Clove *nm = alloc(CLOVE_MAP);
     nm->as.map.root = root;
     nm->as.map.count = m->as.map.count - 1;
     nm->meta = m->meta;
@@ -1993,10 +1993,10 @@ static Cljc *map_dissoc_one(Cljc *m, Cljc *k) {
 }
 
 /* Flatten to a list of (k . v) cons pairs for iteration (print, eq, seq). */
-static void hamt_entries(Cljc *node, Cljc ***t) {
+static void hamt_entries(Clove *node, Clove ***t) {
     if (!node) return;
     for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
-        Cljc *k = node->as.hnode.kids[i];
+        Clove *k = node->as.hnode.kids[i];
         if (k == NULL && !node->as.hnode.collision) {
             hamt_entries(node->as.hnode.kids[i + 1], t);
         } else {
@@ -2006,49 +2006,49 @@ static void hamt_entries(Cljc *node, Cljc ***t) {
     }
 }
 
-static Cljc *map_entry_list(Cljc *m) {
-    Cljc *out = NIL, **t = &out;
+static Clove *map_entry_list(Clove *m) {
+    Clove *out = NIL, **t = &out;
     hamt_entries(m->as.map.root, &t);
     return out;
 }
 
 /* ── Sets: a HAMT keyed by its elements (each element is its own value) ── */
 
-static Cljc *mk_set(void) {
-    return alloc(CLJC_SET);  /* union zeroed: root NULL, count 0 */
+static Clove *mk_set(void) {
+    return alloc(CLOVE_SET);  /* union zeroed: root NULL, count 0 */
 }
 
-static Cljc *set_conj(Cljc *s, Cljc *x) {
+static Clove *set_conj(Clove *s, Clove *x) {
     bool added = false;
-    Cljc *root = hamt_assoc(s->as.map.root, 0, cljc_hash(x), x, x, &added);
-    Cljc *ns = alloc(CLJC_SET);
+    Clove *root = hamt_assoc(s->as.map.root, 0, clove_hash(x), x, x, &added);
+    Clove *ns = alloc(CLOVE_SET);
     ns->as.map.root = root;
     ns->as.map.count = s->as.map.count + (added ? 1 : 0);
     ns->meta = s->meta;
     return ns;
 }
 
-static Cljc *set_disj(Cljc *s, Cljc *x) {
+static Clove *set_disj(Clove *s, Clove *x) {
     bool removed = false;
-    Cljc *root = hamt_dissoc(s->as.map.root, 0, cljc_hash(x), x, &removed);
+    Clove *root = hamt_dissoc(s->as.map.root, 0, clove_hash(x), x, &removed);
     if (!removed) return s;
-    Cljc *ns = alloc(CLJC_SET);
+    Clove *ns = alloc(CLOVE_SET);
     ns->as.map.root = root;
     ns->as.map.count = s->as.map.count - 1;
     ns->meta = s->meta;
     return ns;
 }
 
-static bool set_contains(Cljc *s, Cljc *x, Cljc **out) {
+static bool set_contains(Clove *s, Clove *x, Clove **out) {
     if (!s->as.map.root) return false;
-    return hamt_find(s->as.map.root, 0, cljc_hash(x), x, out);
+    return hamt_find(s->as.map.root, 0, clove_hash(x), x, out);
 }
 
 /* Set elements as a list (each HAMT entry's key). */
-static Cljc *set_element_list(Cljc *s) {
-    Cljc *out = NIL, **t = &out;
+static Clove *set_element_list(Clove *s) {
+    Clove *out = NIL, **t = &out;
     hamt_entries(s->as.map.root, &t);
-    for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    for (Clove *l = out; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         l->as.cons.head = l->as.cons.head->as.cons.head;  /* (x . x) -> x */
     return out;
 }
@@ -2058,34 +2058,34 @@ static Cljc *set_element_list(Cljc *s) {
 /* Clojure-style: a 32-way trie indexed by position bits plus a tail array
  * holding the last ≤32 elements. conj is amortized O(1) (tail copy); every
  * 32nd conj pushes the tail into the trie as a leaf by path copying.
- * Trie nodes reuse CLJC_HNODE with 32 fixed kid slots (bitmap unused). */
+ * Trie nodes reuse CLOVE_HNODE with 32 fixed kid slots (bitmap unused). */
 
-static size_t vec_len(Cljc *v) { return v->as.vec.count; }
+static size_t vec_len(Clove *v) { return v->as.vec.count; }
 
-static size_t vec_tailoff(Cljc *v) {
+static size_t vec_tailoff(Clove *v) {
     uint32_t cnt = v->as.vec.count;
     return cnt < 32 ? 0 : ((size_t)((cnt - 1) >> 5)) << 5;
 }
 
-static Cljc *vec_nth(Cljc *v, size_t i) {
-    if (i >= v->as.vec.count) cljc_error_cls("IndexOutOfBoundsException", "index %zu out of bounds for length %u", i, v->as.vec.count);
+static Clove *vec_nth(Clove *v, size_t i) {
+    if (i >= v->as.vec.count) clove_error_cls("IndexOutOfBoundsException", "index %zu out of bounds for length %u", i, v->as.vec.count);
     size_t off = vec_tailoff(v);
     if (i >= off) return v->as.vec.tail[i - off];
-    Cljc *node = v->as.vec.root;
+    Clove *node = v->as.vec.root;
     for (int level = v->as.vec.shift; level > 0; level -= 5)
         node = node->as.hnode.kids[(i >> level) & 31];
     return node->as.hnode.kids[i & 31];
 }
 
-static Cljc *vec_node32(void) { return mk_hnode(0, 32, false, 0); }
+static Clove *vec_node32(void) { return mk_hnode(0, 32, false, 0); }
 
 /* Fresh vector cell sharing v's tree but with its own (copied) tail. */
-static Cljc *vec_cell(Cljc *root, uint8_t shift, uint32_t count,
-                      Cljc **tail_src, uint8_t taillen, Cljc *append) {
-    Cljc *nv = alloc(CLJC_VECTOR);  /* union zeroed: safe if GC fires below */
+static Clove *vec_cell(Clove *root, uint8_t shift, uint32_t count,
+                      Clove **tail_src, uint8_t taillen, Clove *append) {
+    Clove *nv = alloc(CLOVE_VECTOR);  /* union zeroed: safe if GC fires below */
     uint8_t n = (uint8_t)(taillen + (append ? 1 : 0));
     nv->as.vec.tail = tail_alloc(n);
-    if (taillen) memcpy(nv->as.vec.tail, tail_src, sizeof(Cljc *) * taillen);
+    if (taillen) memcpy(nv->as.vec.tail, tail_src, sizeof(Clove *) * taillen);
     if (append) nv->as.vec.tail[taillen] = append;
     nv->as.vec.taillen = n;
     nv->as.vec.root = root;
@@ -2098,23 +2098,23 @@ static Cljc *vec_cell(Cljc *root, uint8_t shift, uint32_t count,
  * EMPTY: `[]`, (vector), (empty v), (persistent! (transient [])) all return
  * the same cell, so (identical? x []) works as an emptiness test (specter's
  * terminal* relies on it). Never write to it — vec_with_meta copies. */
-static Cljc *mk_empty_vec(void) {
+static Clove *mk_empty_vec(void) {
     return EMPTY_VEC ? EMPTY_VEC : vec_cell(NULL, 0, 0, NULL, 0, NULL);
 }
 
 /* Attach metadata to a just-built vector; a non-NULL meta on the empty
  * singleton takes a private copy (EMPTY.withMeta semantics). */
-static Cljc *vec_with_meta(Cljc *nv, Cljc *meta) {
+static Clove *vec_with_meta(Clove *nv, Clove *meta) {
     if (nv != EMPTY_VEC) { nv->meta = meta; return nv; }
     if (!meta) return nv;
-    Cljc *c = vec_cell(NULL, 0, 0, NULL, 0, NULL);
+    Clove *c = vec_cell(NULL, 0, 0, NULL, 0, NULL);
     c->meta = meta;
     return c;
 }
 
-static Cljc *vec_newpath(int level, Cljc *node) {
+static Clove *vec_newpath(int level, Clove *node) {
     while (level > 0) {
-        Cljc *wrap = vec_node32();  /* node stays stack-rooted */
+        Clove *wrap = vec_node32();  /* node stays stack-rooted */
         wrap->as.hnode.kids[0] = node;
         node = wrap;
         level -= 5;
@@ -2122,40 +2122,40 @@ static Cljc *vec_newpath(int level, Cljc *node) {
     return node;
 }
 
-static Cljc *vec_pushtail(int level, Cljc *parent, Cljc *tailnode, uint32_t cnt) {
+static Clove *vec_pushtail(int level, Clove *parent, Clove *tailnode, uint32_t cnt) {
     size_t subidx = ((cnt - 1) >> level) & 31;
-    Cljc *newchild;
+    Clove *newchild;
     if (level == 5) {
         newchild = tailnode;
     } else {
-        Cljc *child = parent->as.hnode.kids[subidx];
+        Clove *child = parent->as.hnode.kids[subidx];
         newchild = child ? vec_pushtail(level - 5, child, tailnode, cnt)
                          : vec_newpath(level - 5, tailnode);
     }
-    Cljc *ret = vec_node32();  /* newchild computed first: stack-rooted */
-    memcpy(ret->as.hnode.kids, parent->as.hnode.kids, sizeof(Cljc *) * 32);
+    Clove *ret = vec_node32();  /* newchild computed first: stack-rooted */
+    memcpy(ret->as.hnode.kids, parent->as.hnode.kids, sizeof(Clove *) * 32);
     ret->as.hnode.kids[subidx] = newchild;
     return ret;
 }
 
-static Cljc *vec_conj1(Cljc *v, Cljc *x) {
+static Clove *vec_conj1(Clove *v, Clove *x) {
     uint32_t cnt = v->as.vec.count;
     if (cnt - vec_tailoff(v) < 32) {  /* room in tail: the cheap path */
-        Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
+        Clove *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
                             v->as.vec.tail, v->as.vec.taillen, x);
         nv->meta = v->meta;
         return nv;
     }
     /* Tail full: push it into the trie as a leaf. */
-    Cljc *leaf = vec_node32();
-    memcpy(leaf->as.hnode.kids, v->as.vec.tail, sizeof(Cljc *) * 32);
-    Cljc *newroot;
+    Clove *leaf = vec_node32();
+    memcpy(leaf->as.hnode.kids, v->as.vec.tail, sizeof(Clove *) * 32);
+    Clove *newroot;
     uint8_t newshift = v->as.vec.shift;
     if (v->as.vec.root == NULL) {
         newroot = leaf;             /* first leaf IS the root (shift 0) */
         newshift = 0;
     } else if ((cnt >> 5) > (1u << v->as.vec.shift)) {
-        Cljc *path = vec_newpath(v->as.vec.shift, leaf);
+        Clove *path = vec_newpath(v->as.vec.shift, leaf);
         newroot = vec_node32();
         newroot->as.hnode.kids[0] = v->as.vec.root;
         newroot->as.hnode.kids[1] = path;
@@ -2163,13 +2163,13 @@ static Cljc *vec_conj1(Cljc *v, Cljc *x) {
     } else {
         newroot = vec_pushtail(v->as.vec.shift, v->as.vec.root, leaf, cnt);
     }
-    Cljc *nv = vec_cell(newroot, newshift, cnt + 1, &x, 0, x); /* tail = [x] */
+    Clove *nv = vec_cell(newroot, newshift, cnt + 1, &x, 0, x); /* tail = [x] */
     nv->meta = v->meta;
     return nv;
 }
 
-static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
-    Cljc *newchild = NULL;
+static Clove *vec_doassoc(int level, Clove *node, size_t i, Clove *x) {
+    Clove *newchild = NULL;
     size_t subidx;
     if (level == 0) {
         subidx = i & 31;
@@ -2177,26 +2177,26 @@ static Cljc *vec_doassoc(int level, Cljc *node, size_t i, Cljc *x) {
         subidx = (i >> level) & 31;
         newchild = vec_doassoc(level - 5, node->as.hnode.kids[subidx], i, x);
     }
-    Cljc *ret = vec_node32();
-    memcpy(ret->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 32);
+    Clove *ret = vec_node32();
+    memcpy(ret->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 32);
     ret->as.hnode.kids[subidx] = level == 0 ? x : newchild;
     return ret;
 }
 
-static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
+static Clove *vec_assoc_idx(Clove *v, size_t i, Clove *x) {
     uint32_t cnt = v->as.vec.count;
     if (i == cnt) return vec_conj1(v, x);  /* assoc at len appends */
-    if (i > cnt) cljc_error_cls("IndexOutOfBoundsException", "assoc: index %zu out of bounds for length %u", i, cnt);
+    if (i > cnt) clove_error_cls("IndexOutOfBoundsException", "assoc: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(v);
     if (i >= off) {
-        Cljc *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
+        Clove *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt,
                             v->as.vec.tail, v->as.vec.taillen, NULL);
         nv->as.vec.tail[i - off] = x;
         nv->meta = v->meta;
         return nv;
     }
-    Cljc *newroot = vec_doassoc(v->as.vec.shift, v->as.vec.root, i, x);
-    Cljc *nv = vec_cell(newroot, v->as.vec.shift, cnt,
+    Clove *newroot = vec_doassoc(v->as.vec.shift, v->as.vec.root, i, x);
+    Clove *nv = vec_cell(newroot, v->as.vec.shift, cnt,
                         v->as.vec.tail, v->as.vec.taillen, NULL);
     nv->meta = v->meta;
     return nv;
@@ -2209,33 +2209,33 @@ static Cljc *vec_assoc_idx(Cljc *v, size_t i, Cljc *x) {
 
 static uint32_t tvec_next_edit = 1;
 
-static Cljc *tvec_ensure_owned(Cljc *node, uint32_t id) {
+static Clove *tvec_ensure_owned(Clove *node, uint32_t id) {
     if (node->as.hnode.edit_id == id) return node;
-    Cljc *copy = vec_node32();
-    memcpy(copy->as.hnode.kids, node->as.hnode.kids, sizeof(Cljc *) * 32);
+    Clove *copy = vec_node32();
+    memcpy(copy->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 32);
     copy->as.hnode.edit_id = id;
     return copy;
 }
 
-static Cljc *as_tvec(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_TVEC) cljc_error("%s: not a transient", what);
-    if (!v->as.vec.alive) cljc_error("%s: transient used after persistent!", what);
+static Clove *as_tvec(Clove *v, const char *what) {
+    if (v == NIL || v->tag != CLOVE_TVEC) clove_error("%s: not a transient", what);
+    if (!v->as.vec.alive) clove_error("%s: transient used after persistent!", what);
     return v;
 }
 
-static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_transient(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     /* Maps/sets: persistent-fallback shim — transient ops delegate to the
      * persistent versions (same results, no speedup; real HAMT transients
      * are future work). Vectors get the true in-place implementation. */
-    if (v != NIL && (v->tag == CLJC_MAP || v->tag == CLJC_SET)) return v;
-    if (v == NIL || v->tag != CLJC_VECTOR)
-        cljc_error("transient: unsupported collection");
-    Cljc *t = alloc(CLJC_TVEC);
+    if (v != NIL && (v->tag == CLOVE_MAP || v->tag == CLOVE_SET)) return v;
+    if (v == NIL || v->tag != CLOVE_VECTOR)
+        clove_error("transient: unsupported collection");
+    Clove *t = alloc(CLOVE_TVEC);
     t->as.vec.tail = chunk32_alloc();   /* private, mutable, full capacity */
-    memset(t->as.vec.tail, 0, sizeof(Cljc *) * 32);
-    memcpy(t->as.vec.tail, v->as.vec.tail, sizeof(Cljc *) * v->as.vec.taillen);
+    memset(t->as.vec.tail, 0, sizeof(Clove *) * 32);
+    memcpy(t->as.vec.tail, v->as.vec.tail, sizeof(Clove *) * v->as.vec.taillen);
     t->as.vec.root = v->as.vec.root;    /* shared until first owned copy */
     t->as.vec.count = v->as.vec.count;
     t->as.vec.shift = v->as.vec.shift;
@@ -2243,35 +2243,35 @@ static Cljc *prim_transient(CljcEnv *env, Cljc **argv, int nargs) {
     t->as.vec.edit_id = tvec_next_edit++;
     t->as.vec.alive = true;
     t->meta = v->meta;          /* carried through the transient roundtrip */
-    if (tvec_next_edit == 0) cljc_error("transient: edit ids exhausted");
+    if (tvec_next_edit == 0) clove_error("transient: edit ids exhausted");
     return t;
 }
 
-static Cljc *prim_persistent_bang(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_persistent_bang(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    if (argv[0] != NIL && (argv[0]->tag == CLJC_MAP || argv[0]->tag == CLJC_SET))
+    if (argv[0] != NIL && (argv[0]->tag == CLOVE_MAP || argv[0]->tag == CLOVE_SET))
         return argv[0];                       /* shim passthrough */
-    if (argv[0] != NIL && argv[0]->tag == CLJC_IARRAY) {   /* array -> vector copy */
-        Cljc *arr = argv[0], *v = mk_empty_vec();
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_IARRAY) {   /* array -> vector copy */
+        Clove *arr = argv[0], *v = mk_empty_vec();
         for (uint32_t i = 0; i < arr->as.iarr.n; i++) v = vec_conj1(v, iarr_get(arr, i));
         return v;
     }
-    Cljc *t = as_tvec(argv[0], "persistent!");
+    Clove *t = as_tvec(argv[0], "persistent!");
     t->as.vec.alive = false;            /* invalidate further edits */
-    Cljc *nv = t->as.vec.count == 0 ? mk_empty_vec()
+    Clove *nv = t->as.vec.count == 0 ? mk_empty_vec()
              : vec_cell(t->as.vec.root, t->as.vec.shift, t->as.vec.count,
                         t->as.vec.tail, t->as.vec.taillen, NULL);
     return vec_with_meta(nv, t->meta);
 }
 
-static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
+static Clove *tvec_pushtail(int level, Clove *parent, Clove *tailnode,
                            uint32_t cnt, uint32_t id) {
-    Cljc *p = tvec_ensure_owned(parent, id);
+    Clove *p = tvec_ensure_owned(parent, id);
     size_t subidx = ((cnt - 1) >> level) & 31;
     if (level == 5) {
         p->as.hnode.kids[subidx] = tailnode;
     } else {
-        Cljc *child = p->as.hnode.kids[subidx];
+        Clove *child = p->as.hnode.kids[subidx];
         p->as.hnode.kids[subidx] = child
             ? tvec_pushtail(level - 5, child, tailnode, cnt, id)
             : vec_newpath(level - 5, tailnode);
@@ -2279,27 +2279,27 @@ static Cljc *tvec_pushtail(int level, Cljc *parent, Cljc *tailnode,
     return p;
 }
 
-static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_conj_bang(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    if (argv[0] != NIL && (argv[0]->tag == CLJC_MAP || argv[0]->tag == CLJC_SET))
+    if (argv[0] != NIL && (argv[0]->tag == CLOVE_MAP || argv[0]->tag == CLOVE_SET))
         return prim_conj(env, argv, nargs);   /* shim: persistent conj */
-    Cljc *t = as_tvec(argv[0], "conj!");
-    Cljc *x = argv[1];
+    Clove *t = as_tvec(argv[0], "conj!");
+    Clove *x = argv[1];
     uint32_t cnt = t->as.vec.count;
     if (cnt - vec_tailoff(t) < 32) {            /* in-place: zero alloc */
         t->as.vec.tail[t->as.vec.taillen++] = x;
         t->as.vec.count = cnt + 1;
         return t;
     }
-    Cljc *leaf = vec_node32();                  /* tail becomes an owned leaf */
-    memcpy(leaf->as.hnode.kids, t->as.vec.tail, sizeof(Cljc *) * 32);
+    Clove *leaf = vec_node32();                  /* tail becomes an owned leaf */
+    memcpy(leaf->as.hnode.kids, t->as.vec.tail, sizeof(Clove *) * 32);
     leaf->as.hnode.edit_id = t->as.vec.edit_id;
     if (t->as.vec.root == NULL) {
         t->as.vec.root = leaf;
         t->as.vec.shift = 0;
     } else if ((cnt >> 5) > (1u << t->as.vec.shift)) {
-        Cljc *path = vec_newpath(t->as.vec.shift, leaf);
-        Cljc *newroot = vec_node32();
+        Clove *path = vec_newpath(t->as.vec.shift, leaf);
+        Clove *newroot = vec_node32();
         newroot->as.hnode.edit_id = t->as.vec.edit_id;
         newroot->as.hnode.kids[0] = t->as.vec.root;
         newroot->as.hnode.kids[1] = path;
@@ -2315,43 +2315,43 @@ static Cljc *prim_conj_bang(CljcEnv *env, Cljc **argv, int nargs) {
     return t;
 }
 
-static int64_t as_int(Cljc *v, const char *what);
+static int64_t as_int(Clove *v, const char *what);
 
 /* Natives get argv straight off the vstack: slots past nargs hold stale
  * values, so an under-arity call must fail before reading them. */
 static void need_nargs(int nargs, int want, const char *what) {
-    if (nargs < want) cljc_error("wrong number of args (%d) passed to %s", nargs, what);
+    if (nargs < want) clove_error("wrong number of args (%d) passed to %s", nargs, what);
 }
 
-static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_assoc_bang(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 3, "assoc!");
-    if (argv[0] != NIL && argv[0]->tag == CLJC_IARRAY) {
-        Cljc *arr = argv[0];
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_IARRAY) {
+        Clove *arr = argv[0];
         int64_t i = as_int(argv[1], "assoc!");
         if (i < 0 || i >= (int64_t)arr->as.iarr.n)
-            cljc_error_cls("IndexOutOfBoundsException", "assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
+            clove_error_cls("IndexOutOfBoundsException", "assoc!: index %lld out of bounds for length %u", (long long)i, arr->as.iarr.n);
         iarr_set(arr, i, argv[2], "assoc!");
         return arr;
     }
     (void)env; (void)nargs;
-    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP)
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_MAP)
         return prim_assoc(env, argv, nargs);  /* shim: persistent assoc */
-    Cljc *t = as_tvec(argv[0], "assoc!");
+    Clove *t = as_tvec(argv[0], "assoc!");
     size_t i = (size_t)as_int(argv[1], "assoc!");
-    Cljc *x = argv[2];
+    Clove *x = argv[2];
     uint32_t cnt = t->as.vec.count;
-    if (i == cnt) { Cljc *cargs[2] = {t, x}; return prim_conj_bang(env, cargs, 2); }
-    if (i > cnt) cljc_error_cls("IndexOutOfBoundsException", "assoc!: index %zu out of bounds for length %u", i, cnt);
+    if (i == cnt) { Clove *cargs[2] = {t, x}; return prim_conj_bang(env, cargs, 2); }
+    if (i > cnt) clove_error_cls("IndexOutOfBoundsException", "assoc!: index %zu out of bounds for length %u", i, cnt);
     size_t off = vec_tailoff(t);
     if (i >= off) {                              /* in-place: zero alloc */
         t->as.vec.tail[i - off] = x;
         return t;
     }
     uint32_t id = t->as.vec.edit_id;
-    Cljc *node = t->as.vec.root = tvec_ensure_owned(t->as.vec.root, id);
+    Clove *node = t->as.vec.root = tvec_ensure_owned(t->as.vec.root, id);
     for (int level = t->as.vec.shift; level > 0; level -= 5) {
         size_t sub = (i >> level) & 31;
-        Cljc *child = tvec_ensure_owned(node->as.hnode.kids[sub], id);
+        Clove *child = tvec_ensure_owned(node->as.hnode.kids[sub], id);
         node->as.hnode.kids[sub] = child;        /* owned: safe to mutate */
         node = child;
     }
@@ -2360,22 +2360,22 @@ static Cljc *prim_assoc_bang(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* Build a vector from a C array (small n — entry pairs, literals). */
-static Cljc *mk_vector(Cljc **items, size_t n) {
-    Cljc *v = mk_empty_vec();
+static Clove *mk_vector(Clove **items, size_t n) {
+    Clove *v = mk_empty_vec();
     for (size_t i = 0; i < n; i++) v = vec_conj1(v, items[i]);
     return v;
 }
 
-static Cljc *cell_alloc(bool zero) {
+static Clove *cell_alloc(bool zero) {
     maybe_gc();
-    Cljc *c;
+    Clove *c;
     if (cell_freelist) {
         c = cell_freelist;
         cell_freelist = c->as.cons.head;
     } else {
         if (!cell_blocks || cell_blocks->used == CELL_BLOCK_N) {
             CellBlock *b = malloc(sizeof *b);
-            if (!b) cljc_error("out of memory");
+            if (!b) clove_error("out of memory");
             b->used = 0;
             b->next = cell_blocks;
             cell_blocks = b;
@@ -2391,16 +2391,16 @@ static Cljc *cell_alloc(bool zero) {
     return c;
 }
 
-static CljcEnv *env_alloc(void) {
+static CloveEnv *env_alloc(void) {
     maybe_gc();
-    CljcEnv *e;
+    CloveEnv *e;
     if (env_freelist) {
         e = env_freelist;
         env_freelist = e->parent;
     } else {
         if (!env_blocks || env_blocks->used == ENV_BLOCK_N) {
             EnvBlock *b = malloc(sizeof *b);
-            if (!b) cljc_error("out of memory");
+            if (!b) clove_error("out of memory");
             b->used = 0;
             b->next = env_blocks;
             env_blocks = b;
@@ -2417,13 +2417,13 @@ static CljcEnv *env_alloc(void) {
 
 /* ───── Argument validation helpers ──────────────────────────────────── */
 
-static void need_args(Cljc *rest, size_t n, const char *what) {
+static void need_args(Clove *rest, size_t n, const char *what) {
     if (list_len(rest) < n)
-        cljc_error("%s: expected at least %zu argument%s", what, n, n == 1 ? "" : "s");
+        clove_error("%s: expected at least %zu argument%s", what, n, n == 1 ? "" : "s");
 }
 
-static const char *sym_name(Cljc *v, const char *what) {
-    if (v == NULL || v->tag != CLJC_SYMBOL) cljc_error("%s: expected a symbol", what);
+static const char *sym_name(Clove *v, const char *what) {
+    if (v == NULL || v->tag != CLOVE_SYMBOL) clove_error("%s: expected a symbol", what);
     return v->as.sym;
 }
 
@@ -2431,20 +2431,20 @@ static const char *sym_name(Cljc *v, const char *what) {
  * name as (with-meta x m) — possibly stacked. :private is retained (via the
  * priv out-param; def/defmacro record it in the private-defs table), and a
  * ^{:doc "…"} string surfaces through doc_out for the doc registry. */
-static Cljc *peel_meta_sym_doc(Cljc *v, bool *priv, Cljc **doc_out) {
-    while (v != NIL && v->tag == CLJC_LIST &&
-           v->as.cons.head->tag == CLJC_SYMBOL &&
+static Clove *peel_meta_sym_doc(Clove *v, bool *priv, Clove **doc_out) {
+    while (v != NIL && v->tag == CLOVE_LIST &&
+           v->as.cons.head->tag == CLOVE_SYMBOL &&
            !strcmp(v->as.cons.head->as.sym, "with-meta") &&
            v->as.cons.tail != NIL) {
         if (priv || doc_out) {
-            Cljc *mt = v->as.cons.tail->as.cons.tail;
-            Cljc *mf = (mt != NIL && mt->tag == CLJC_LIST) ? mt->as.cons.head : NIL;
-            if (mf != NIL && mf->tag == CLJC_MAP) {
-                Cljc *pv;
+            Clove *mt = v->as.cons.tail->as.cons.tail;
+            Clove *mf = (mt != NIL && mt->tag == CLOVE_LIST) ? mt->as.cons.head : NIL;
+            if (mf != NIL && mf->tag == CLOVE_MAP) {
+                Clove *pv;
                 if (priv && map_find(mf, mk_kw(intern("private", 7)), &pv) && is_truthy(pv))
                     *priv = true;
                 if (doc_out && map_find(mf, mk_kw(intern("doc", 3)), &pv) &&
-                    pv != NIL && pv->tag == CLJC_STRING)
+                    pv != NIL && pv->tag == CLOVE_STRING)
                     *doc_out = pv;
             }
         }
@@ -2452,30 +2452,30 @@ static Cljc *peel_meta_sym_doc(Cljc *v, bool *priv, Cljc **doc_out) {
     }
     return v;
 }
-static Cljc *peel_meta_sym_priv(Cljc *v, bool *priv) {
+static Clove *peel_meta_sym_priv(Clove *v, bool *priv) {
     return peel_meta_sym_doc(v, priv, NULL);
 }
-static Cljc *peel_meta_sym(Cljc *v) { return peel_meta_sym_doc(v, NULL, NULL); }
+static Clove *peel_meta_sym(Clove *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
-static int64_t as_int(Cljc *v, const char *what) {
+static int64_t as_int(Clove *v, const char *what) {
     if (v != NULL) {
-        if (v->tag == CLJC_INT) return v->as.i;
+        if (v->tag == CLOVE_INT) return v->as.i;
         /* Clojure coerces at integer positions (RT.intCast): (nth v 1.9) is
          * index 1, (subs s 1/2) index 0 -- truncation toward zero, which is
          * what a C cast already does. Numeric code that computes an index in
          * floating point (chebfun, array shapes) relies on this. A BIGINT
          * here is by construction out of int64 range (in-range values demote
-         * to CLJC_INT), so it falls through to the error below. */
-        if (v->tag == CLJC_DOUBLE || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
+         * to CLOVE_INT), so it falls through to the error below. */
+        if (v->tag == CLOVE_DOUBLE || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC) {
             double d = as_num(v);
             if (!(d >= -9.2233720368547758e18 && d <= 9.2233720368547758e18))
-                cljc_error("%s: value out of integer range: %g", what, d);
+                clove_error("%s: value out of integer range: %g", what, d);
             return (int64_t)d;
         }
     }
     /* the JVM's two type errors: nil where a number goes is an NPE, anything
      * else a ClassCastException -- classed so a typed catch sees them */
-    cljc_error_cls(v == NULL || v == NIL ? "NullPointerException" : "ClassCastException",
+    clove_error_cls(v == NULL || v == NIL ? "NullPointerException" : "ClassCastException",
                    "%s: expected a number, got %s", what, val_desc(v));
     return 0;
 }
@@ -2485,14 +2485,14 @@ static int64_t as_int(Cljc *v, const char *what) {
 /* Shared by the reader (string escapes) and the printer, so that `str`,
  * `pr-str`, and stdout printing all use a single implementation. */
 typedef struct { char *data; size_t len, cap; } SBuf;
-static void bd_print(SBuf *sb, Cljc *v);
+static void bd_print(SBuf *sb, Clove *v);
 
 static void sb_grow(SBuf *sb, size_t need) {
     if (sb->len + need + 1 <= sb->cap) return;
     sb->cap = sb->cap ? sb->cap * 2 : 64;
     while (sb->len + need + 1 > sb->cap) sb->cap *= 2;
     sb->data = realloc(sb->data, sb->cap);
-    if (!sb->data) cljc_error("out of memory");
+    if (!sb->data) clove_error("out of memory");
 }
 static void sb_putc(SBuf *sb, char c) { sb_grow(sb, 1); sb->data[sb->len++] = c; sb->data[sb->len] = '\0'; }
 static void sb_puts(SBuf *sb, const char *s) {
@@ -2523,9 +2523,9 @@ static void rd_error(const char *fmt, ...) {
     vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
     if (rd_line > 0 && rd_file_cell)
-        cljc_error("%s (%s:%d)", msg, rd_file_cell->as.str, rd_line);
-    if (rd_line > 0) cljc_error("%s (line %d)", msg, rd_line);
-    cljc_error("%s", msg);
+        clove_error("%s (%s:%d)", msg, rd_file_cell->as.str, rd_line);
+    if (rd_line > 0) clove_error("%s (line %d)", msg, rd_line);
+    clove_error("%s", msg);
 }
 
 static void skip_ws(const char **p) {
@@ -2536,7 +2536,7 @@ static void skip_ws(const char **p) {
         /* #! ... : shebang / dispatch comment. Clojure registers `!` in the
          * dispatch table as a comment reader, so this is a line comment
          * ANYWHERE, not just line 1 -- which is also what makes an executable
-         * `#!/usr/bin/env cljc` script just work on every load path. The \n
+         * `#!/usr/bin/env clove` script just work on every load path. The \n
          * is left for the branch above, so rd_line stays accurate. */
         else if (**p == '#' && (*p)[1] == '!') { while (**p && **p != '\n') (*p)++; }
         else break;
@@ -2548,7 +2548,7 @@ static bool is_sym_char(int c) {
     return !strchr("()[]{}\";`,~@", c);  /* ' is legal INSIDE symbols (coll') */
 }
 
-static Cljc *read_atom(const char **p) {
+static Clove *read_atom(const char **p) {
     const char *start = *p;
     while (is_sym_char((unsigned char)**p)) (*p)++;
     size_t n = *p - start;
@@ -2571,14 +2571,14 @@ static Cljc *read_atom(const char **p) {
             for (size_t i = 0; i < dn && alldig; i++) if (q[i] < '0' || q[i] > '9') alldig = false;
             if (alldig && (hasN || dn >= 19)) {
                 char *tmp = xmalloc(n + 1); memcpy(tmp, start, n); tmp[n] = '\0';
-                Cljc *r = big_from_decimal(tmp);   /* stops at the trailing N */
+                Clove *r = big_from_decimal(tmp);   /* stops at the trailing N */
                 free(tmp);
                 return r;
             }
         }
         /* BigDecimal literal: 1.5M, 1M, 1E+3M -- the decimal text before M */
         if (start[n - 1] == 'M') {
-            Cljc *d = bd_parse(start, n - 1);
+            Clove *d = bd_parse(start, n - 1);
             if (!d) rd_error("invalid number: %.*s", (int)n, start);
             return d;
         }
@@ -2595,13 +2595,13 @@ static Cljc *read_atom(const char **p) {
                     size_t nl = (size_t)(slash - start), dl = (size_t)(start + n - slash - 1);
                     memcpy(nb, start, nl); nb[nl] = '\0';
                     memcpy(db, slash + 1, dl); db[dl] = '\0';
-                    Cljc *num = big_from_decimal(nb), *den = big_from_decimal(db);
+                    Clove *num = big_from_decimal(nb), *den = big_from_decimal(db);
                     free(nb); free(db);
                     return make_ratio(num, den);
                 }
             }
         }
-        char buf[64]; if (n >= sizeof buf) cljc_error("number too long");
+        char buf[64]; if (n >= sizeof buf) clove_error("number too long");
         memcpy(buf, start, n); buf[n] = '\0';
         int64_t sign = 1;
         char *d = buf;
@@ -2625,7 +2625,7 @@ static Cljc *read_atom(const char **p) {
             if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') is_float = true;
         if (is_float) return mk_double(strtod(buf, NULL));
         /* NB: leading-zero stays DECIMAL (017 => 17), not octal — a deliberate
-         * cljc choice to avoid the octal footgun (see tests.clj). */
+         * clove choice to avoid the octal footgun (see tests.clj). */
         return mk_int(strtoll(buf, NULL, 10));
     }
 
@@ -2663,7 +2663,7 @@ static Cljc *read_atom(const char **p) {
     return mk_sym(intern(start, n));
 }
 
-static Cljc *read_string(const char **p) {
+static Clove *read_string(const char **p) {
     (*p)++; /* consume opening " */
     SBuf sb = {0};
     while (**p && **p != '"') {
@@ -2689,7 +2689,7 @@ static Cljc *read_string(const char **p) {
                         if (d < 0) break;
                         cp = cp * 16 + d;
                     }
-                    if (k == 0) cljc_error("invalid \\u escape");
+                    if (k == 0) clove_error("invalid \\u escape");
                     if (cp < 0x80) sb_putc(&sb, (char)cp);
                     else if (cp < 0x800) {
                         sb_putc(&sb, (char)(0xC0 | (cp >> 6)));
@@ -2713,24 +2713,24 @@ static Cljc *read_string(const char **p) {
     }
     if (**p != '"') rd_error("unterminated string");
     (*p)++; /* consume closing " */
-    Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+    Clove *r = mk_str(sb.data ? sb.data : "", sb.len);
     free(sb.data);
     return r;
 }
 
-static Cljc *read_list(const char **p, char close) {
+static Clove *read_list(const char **p, char close) {
     int col0 = (rd_line && rd_line_start && *p >= rd_line_start)
         ? (int)(*p - rd_line_start) + 1 : 0;
     (*p)++; /* consume open */
     int line0 = rd_line;
-    Cljc *head = NIL, **tail = &head;
+    Clove *head = NIL, **tail = &head;
     for (;;) {
         skip_ws(p);
         if (**p == '\0') rd_error("unterminated list");
         if (**p == close) {
             (*p)++;
             if (line0 && head != NIL) {   /* location for error traces */
-                Cljc *m = mk_map();
+                Clove *m = mk_map();
                 m = map_assoc(m, mk_kw(intern("line", 4)), mk_int(line0));
                 if (col0) m = map_assoc(m, mk_kw(intern("col", 3)), mk_int(col0));
                 if (rd_file_cell)
@@ -2739,13 +2739,13 @@ static Cljc *read_list(const char **p, char close) {
             }
             return head;
         }
-        Cljc *item = read_form(p);
+        Clove *item = read_form(p);
         /* unpack #?@ splice markers into this list */
-        if (item != NULL && item != NIL && item->tag == CLJC_LIST &&
-            item->as.cons.head->tag == CLJC_SYMBOL &&
+        if (item != NULL && item != NIL && item->tag == CLOVE_LIST &&
+            item->as.cons.head->tag == CLOVE_SYMBOL &&
             item->as.cons.head->as.sym == intern("**reader-splice**", 17)) {
-            Cljc *branch = item->as.cons.tail->as.cons.head;
-            for (Cljc *s = to_seq(branch); s && s->tag == CLJC_LIST; s = s->as.cons.tail) {
+            Clove *branch = item->as.cons.tail->as.cons.head;
+            for (Clove *s = to_seq(branch); s && s->tag == CLOVE_LIST; s = s->as.cons.tail) {
                 *tail = mk_cons(s->as.cons.head, NIL);
                 tail = &(*tail)->as.cons.tail;
             }
@@ -2756,18 +2756,18 @@ static Cljc *read_list(const char **p, char close) {
     }
 }
 
-static Cljc *read_form(const char **p) {
+static Clove *read_form(const char **p) {
     skip_ws(p);
     char c = **p;
     if (c == '\0') return NULL;
-    if (c == '(') { Cljc *l = read_list(p, ')'); return l == NIL ? EMPTY : l; }
+    if (c == '(') { Clove *l = read_list(p, ')'); return l == NIL ? EMPTY : l; }
     if (c == '[') {
         /* v0: treat [ … ] as a list tagged for vector semantics later. For
          * now use the list reader and rewrap. Persistent vectors arrive
          * with the PVec milestone. */
-        Cljc *list = read_list(p, ']');
-        Cljc *v = mk_empty_vec();
-        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        Clove *list = read_list(p, ']');
+        Clove *v = mk_empty_vec();
+        for (Clove *l = list; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
@@ -2779,23 +2779,23 @@ static Cljc *read_form(const char **p) {
          * (meta '^double x) => {:tag double} and jit.clj can honor hints.
          * Hints on non-symbol forms are discarded as before. */
         (*p)++;
-        Cljc *m = read_form(p);
-        Cljc *form = m ? read_form(p) : NULL;
-        if (!m || !form) cljc_error("unexpected EOF after ^ metadata");
-        if (m != NIL && m->tag == CLJC_KEYWORD) {
-            Cljc *mm = mk_map();
+        Clove *m = read_form(p);
+        Clove *form = m ? read_form(p) : NULL;
+        if (!m || !form) clove_error("unexpected EOF after ^ metadata");
+        if (m != NIL && m->tag == CLOVE_KEYWORD) {
+            Clove *mm = mk_map();
             m = map_assoc(mm, m, TRUE);
         }
-        if (m == NIL || m->tag != CLJC_MAP) {  /* ^Tag type hint */
-            if (m != NIL && m->tag == CLJC_SYMBOL &&
-                form != NIL && form->tag == CLJC_SYMBOL)
+        if (m == NIL || m->tag != CLOVE_MAP) {  /* ^Tag type hint */
+            if (m != NIL && m->tag == CLOVE_SYMBOL &&
+                form != NIL && form->tag == CLOVE_SYMBOL)
                 form->meta = map_assoc(mk_map(), mk_kw(intern("tag", 3)), m);
             return form;
         }
         return mk_cons(mk_sym(intern("with-meta", 9)),
                        mk_cons(form, mk_cons(m, NIL)));
     }
-    if (c == '\\') {  /* char literal => CLJC_CHAR */
+    if (c == '\\') {  /* char literal => CLOVE_CHAR */
         (*p)++;
         const char *start = *p;
         while (is_sym_char((unsigned char)**p)) (*p)++;
@@ -2815,7 +2815,7 @@ static Cljc *read_form(const char **p) {
                 if (d >= '0' && d <= '9') hv = d - '0';
                 else if (d >= 'a' && d <= 'f') hv = d - 'a' + 10;
                 else if (d >= 'A' && d <= 'F') hv = d - 'A' + 10;
-                else cljc_error("bad \\u char literal");
+                else clove_error("bad \\u char literal");
                 cp = cp * 16 + hv;
             }
             return mk_char(cp);
@@ -2853,7 +2853,7 @@ static Cljc *read_form(const char **p) {
     }
     if (c == '#' && (*p)[1] == '\'') {  /* #'x => (var x) */
         *p += 2;
-        Cljc *form = read_form(p);
+        Clove *form = read_form(p);
         return mk_cons(mk_sym(intern("var", 3)), mk_cons(form, NIL));
     }
     if (c == '#' && (*p)[1] == 'p' &&
@@ -2865,12 +2865,12 @@ static Cljc *read_form(const char **p) {
         int line0 = rd_line;
         *p += 2;
         skip_ws(p);
-        Cljc *form = read_form(p);
-        Cljc *w = mk_cons(mk_sym(intern("dbg", 3)), mk_cons(form, NIL));
-        if (form != NULL && form != NIL && form->tag == CLJC_LIST && form->meta)
+        Clove *form = read_form(p);
+        Clove *w = mk_cons(mk_sym(intern("dbg", 3)), mk_cons(form, NIL));
+        if (form != NULL && form != NIL && form->tag == CLOVE_LIST && form->meta)
             w->meta = form->meta;              /* dbg reports the inner form's location */
         else if (line0) {
-            Cljc *m = map_assoc(mk_map(), mk_kw(intern("line", 4)), mk_int(line0));
+            Clove *m = map_assoc(mk_map(), mk_kw(intern("line", 4)), mk_int(line0));
             if (rd_file_cell) m = map_assoc(m, mk_kw(intern("file", 4)), rd_file_cell);
             w->meta = m;
         }
@@ -2881,34 +2881,36 @@ static Cljc *read_form(const char **p) {
         if (!strncmp(*p, "Inf", 3))  { *p += 3; return mk_double(INFINITY); }
         if (!strncmp(*p, "-Inf", 4)) { *p += 4; return mk_double(-INFINITY); }
         if (!strncmp(*p, "NaN", 3))  { *p += 3; return mk_double(NAN); }
-        cljc_error("unknown ## literal (expected ##Inf, ##-Inf, ##NaN)");
+        clove_error("unknown ## literal (expected ##Inf, ##-Inf, ##NaN)");
     }
     if (c == '#' && (*p)[1] == '?') {
-        /* reader conditional: pick a branch by PRIORITY :cljc > :bb >
-         * :default > :clj. :cljc always wins (cljc-specific); :bb next — a
+        /* reader conditional: pick a branch by PRIORITY :clove (or the old
+         * :cljc, the project's former name) > :bb >
+         * :default > :clj. :clove always wins (clove-specific); :bb next — a
          * library's babashka branch is its JVM-class-free path (specter's
          * MutableCell is a defrecord under :bb, an imported Java class under
-         * :clj), which is what cljc can run; :default beats :clj so a
+         * :clj), which is what clove can run; :default beats :clj so a
          * portable #?(:clj java :default portable) still takes the portable
-         * branch; :clj is a last resort so cljc can still load clj-only
+         * branch; :clj is a last resort so clove can still load clj-only
          * conditionals like #?(:clj X :cljs Y) (taking X). #?@(...) splices the
          * branch into the enclosing list — a marker cons read_list unpacks. */
         *p += 2;
         bool splicing = **p == '@';
         if (splicing) (*p)++;
         skip_ws(p);
-        if (**p != '(') cljc_error("#? expects a list");
-        Cljc *clauses = read_list(p, ')');
-        static const char *KW_CLJC, *KW_CLJ, *KW_DEFAULT, *KW_BB;
-        if (!KW_CLJC) { KW_CLJC = intern("cljc", 4); KW_CLJ = intern("clj", 3);
+        if (**p != '(') clove_error("#? expects a list");
+        Clove *clauses = read_list(p, ')');
+        static const char *KW_CLOVE, *KW_CLJC_OLD, *KW_CLJ, *KW_DEFAULT, *KW_BB;
+        if (!KW_CLOVE) { KW_CLOVE = intern("clove", 5); KW_CLJ = intern("clj", 3);
+                        KW_CLJC_OLD = intern("cljc", 4);   /* the pre-rename feature name */
                         KW_DEFAULT = intern("default", 7); KW_BB = intern("bb", 2); }
-        Cljc *b_cljc = NULL, *b_clj = NULL, *b_default = NULL, *b_bb = NULL;
-        for (Cljc *l = clauses; l && l->tag == CLJC_LIST && l->as.cons.tail != NIL;
+        Clove *b_clove = NULL, *b_clj = NULL, *b_default = NULL, *b_bb = NULL;
+        for (Clove *l = clauses; l && l->tag == CLOVE_LIST && l->as.cons.tail != NIL;
              l = l->as.cons.tail->as.cons.tail) {
-            Cljc *k = l->as.cons.head;
-            Cljc *branch = l->as.cons.tail->as.cons.head;
-            if (k->tag == CLJC_KEYWORD) {
-                if (k->as.kw == KW_CLJC && !b_cljc) b_cljc = branch;
+            Clove *k = l->as.cons.head;
+            Clove *branch = l->as.cons.tail->as.cons.head;
+            if (k->tag == CLOVE_KEYWORD) {
+                if ((k->as.kw == KW_CLOVE || k->as.kw == KW_CLJC_OLD) && !b_clove) b_clove = branch;
                 else if (k->as.kw == KW_BB && !b_bb) b_bb = branch;
                 else if (k->as.kw == KW_CLJ && !b_clj) b_clj = branch;
                 else if (k->as.kw == KW_DEFAULT && !b_default) b_default = branch;
@@ -2916,7 +2918,7 @@ static Cljc *read_form(const char **p) {
             if (l->as.cons.tail == NIL) break;
         }
         {
-            Cljc *branch = b_cljc ? b_cljc : b_bb ? b_bb : b_default ? b_default : b_clj;
+            Clove *branch = b_clove ? b_clove : b_bb ? b_bb : b_default ? b_default : b_clj;
             if (branch) {
                 if (!splicing) return branch;
                 return mk_cons(mk_sym(intern("**reader-splice**", 17)),
@@ -2933,31 +2935,31 @@ static Cljc *read_form(const char **p) {
     if (c == '#' && (*p)[1] == '(') {
         /* #(...) => (fn [%1 ...] (...)); % aliases %1, %& is the rest arg */
         (*p)++;
-        Cljc *body = read_form(p);
+        Clove *body = read_form(p);
         int maxn = 0;
         bool pct = false, variadic = false;
         /* scan for %-symbols (iterative worklist over nested collections) */
-        Cljc *work[256]; int wn = 0;
+        Clove *work[256]; int wn = 0;
         bool overflow = false;
         work[wn++] = body;
         while (wn > 0) {
-            Cljc *f = work[--wn];
+            Clove *f = work[--wn];
             if (!f || f == NIL) continue;
-            if (f->tag == CLJC_SYMBOL && f->as.sym[0] == '%') {
+            if (f->tag == CLOVE_SYMBOL && f->as.sym[0] == '%') {
                 const char *s = f->as.sym;
                 if (s[1] == '\0') { pct = true; if (maxn < 1) maxn = 1; }
                 else if (s[1] == '&' && s[2] == '\0') variadic = true;
                 else if (s[1] >= '1' && s[1] <= '9' && s[2] == '\0') {
                     if (s[1] - '0' > maxn) maxn = s[1] - '0';
                 }
-            } else if (f->tag == CLJC_LIST) {
-                for (Cljc *l = f; l && l->tag == CLJC_LIST && wn < 254; l = l->as.cons.tail)
+            } else if (f->tag == CLOVE_LIST) {
+                for (Clove *l = f; l && l->tag == CLOVE_LIST && wn < 254; l = l->as.cons.tail)
                     work[wn++] = l->as.cons.head;
-            } else if (f->tag == CLJC_VECTOR) {
+            } else if (f->tag == CLOVE_VECTOR) {
                 for (size_t i = 0; i < vec_len(f) && wn < 254; i++)
                     work[wn++] = vec_nth(f, i);
-            } else if (f->tag == CLJC_MAP) {
-                for (Cljc *e = map_entry_list(f); e && e->tag == CLJC_LIST && wn < 253;
+            } else if (f->tag == CLOVE_MAP) {
+                for (Clove *e = map_entry_list(f); e && e->tag == CLOVE_LIST && wn < 253;
                      e = e->as.cons.tail) {
                     work[wn++] = e->as.cons.head->as.cons.head;
                     work[wn++] = e->as.cons.head->as.cons.tail;
@@ -2965,8 +2967,8 @@ static Cljc *read_form(const char **p) {
             }
         }
         if (wn >= 253) overflow = true;
-        if (overflow) cljc_error("#(): body too complex to scan for %% params");
-        Cljc *items[11];
+        if (overflow) clove_error("#(): body too complex to scan for %% params");
+        Clove *items[11];
         size_t ni = 0;
         /* params are always %1..%maxn; bare % is an alias for %1 (Clojure), so a
          * body mixing % and %1 is fine — we bind % via a let below. */
@@ -2978,9 +2980,9 @@ static Cljc *read_form(const char **p) {
             items[ni++] = mk_sym(intern("&", 1));
             items[ni++] = mk_sym(intern("%&", 2));
         }
-        Cljc *params = mk_vector(items, ni);
+        Clove *params = mk_vector(items, ni);
         if (pct) {   /* (let [% %1] body) so bare % refers to the first param */
-            Cljc *bv2[2] = { mk_sym(intern("%", 1)), mk_sym(intern("%1", 2)) };
+            Clove *bv2[2] = { mk_sym(intern("%", 1)), mk_sym(intern("%1", 2)) };
             body = mk_cons(mk_sym(intern("let", 3)),
                            mk_cons(mk_vector(bv2, 2), mk_cons(body, NIL)));
         }
@@ -3005,9 +3007,9 @@ static Cljc *read_form(const char **p) {
             sb_putc(&sb, **p);
             (*p)++;
         }
-        if (**p != '"') cljc_error("unterminated regex literal");
+        if (**p != '"') clove_error("unterminated regex literal");
         (*p)++;
-        Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+        Clove *r = mk_str(sb.data ? sb.data : "", sb.len);
         free(sb.data);
         /* Tag as a regex: str/split etc. dispatch on this meta. The map is
          * rebuilt per literal (cheap; a static would dodge the GC roots). */
@@ -3024,25 +3026,25 @@ static Cljc *read_form(const char **p) {
         while (**p && **p != '{' && !isspace((unsigned char)**p) && nl < 255) nsbuf[nl++] = *(*p)++;
         nsbuf[nl] = '\0';
         skip_ws(p);
-        if (**p != '{') cljc_error("namespaced map literal expects {");
+        if (**p != '{') clove_error("namespaced map literal expects {");
         const char *ns = nl ? nsbuf : (cur_reader_ns ? cur_reader_ns : "user");
-        Cljc *list = read_list(p, '}');
+        Clove *list = read_list(p, '}');
         if (list_len(list) % 2 != 0) rd_error("map literal must contain an even number of forms");
-        Cljc *m = mk_map();
-        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
-            Cljc *k = l->as.cons.head, *val = l->as.cons.tail->as.cons.head;
-            const char *nm = k->tag == CLJC_KEYWORD ? k->as.kw : k->tag == CLJC_SYMBOL ? k->as.sym : NULL;
+        Clove *m = mk_map();
+        for (Clove *l = list; l && l->tag == CLOVE_LIST; l = l->as.cons.tail->as.cons.tail) {
+            Clove *k = l->as.cons.head, *val = l->as.cons.tail->as.cons.head;
+            const char *nm = k->tag == CLOVE_KEYWORD ? k->as.kw : k->tag == CLOVE_SYMBOL ? k->as.sym : NULL;
             if (nm) {
                 const char *slash = strchr(nm, '/');
                 if (slash) {                       /* already qualified (or _/k) */
                     if (nm[0] == '_' && nm[1] == '/') {
                         const char *bare = nm + 2;
-                        k = k->tag == CLJC_KEYWORD ? mk_kw(intern(bare, strlen(bare)))
+                        k = k->tag == CLOVE_KEYWORD ? mk_kw(intern(bare, strlen(bare)))
                                                    : mk_sym(intern(bare, strlen(bare)));
                     }
                 } else {
                     char buf[512]; snprintf(buf, sizeof buf, "%s/%s", ns, nm);
-                    k = k->tag == CLJC_KEYWORD ? mk_kw(intern(buf, strlen(buf)))
+                    k = k->tag == CLOVE_KEYWORD ? mk_kw(intern(buf, strlen(buf)))
                                                : mk_sym(intern(buf, strlen(buf)));
                 }
             }
@@ -3052,11 +3054,11 @@ static Cljc *read_form(const char **p) {
     }
     if (c == '#' && (*p)[1] == '{') {
         (*p)++;  /* consume '#'; read_list consumes '{' */
-        Cljc *list = read_list(p, '}');
+        Clove *list = read_list(p, '}');
         /* Elements are unevaluated forms; eval builds the live set.
          * Duplicate literal elements are a reader error, as in Clojure. */
-        Cljc *s = mk_set();
-        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+        Clove *s = mk_set();
+        for (Clove *l = list; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
             if (set_contains(s, l->as.cons.head, NULL))
                 rd_error("duplicate element in set literal");
             s = set_conj(s, l->as.cons.head);
@@ -3064,13 +3066,13 @@ static Cljc *read_form(const char **p) {
         return s;
     }
     if (c == '{') {
-        Cljc *list = read_list(p, '}');
+        Clove *list = read_list(p, '}');
         if (list_len(list) % 2 != 0)
             rd_error("map literal must contain an even number of forms");
         /* Keys here are unevaluated FORMS — eval() builds the live map.
          * Duplicate literal keys are a reader error, as in Clojure. */
-        Cljc *m = mk_map();
-        for (Cljc *l = list; l && l->tag == CLJC_LIST; l = l->as.cons.tail->as.cons.tail) {
+        Clove *m = mk_map();
+        for (Clove *l = list; l && l->tag == CLOVE_LIST; l = l->as.cons.tail->as.cons.tail) {
             if (map_find(m, l->as.cons.head, NULL))
                 rd_error("duplicate key in map literal");
             m = map_assoc(m, l->as.cons.head, l->as.cons.tail->as.cons.head);
@@ -3083,12 +3085,12 @@ static Cljc *read_form(const char **p) {
     if (c == '"') return read_string(p);
     if (c == '\'') {
         (*p)++;
-        Cljc *quoted = read_form(p);
+        Clove *quoted = read_form(p);
         return mk_cons(mk_sym(intern("quote", 5)), mk_cons(quoted, NIL));
     }
     if (c == '`') {
         (*p)++;
-        Cljc *form = read_form(p);
+        Clove *form = read_form(p);
         return mk_cons(mk_sym(intern("quasiquote", 10)), mk_cons(form, NIL));
     }
     if (c == '~') {
@@ -3098,12 +3100,12 @@ static Cljc *read_form(const char **p) {
         const char *tag = "clojure.core/unquote";
         size_t taglen = 20;
         if (**p == '@') { (*p)++; tag = "clojure.core/unquote-splicing"; taglen = 29; }
-        Cljc *form = read_form(p);
+        Clove *form = read_form(p);
         return mk_cons(mk_sym(intern(tag, taglen)), mk_cons(form, NIL));
     }
     if (c == '@') {
         (*p)++;
-        Cljc *form = read_form(p);
+        Clove *form = read_form(p);
         /* @x is clojure.core/deref (qualified, like Clojure) so a namespace that
          * shadows `deref` with its own (e.g. malli's ref deref) doesn't capture it */
         return mk_cons(mk_sym(intern("clojure.core/deref", 18)), mk_cons(form, NIL));
@@ -3115,9 +3117,9 @@ static Cljc *read_form(const char **p) {
 
 /* Evaluate each form in sequence, return the last result (nil if empty).
  * The shape of fn bodies, do, let, when, and loop. */
-static Cljc *eval_body(CljcEnv *env, Cljc *body) {
-    Cljc *r = NIL;
-    for (; body && body->tag == CLJC_LIST; body = body->as.cons.tail)
+static Clove *eval_body(CloveEnv *env, Clove *body) {
+    Clove *r = NIL;
+    for (; body && body->tag == CLOVE_LIST; body = body->as.cons.tail)
         r = eval(env, body->as.cons.head);
     return r;
 }
@@ -3135,38 +3137,38 @@ static const char *sym_amp(void) {
  *   {a :k}            → bind a to (get value :k)
  *   {:keys [a b] :or {a 1} :as m}
  * :or defaults are forms, evaluated in `scope` when the key is missing. */
-static Cljc *kvseq_to_map(Cljc *s);
-static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
+static Clove *kvseq_to_map(Clove *s);
+static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
     /* ^{..}sym in a binding position arrives as the deferred (with-meta sym m)
      * form — bind the symbol, drop the meta (Clojure keeps only type hints
-     * there, which cljc discards anyway). core.match's generated matchers tag
+     * there, which clove discards anyway). core.match's generated matchers tag
      * every occurrence binding this way. */
     pattern = peel_meta_sym(pattern);
-    if (pattern != NIL && pattern->tag == CLJC_SYMBOL) {
+    if (pattern != NIL && pattern->tag == CLOVE_SYMBOL) {
         env_define(scope, pattern->as.sym, value);
         return;
     }
-    if (pattern != NIL && pattern->tag == CLJC_VECTOR) {
+    if (pattern != NIL && pattern->tag == CLOVE_VECTOR) {
         static const char *KW_AS;
         if (!KW_AS) KW_AS = intern("as", 2);
         /* seq1 cursor, NOT to_seq: [[x & xs]] on an infinite lazy seq must
          * realize one element per binding — to_seq realized the whole seq
          * (a self-recursive sieve def ran away to 17GB). */
-        Cljc *s = value == NIL ? NIL : seq1(value);
+        Clove *s = value == NIL ? NIL : seq1(value);
         for (size_t i = 0; i < vec_len(pattern); i++) {
-            Cljc *pe = vec_nth(pattern, i);
-            if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
+            Clove *pe = vec_nth(pattern, i);
+            if (pe->tag == CLOVE_SYMBOL && pe->as.sym == sym_amp()) {
                 if (i + 1 >= vec_len(pattern))
-                    cljc_error("destructure: & needs a binding form");
-                Cljc *restpat = vec_nth(pattern, ++i);
+                    clove_error("destructure: & needs a binding form");
+                Clove *restpat = vec_nth(pattern, ++i);
                 destructure(scope, restpat,
-                            (restpat != NIL && restpat->tag == CLJC_MAP)
+                            (restpat != NIL && restpat->tag == CLOVE_MAP)
                             ? kvseq_to_map(s) : s);
                 continue;
             }
-            if (pe->tag == CLJC_KEYWORD && pe->as.kw == KW_AS) {
+            if (pe->tag == CLOVE_KEYWORD && pe->as.kw == KW_AS) {
                 if (i + 1 >= vec_len(pattern))
-                    cljc_error("destructure: :as needs a symbol");
+                    clove_error("destructure: :as needs a symbol");
                 env_define(scope, sym_name(vec_nth(pattern, ++i), ":as"), value);
                 continue;
             }
@@ -3175,7 +3177,7 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
         }
         return;
     }
-    if (pattern != NIL && pattern->tag == CLJC_MAP) {
+    if (pattern != NIL && pattern->tag == CLOVE_MAP) {
         static const char *KW_KEYS, *KW_AS, *KW_OR, *KW_STRS, *KW_SYMS;
         if (!KW_KEYS) {
             KW_KEYS = intern("keys", 4);
@@ -3184,41 +3186,41 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
             KW_STRS = intern("strs", 4);
             KW_SYMS = intern("syms", 4);
         }
-        Cljc *defaults = NULL;  /* the :or map, if present */
-        Cljc *pentries = map_entry_list(pattern);
-        for (Cljc *e = pentries; e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-            Cljc *k = e->as.cons.head->as.cons.head;
-            if (k->tag == CLJC_KEYWORD && k->as.kw == KW_OR) defaults = e->as.cons.head->as.cons.tail;
+        Clove *defaults = NULL;  /* the :or map, if present */
+        Clove *pentries = map_entry_list(pattern);
+        for (Clove *e = pentries; e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *k = e->as.cons.head->as.cons.head;
+            if (k->tag == CLOVE_KEYWORD && k->as.kw == KW_OR) defaults = e->as.cons.head->as.cons.tail;
         }
-        for (Cljc *e = pentries; e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-            Cljc *k = e->as.cons.head->as.cons.head;
-            Cljc *spec = e->as.cons.head->as.cons.tail;
-            if (k->tag == CLJC_KEYWORD) {
+        for (Clove *e = pentries; e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *k = e->as.cons.head->as.cons.head;
+            Clove *spec = e->as.cons.head->as.cons.tail;
+            if (k->tag == CLOVE_KEYWORD) {
                 if (k->as.kw == KW_OR) continue;
                 if (k->as.kw == KW_AS) {
                     env_define(scope, sym_name(spec, ":as"), value);
                     continue;
                 }
                 if (k->as.kw == KW_KEYS) {
-                    if (spec == NIL || spec->tag != CLJC_VECTOR)
-                        cljc_error("destructure: :keys needs a vector of symbols");
+                    if (spec == NIL || spec->tag != CLOVE_VECTOR)
+                        clove_error("destructure: :keys needs a vector of symbols");
                     for (size_t j = 0; j < vec_len(spec); j++) {
                         /* {:keys [a b]} or the keyword shorthand {:keys [:a :b]} */
-                        Cljc *elt = vec_nth(spec, j);
+                        Clove *elt = vec_nth(spec, j);
                         if (elt == NIL) continue;   /* a #?(:cljs ..)-only key elides to nil */
-                        const char *nm = elt->tag == CLJC_KEYWORD
+                        const char *nm = elt->tag == CLOVE_KEYWORD
                                          ? elt->as.kw : sym_name(elt, ":keys");
-                        Cljc *kw = mk_kw(nm);   /* lookup key keeps the namespace */
+                        Clove *kw = mk_kw(nm);   /* lookup key keeps the namespace */
                         /* a namespaced key ({:keys [a/b]} / {:keys [::foo]}) binds
                          * the BARE local name (b / foo) to the namespaced value. */
                         const char *slash = strrchr(nm, '/');
                         const char *local = (slash && slash[1])
                                             ? intern(slash + 1, strlen(slash + 1)) : nm;
-                        Cljc *v = NIL;
-                        bool found = value != NIL && value->tag == CLJC_MAP &&
+                        Clove *v = NIL;
+                        bool found = value != NIL && value->tag == CLOVE_MAP &&
                                      map_find(value, kw, &v);
-                        if (!found && defaults && defaults->tag == CLJC_MAP) {
-                            Cljc *d;
+                        if (!found && defaults && defaults->tag == CLOVE_MAP) {
+                            Clove *d;
                             if (map_find(defaults, mk_sym(local), &d))
                                 v = eval(scope, d);
                         }
@@ -3228,52 +3230,52 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
                 }
                 if (k->as.kw == KW_STRS || k->as.kw == KW_SYMS) {
                     /* {:strs [a b]} → (get m "a"); {:syms [a b]} → (get m 'a) */
-                    if (spec == NIL || spec->tag != CLJC_VECTOR)
-                        cljc_error("destructure: :%s needs a vector of symbols", k->as.kw);
+                    if (spec == NIL || spec->tag != CLOVE_VECTOR)
+                        clove_error("destructure: :%s needs a vector of symbols", k->as.kw);
                     bool syms = (k->as.kw == KW_SYMS);
                     for (size_t j = 0; j < vec_len(spec); j++) {
-                        Cljc *elt = vec_nth(spec, j);
+                        Clove *elt = vec_nth(spec, j);
                         if (elt == NIL) continue;
                         const char *nm = sym_name(elt, syms ? ":syms" : ":strs");
-                        Cljc *key = syms ? mk_sym(nm) : mk_str(nm, strlen(nm));
-                        Cljc *v = NIL;
-                        bool found = value != NIL && value->tag == CLJC_MAP &&
+                        Clove *key = syms ? mk_sym(nm) : mk_str(nm, strlen(nm));
+                        Clove *v = NIL;
+                        bool found = value != NIL && value->tag == CLOVE_MAP &&
                                      map_find(value, key, &v);
-                        if (!found && defaults && defaults->tag == CLJC_MAP) {
-                            Cljc *d;
+                        if (!found && defaults && defaults->tag == CLOVE_MAP) {
+                            Clove *d;
                             if (map_find(defaults, mk_sym(nm), &d)) v = eval(scope, d);
                         }
                         env_define(scope, nm, v);
                     }
                     continue;
                 }
-                cljc_error("destructure: unsupported map directive :%s", k->as.kw);
+                clove_error("destructure: unsupported map directive :%s", k->as.kw);
             }
             /* {binding-form lookup-key} — the key is evaluated (a keyword self-
              * evaluates, but a symbol key is written quoted: {n '?n} looks up the
              * symbol ?n, not the literal form (quote ?n)). */
-            Cljc *key = eval(scope, spec);
-            Cljc *v = NIL;
+            Clove *key = eval(scope, spec);
+            Clove *v = NIL;
             /* Clojure semantics: the lookup is (get value key) — maps by key,
              * vectors by integer index, sorted maps through their comparator. */
             bool found = false;
             if (value != NIL) {
-                if (value->tag == CLJC_MAP) found = map_find(value, key, &v);
-                else if (value->tag == CLJC_VECTOR && key != NIL && key->tag == CLJC_INT &&
+                if (value->tag == CLOVE_MAP) found = map_find(value, key, &v);
+                else if (value->tag == CLOVE_VECTOR && key != NIL && key->tag == CLOVE_INT &&
                          key->as.i >= 0 && (size_t)key->as.i < vec_len(value)) {
                     v = vec_nth(value, (size_t)key->as.i); found = true;
-                } else if (value->tag == CLJC_SORTED && value->as.sorted.is_map)
+                } else if (value->tag == CLOVE_SORTED && value->as.sorted.is_map)
                     found = sorted_get(scope, value, key, &v);
             }
-            if (!found && defaults && defaults->tag == CLJC_MAP && k->tag == CLJC_SYMBOL) {
-                Cljc *d;
+            if (!found && defaults && defaults->tag == CLOVE_MAP && k->tag == CLOVE_SYMBOL) {
+                Clove *d;
                 if (map_find(defaults, k, &d)) v = eval(scope, d);
             }
             destructure(scope, k, v);
         }
         return;
     }
-    cljc_error("unsupported binding form");
+    clove_error("unsupported binding form");
 }
 
 /* Bind an arity's params to argv. Each param may be any destructuring
@@ -3281,47 +3283,47 @@ static void destructure(CljcEnv *scope, Cljc *pattern, Cljc *value) {
 /* [& {:keys [a b]}] kwargs: turn the trailing args (k1 v1 k2 v2 ..) into a map
  * so the map pattern can bind them. A lone trailing map is used as-is (the
  * Clojure 1.11 (f {:a 1}) form). */
-static Cljc *kvseq_to_map(Cljc *s) {
-    if (s != NIL && s->tag == CLJC_LIST && s->as.cons.tail == NIL &&
-        s->as.cons.head != NIL && s->as.cons.head->tag == CLJC_MAP)
+static Clove *kvseq_to_map(Clove *s) {
+    if (s != NIL && s->tag == CLOVE_LIST && s->as.cons.tail == NIL &&
+        s->as.cons.head != NIL && s->as.cons.head->tag == CLOVE_MAP)
         return s->as.cons.head;
-    Cljc *m = mk_map();
-    for (; s != NIL && s->tag == CLJC_LIST && s->as.cons.tail != NIL &&
-           s->as.cons.tail->tag == CLJC_LIST;
+    Clove *m = mk_map();
+    for (; s != NIL && s->tag == CLOVE_LIST && s->as.cons.tail != NIL &&
+           s->as.cons.tail->tag == CLOVE_LIST;
          s = s->as.cons.tail->as.cons.tail)
         m = map_assoc(m, s->as.cons.head, s->as.cons.tail->as.cons.head);
     return m;
 }
 
-static void bind_params(CljcEnv *call, Cljc *params, Cljc **argv, int nargs) {
-    Cljc *p = params;
+static void bind_params(CloveEnv *call, Clove *params, Clove **argv, int nargs) {
+    Clove *p = params;
     int i = 0;
-    while (p && p->tag == CLJC_LIST) {
-        Cljc *pat = p->as.cons.head;
-        if (pat->tag == CLJC_SYMBOL && pat->as.sym == sym_amp()) {
-            Cljc *restl = NIL, **t = &restl;
+    while (p && p->tag == CLOVE_LIST) {
+        Clove *pat = p->as.cons.head;
+        if (pat->tag == CLOVE_SYMBOL && pat->as.sym == sym_amp()) {
+            Clove *restl = NIL, **t = &restl;
             for (int j = i; j < nargs; j++) {
                 *t = mk_cons(argv[j], NIL);
                 t = &(*t)->as.cons.tail;
             }
-            Cljc *restpat = p->as.cons.tail->as.cons.head;
+            Clove *restpat = p->as.cons.tail->as.cons.head;
             destructure(call, restpat,
-                        (restpat != NIL && restpat->tag == CLJC_MAP)
+                        (restpat != NIL && restpat->tag == CLOVE_MAP)
                         ? kvseq_to_map(restl) : restl);
             return;
         }
-        if (i >= nargs) cljc_error("not enough arguments");
+        if (i >= nargs) clove_error("not enough arguments");
         destructure(call, pat, argv[i++]);
         p = p->as.cons.tail;
     }
-    if (i < nargs) cljc_error("too many arguments");
+    if (i < nargs) clove_error("too many arguments");
 }
 
-static void arity_info(Cljc *params, size_t *fixed, bool *variadic) {
+static void arity_info(Clove *params, size_t *fixed, bool *variadic) {
     *fixed = 0; *variadic = false;
-    for (Cljc *p = params; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
-        Cljc *h = p->as.cons.head;
-        if (h->tag == CLJC_SYMBOL && h->as.sym == sym_amp()) { *variadic = true; return; }
+    for (Clove *p = params; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+        Clove *h = p->as.cons.head;
+        if (h->tag == CLOVE_SYMBOL && h->as.sym == sym_amp()) { *variadic = true; return; }
         (*fixed)++;
     }
 }
@@ -3343,7 +3345,7 @@ static bool private_denied(const char *qual, const char *home_ns) {
     size_t plen = (size_t)(slash - qual);
     return !(home_ns && strlen(home_ns) == plen && !memcmp(home_ns, qual, plen));
 }
-static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
+static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                           bool public_only) {
     if (home_ns) {
         char buf[256];
@@ -3360,7 +3362,7 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
     for (Binding *b = root->bindings; b; b = b->next)
         if (b->name == name) {
             if (public_only && n_private_defs && private_denied(name, home_ns))
-                cljc_error("var: %s is not public", name);
+                clove_error("var: %s is not public", name);
             return b;
         }
     /* refer alias on an already-qualified name */
@@ -3369,8 +3371,8 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
             for (Binding *b = root->bindings; b; b = b->next)
                 if (b->name == refer_to[i]) return b;
     /* clojure.core / cljs.core / clojure.lang qualified names resolve to the
-     * bare global (cljc's core lives in the flat global namespace). Lets code
-     * (and macroexpansions) that fully-qualify core refer to cljc's builtins. */
+     * bare global (clove's core lives in the flat global namespace). Lets code
+     * (and macroexpansions) that fully-qualify core refer to clove's builtins. */
     {
         const char *slash = strchr(name, '/');
         if (slash && slash != name) {
@@ -3400,7 +3402,7 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
                     if (b->name == qual) {
                         if (public_only && n_private_defs &&
                             private_denied(qual, home_ns))
-                            cljc_error("var: %s is not public", qual);
+                            clove_error("var: %s is not public", qual);
                         return b;
                     }
                 for (Binding *b = root->bindings; b; b = b->next)
@@ -3409,7 +3411,7 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
         }
     }
     /* JVM-qualified type/ctor name (sci.lang.Var, sci.lang.Var., java.io.Writer):
-     * cljc stores a deftype's name/ctor as ns/Name (slash) via home-ns stamping,
+     * clove stores a deftype's name/ctor as ns/Name (slash) via home-ns stamping,
      * so map the "." before the Capitalized class segment to "/" and retry. */
     if (!strchr(name, '/')) {
         for (const char *p = name; *p; p++) {
@@ -3429,7 +3431,7 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
         }
     }
     /* a qualified constructor name (pkg.Class.) resolves to the bare Class.
-     * ctor — cljc registers host constructors under the short class name. */
+     * ctor — clove registers host constructors under the short class name. */
     {
         size_t ln = strlen(name);
         if (ln > 1 && name[ln - 1] == '.') {
@@ -3444,7 +3446,7 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
         }
     }
     /* Host-class fallback: an unresolved DOTTED, Capitalized-last-segment name
-     * (e.g. sci.lang.IVar, java.io.Writer) is a JVM class cljc has no instance
+     * (e.g. sci.lang.IVar, java.io.Writer) is a JVM class clove has no instance
      * of. Synthesize (and memoize) a keyword token so references to it resolve
      * — protocol extensions / prefer-method / instance? on it become harmless
      * no-ops. (Bare Capitalized names like Object are stubbed explicitly.) */
@@ -3461,10 +3463,10 @@ static Binding *root_find(CljcEnv *root, const char *name, const char *home_ns,
 
 /* Enter a namespace: the reader stamps subsequent symbols/defs with it, the
  * registry learns it (find-ns/all-ns), and the *ns* var tracks it as a
- * symbol. Shared by the ns special form, cljc/in-ns*, and the load path's
+ * symbol. Shared by the ns special form, clove/in-ns*, and the load path's
  * save/restore. NULL only occurs while the preamble boots (*ns* not yet
  * def'd), so the var update is conditional on both. */
-static void set_cur_ns(CljcEnv *root, const char *ns) {
+static void set_cur_ns(CloveEnv *root, const char *ns) {
     cur_reader_ns = ns;
     if (!ns) return;
     register_ns(ns);
@@ -3477,17 +3479,17 @@ static void set_cur_ns(CljcEnv *root, const char *ns) {
  * a special form (Clojure lets (letfn [(loop [..] ..)] (loop ..)) call the local).
  * Only consulted for the function-like special forms loop/let/fn, never the hot
  * syntactic ones (if/when/cond/..), so ordinary code pays nothing. */
-static bool head_shadowed(CljcEnv *env, const char *name) {
-    for (CljcEnv *e = env; e->parent; e = e->parent)
+static bool head_shadowed(CloveEnv *env, const char *name) {
+    for (CloveEnv *e = env; e->parent; e = e->parent)
         if (env_local_find(e, name)) return true;
     return false;
 }
 
-static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
+static Clove *resolve_symbol(CloveEnv *env, Clove *form) {
     const char *name = form->as.symc.name;
-    CljcEnv *e = env;
+    CloveEnv *e = env;
     for (; e->parent; e = e->parent) {
-        Cljc **p = env_local_find(e, name);
+        Clove **p = env_local_find(e, name);
         if (p) return *p;
     }
     Binding *cb = form->as.symc.root_cache;
@@ -3495,7 +3497,7 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
     Binding *b = root_find(e, name, form->as.symc.home_ns, true);
     if (b) { form->as.symc.root_cache = b; return b->value; }
     err_token = name;
-    cljc_error("I don't know what `%s` refers to.", name);
+    clove_error("I don't know what `%s` refers to.", name);
     return NIL;
 }
 
@@ -3519,20 +3521,20 @@ static Cljc *resolve_symbol(CljcEnv *env, Cljc *form) {
  * symbol cells, so root_cache caching carries over. Error traces inside
  * compiled bodies are coarser (no per-subform eval_stack frames). */
 
-static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro);
-static void print_to(SBuf *sb, Cljc *v, bool readably);
-static void str_to(SBuf *sb, Cljc *v);
+static Clove *make_fn(CloveEnv *env, Clove *forms, bool is_macro);
+static void print_to(SBuf *sb, Clove *v, bool readably);
+static void str_to(SBuf *sb, Clove *v);
 
 /* Expand a macro with &form bound to the call form for the duration — its
  * :line/:file meta is how location-aware macros (dbg) know where they are.
  * The binding is a plain root set/restore; a throw mid-expansion leaves the
  * stale form behind, which only ever mislabels the next reader of &form. */
-static Cljc *macro_expand1(CljcEnv *env, Cljc *fn, Cljc **args, int n, Cljc *form) {
-    CljcEnv *root = env_root(env);
+static Clove *macro_expand1(CloveEnv *env, Clove *fn, Clove **args, int n, Clove *form) {
+    CloveEnv *root = env_root(env);
     Binding *b = root_find(root, intern("&form", 5), NULL, false);
-    Cljc *saved = b ? b->value : NULL;
+    Clove *saved = b ? b->value : NULL;
     if (b) b->value = form;
-    /* Expand under the call site's HOME namespace. cljc expands macros lazily
+    /* Expand under the call site's HOME namespace. clove expands macros lazily
      * (first call of the enclosing fn), by which time *ns* is the CALLER's;
      * JVM Clojure expands at definition time, so a macro that reads *ns* or
      * (ns-aliases *ns*) (meander's expand-symbol, alias-qualified operator
@@ -3540,11 +3542,11 @@ static Cljc *macro_expand1(CljcEnv *env, Cljc *fn, Cljc **args, int n, Cljc *for
      * that at read time (home_ns; NULL in the main script, where nothing
      * changes). ErrFrames restore it on a throw mid-expansion. */
     const char *home = NULL;
-    if (form && form != NIL && form->tag == CLJC_LIST &&
-        form->as.cons.head->tag == CLJC_SYMBOL)
+    if (form && form != NIL && form->tag == CLOVE_LIST &&
+        form->as.cons.head->tag == CLOVE_SYMBOL)
         home = form->as.cons.head->as.symc.home_ns;
     const char *saved_ns = cur_reader_ns;
-    Cljc *saved_nsvar = NULL;
+    Clove *saved_nsvar = NULL;
     Binding *nsb = NULL;
     bool swap_ns = home && home != saved_ns;
     if (swap_ns) {
@@ -3552,7 +3554,7 @@ static Cljc *macro_expand1(CljcEnv *env, Cljc *fn, Cljc **args, int n, Cljc *for
         saved_nsvar = nsb ? nsb->value : NULL;
         set_cur_ns(root, home);
     }
-    Cljc *r = apply(env, fn, args, n);
+    Clove *r = apply(env, fn, args, n);
     if (swap_ns) {
         cur_reader_ns = saved_ns;
         if (nsb) nsb->value = saved_nsvar;
@@ -3575,7 +3577,7 @@ enum {
 /* Decode the source form of a VM frame's in-flight call: pc indexes just
  * past the VOP_CALL/VOP_EVAL being dispatched, and the op's const operand
  * is the call-site form — which carries :line/:col meta from the reader. */
-static Cljc *vm_frame_form(VmTraceFrame *vf) {
+static Clove *vm_frame_form(VmTraceFrame *vf) {
     if (!vf->pc) return NIL;
     uint32_t ins = vf->chunk->as.chunk.code[vf->pc - 1];
     uint8_t op = ins & 0xff;
@@ -3598,14 +3600,14 @@ static Cljc *vm_frame_form(VmTraceFrame *vf) {
 #define VMC_MAXFRAME 64
 typedef struct {
     uint32_t *code; uint32_t ncode, ccap;
-    Cljc **consts; uint32_t nconst, kcap;
+    Clove **consts; uint32_t nconst, kcap;
     struct { const char *name; int16_t frame; int16_t slot; } locals[256];
     int nlocals;                               /* compile-time scope names */
     int frame;                                 /* current frame nesting    */
     uint8_t frame_n[VMC_MAXFRAME];             /* slots used per frame      */
     bool frame_opaque[VMC_MAXFRAME];           /* indexing off for frame    */
     int loop_pc;                               /* innermost loop target    */
-    Cljc *loop_names;                          /* its binding symbols      */
+    Clove *loop_names;                          /* its binding symbols      */
     uint32_t loop_nbind;
     int loop_depth;                            /* NEWENVs since loop entry */
     bool ok;
@@ -3626,13 +3628,13 @@ static void vmc_emit(VmC *c, uint8_t op, uint32_t arg) {
     c->code[c->ncode++] = (uint32_t)op | (arg << 8);
 }
 
-static uint32_t vmc_const(VmC *c, Cljc *v) {
+static uint32_t vmc_const(VmC *c, Clove *v) {
     if (!c->ok) return 0;              /* doomed chunk: no vstack growth */
     for (uint32_t i = 0; i < c->nconst; i++)      /* dedup (small pools) */
         if (c->consts[i] == v) return i;
     if (c->nconst >= c->kcap) {
         c->kcap = c->kcap ? c->kcap * 2 : 16;
-        c->consts = xrealloc(c->consts, sizeof(Cljc *) * c->kcap);
+        c->consts = xrealloc(c->consts, sizeof(Clove *) * c->kcap);
     }
     vpush(v);                  /* GC root until the chunk cell owns them */
     c->consts[c->nconst] = v;
@@ -3669,25 +3671,25 @@ static void vmc_bind_name(VmC *c, const char *name, bool simple) {
 
 /* names bound by a destructuring pattern (slot -1: order/count of the
  * runtime env_defines isn't statically known, so never indexed) */
-static void vmc_pattern_locals(VmC *c, Cljc *pat) {
+static void vmc_pattern_locals(VmC *c, Clove *pat) {
     if (pat == NIL) return;
-    if (pat->tag == CLJC_SYMBOL) { vmc_bind_name(c, pat->as.sym, false); return; }
-    if (pat->tag == CLJC_VECTOR)
+    if (pat->tag == CLOVE_SYMBOL) { vmc_bind_name(c, pat->as.sym, false); return; }
+    if (pat->tag == CLOVE_VECTOR)
         for (size_t i = 0; i < vec_len(pat); i++)
             vmc_pattern_locals(c, vec_nth(pat, i));
-    if (pat->tag == CLJC_MAP)
-        for (Cljc *e = map_entry_list(pat); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-            Cljc *k = e->as.cons.head->as.cons.head;
-            Cljc *v = e->as.cons.head->as.cons.tail;
-            if (k->tag == CLJC_KEYWORD) vmc_pattern_locals(c, v);
+    if (pat->tag == CLOVE_MAP)
+        for (Clove *e = map_entry_list(pat); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *k = e->as.cons.head->as.cons.head;
+            Clove *v = e->as.cons.head->as.cons.tail;
+            if (k->tag == CLOVE_KEYWORD) vmc_pattern_locals(c, v);
             else vmc_pattern_locals(c, k);     /* {sym :key} */
         }
 }
 
 /* Bind a let/param pattern: simple symbol → indexable slot; anything else
  * → the frame goes opaque and its names resolve by name. */
-static void vmc_bind(VmC *c, Cljc *pat) {
-    if (pat != NIL && pat->tag == CLJC_SYMBOL) {
+static void vmc_bind(VmC *c, Clove *pat) {
+    if (pat != NIL && pat->tag == CLOVE_SYMBOL) {
         vmc_bind_name(c, pat->as.sym, true);
     } else {
         if (c->frame < VMC_MAXFRAME) c->frame_opaque[c->frame] = true;
@@ -3728,17 +3730,17 @@ static bool vm_special_name(const char *s) {
  * lexical shadow structure is identical for every closure sharing the
  * arities), else the full root resolution (home_ns + alias paths, the
  * same ones resolve_symbol takes) without erroring. */
-/* The macro fn behind a call head, or NULL: a CLJC_FN flagged is_macro, or
+/* The macro fn behind a call head, or NULL: a CLOVE_FN flagged is_macro, or
  * a Var (chain of Vars) whose root value is one. The latter is Clojure's
  * macro-alias idiom — `(def alias (var m))` + `(alter-meta! #'alias merge
  * {:macro true})` (specter's defmacroalias). Var cells here are fresh per
  * (var x) so the :macro meta cannot stick; a Var that derefs to a macro fn
  * is taken as a macro alias regardless (the JVM would otherwise invoke the
  * macro fn with the wrong arity — never a useful program). */
-static Cljc *macro_fn_of(CljcEnv *env, Cljc *v) {
+static Clove *macro_fn_of(CloveEnv *env, Clove *v) {
     for (int hops = 0; v && v != NIL && hops < 4; hops++) {
-        if (v->tag == CLJC_FN) return v->as.fn.is_macro ? v : NULL;
-        if (v->tag != CLJC_VAR) return NULL;
+        if (v->tag == CLOVE_FN) return v->as.fn.is_macro ? v : NULL;
+        if (v->tag != CLOVE_VAR) return NULL;
         Binding *b = root_find(env_root(env), v->as.var.name, NULL, false);
         if (!b || b->value == v) return NULL;
         v = b->value;
@@ -3747,12 +3749,12 @@ static Cljc *macro_fn_of(CljcEnv *env, Cljc *v) {
 }
 /* Hot-path form: FNs answer with the flag, only Vars take the lookup. */
 #define IS_MACRO_HEAD(env, f) \
-    ((f) != NIL && ((f)->tag == CLJC_FN ? (f)->as.fn.is_macro \
-                    : ((f)->tag == CLJC_VAR && macro_fn_of((env), (f)) != NULL)))
+    ((f) != NIL && ((f)->tag == CLOVE_FN ? (f)->as.fn.is_macro \
+                    : ((f)->tag == CLOVE_VAR && macro_fn_of((env), (f)) != NULL)))
 
-static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
+static Clove *vm_resolve_maybe(CloveEnv *env, Clove *sym) {
     const char *name = sym->as.symc.name;
-    CljcEnv *e = env;
+    CloveEnv *e = env;
     for (; e->parent; e = e->parent)
         if (env_local_find(e, name)) return NULL;     /* local shadows */
     Binding *cb = sym->as.symc.root_cache;
@@ -3764,25 +3766,25 @@ static Cljc *vm_resolve_maybe(CljcEnv *env, Cljc *sym) {
 /* Does this form contain a (recur ...) that would belong to the
  * enclosing loop? Skips nested fn/loop/lazy-seq (they own their recur).
  * Compile-time only — guards VOP_EVAL emission inside compiled loops. */
-static bool vmc_contains_recur(Cljc *form) {
+static bool vmc_contains_recur(Clove *form) {
     static const char *S_R, *S_F, *S_L, *S_LZ;
     if (!S_R) {
         S_R = intern("recur", 5); S_F = intern("fn", 2);
         S_L = intern("loop", 4);  S_LZ = intern("lazy-seq", 8);
     }
     if (form == NIL || form == NULL) return false;
-    if (form->tag == CLJC_SYMBOL) return form->as.sym == S_R;
-    if (form->tag == CLJC_VECTOR) {
+    if (form->tag == CLOVE_SYMBOL) return form->as.sym == S_R;
+    if (form->tag == CLOVE_VECTOR) {
         for (size_t i = 0; i < vec_len(form); i++)
             if (vmc_contains_recur(vec_nth(form, i))) return true;
         return false;
     }
-    if (form->tag != CLJC_LIST) return false;
-    Cljc *h = form->as.cons.head;
-    if (h != NIL && h->tag == CLJC_SYMBOL &&
+    if (form->tag != CLOVE_LIST) return false;
+    Clove *h = form->as.cons.head;
+    if (h != NIL && h->tag == CLOVE_SYMBOL &&
         (h->as.sym == S_F || h->as.sym == S_L || h->as.sym == S_LZ))
         return false;
-    for (Cljc *l = form; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    for (Clove *l = form; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         if (vmc_contains_recur(l->as.cons.head)) return true;
     return false;
 }
@@ -3806,36 +3808,36 @@ static const char *strip_core_qualifier(const char *s) {
     return core ? intern(slash + 1, strlen(slash + 1)) : s;
 }
 
-static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail);
+static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail);
 
-static void vmc_body(VmC *c, CljcEnv *cenv, Cljc *body, bool tail) {  /* do semantics */
-    if (body == NIL || body->tag != CLJC_LIST) { vmc_emit(c, VOP_NIL, 0); return; }
-    for (Cljc *b = body; b && b->tag == CLJC_LIST && c->ok; b = b->as.cons.tail) {
-        bool last = b->as.cons.tail == NIL || b->as.cons.tail->tag != CLJC_LIST;
+static void vmc_body(VmC *c, CloveEnv *cenv, Clove *body, bool tail) {  /* do semantics */
+    if (body == NIL || body->tag != CLOVE_LIST) { vmc_emit(c, VOP_NIL, 0); return; }
+    for (Clove *b = body; b && b->tag == CLOVE_LIST && c->ok; b = b->as.cons.tail) {
+        bool last = b->as.cons.tail == NIL || b->as.cons.tail->tag != CLOVE_LIST;
         vmc_form(c, cenv, b->as.cons.head, tail && last);  /* only the last form is tail */
         if (!last) vmc_emit(c, VOP_POP, 0);
     }
 }
 
-static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
+static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
     if (!c->ok) return;
     if (form == NIL) { vmc_emit(c, VOP_NIL, 0); return; }
     switch (form->tag) {
-        case CLJC_BOOL:
+        case CLOVE_BOOL:
             vmc_emit(c, form->as.b ? VOP_TRUE : VOP_FALSE, 0);
             return;
-        case CLJC_INT: case CLJC_DOUBLE: case CLJC_STRING: case CLJC_CHAR:
-        case CLJC_KEYWORD: case CLJC_BIGINT: case CLJC_RATIO: case CLJC_BIGDEC:
-        case CLJC_FN: case CLJC_NATIVE: case CLJC_MAP: case CLJC_SET:
+        case CLOVE_INT: case CLOVE_DOUBLE: case CLOVE_STRING: case CLOVE_CHAR:
+        case CLOVE_KEYWORD: case CLOVE_BIGINT: case CLOVE_RATIO: case CLOVE_BIGDEC:
+        case CLOVE_FN: case CLOVE_NATIVE: case CLOVE_MAP: case CLOVE_SET:
             /* map/set literals with computed elements are rare in hot
              * bodies; constant ones are common — non-constant fall back */
-            if (form->tag == CLJC_MAP || form->tag == CLJC_SET) {
+            if (form->tag == CLOVE_MAP || form->tag == CLOVE_SET) {
                 vmc_emit(c, VOP_EVAL, vmc_const(c, form));
                 return;
             }
             vmc_emit(c, VOP_CONST, vmc_const(c, form));
             return;
-        case CLJC_SYMBOL: {
+        case CLOVE_SYMBOL: {
             const char *nm = form->as.sym;
             for (int i = c->nlocals - 1; i >= 0; i--) {
                 if (c->locals[i].name != nm) continue;
@@ -3850,18 +3852,18 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             vmc_emit(c, VOP_SYM, vmc_const(c, form));
             return;
         }
-        case CLJC_VECTOR: {
+        case CLOVE_VECTOR: {
             size_t n = vec_len(form);
             if (n > 0xff) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
             for (size_t i = 0; i < n; i++) vmc_form(c, cenv, vec_nth(form, i), false);
             vmc_emit(c, VOP_VEC, (uint32_t)n);
             return;
         }
-        case CLJC_LAZY:
+        case CLOVE_LAZY:
             form = to_seq(form);
-            if (form == NIL || form->tag != CLJC_LIST) { vmc_form(c, cenv, form, tail); return; }
+            if (form == NIL || form->tag != CLOVE_LIST) { vmc_form(c, cenv, form, tail); return; }
             break;  /* fall through to list handling */
-        case CLJC_LIST:
+        case CLOVE_LIST:
             break;
         default:
             vmc_emit(c, VOP_EVAL, vmc_const(c, form));
@@ -3869,13 +3871,13 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
     }
     /* list form — realize lazy tails up front, like eval */
     {
-        Cljc *l = form;
-        while (l->tag == CLJC_LIST) l = l->as.cons.tail;
-        if (l != NIL && l->tag == CLJC_LAZY) form = to_seq(form);
+        Clove *l = form;
+        while (l->tag == CLOVE_LIST) l = l->as.cons.tail;
+        if (l != NIL && l->tag == CLOVE_LAZY) form = to_seq(form);
     }
-    Cljc *head = form->as.cons.head;
-    Cljc *rest = form->as.cons.tail;
-    if (head != NIL && head->tag == CLJC_SYMBOL) {
+    Clove *head = form->as.cons.head;
+    Clove *rest = form->as.cons.tail;
+    if (head != NIL && head->tag == CLOVE_SYMBOL) {
         const char *s = strip_core_qualifier(head->as.sym);
         /* (.-field obj) / an undefined (.foo x) field access: deopt to the
          * tree-walker, which resolves it as a deftype field read */
@@ -3900,11 +3902,11 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             return;
         }
         if (s == S_IF) {
-            if (rest == NIL || rest->tag != CLJC_LIST ||
+            if (rest == NIL || rest->tag != CLOVE_LIST ||
                 rest->as.cons.tail == NIL) { c->ok = false; return; }
-            Cljc *cond = rest->as.cons.head;
-            Cljc *then = rest->as.cons.tail != NIL ? rest->as.cons.tail->as.cons.head : NIL;
-            Cljc *els = rest->as.cons.tail != NIL && rest->as.cons.tail->as.cons.tail != NIL
+            Clove *cond = rest->as.cons.head;
+            Clove *then = rest->as.cons.tail != NIL ? rest->as.cons.tail->as.cons.head : NIL;
+            Clove *els = rest->as.cons.tail != NIL && rest->as.cons.tail->as.cons.tail != NIL
                         ? rest->as.cons.tail->as.cons.tail->as.cons.head : NIL;
             vmc_form(c, cenv, cond, false);
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
@@ -3917,7 +3919,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         }
         if (s == S_DO) { vmc_body(c, cenv, rest, tail); return; }
         if (s == S_WHEN) {
-            if (rest == NIL || rest->tag != CLJC_LIST) { c->ok = false; return; }
+            if (rest == NIL || rest->tag != CLOVE_LIST) { c->ok = false; return; }
             vmc_form(c, cenv, rest->as.cons.head, false);
             uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
             vmc_body(c, cenv, rest->as.cons.tail, tail);
@@ -3928,14 +3930,14 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             return;
         }
         if (s == S_AND || s == S_OR) {
-            if (rest == NIL || rest->tag != CLJC_LIST) {
+            if (rest == NIL || rest->tag != CLOVE_LIST) {
                 vmc_emit(c, s == S_AND ? VOP_TRUE : VOP_NIL, 0);
                 return;
             }
             uint32_t jumps[128]; int nj = 0;
-            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+            for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
                 vmc_form(c, cenv, a->as.cons.head, false);
-                if (a->as.cons.tail != NIL && a->as.cons.tail->tag == CLJC_LIST) {
+                if (a->as.cons.tail != NIL && a->as.cons.tail->tag == CLOVE_LIST) {
                     if (nj >= 128) { c->ok = false; return; }
                     jumps[nj++] = c->ncode;
                     vmc_emit(c, s == S_AND ? VOP_JMPF_KEEP : VOP_JMPT_KEEP, 0);
@@ -3947,9 +3949,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         }
         if (s == S_COND) {
             uint32_t ends[128]; int ne = 0;
-            Cljc *a = rest;
-            while (a && a->tag == CLJC_LIST && a->as.cons.tail != NIL &&
-                   a->as.cons.tail->tag == CLJC_LIST) {
+            Clove *a = rest;
+            while (a && a->tag == CLOVE_LIST && a->as.cons.tail != NIL &&
+                   a->as.cons.tail->tag == CLOVE_LIST) {
                 vmc_form(c, cenv, a->as.cons.head, false);
                 uint32_t jf = c->ncode; vmc_emit(c, VOP_JMPF, 0);
                 vmc_form(c, cenv, a->as.cons.tail->as.cons.head, tail);
@@ -3958,14 +3960,14 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
                 vmc_patch(c, jf);
                 a = a->as.cons.tail->as.cons.tail;
             }
-            if (a != NIL && a->tag == CLJC_LIST) { c->ok = false; return; }
+            if (a != NIL && a->tag == CLOVE_LIST) { c->ok = false; return; }
             vmc_emit(c, VOP_NIL, 0);
             for (int i = 0; i < ne; i++) vmc_patch(c, ends[i]);
             return;
         }
         if (s == S_LET) {
-            Cljc *bv = rest->as.cons.head;
-            if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0) {
+            Clove *bv = rest->as.cons.head;
+            if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0) {
                 c->ok = false; return;
             }
             int save_locals = c->nlocals;
@@ -3973,9 +3975,9 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             vmc_emit(c, VOP_NEWENV, 0);
             vmc_frame_enter(c);
             for (size_t i = 0; i < vec_len(bv); i += 2) {
-                Cljc *pat = vec_nth(bv, i);
+                Clove *pat = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1), false);
-                if (pat != NIL && pat->tag == CLJC_SYMBOL)
+                if (pat != NIL && pat->tag == CLOVE_SYMBOL)
                     vmc_emit(c, VOP_BIND, vmc_const(c, pat));
                 else
                     vmc_emit(c, VOP_DESTRUCT, vmc_const(c, pat));
@@ -3989,26 +3991,26 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
             return;
         }
         if (s == S_LOOP) {
-            Cljc *bv = rest->as.cons.head;
-            if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0) {
+            Clove *bv = rest->as.cons.head;
+            if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0) {
                 c->ok = false; return;
             }
             for (size_t i = 0; i < vec_len(bv); i += 2)
-                if (vec_nth(bv, i)->tag != CLJC_SYMBOL) {
+                if (vec_nth(bv, i)->tag != CLOVE_SYMBOL) {
                     /* pattern loops: let eval desugar+splice at runtime */
                     vmc_emit(c, VOP_EVAL, vmc_const(c, form));
                     return;
                 }
             int save_locals = c->nlocals;
             int save_pc = c->loop_pc;
-            Cljc *save_names = c->loop_names;
+            Clove *save_names = c->loop_names;
             uint32_t save_nb = c->loop_nbind;
             int save_depth = c->loop_depth;
             vmc_emit(c, VOP_NEWENV, 0);
             vmc_frame_enter(c);
-            Cljc *names = NIL, **t = &names;
+            Clove *names = NIL, **t = &names;
             for (size_t i = 0; i < vec_len(bv); i += 2) {
-                Cljc *sym = vec_nth(bv, i);
+                Clove *sym = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1), false);
                 vmc_emit(c, VOP_BIND, vmc_const(c, sym));
                 vmc_bind_name(c, sym->as.sym, true);
@@ -4032,7 +4034,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         }
         if (s == S_RECUR) {
             uint32_t n = 0;
-            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+            for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
                 vmc_form(c, cenv, a->as.cons.head, false);
                 n++;
             }
@@ -4051,7 +4053,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         }
         if (s == S_FN) {
             /* named fns get name-stripping in the tree-walk path */
-            if (rest != NIL && rest->as.cons.head->tag == CLJC_SYMBOL) {
+            if (rest != NIL && rest->as.cons.head->tag == CLOVE_SYMBOL) {
                 vmc_emit(c, VOP_EVAL, vmc_const(c, form));
                 return;
             }
@@ -4075,15 +4077,15 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
         /* compile-time macro expansion, spliced like eval does;
          * any local shadowing the name suppresses it (vm_resolve_maybe
          * scans the compile env chain AND c's own body locals below) */
-        Cljc *mfn = vmc_local_p(c, s) ? NULL : vm_resolve_maybe(cenv, head);
+        Clove *mfn = vmc_local_p(c, s) ? NULL : vm_resolve_maybe(cenv, head);
         mfn = macro_fn_of(cenv, mfn);
         if (mfn) {
             size_t base = vsp;
-            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+            for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
                 vpush(a->as.cons.head);
-            Cljc *expansion = macro_expand1(cenv, mfn, &vstack[base], (int)(vsp - base), form);
+            Clove *expansion = macro_expand1(cenv, mfn, &vstack[base], (int)(vsp - base), form);
             vsp = base;
-            if (expansion != NIL && expansion->tag == CLJC_LIST) {
+            if (expansion != NIL && expansion->tag == CLOVE_LIST) {
                 form->as.cons.head = expansion->as.cons.head;
                 form->as.cons.tail = expansion->as.cons.tail;
             }
@@ -4100,7 +4102,7 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
     {
         uint32_t n = 0;
         vmc_form(c, cenv, head, false);
-        for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+        for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
             vmc_form(c, cenv, a->as.cons.head, false);
             n++;
         }
@@ -4111,19 +4113,19 @@ static void vmc_form(VmC *c, CljcEnv *cenv, Cljc *form, bool tail) {
 
 /* Compile one arity body. Returns a chunk cell, or NULL (caller falls
  * back to the tree-walker permanently). */
-static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
+static Clove *vm_compile(CloveEnv *cenv, Clove *params, Clove *body) {
     VmC c;
     memset(&c, 0, sizeof c);
     c.ok = true;
     c.loop_pc = -1;
     size_t base = vsp;                 /* consts rooted here during build */
-    for (Cljc *p = params; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
-        Cljc *pe = p->as.cons.head;
-        if (pe->tag == CLJC_SYMBOL && pe->as.sym == sym_amp()) {
+    for (Clove *p = params; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+        Clove *pe = p->as.cons.head;
+        if (pe->tag == CLOVE_SYMBOL && pe->as.sym == sym_amp()) {
             /* the rest binding lands in the next slot (one env_define);
              * a destructuring rest makes the param frame opaque */
-            Cljc *tail = p->as.cons.tail;
-            if (tail != NIL && tail->tag == CLJC_LIST)
+            Clove *tail = p->as.cons.tail;
+            if (tail != NIL && tail->tag == CLOVE_LIST)
                 vmc_bind(&c, tail->as.cons.head);
             break;
         }
@@ -4132,7 +4134,7 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
     vmc_body(&c, cenv, body, true);        /* the fn body is in tail position */
     vmc_emit(&c, VOP_RET, 0);
     if (!c.ok || c.ncode > 0xffffff || c.nconst > 0xffff) {
-        if (getenv("CLJC_VM_LOG") && body != NIL && body->tag == CLJC_LIST) {
+        if (getenv("CLOVE_VM_LOG") && body != NIL && body->tag == CLOVE_LIST) {
             SBuf sb = {0};
             print_to(&sb, body->as.cons.head, true);
             fprintf(stderr, "[vm] compile bail: %.80s%s\n",
@@ -4143,10 +4145,10 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
         vsp = base;
         return NULL;
     }
-    Cljc *chunk = alloc(CLJC_CHUNK);   /* consts still vstack-rooted here */
+    Clove *chunk = alloc(CLOVE_CHUNK);   /* consts still vstack-rooted here */
     /* counted for byte-pressure consistency with vec tails / HAMT kids,
      * though chunks are effectively immortal once cached */
-    gc_extra_bytes += sizeof(uint32_t) * c.ncode + sizeof(Cljc *) * c.nconst;
+    gc_extra_bytes += sizeof(uint32_t) * c.ncode + sizeof(Clove *) * c.nconst;
     chunk->as.chunk.code = c.code;
     chunk->as.chunk.consts = c.consts;
     chunk->as.chunk.ncode = c.ncode;
@@ -4155,15 +4157,15 @@ static Cljc *vm_compile(CljcEnv *cenv, Cljc *params, Cljc *body) {
     return chunk;
 }
 
-static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
+static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
     uint32_t *code = chunk->as.chunk.code;
-    Cljc **K = chunk->as.chunk.consts;
+    Clove **K = chunk->as.chunk.consts;
     uint32_t pc = 0;
     size_t base = vsp;
     /* volatile: env and the chunk itself must stay visible to the
      * conservative GC scan — code/K are interior malloc pointers the
      * scan can't see, so the chunk cell is their only root here. */
-    Cljc * volatile chunk_keep = chunk;
+    Clove * volatile chunk_keep = chunk;
     (void)chunk_keep;
     int tslot = vm_tsp < VM_TRACE_MAX ? vm_tsp : -1;
     vm_tsp++;
@@ -4172,8 +4174,8 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
         vm_trace[tslot].pc = 0;
         vm_trace[tslot].esp = eval_sp;
     }
-    CljcEnv * volatile env_keep = env_in;
-    CljcEnv *env = env_in;
+    CloveEnv * volatile env_keep = env_in;
+    CloveEnv *env = env_in;
     uint32_t ins, a;
     /* Dispatch: threaded code (one indirect jump per op — far better branch
      * prediction than a switch's single shared jump) on GCC/Clang via
@@ -4208,7 +4210,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             VM_CASE(VOP_SYM)   vpush(resolve_symbol(env, K[a])); VM_NEXT();
             VM_CASE(VOP_LOCAL) {
                 /* lexical address: `depth` parent hops, then sval[slot] */
-                CljcEnv *e = env;
+                CloveEnv *e = env;
                 for (uint32_t d = a >> 8; d; d--) e = e->parent;
                 vpush(e->sval[a & 0xff]);
                 VM_NEXT();
@@ -4226,12 +4228,12 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             VM_CASE(VOP_POP)    vsp--; VM_NEXT();
             VM_CASE(VOP_CALL) {
                 uint32_t n = a & 0xff;
-                Cljc *f = vstack[vsp - n - 1];
-                Cljc *r;
+                Clove *f = vstack[vsp - n - 1];
+                Clove *r;
                 if (IS_MACRO_HEAD(env, f)) {
                     /* late-resolved macro: deopt to eval of the source
                      * form (expands + splices, same as the tree-walk) */
-                    if (getenv("CLJC_VM_LOG")) {
+                    if (getenv("CLOVE_VM_LOG")) {
                         SBuf sb = {0};
                         print_to(&sb, K[a >> 8], true);
                         fprintf(stderr, "[vm] macro deopt: %.60s\n", sb.data ? sb.data : "");
@@ -4240,7 +4242,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                     vsp -= n + 1;
                     r = eval(env, K[a >> 8]);
                 } else {
-                    if (g_interrupt) { g_interrupt = 0; cljc_error("interrupted"); }
+                    if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
                     /* mark the in-flight call for error traces. Deliberately
                      * never cleared: a raise at a non-recording op (unresolved
                      * sym, destructure) then shows the body's previous call —
@@ -4259,14 +4261,14 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             VM_CASE(VOP_EVAL) { if (tslot >= 0) vm_trace[tslot].pc = pc; vpush(eval(env, K[a])); } VM_NEXT();
             VM_CASE(VOP_CLOSURE) vpush(make_fn(env, K[a], false)); VM_NEXT();
             VM_CASE(VOP_LAZY) {
-                Cljc *t = make_fn(env, K[a], false);
-                Cljc *l = alloc(CLJC_LAZY);
+                Clove *t = make_fn(env, K[a], false);
+                Clove *l = alloc(CLOVE_LAZY);
                 l->as.lazy.thunk = t;
                 vpush(l);
                 VM_NEXT();
             }
             VM_CASE(VOP_VEC) {
-                Cljc *v = mk_vector(&vstack[vsp - a], a);
+                Clove *v = mk_vector(&vstack[vsp - a], a);
                 vsp -= a;
                 vpush(v);
                 VM_NEXT();
@@ -4277,8 +4279,8 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 uint32_t k = a & 0xffff, depth = a >> 16;
                 for (uint32_t d = 0; d < depth; d++) env = env->parent;
                 uint32_t n = 0;
-                for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail) n++;
-                Cljc **vals = &vstack[vsp - n];
+                for (Clove *nm = K[k]; nm && nm->tag == CLOVE_LIST; nm = nm->as.cons.tail) n++;
+                Clove **vals = &vstack[vsp - n];
                 if (env->captured) {
                     /* a closure captured this frame — rebind into a FRESH one
                      * so the closure keeps THIS iteration's values (the
@@ -4287,12 +4289,12 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                      * the vstack, so nothing is read from the old frame. */
                     env = env_new(env->parent);  /* vals stay vstack-rooted */
                     uint32_t i = 0;
-                    for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++)
+                    for (Clove *nm = K[k]; nm && nm->tag == CLOVE_LIST; nm = nm->as.cons.tail, i++)
                         env_define(env, nm->as.cons.head->as.sym, vals[i]);
                 } else {
                     uint32_t i = 0;
-                    for (Cljc *nm = K[k]; nm && nm->tag == CLJC_LIST; nm = nm->as.cons.tail, i++) {
-                        Cljc **p = env_local_find(env, nm->as.cons.head->as.sym);
+                    for (Clove *nm = K[k]; nm && nm->tag == CLOVE_LIST; nm = nm->as.cons.tail, i++) {
+                        Clove **p = env_local_find(env, nm->as.cons.head->as.sym);
                         if (p) *p = vals[i];
                     }
                 }
@@ -4301,11 +4303,11 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                 VM_NEXT();
             }
             VM_CASE(VOP_RECURFN) {
-                Cljc *r = alloc(CLJC_RECUR);
-                Cljc **vals = r->as.recur.iv;
+                Clove *r = alloc(CLOVE_RECUR);
+                Clove **vals = r->as.recur.iv;
                 if (a > 3) {
-                    vals = xmalloc(sizeof(Cljc *) * a);
-                    r->as.recur.iv[0] = (Cljc *)vals;
+                    vals = xmalloc(sizeof(Clove *) * a);
+                    r->as.recur.iv[0] = (Clove *)vals;
                     r->as.recur.spill = true;
                 }
                 for (uint32_t i = 0; i < a; i++)
@@ -4320,18 +4322,18 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
                  * args, with the TARGET fn in meta. apply's loop re-dispatches
                  * to it instead of recursing — a proper tail call. */
                 uint32_t n = a & 0xff;
-                Cljc *f = vstack[vsp - n - 1];
+                Clove *f = vstack[vsp - n - 1];
                 if (IS_MACRO_HEAD(env, f)) {
                     vsp -= n + 1;                    /* late macro: deopt, no TCO */
                     vpush(eval(env, K[a >> 8]));
                     VM_NEXT();
                 }
                 g_tc_form = K[a >> 8];               /* trace frame for the trampoline */
-                Cljc *r = alloc(CLJC_RECUR);         /* args still rooted on the vstack */
-                Cljc **vals = r->as.recur.iv;
+                Clove *r = alloc(CLOVE_RECUR);         /* args still rooted on the vstack */
+                Clove **vals = r->as.recur.iv;
                 if (n > 3) {
-                    vals = xmalloc(sizeof(Cljc *) * n);
-                    r->as.recur.iv[0] = (Cljc *)vals;
+                    vals = xmalloc(sizeof(Clove *) * n);
+                    r->as.recur.iv[0] = (Clove *)vals;
                     r->as.recur.spill = true;
                 }
                 for (uint32_t i = 0; i < n; i++) vals[i] = vstack[vsp - n + i];
@@ -4343,7 +4345,7 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
             }
             VM_CASE(VOP_RET) {
                 vm_tsp--;
-                Cljc *r = vstack[vsp - 1];
+                Clove *r = vstack[vsp - 1];
                 vsp = base;
                 (void)env_keep;
                 return r;
@@ -4359,18 +4361,18 @@ static Cljc *vm_run(CljcEnv *env_in, Cljc *chunk) {
 /* Decide once whether `fn` qualifies for the direct-slot fast call path:
  * exactly one arity, fixed (no &), every param a plain symbol, count within
  * the inline slots. Result cached on the cell (arities are immutable). */
-static void fastcall_init(Cljc *fn) {
+static void fastcall_init(Clove *fn) {
     fn->as.fn.fc_ready = true;
     fn->as.fn.fc_arity = NULL;
     fn->as.fn.fc_n = 0;
-    Cljc *arities = fn->as.fn.arities;
-    if (!arities || arities->tag != CLJC_LIST) return;
+    Clove *arities = fn->as.fn.arities;
+    if (!arities || arities->tag != CLOVE_LIST) return;
     if (arities->as.cons.tail != NIL) return;          /* multi-arity */
-    Cljc *arity = arities->as.cons.head;
+    Clove *arity = arities->as.cons.head;
     int n = 0;
-    for (Cljc *p = arity->as.cons.head; p && p->tag == CLJC_LIST; p = p->as.cons.tail) {
-        Cljc *pe = p->as.cons.head;
-        if (pe == NIL || pe->tag != CLJC_SYMBOL) return;   /* destructuring */
+    for (Clove *p = arity->as.cons.head; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+        Clove *pe = p->as.cons.head;
+        if (pe == NIL || pe->tag != CLOVE_SYMBOL) return;   /* destructuring */
         if (pe->as.sym == sym_amp()) return;               /* variadic     */
         n++;
     }
@@ -4379,38 +4381,38 @@ static void fastcall_init(Cljc *fn) {
     fn->as.fn.fc_n = (uint8_t)n;
 }
 
-/* If `inst` is a deftype instance (:cljc/type-tagged map) whose type has a
- * method `mname` registered in cljc/multi-tables, call it with the instance
+/* If `inst` is a deftype instance (:clove/type-tagged map) whose type has a
+ * method `mname` registered in clove/multi-tables, call it with the instance
  * prepended to argv and store the result in *out; return true. Else false.
- * This is how cljc bridges to protocol methods a host would dispatch via an
+ * This is how clove bridges to protocol methods a host would dispatch via an
  * interface — invoke (IFn), deref (IDeref), etc. */
-static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
-                                    Cljc **argv, int nargs, Cljc **out) {
-    if (inst == NIL || inst->tag != CLJC_MAP) return false;
-    /* cache the :cljc/type keyword: this runs on every count/get-miss/assoc/nth,
+static bool dispatch_deftype_method(CloveEnv *env, Clove *inst, const char *mname,
+                                    Clove **argv, int nargs, Clove **out) {
+    if (inst == NIL || inst->tag != CLOVE_MAP) return false;
+    /* cache the :clove/type keyword: this runs on every count/get-miss/assoc/nth,
      * so re-interning + re-allocating the keyword each time is pure waste. */
-    static Cljc *KW_CLJC_TYPE;
-    if (!KW_CLJC_TYPE) KW_CLJC_TYPE = mk_kw(intern("cljc/type", 9));
-    Cljc *tykw;
-    if (!map_find(inst, KW_CLJC_TYPE, &tykw)) return false;
-    Cljc *msym = mk_sym(intern(mname, strlen(mname)));
-    /* reify instances carry their methods on the instance (:cljc/impls) and
-     * register in cljc/multi-tables, not deftype-methods — look there first */
-    static Cljc *KW_IMPLS;
-    if (!KW_IMPLS) KW_IMPLS = mk_kw(intern("cljc/impls", 10));
-    Cljc *impls, *method = NULL;
-    if (!(map_find(inst, KW_IMPLS, &impls) && impls != NIL && impls->tag == CLJC_MAP &&
+    static Clove *KW_CLOVE_TYPE;
+    if (!KW_CLOVE_TYPE) KW_CLOVE_TYPE = mk_kw(intern("clove/type", 10));
+    Clove *tykw;
+    if (!map_find(inst, KW_CLOVE_TYPE, &tykw)) return false;
+    Clove *msym = mk_sym(intern(mname, strlen(mname)));
+    /* reify instances carry their methods on the instance (:clove/impls) and
+     * register in clove/multi-tables, not deftype-methods — look there first */
+    static Clove *KW_IMPLS;
+    if (!KW_IMPLS) KW_IMPLS = mk_kw(intern("clove/impls", 11));
+    Clove *impls, *method = NULL;
+    if (!(map_find(inst, KW_IMPLS, &impls) && impls != NIL && impls->tag == CLOVE_MAP &&
           map_find(impls, msym, &method) && method != NIL)) {
-        Binding *mtb = root_find(env_root(env), intern("cljc/deftype-methods", 20), NULL, false);
-        if (!mtb || mtb->value == NIL || mtb->value->tag != CLJC_ATOM) return false;
-        Cljc *tables = mtb->value->as.atom.value, *tab;
-        if (tables == NIL || tables->tag != CLJC_MAP) return false;
+        Binding *mtb = root_find(env_root(env), intern("clove/deftype-methods", 21), NULL, false);
+        if (!mtb || mtb->value == NIL || mtb->value->tag != CLOVE_ATOM) return false;
+        Clove *tables = mtb->value->as.atom.value, *tab;
+        if (tables == NIL || tables->tag != CLOVE_MAP) return false;
         if (!map_find(tables, msym, &tab)) return false;
-        if (tab == NIL || tab->tag != CLJC_MAP) return false;
+        if (tab == NIL || tab->tag != CLOVE_MAP) return false;
         if (!map_find(tab, tykw, &method)) return false;
     }
-    Cljc *iargv[256];
-    if (nargs + 1 > 256) cljc_error("too many args to %s", mname);
+    Clove *iargv[256];
+    if (nargs + 1 > 256) clove_error("too many args to %s", mname);
     iargv[0] = inst;
     for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
     *out = apply(env, method, iargv, nargs + 1);
@@ -4419,33 +4421,33 @@ static bool dispatch_deftype_method(CljcEnv *env, Cljc *inst, const char *mname,
 
 /* ───── apply + tree-walking evaluator (special forms) ─────────────────── */
 
-static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
-    cljc_check_stack();   /* raise a catchable error before the C stack overflows */
+static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
+    clove_check_stack();   /* raise a catchable error before the C stack overflows */
     /* NATIVE/FN are the overwhelmingly common cases — check them before VAR so
      * the hot path (every +, <, fn call) doesn't pay an extra branch. */
-    if (fn->tag == CLJC_NATIVE) return fn->as.native(env, argv, nargs);
-    if (fn->tag == CLJC_VAR) {     /* a Var is IFn: call its current value */
+    if (fn->tag == CLOVE_NATIVE) return fn->as.native(env, argv, nargs);
+    if (fn->tag == CLOVE_VAR) {     /* a Var is IFn: call its current value */
         Binding *b = root_find(env_root(env), fn->as.var.name, NULL, false);
         if (b && b->value != fn) return apply(env, b->value, argv, nargs);
-        cljc_error("var is unbound or not callable");
+        clove_error("var is unbound or not callable");
     }
-    if (fn->tag == CLJC_FN) {
+    if (fn->tag == CLOVE_FN) {
         /* volatile: when recur swaps argv to the sentinel's (possibly heap-
          * spilled) value array, this slot is the cell's only GC root — the
          * optimizer must not elide it. */
-        Cljc * volatile recur_keep = NIL;
+        Clove * volatile recur_keep = NIL;
         (void)recur_keep;
         int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
         for (;;) {
             if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
-            Cljc *chosen;
-            CljcEnv *call;
+            Clove *chosen;
+            CloveEnv *call;
             if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
                 /* fast path: fill the frame's slots straight from argv, no
                  * arity_info walk and no bind_params/destructure calls. */
                 chosen = fn->as.fn.fc_arity;
                 call = env_new(fn->as.fn.env);
-                Cljc *p = chosen->as.cons.head;
+                Clove *p = chosen->as.cons.head;
                 for (int i = 0; i < nargs; i++) {
                     call->sname[i] = p->as.cons.head->as.sym;
                     call->sval[i] = argv[i];
@@ -4454,10 +4456,10 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                 call->nslots = (uint8_t)nargs;
             } else {
                 /* slow dispatch: exact param-count match wins; variadic is fallback. */
-                Cljc *fallback = NULL;
+                Clove *fallback = NULL;
                 chosen = NULL;
-                for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
-                    Cljc *arity = ar->as.cons.head;
+                for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
+                    Clove *arity = ar->as.cons.head;
                     size_t fixed; bool variadic;
                     arity_info(arity->as.cons.head, &fixed, &variadic);
                     if (!variadic && (size_t)nargs == fixed) { chosen = arity; break; }
@@ -4468,19 +4470,19 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                     /* name the fn and list the arities it DOES take, so the
                      * caller knows which call is wrong (not just the count). */
                     char ab[160]; int al = 0; ab[0] = '\0';
-                    for (Cljc *ar = fn->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
+                    for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
                         size_t fx; bool va; arity_info(ar->as.cons.head->as.cons.head, &fx, &va);
                         int n = snprintf(ab + al, sizeof(ab) - al, "%s%zu%s",
                                          al ? " " : "", fx, va ? "+" : "");
                         if (n > 0 && al + n < (int)sizeof(ab)) al += n; else break;
                     }
                     const char *nm = NULL;
-                    if (fn->meta && fn->meta->tag == CLJC_MAP) {
-                        Cljc *o;
+                    if (fn->meta && fn->meta->tag == CLOVE_MAP) {
+                        Clove *o;
                         if (map_find(fn->meta, mk_kw(intern("name", 4)), &o) &&
-                            o != NIL && o->tag == CLJC_SYMBOL) nm = o->as.sym;
+                            o != NIL && o->tag == CLOVE_SYMBOL) nm = o->as.sym;
                     }
-                    cljc_error("no matching arity: %s called with %d arg%s (takes %s)",
+                    clove_error("no matching arity: %s called with %d arg%s (takes %s)",
                                nm ? nm : "fn", nargs, nargs == 1 ? "" : "s", ab);
                 }
                 call = env_new(fn->as.fn.env);
@@ -4492,14 +4494,14 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
              * compiler's buffers on every subsequent call. */
             if (chosen->meta == NULL) {
                 chosen->meta = TRUE;
-                Cljc *ch = vm_compile(call, chosen->as.cons.head,
+                Clove *ch = vm_compile(call, chosen->as.cons.head,
                                       chosen->as.cons.tail);
                 if (ch) chosen->meta = ch;
             }
-            Cljc *result = chosen->meta->tag == CLJC_CHUNK
+            Clove *result = chosen->meta->tag == CLOVE_CHUNK
                 ? vm_run(call, chosen->meta)
                 : eval_body(call, chosen->as.cons.tail);
-            if (!(result && result->tag == CLJC_RECUR)) {
+            if (!(result && result->tag == CLOVE_RECUR)) {
                 if (tc_frame >= 0) eval_sp = tc_frame;
                 return result;
             }
@@ -4509,7 +4511,7 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
              * elision; recur loops stay at one slot) */
             int native_frame = -1;   /* extra trace slot for a native tail call */
             if (g_tc_form) {
-                if (result->meta && result->meta->tag != CLJC_FN) {
+                if (result->meta && result->meta->tag != CLOVE_FN) {
                     /* a native does not reuse this frame, so its form goes
                      * ABOVE the current one: (defn f [x] (+ x 1)) failing in
                      * + must still show `(f ...)` in the trace */
@@ -4524,18 +4526,18 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
                 g_tc_form = NULL;
             }
             argv = result->as.recur.spill
-                ? (Cljc **)result->as.recur.iv[0] : result->as.recur.iv;
+                ? (Clove **)result->as.recur.iv[0] : result->as.recur.iv;
             nargs = (int)result->as.recur.n;
             if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
-                Cljc *newfn = result->meta;
-                if (newfn->tag == CLJC_FN) fn = newfn;         /* loop, replacing this frame */
+                Clove *newfn = result->meta;
+                if (newfn->tag == CLOVE_FN) fn = newfn;         /* loop, replacing this frame */
                 else {
                     /* native/keyword/map: dispatch here. NOT `return apply(...)`
                      * — that C tail call lets -O2 free this frame (and the
                      * volatile recur_keep rooting the sentinel that owns argv),
                      * so the GC could reclaim the args mid-call. Reading
                      * recur_keep after the call pins the sentinel live. */
-                    Cljc *rv = apply(env, newfn, argv, nargs);
+                    Clove *rv = apply(env, newfn, argv, nargs);
                     recur_keep = result;
                     if (native_frame >= 0) eval_sp = native_frame;
                     if (tc_frame >= 0) eval_sp = tc_frame;
@@ -4544,118 +4546,118 @@ static Cljc *apply(CljcEnv *env, Cljc *fn, Cljc **argv, int nargs) {
             }
         }
     }
-    Cljc *a0 = nargs > 0 ? argv[0] : NIL;
-    Cljc *a1 = nargs > 1 ? argv[1] : NIL;
+    Clove *a0 = nargs > 0 ? argv[0] : NIL;
+    Clove *a1 = nargs > 1 ? argv[1] : NIL;
     /* Keywords as functions: (:key m) and (:key m default). */
-    if (fn->tag == CLJC_KEYWORD) {
-        if (nargs < 1 || nargs > 2) cljc_error("keyword lookup takes 1 or 2 args, got %d", nargs);
+    if (fn->tag == CLOVE_KEYWORD) {
+        if (nargs < 1 || nargs > 2) clove_error("keyword lookup takes 1 or 2 args, got %d", nargs);
         /* Clojure's Keyword.invoke is exactly RT.get, so this has to cover
-         * every collection `get` covers. Matching only CLJC_MAP here made
+         * every collection `get` covers. Matching only CLOVE_MAP here made
          * (:k (sorted-map ...)) and (:k #{:k}) read as nil instead of finding
          * the entry -- a silent wrong answer, not an error. */
-        Cljc *gargv[3] = { a0, fn, a1 };
+        Clove *gargv[3] = { a0, fn, a1 };
         return prim_get(env, gargv, nargs > 1 ? 3 : 2);
     }
-    if (fn->tag == CLJC_MAP) {
+    if (fn->tag == CLOVE_MAP) {
         /* a deftype instance implementing `invoke` is callable (SCI's Var-as-fn
          * / fn objects); otherwise it's a plain map used as a fn: (m key dflt) */
-        Cljc *out;
+        Clove *out;
         if (dispatch_deftype_method(env, fn, "invoke", argv, nargs, &out)) return out;
-        /* a reify keeps `invoke` per-instance in :cljc/impls (e.g. DataScript's
+        /* a reify keeps `invoke` per-instance in :clove/impls (e.g. DataScript's
          * Comparator reify is called as a 2-arg fn) */
-        Cljc *impls, *inv;
-        if (map_find(fn, mk_kw(intern("cljc/impls", 10)), &impls) &&
-            impls != NIL && impls->tag == CLJC_MAP &&
+        Clove *impls, *inv;
+        if (map_find(fn, mk_kw(intern("clove/impls", 11)), &impls) &&
+            impls != NIL && impls->tag == CLOVE_MAP &&
             map_find(impls, mk_sym(intern("invoke", 6)), &inv)) {
-            Cljc *iargv[256]; iargv[0] = fn;
-            if (nargs + 1 > 256) cljc_error("too many args to invoke");
+            Clove *iargv[256]; iargv[0] = fn;
+            if (nargs + 1 > 256) clove_error("too many args to invoke");
             for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
             return apply(env, inv, iargv, nargs + 1);
         }
-        if (nargs < 1 || nargs > 2) cljc_error("map lookup takes 1 or 2 args, got %d", nargs);
+        if (nargs < 1 || nargs > 2) clove_error("map lookup takes 1 or 2 args, got %d", nargs);
         if (map_find(fn, a0, &out)) return out;
         return a1;
     }
-    if (fn->tag == CLJC_SET) {
-        if (nargs < 1 || nargs > 2) cljc_error("set lookup takes 1 or 2 args, got %d", nargs);
-        Cljc *out;
+    if (fn->tag == CLOVE_SET) {
+        if (nargs < 1 || nargs > 2) clove_error("set lookup takes 1 or 2 args, got %d", nargs);
+        Clove *out;
         if (set_contains(fn, a0, &out)) return out;
         return a1;
     }
-    if (fn->tag == CLJC_SORTED) {
-        if (nargs < 1 || nargs > 2) cljc_error("collection lookup takes 1 or 2 args, got %d", nargs);
-        Cljc *out;
+    if (fn->tag == CLOVE_SORTED) {
+        if (nargs < 1 || nargs > 2) clove_error("collection lookup takes 1 or 2 args, got %d", nargs);
+        Clove *out;
         if (sorted_get(env, fn, a0, &out)) return out;
         return a1;
     }
-    if (fn->tag == CLJC_IARRAY) {
-        if (a0 == NIL || a0->tag != CLJC_INT || a0->as.i < 0 ||
+    if (fn->tag == CLOVE_IARRAY) {
+        if (a0 == NIL || a0->tag != CLOVE_INT || a0->as.i < 0 ||
             a0->as.i >= (int64_t)fn->as.iarr.n)
-            cljc_error("int-array lookup: bad index");
+            clove_error("int-array lookup: bad index");
         return iarr_get(fn, a0->as.i);
     }
-    if (fn->tag == CLJC_VECTOR || fn->tag == CLJC_TVEC) {  /* transients too */
-        if (a0->tag != CLJC_INT) cljc_error("vector lookup needs an integer index");
+    if (fn->tag == CLOVE_VECTOR || fn->tag == CLOVE_TVEC) {  /* transients too */
+        if (a0->tag != CLOVE_INT) clove_error("vector lookup needs an integer index");
         if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
-            cljc_error_cls("IndexOutOfBoundsException", "index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
+            clove_error_cls("IndexOutOfBoundsException", "index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
         return vec_nth(fn, (size_t)a0->as.i);
     }
     /* Symbols as functions: ('k m) and ('k m default), like keywords. */
-    if (fn->tag == CLJC_SYMBOL) {
-        if (nargs < 1 || nargs > 2) cljc_error("symbol lookup takes 1 or 2 args, got %d", nargs);
-        Cljc *out;
-        if (a0 != NIL && a0->tag == CLJC_MAP && map_find(a0, fn, &out)) return out;
+    if (fn->tag == CLOVE_SYMBOL) {
+        if (nargs < 1 || nargs > 2) clove_error("symbol lookup takes 1 or 2 args, got %d", nargs);
+        Clove *out;
+        if (a0 != NIL && a0->tag == CLOVE_MAP && map_find(a0, fn, &out)) return out;
         return a1;
     }
-    cljc_error("%s is not callable as a function", val_desc(fn));
+    clove_error("%s is not callable as a function", val_desc(fn));
     return NIL;
 }
 
 /* One arity: validate a [params] vector and pair it with its body. */
-static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
+static Clove *build_arity(Clove *params_vec, Clove *body) {
     /* a return-type hint reads as (with-meta [params] {..}) (reader turns ^{..}
      * into a with-meta call) — unwrap to the param vector. ^Symbol hints are
      * dropped by the reader already, so only the map-meta form reaches here. */
-    if (params_vec != NIL && params_vec->tag == CLJC_LIST &&
-        params_vec->as.cons.head->tag == CLJC_SYMBOL &&
+    if (params_vec != NIL && params_vec->tag == CLOVE_LIST &&
+        params_vec->as.cons.head->tag == CLOVE_SYMBOL &&
         params_vec->as.cons.head->as.sym == intern("with-meta", 9) &&
         params_vec->as.cons.tail != NIL)
         params_vec = params_vec->as.cons.tail->as.cons.head;
-    if (params_vec == NIL || params_vec->tag != CLJC_VECTOR)
-        cljc_error("fn params must be a vector");
-    Cljc *params = NIL, **t = &params;
+    if (params_vec == NIL || params_vec->tag != CLOVE_VECTOR)
+        clove_error("fn params must be a vector");
+    Clove *params = NIL, **t = &params;
     for (size_t i = 0; i < vec_len(params_vec); i++) {
-        Cljc *p = peel_meta_sym(vec_nth(params_vec, i));  /* drop ^:foo / ^{..} on a param */
+        Clove *p = peel_meta_sym(vec_nth(params_vec, i));  /* drop ^:foo / ^{..} on a param */
         if (p == NIL) continue;     /* a #?(:cljs ..)-only param elides to nil */
-        bool is_amp = p->tag == CLJC_SYMBOL && p->as.sym == sym_amp();
+        bool is_amp = p->tag == CLOVE_SYMBOL && p->as.sym == sym_amp();
         if (is_amp && i + 2 != vec_len(params_vec))
-            cljc_error("fn params: & must be followed by exactly one binding");
-        if (!is_amp && p->tag != CLJC_SYMBOL && p->tag != CLJC_VECTOR && p->tag != CLJC_MAP)
-            cljc_error("fn params: unsupported binding form");
+            clove_error("fn params: & must be followed by exactly one binding");
+        if (!is_amp && p->tag != CLOVE_SYMBOL && p->tag != CLOVE_VECTOR && p->tag != CLOVE_MAP)
+            clove_error("fn params: unsupported binding form");
         *t = mk_cons(p, NIL);
         t = &(*t)->as.cons.tail;
     }
     /* {:pre [..] :post [..]} as the first of MULTIPLE body forms: assert each
      * :pre before the body, each :post after with % bound to the return value
      * — (assert p)... (let [% (do body)] (assert q)... %). */
-    if (body != NIL && body->tag == CLJC_LIST && body->as.cons.head != NIL &&
-        body->as.cons.head->tag == CLJC_MAP && body->as.cons.tail != NIL) {
-        Cljc *pp = body->as.cons.head, *pres = NIL, *posts = NIL;
+    if (body != NIL && body->tag == CLOVE_LIST && body->as.cons.head != NIL &&
+        body->as.cons.head->tag == CLOVE_MAP && body->as.cons.tail != NIL) {
+        Clove *pp = body->as.cons.head, *pres = NIL, *posts = NIL;
         map_find(pp, mk_kw(intern("pre", 3)), &pres);
         map_find(pp, mk_kw(intern("post", 4)), &posts);
-        if ((pres != NIL && pres->tag == CLJC_VECTOR) ||
-            (posts != NIL && posts->tag == CLJC_VECTOR)) {
+        if ((pres != NIL && pres->tag == CLOVE_VECTOR) ||
+            (posts != NIL && posts->tag == CLOVE_VECTOR)) {
             const char *ASSERT = intern("assert", 6);
-            Cljc *rest = body->as.cons.tail, *out = NIL, **ot = &out;
-            if (pres != NIL && pres->tag == CLJC_VECTOR)
+            Clove *rest = body->as.cons.tail, *out = NIL, **ot = &out;
+            if (pres != NIL && pres->tag == CLOVE_VECTOR)
                 for (size_t i = 0; i < vec_len(pres); i++) {
                     *ot = mk_cons(mk_cons(mk_sym(ASSERT), mk_cons(vec_nth(pres, i), NIL)), NIL);
                     ot = &(*ot)->as.cons.tail;
                 }
-            if (posts != NIL && posts->tag == CLJC_VECTOR) {
-                Cljc *pct = mk_sym(intern("%", 1));
-                Cljc *bv[2] = { pct, mk_cons(mk_sym(intern("do", 2)), rest) };
-                Cljc *lbody = NIL, **lt = &lbody;
+            if (posts != NIL && posts->tag == CLOVE_VECTOR) {
+                Clove *pct = mk_sym(intern("%", 1));
+                Clove *bv[2] = { pct, mk_cons(mk_sym(intern("do", 2)), rest) };
+                Clove *lbody = NIL, **lt = &lbody;
                 for (size_t i = 0; i < vec_len(posts); i++) {
                     *lt = mk_cons(mk_cons(mk_sym(ASSERT), mk_cons(vec_nth(posts, i), NIL)), NIL);
                     lt = &(*lt)->as.cons.tail;
@@ -4675,11 +4677,11 @@ static Cljc *build_arity(Cljc *params_vec, Cljc *body) {
 /* Build an interpreted fn from the forms after `fn` (or after a defn name):
  * single arity ([params] body...) or multi-arity (([p] b...) ([p q] b...)). */
 /* The **arities** cache marker on fn source spines (see make_fn). */
-static bool is_arities_meta(Cljc *m) {
+static bool is_arities_meta(Clove *m) {
     static const char *SYM_ARITIES;
     if (!SYM_ARITIES) SYM_ARITIES = intern("**arities**", 11);
-    return m != NULL && m != NIL && m->tag == CLJC_LIST &&
-           m->as.cons.head->tag == CLJC_SYMBOL &&
+    return m != NULL && m != NIL && m->tag == CLOVE_LIST &&
+           m->as.cons.head->tag == CLOVE_SYMBOL &&
            m->as.cons.head->as.sym == SYM_ARITIES;
 }
 
@@ -4689,28 +4691,28 @@ static bool is_arities_meta(Cljc *m) {
  * read as an EMPTY BODY (the fn silently returned nil). Element-preserving,
  * hence invisible to other holders; in place so the **arities** cache marker
  * on the spine survives (a copy would recompile the fn per closure). */
-static Cljc *realize_spine(Cljc *l) {
+static Clove *realize_spine(Clove *l) {
     if (l == NIL) return NIL;
-    if (l->tag != CLJC_LIST) return to_seq(l);
-    Cljc *c = l;
-    while (c->as.cons.tail != NIL && c->as.cons.tail->tag == CLJC_LIST) c = c->as.cons.tail;
+    if (l->tag != CLOVE_LIST) return to_seq(l);
+    Clove *c = l;
+    while (c->as.cons.tail != NIL && c->as.cons.tail->tag == CLOVE_LIST) c = c->as.cons.tail;
     if (c->as.cons.tail != NIL) c->as.cons.tail = to_seq(c->as.cons.tail);
     return l;
 }
 
-static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
+static Clove *make_fn(CloveEnv *env, Clove *forms, bool is_macro) {
     /* The closure holds env — every frame up the chain may now outlive its
      * scope, so loop frames among them must stop rebinding in place
      * (VOP_REBIND). Parents never change, so an already-marked frame means
      * its whole ancestry is marked: stop there. */
-    for (CljcEnv *e = env; e && !e->captured; e = e->parent) e->captured = 1;
+    for (CloveEnv *e = env; e && !e->captured; e = e->parent) e->captured = 1;
     /* Arities (and the chunks cached on them) are pure structure: share
      * them across every closure built from the same source forms. A hot
      * loop creating a closure per iteration otherwise RECOMPILES its
      * body each call (5M+ vm_compiles in one profile). */
-    if (forms != NIL && forms->tag == CLJC_LIST &&
+    if (forms != NIL && forms->tag == CLOVE_LIST &&
         is_arities_meta(forms->meta)) {
-        Cljc *f = alloc(CLJC_FN);
+        Clove *f = alloc(CLOVE_FN);
         f->as.fn.arities = forms->meta->as.cons.tail;
         f->as.fn.env = env;
         f->as.fn.is_macro = is_macro;
@@ -4719,36 +4721,36 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
     forms = realize_spine(forms);
     /* single arity with a return-type hint: (fn ^{:tag T} [x] ..) reads its
      * params as (with-meta [x] {..}); unwrap so it's seen as a [params] head. */
-    if (forms != NIL && forms->as.cons.head->tag == CLJC_LIST) {
-        Cljc *h = forms->as.cons.head;
-        if (h->as.cons.head->tag == CLJC_SYMBOL &&
+    if (forms != NIL && forms->as.cons.head->tag == CLOVE_LIST) {
+        Clove *h = forms->as.cons.head;
+        if (h->as.cons.head->tag == CLOVE_SYMBOL &&
             h->as.cons.head->as.sym == intern("with-meta", 9) &&
-            h->as.cons.tail != NIL && h->as.cons.tail->as.cons.head->tag == CLJC_VECTOR)
+            h->as.cons.tail != NIL && h->as.cons.tail->as.cons.head->tag == CLOVE_VECTOR)
             forms = mk_cons(h->as.cons.tail->as.cons.head, forms->as.cons.tail);
     }
-    Cljc *arities = NIL, **t = &arities;
-    if (forms != NIL && forms->as.cons.head->tag == CLJC_VECTOR) {
+    Clove *arities = NIL, **t = &arities;
+    if (forms != NIL && forms->as.cons.head->tag == CLOVE_VECTOR) {
         *t = mk_cons(build_arity(forms->as.cons.head, forms->as.cons.tail), NIL);
     } else {
-        for (Cljc *c = forms; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
-            Cljc *clause = realize_spine(c->as.cons.head);
-            if (clause == NIL || clause->tag != CLJC_LIST)
-                cljc_error("fn: expected ([params] body...) clauses");
+        for (Clove *c = forms; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+            Clove *clause = realize_spine(c->as.cons.head);
+            if (clause == NIL || clause->tag != CLOVE_LIST)
+                clove_error("fn: expected ([params] body...) clauses");
             *t = mk_cons(build_arity(clause->as.cons.head, clause->as.cons.tail), NIL);
             t = &(*t)->as.cons.tail;
         }
-        if (arities == NIL) cljc_error("fn needs at least one arity");
+        if (arities == NIL) clove_error("fn needs at least one arity");
     }
     /* NOTE: cache only engages when the spine carries no other meta —
      * any foreign meta silently reverts to rebuild-per-closure (the 5M-
      * compile cliff); log it so the cliff is visible. */
-    if (forms != NIL && forms->tag == CLJC_LIST) {
+    if (forms != NIL && forms->tag == CLOVE_LIST) {
         if (forms->meta == NULL)
             forms->meta = mk_cons(mk_sym(intern("**arities**", 11)), arities);
-        else if (!is_arities_meta(forms->meta) && getenv("CLJC_VM_LOG"))
+        else if (!is_arities_meta(forms->meta) && getenv("CLOVE_VM_LOG"))
             fprintf(stderr, "[vm] arities cache bypassed (foreign meta)\n");
     }
-    Cljc *f = alloc(CLJC_FN);
+    Clove *f = alloc(CLOVE_FN);
     f->as.fn.arities = arities;
     f->as.fn.env = env;
     f->as.fn.is_macro = is_macro;
@@ -4758,24 +4760,24 @@ static Cljc *make_fn(CljcEnv *env, Cljc *forms, bool is_macro) {
 /* Quasiquote template expansion: copy structure, evaluating ~x holes and
  * splicing ~@xs. Nested quasiquotes are not given Clojure's full treatment
  * (no level counting, no auto-gensym #-suffixes, no namespace resolution). */
-static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
+static Clove *qq_expand(CloveEnv *env, Clove *form) {
     static const char *SYM_UQ, *SYM_UQS;
     if (!SYM_UQ) { SYM_UQ = intern("clojure.core/unquote", 20); SYM_UQS = intern("clojure.core/unquote-splicing", 29); }
 
     if (form == NULL || form == NIL) return NIL;
 
-    if (form->tag == CLJC_LIST) {
-        Cljc *head = form->as.cons.head;
-        if (head->tag == CLJC_SYMBOL && head->as.sym == SYM_UQ)
+    if (form->tag == CLOVE_LIST) {
+        Clove *head = form->as.cons.head;
+        if (head->tag == CLOVE_SYMBOL && head->as.sym == SYM_UQ)
             return eval(env, form->as.cons.tail->as.cons.head);
-        Cljc *out = NIL, **t = &out;
-        for (Cljc *l = form; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-            Cljc *el = l->as.cons.head;
-            if (el != NIL && el->tag == CLJC_LIST && el->as.cons.head->tag == CLJC_SYMBOL
+        Clove *out = NIL, **t = &out;
+        for (Clove *l = form; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
+            Clove *el = l->as.cons.head;
+            if (el != NIL && el->tag == CLOVE_LIST && el->as.cons.head->tag == CLOVE_SYMBOL
                 && el->as.cons.head->as.sym == SYM_UQS) {
                 /* to_seq so ~@ splices vectors and maps too, not just lists. */
-                Cljc *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
-                for (Cljc *s = spliced; s && s->tag == CLJC_LIST; s = s->as.cons.tail) {
+                Clove *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
+                for (Clove *s = spliced; s && s->tag == CLOVE_LIST; s = s->as.cons.tail) {
                     *t = mk_cons(s->as.cons.head, NIL);
                     t = &(*t)->as.cons.tail;
                 }
@@ -4786,16 +4788,16 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
         }
         return out;
     }
-    if (form->tag == CLJC_VECTOR) {
+    if (form->tag == CLOVE_VECTOR) {
         /* Expand into a list first so ~@ splices work inside vector
          * templates ([~@(...)]), then convert. The list is stack-rooted. */
-        Cljc *out = NIL, **t = &out;
+        Clove *out = NIL, **t = &out;
         for (size_t i = 0; i < vec_len(form); i++) {
-            Cljc *el = vec_nth(form, i);
-            if (el != NIL && el->tag == CLJC_LIST && el->as.cons.head->tag == CLJC_SYMBOL
+            Clove *el = vec_nth(form, i);
+            if (el != NIL && el->tag == CLOVE_LIST && el->as.cons.head->tag == CLOVE_SYMBOL
                 && el->as.cons.head->as.sym == SYM_UQS) {
-                Cljc *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
-                for (Cljc *s = spliced; s && s->tag == CLJC_LIST; s = s->as.cons.tail) {
+                Clove *spliced = to_seq(eval(env, el->as.cons.tail->as.cons.head));
+                for (Clove *s = spliced; s && s->tag == CLOVE_LIST; s = s->as.cons.tail) {
                     *t = mk_cons(s->as.cons.head, NIL);
                     t = &(*t)->as.cons.tail;
                 }
@@ -4804,23 +4806,23 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
                 t = &(*t)->as.cons.tail;
             }
         }
-        Cljc *v = mk_empty_vec();
-        for (Cljc *l = out; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+        Clove *v = mk_empty_vec();
+        for (Clove *l = out; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
             v = vec_conj1(v, l->as.cons.head);
         return v;
     }
-    if (form->tag == CLJC_MAP) {
-        Cljc *m = mk_map();
-        for (Cljc *e = map_entry_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-            Cljc *k = qq_expand(env, e->as.cons.head->as.cons.head);
-            Cljc *val = qq_expand(env, e->as.cons.head->as.cons.tail);
+    if (form->tag == CLOVE_MAP) {
+        Clove *m = mk_map();
+        for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *k = qq_expand(env, e->as.cons.head->as.cons.head);
+            Clove *val = qq_expand(env, e->as.cons.head->as.cons.tail);
             m = map_assoc(m, k, val);
         }
         return m;
     }
-    if (form->tag == CLJC_SET) {
-        Cljc *s = mk_set();
-        for (Cljc *e = set_element_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+    if (form->tag == CLOVE_SET) {
+        Clove *s = mk_set();
+        for (Clove *e = set_element_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
             s = set_conj(s, qq_expand(env, e->as.cons.head));
         return s;
     }
@@ -4829,7 +4831,7 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
      * to the FULL ns-qualified symbol, so the emitted code is resolvable in
      * namespaces that don't share the alias (meander's defsyntax operators
      * were emitted alias-qualified and unresolvable at the use site). */
-    if (form->tag == CLJC_SYMBOL && form->as.symc.home_ns) {
+    if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns) {
         const char *slash = strchr(form->as.symc.name, '/');
         if (slash && slash != form->as.symc.name && slash[1]) {
             size_t plen = (size_t)(slash - form->as.symc.name);
@@ -4848,7 +4850,7 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
      * symbol whose home ns defines it expands to the qualified symbol, so
      * `(move ~a) inside (ns p21 ...) yields p21/move — matching the case
      * constants real Clojure code writes against syntax-quoted forms. */
-    if (form->tag == CLJC_SYMBOL && form->as.symc.home_ns &&
+    if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns &&
         !strchr(form->as.symc.name, '/')) {
         char buf[256];
         snprintf(buf, sizeof buf, "%s/%s",
@@ -4867,8 +4869,8 @@ static Cljc *qq_expand(CljcEnv *env, Cljc *form) {
  * `type`/`class` already honor :type, and equality/hash ignore metadata.
  *   - (ex-info ...)                     → :ExceptionInfo
  *   - (IllegalStateException. "..") etc → that class
- *   - cljc_error_cls sites              → their class, attached when caught
- *   - plain cljc_error, (throw 42)      → none: UNTYPED
+ *   - clove_error_cls sites              → their class, attached when caught
+ *   - plain clove_error, (throw 42)      → none: UNTYPED
  * (catch C e ...) picks the first clause whose class the exception is-a,
  * walking the table below. An UNTYPED exception takes any clause except the
  * ones it certainly is not (ExceptionInfo, AssertionError, Error): most
@@ -4925,30 +4927,30 @@ static bool exc_isa(const char *cls, const char *target) {
 }
 
 /* The class recorded on an exception value, or NULL when untyped. */
-static const char *exc_class_of(Cljc *v) {
-    Cljc *t;
-    if (v == NULL || v == NIL || v->meta == NULL || v->meta->tag != CLJC_MAP) return NULL;
+static const char *exc_class_of(Clove *v) {
+    Clove *t;
+    if (v == NULL || v == NIL || v->meta == NULL || v->meta->tag != CLOVE_MAP) return NULL;
     if (!map_find(v->meta, mk_kw(intern("type", 4)), &t) || t == NIL) return NULL;
-    if (t->tag == CLJC_KEYWORD) return class_simple(t->as.kw);
-    if (t->tag == CLJC_SYMBOL) return class_simple(t->as.sym);
+    if (t->tag == CLOVE_KEYWORD) return class_simple(t->as.kw);
+    if (t->tag == CLOVE_SYMBOL) return class_simple(t->as.sym);
     return NULL;
 }
 
-static Cljc *exc_with_class(Cljc *v, const char *cls) {
-    Cljc *m = map_assoc(mk_map(), mk_kw(intern("type", 4)), mk_kw(intern(cls, strlen(cls))));
+static Clove *exc_with_class(Clove *v, const char *cls) {
+    Clove *m = map_assoc(mk_map(), mk_kw(intern("type", 4)), mk_kw(intern(cls, strlen(cls))));
     v->meta = m;
     return v;
 }
 
 /* The exception in flight as a value: what (catch _ e) binds. A message-style
  * error becomes its message string, carrying err_class when it has one. */
-static Cljc *err_as_value(void) {
+static Clove *err_as_value(void) {
     if (cur_exc) return cur_exc;
-    Cljc *sv = mk_str(err_msg, strlen(err_msg));
+    Clove *sv = mk_str(err_msg, strlen(err_msg));
     return err_class ? exc_with_class(sv, err_class) : sv;
 }
 
-static bool catch_matches(const char *catch_class, Cljc *exc) {
+static bool catch_matches(const char *catch_class, Clove *exc) {
     const char *c = class_simple(catch_class);
     if (!strcmp(c, "Throwable") || !strcmp(c, "Object")) return true;
     const char *ec = exc_class_of(exc);
@@ -4958,51 +4960,51 @@ static bool catch_matches(const char *catch_class, Cljc *exc) {
     return exc_isa(ec, c);
 }
 
-static Cljc *eval_inner(CljcEnv *env, Cljc *form);
+static Clove *eval_inner(CloveEnv *env, Clove *form);
 
 /* eval wrapper: maintains the form stack that error traces snapshot.
  * longjmp unwinds restore eval_sp from ErrFrames / top-level handlers. */
-static Cljc *eval(CljcEnv *env, Cljc *form) {
-    if (g_interrupt) { g_interrupt = 0; cljc_error("interrupted"); }
+static Clove *eval(CloveEnv *env, Clove *form) {
+    if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
     if (form == NULL || form == NIL) return NIL;
-    if (form->tag != CLJC_LIST) return eval_inner(env, form);
+    if (form->tag != CLOVE_LIST) return eval_inner(env, form);
     if (eval_sp < EVAL_STACK_MAX) {
         eval_stack[eval_sp++] = form;
-        Cljc *r = eval_inner(env, form);
+        Clove *r = eval_inner(env, form);
         eval_sp--;
         return r;
     }
     return eval_inner(env, form);
 }
 
-static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
+static Clove *eval_inner(CloveEnv *env, Clove *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
-        case CLJC_INT: case CLJC_DOUBLE: case CLJC_BOOL: case CLJC_NIL: case CLJC_EMPTY:
-        case CLJC_BIGINT: case CLJC_RATIO: case CLJC_BIGDEC: case CLJC_VAR:
-        case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_FN: case CLJC_NATIVE:
-        case CLJC_ATOM: case CLJC_TVEC: case CLJC_CORO: case CLJC_IARRAY:
-        case CLJC_SORTED:  /* a constructed sorted coll has no reader literal */
-        case CLJC_TNODE:   /* internal sorted-tree node; self-evaluates if it leaks */
-        case CLJC_RECUR:   /* not produced by the reader; appears only inside loop */
-        case CLJC_CHUNK:   /* internal; self-evaluates if it ever leaks */
+        case CLOVE_INT: case CLOVE_DOUBLE: case CLOVE_BOOL: case CLOVE_NIL: case CLOVE_EMPTY:
+        case CLOVE_BIGINT: case CLOVE_RATIO: case CLOVE_BIGDEC: case CLOVE_VAR:
+        case CLOVE_STRING: case CLOVE_CHAR: case CLOVE_KEYWORD: case CLOVE_FN: case CLOVE_NATIVE:
+        case CLOVE_ATOM: case CLOVE_TVEC: case CLOVE_CORO: case CLOVE_IARRAY:
+        case CLOVE_SORTED:  /* a constructed sorted coll has no reader literal */
+        case CLOVE_TNODE:   /* internal sorted-tree node; self-evaluates if it leaks */
+        case CLOVE_RECUR:   /* not produced by the reader; appears only inside loop */
+        case CLOVE_CHUNK:   /* internal; self-evaluates if it ever leaks */
             return form;
-        case CLJC_LAZY:
+        case CLOVE_LAZY:
             /* Lazy seqs ARE seqs: in form position (e.g. a macro expansion
              * built with lazy concat) they evaluate as call forms. */
             return eval(env, to_seq(form));
-        case CLJC_FREE:
-            cljc_error("internal: evaluated a freed value (GC bug)");
-        case CLJC_VECTOR: {
+        case CLOVE_FREE:
+            clove_error("internal: evaluated a freed value (GC bug)");
+        case CLOVE_VECTOR: {
             /* Vector literals evaluate each element: [(+ 1 2)] => [3].
              * len grows as slots fill so a mid-eval GC marks exactly the
              * elements written so far. */
-            Cljc *v = mk_empty_vec();
+            Clove *v = mk_empty_vec();
             for (size_t i = 0; i < vec_len(form); i++)
                 v = vec_conj1(v, eval(env, vec_nth(form, i)));
             return v;
         }
-        case CLJC_MAP: {
+        case CLOVE_MAP: {
             /* Map literal: evaluate each key/value form, assoc into a fresh
              * map. Clojure evaluates the entries in SOURCE order -- a small
              * map literal is an array-map, whose seq is insertion order -- so
@@ -5010,13 +5012,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
              * no source order, so walk the reader's original k/v form list
              * when we have it (every map literal) and fall back to hash order
              * for a map form built some other way, e.g. by a macro. */
-            Cljc *m = mk_map();
-            Cljc *ord = form->as.map.lit_order;
+            Clove *m = mk_map();
+            Clove *ord = form->as.map.lit_order;
             if (ord) {
-                for (Cljc *l = ord; l && l->tag == CLJC_LIST;
+                for (Clove *l = ord; l && l->tag == CLOVE_LIST;
                      l = l->as.cons.tail->as.cons.tail) {
-                    Cljc *k = eval(env, l->as.cons.head);
-                    Cljc *val = eval(env, l->as.cons.tail->as.cons.head);
+                    Clove *k = eval(env, l->as.cons.head);
+                    Clove *val = eval(env, l->as.cons.tail->as.cons.head);
                     size_t before = m->as.map.count;
                     m = map_assoc(m, k, val);
                     /* the reader rejects {:a 1 :a 2}; keys that only collide
@@ -5026,53 +5028,53 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         SBuf kb = {0}; print_to(&kb, k, true);
                         char msg[256]; snprintf(msg, sizeof msg, "Duplicate key: %s", kb.data ? kb.data : "");
                         free(kb.data);
-                        cljc_error("%s", msg);
+                        clove_error("%s", msg);
                     }
                 }
                 return m;
             }
-            for (Cljc *e = map_entry_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-                Cljc *k = eval(env, e->as.cons.head->as.cons.head);
-                Cljc *val = eval(env, e->as.cons.head->as.cons.tail);
+            for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+                Clove *k = eval(env, e->as.cons.head->as.cons.head);
+                Clove *val = eval(env, e->as.cons.head->as.cons.tail);
                 m = map_assoc(m, k, val);
             }
             return m;
         }
-        case CLJC_SET: {
+        case CLOVE_SET: {
             /* Set literal: evaluate each element form. */
-            Cljc *s = mk_set();
-            for (Cljc *e = set_element_list(form); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+            Clove *s = mk_set();
+            for (Clove *e = set_element_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
                 s = set_conj(s, eval(env, e->as.cons.head));
             return s;
         }
-        case CLJC_HNODE:
-            cljc_error("internal: evaluated a HAMT node");
-        case CLJC_SYMBOL:
+        case CLOVE_HNODE:
+            clove_error("internal: evaluated a HAMT node");
+        case CLOVE_SYMBOL:
             return resolve_symbol(env, form);
-        case CLJC_LIST: {
+        case CLOVE_LIST: {
             /* Macro expansions built with lazy concat/map can carry LAZY
              * tails mid-chain; every special-form walker iterates raw cons
              * tails and would silently truncate. Realize once, up front. */
             {
-                Cljc *l = form;
-                while (l->tag == CLJC_LIST) l = l->as.cons.tail;
-                if (l != NIL && l->tag == CLJC_LAZY) form = to_seq(form);
+                Clove *l = form;
+                while (l->tag == CLOVE_LIST) l = l->as.cons.tail;
+                if (l != NIL && l->tag == CLOVE_LAZY) form = to_seq(form);
             }
-            Cljc *head = form->as.cons.head;
-            Cljc *rest = form->as.cons.tail;
+            Clove *head = form->as.cons.head;
+            Clove *rest = form->as.cons.tail;
 
             /* Special forms — dispatch by interned symbol pointer. A head that
              * resolved to an ordinary call last time is flagged `plain`, so we
              * skip the strip + dot + special-form cascade on every repeat. */
-            if (head->tag == CLJC_SYMBOL && !head->as.symc.plain) {
+            if (head->tag == CLOVE_SYMBOL && !head->as.symc.plain) {
                 const char *s = strip_core_qualifier(head->as.sym);
                 /* (.-field obj): deftype field access -> field of the instance
-                 * map (cljc represents a deftype instance as a tagged map) */
+                 * map (clove represents a deftype instance as a tagged map) */
                 if (s[0] == '.' && s[1] == '-' && s[2] &&
-                    rest != NIL && rest->tag == CLJC_LIST) {
-                    Cljc *obj = eval(env, rest->as.cons.head);
-                    Cljc *out;
-                    if (obj != NIL && obj->tag == CLJC_MAP &&
+                    rest != NIL && rest->tag == CLOVE_LIST) {
+                    Clove *obj = eval(env, rest->as.cons.head);
+                    Clove *out;
+                    if (obj != NIL && obj->tag == CLOVE_MAP &&
                         map_find(obj, mk_kw(intern(s + 2, strlen(s + 2))), &out))
                         return out;
                     return NIL;
@@ -5080,35 +5082,35 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 /* (.foo x): if .foo is not a defined method, treat as a deftype
                  * field access (Java's field-access syntax === method syntax) */
                 if (s[0] == '.' && s[1] && s[1] != '-' &&
-                    rest != NIL && rest->tag == CLJC_LIST &&
+                    rest != NIL && rest->tag == CLOVE_LIST &&
                     !root_find(env_root(env), s, NULL, false)) {
-                    Cljc *obj = eval(env, rest->as.cons.head);
-                    Cljc *out;
+                    Clove *obj = eval(env, rest->as.cons.head);
+                    Clove *out;
                     /* (.method obj args..): route to the deftype's method (sans
                      * dot) — a reify/deftype's own methods, e.g. a Comparator's
                      * .compare, aren't predefined global .fns. */
-                    Cljc *margv[64]; int mn = 0;
-                    for (Cljc *a = rest->as.cons.tail; a && a->tag == CLJC_LIST && mn < 64;
+                    Clove *margv[64]; int mn = 0;
+                    for (Clove *a = rest->as.cons.tail; a && a->tag == CLOVE_LIST && mn < 64;
                          a = a->as.cons.tail)
                         margv[mn++] = eval(env, a->as.cons.head);
                     if (dispatch_deftype_method(env, obj, s + 1, margv, mn, &out)) return out;
-                    /* a reify keeps its methods per-instance in :cljc/impls */
-                    if (obj != NIL && obj->tag == CLJC_MAP) {
-                        Cljc *impls, *m;
-                        if (map_find(obj, mk_kw(intern("cljc/impls", 10)), &impls) &&
-                            impls != NIL && impls->tag == CLJC_MAP &&
+                    /* a reify keeps its methods per-instance in :clove/impls */
+                    if (obj != NIL && obj->tag == CLOVE_MAP) {
+                        Clove *impls, *m;
+                        if (map_find(obj, mk_kw(intern("clove/impls", 11)), &impls) &&
+                            impls != NIL && impls->tag == CLOVE_MAP &&
                             map_find(impls, mk_sym(intern(s + 1, strlen(s + 1))), &m)) {
-                            Cljc *iargv[65]; iargv[0] = obj;
+                            Clove *iargv[65]; iargv[0] = obj;
                             for (int i = 0; i < mn; i++) iargv[i + 1] = margv[i];
                             return apply(env, m, iargv, mn + 1);
                         }
                     }
                     /* one arg, no such method -> field access on the instance map */
-                    if (rest->as.cons.tail == NIL && obj != NIL && obj->tag == CLJC_MAP &&
+                    if (rest->as.cons.tail == NIL && obj != NIL && obj->tag == CLOVE_MAP &&
                         map_find(obj, mk_kw(intern(s + 1, strlen(s + 1))), &out))
                         return out;
                     err_token = s;
-                    cljc_error("I don't know what `%s` refers to.", s);
+                    clove_error("I don't know what `%s` refers to.", s);
                 }
                 static const char *SYM_QUOTE, *SYM_IF, *SYM_DO, *SYM_DEF, *SYM_LET, *SYM_FN, *SYM_LOOP, *SYM_RECUR,
                                   *SYM_AND, *SYM_OR, *SYM_WHEN, *SYM_COND, *SYM_DEFN,
@@ -5134,9 +5136,9 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     if (!SYM_SPLICE) SYM_SPLICE = intern("**reader-splice**", 17);
                     if (s == SYM_SPLICE) {
                         /* payload: list of forms to splice (nil for #_) */
-                        Cljc *items = rest != NIL ? rest->as.cons.head : NIL;
-                        Cljc *r = NIL;
-                        for (Cljc *c = items; c && c->tag == CLJC_LIST; c = c->as.cons.tail)
+                        Clove *items = rest != NIL ? rest->as.cons.head : NIL;
+                        Clove *r = NIL;
+                        for (Clove *c = items; c && c->tag == CLOVE_LIST; c = c->as.cons.tail)
                             r = eval(env, c->as.cons.head);
                         return r;
                     }
@@ -5147,37 +5149,37 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * exception (catch_matches; see "Exception classes"); none
                      * matching rethrows it. finally runs on every exit: normal,
                      * body throw, handler throw, or no clause matching. */
-                    Cljc *body = NIL, **bt = &body;
-                    Cljc *catch_clause = NULL, *finally_clause = NULL;
-                    for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
-                        Cljc *f = c->as.cons.head;
-                        const char *fh = (f != NIL && f->tag == CLJC_LIST &&
-                                          f->as.cons.head->tag == CLJC_SYMBOL)
+                    Clove *body = NIL, **bt = &body;
+                    Clove *catch_clause = NULL, *finally_clause = NULL;
+                    for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+                        Clove *f = c->as.cons.head;
+                        const char *fh = (f != NIL && f->tag == CLOVE_LIST &&
+                                          f->as.cons.head->tag == CLOVE_SYMBOL)
                                          ? f->as.cons.head->as.sym : NULL;
                         if (fh == SYM_CATCH) {
-                            if (finally_clause) cljc_error("try: catch must precede finally");
+                            if (finally_clause) clove_error("try: catch must precede finally");
                             need_args(f->as.cons.tail, 2, "catch");
                             sym_name(f->as.cons.tail->as.cons.head, "catch class");
                             sym_name(f->as.cons.tail->as.cons.tail->as.cons.head,
                                      "catch binding");
                             if (!catch_clause) catch_clause = f;
                         } else if (fh == SYM_FINALLY) {
-                            if (finally_clause) cljc_error("try: only one finally clause is allowed");
+                            if (finally_clause) clove_error("try: only one finally clause is allowed");
                             finally_clause = f;
                         } else {
                             if (catch_clause || finally_clause)
-                                cljc_error("try: body form after catch/finally");
+                                clove_error("try: body form after catch/finally");
                             *bt = mk_cons(f, NIL);
                             bt = &(*bt)->as.cons.tail;
                         }
                     }
 
                     /* volatile: read after a longjmp back into this frame. */
-                    Cljc * volatile body_v = body;
-                    Cljc * volatile catch_v = catch_clause;   /* first catch, or NULL */
-                    Cljc * volatile clauses_v = rest;
-                    Cljc * volatile finally_v = finally_clause;
-                    Cljc * volatile result = NIL;
+                    Clove * volatile body_v = body;
+                    Clove * volatile catch_v = catch_clause;   /* first catch, or NULL */
+                    Clove * volatile clauses_v = rest;
+                    Clove * volatile finally_v = finally_clause;
+                    Clove * volatile result = NIL;
                     volatile bool pending = false;  /* unhandled exception to rethrow */
 
                     ErrFrame frame;
@@ -5201,13 +5203,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         rd_line_start = frame.rd_start_save;
                         rd_file_cell = frame.rd_file_save;
                         /* first clause whose class the exception is-a */
-                        Cljc *exc = NULL, *hit = NULL;
+                        Clove *exc = NULL, *hit = NULL;
                         if (catch_v) {
                             exc = err_as_value();
-                            for (Cljc *c = clauses_v; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
-                                Cljc *f = c->as.cons.head;
-                                if (f != NIL && f->tag == CLJC_LIST &&
-                                    f->as.cons.head->tag == CLJC_SYMBOL &&
+                            for (Clove *c = clauses_v; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+                                Clove *f = c->as.cons.head;
+                                if (f != NIL && f->tag == CLOVE_LIST &&
+                                    f->as.cons.head->tag == CLOVE_SYMBOL &&
                                     f->as.cons.head->as.sym == SYM_CATCH &&
                                     catch_matches(f->as.cons.tail->as.cons.head->as.sym, exc)) {
                                     hit = f;
@@ -5219,8 +5221,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             /* Bind the exception value; run the handler under
                              * its own frame so finally still runs if it throws. */
                             cur_exc = NULL;
-                            CljcEnv *scope = env_new(env);
-                            Cljc *cc = hit->as.cons.tail;           /* (Class e body...) */
+                            CloveEnv *scope = env_new(env);
+                            Clove *cc = hit->as.cons.tail;           /* (Class e body...) */
                             env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
                             ErrFrame hframe;
                             hframe.prev = err_top;
@@ -5252,7 +5254,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         /* The pending exception lives in globals (cur_exc, or
                          * err_msg + err_class), and the finally body is free to
                          * throw and catch errors of its own -- park it across. */
-                        Cljc *pend_exc = NULL, *pend_val = NULL;
+                        Clove *pend_exc = NULL, *pend_val = NULL;
                         const char *pend_cls = NULL;
                         if (pending) {
                             pend_exc = cur_exc;
@@ -5267,7 +5269,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                 snprintf(err_msg, sizeof err_msg, "%s", pend_val->as.str);
                         }
                     }
-                    if (pending) cljc_raise();
+                    if (pending) clove_raise();
                     return result;
                 }
                 {
@@ -5300,37 +5302,37 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                          * (run_stream alternates read/eval, so the rest of
                          * the file is read with the ns active). */
                         {
-                            Cljc *nsn = rest != NIL && rest->tag == CLJC_LIST
+                            Clove *nsn = rest != NIL && rest->tag == CLOVE_LIST
                                         ? peel_meta_sym(rest->as.cons.head) : NIL;
-                            if (nsn != NIL && nsn->tag == CLJC_SYMBOL)
+                            if (nsn != NIL && nsn->tag == CLOVE_SYMBOL)
                                 set_cur_ns(env_root(env), nsn->as.symc.name);
                         }
-                        for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail) {
-                            Cljc *cl = c->as.cons.head;
+                        for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+                            Clove *cl = c->as.cons.head;
                             /* clause head keyword -> which per-spec handler */
                             const char *kw = NULL;
-                            if (cl != NIL && cl->tag == CLJC_LIST &&
-                                cl->as.cons.head->tag == CLJC_KEYWORD)
+                            if (cl != NIL && cl->tag == CLOVE_LIST &&
+                                cl->as.cons.head->tag == CLOVE_KEYWORD)
                                 kw = cl->as.cons.head->as.kw;
-                            else if (cl != NIL && cl->tag == CLJC_VECTOR && vec_len(cl) > 0 &&
-                                     vec_nth(cl, 0)->tag == CLJC_KEYWORD)
+                            else if (cl != NIL && cl->tag == CLOVE_VECTOR && vec_len(cl) > 0 &&
+                                     vec_nth(cl, 0)->tag == CLOVE_KEYWORD)
                                 kw = vec_nth(cl, 0)->as.kw;
                             const char *callee_name =
-                                kw == KW_REQ    ? "cljc/require-one" :
-                                kw == KW_USE    ? "cljc/use-one"     :
-                                kw == KW_IMPORT ? "cljc/import-one"  : NULL;
+                                kw == KW_REQ    ? "clove/require-one" :
+                                kw == KW_USE    ? "clove/use-one"     :
+                                kw == KW_IMPORT ? "clove/import-one"  : NULL;
                             if (!callee_name) continue;
-                            Cljc *callee = env_lookup_maybe(env, callee_name);
+                            Clove *callee = env_lookup_maybe(env, callee_name);
                             if (!callee) continue;
-                            if (cl->tag == CLJC_LIST) {
-                                for (Cljc *sp = cl->as.cons.tail; sp && sp->tag == CLJC_LIST;
+                            if (cl->tag == CLOVE_LIST) {
+                                for (Clove *sp = cl->as.cons.tail; sp && sp->tag == CLOVE_LIST;
                                      sp = sp->as.cons.tail) {
-                                    Cljc *one[1] = {sp->as.cons.head};
+                                    Clove *one[1] = {sp->as.cons.head};
                                     apply(env, callee, one, 1);
                                 }
                             } else {
                                 for (uint32_t vi = 1; vi < vec_len(cl); vi++) {
-                                    Cljc *one[1] = {vec_nth(cl, vi)};
+                                    Clove *one[1] = {vec_nth(cl, vi)};
                                     apply(env, callee, one, 1);
                                 }
                             }
@@ -5349,16 +5351,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         /* (binding [*v* val ...] body) — root bindings mutate
                          * in place (single-threaded), restored on every exit
                          * path via a handler frame. with-redefs is identical. */
-                        Cljc *bv = rest->as.cons.head;
-                        if (bv == NIL || bv->tag != CLJC_VECTOR || vec_len(bv) % 2 != 0)
-                            cljc_error("binding needs an even-sized vector");
+                        Clove *bv = rest->as.cons.head;
+                        if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
+                            clove_error("binding needs an even-sized vector");
                         size_t n = vec_len(bv) / 2;
-                        if (n > 16) cljc_error("binding: too many vars");
+                        if (n > 16) clove_error("binding: too many vars");
                         Binding *slots[16];
-                        Cljc *saved[16];
-                        CljcEnv *root = env_root(env);
+                        Clove *saved[16];
+                        CloveEnv *root = env_root(env);
                         for (size_t i = 0; i < n; i++) {
-                            Cljc *symc = vec_nth(bv, i * 2);
+                            Clove *symc = vec_nth(bv, i * 2);
                             const char *nm = sym_name(symc, "binding");
                             Binding *b = NULL;
                             /* home-ns first, like symbol resolution: a
@@ -5406,13 +5408,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                                     }
                                 }
                             }
-                            if (!b) cljc_error("binding: unable to resolve %s", nm);
+                            if (!b) clove_error("binding: unable to resolve %s", nm);
                             slots[i] = b;
                         }
                         /* parallel semantics, like Clojure: evaluate every
                          * init before mutating any var — a throw mid-inits
                          * then unwinds with nothing to restore */
-                        Cljc *newv[16];
+                        Clove *newv[16];
                         for (size_t i = 0; i < n; i++)
                             newv[i] = eval(env, vec_nth(bv, i * 2 + 1));
                         for (size_t i = 0; i < n; i++) {
@@ -5428,7 +5430,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         frame.rd_start_save = rd_line_start;
                         frame.rd_file_save = rd_file_cell;
                         err_top = &frame;
-                        Cljc * volatile result = NIL;
+                        Clove * volatile result = NIL;
                         volatile bool threw = false;
                         if (setjmp(frame.jb) == 0) {
                             result = eval_body(env, rest->as.cons.tail);
@@ -5444,7 +5446,7 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                             threw = true;
                         }
                         for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
-                        if (threw) cljc_raise();
+                        if (threw) clove_raise();
                         return result;
                     }
                 }
@@ -5454,26 +5456,26 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * eval calls it on unevaluated forms and re-evals the result. */
                     need_args(rest, 2, "defmacro");
                     bool mac_private = false;
-                    Cljc *mac_doc = NIL;
+                    Clove *mac_doc = NIL;
                     const char *name = sym_name(
                         peel_meta_sym_doc(rest->as.cons.head, &mac_private, &mac_doc),
                         "defmacro");
-                    Cljc *mbody = rest->as.cons.tail;
-                    if (mbody->as.cons.head->tag == CLJC_STRING &&
+                    Clove *mbody = rest->as.cons.tail;
+                    if (mbody->as.cons.head->tag == CLOVE_STRING &&
                         mbody->as.cons.tail != NIL) {
                         mac_doc = mbody->as.cons.head;   /* docstring → doc registry */
                         mbody = mbody->as.cons.tail;
                     }
-                    if (mbody->as.cons.head->tag == CLJC_MAP &&
+                    if (mbody->as.cons.head->tag == CLOVE_MAP &&
                         mbody->as.cons.tail != NIL) {
-                        Cljc *dv;                        /* attr-map may carry :doc */
+                        Clove *dv;                        /* attr-map may carry :doc */
                         if (mac_doc == NIL &&
                             map_find(mbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
-                            dv != NIL && dv->tag == CLJC_STRING)
+                            dv != NIL && dv->tag == CLOVE_STRING)
                             mac_doc = dv;
                         mbody = mbody->as.cons.tail;
                     }
-                    Cljc *m = make_fn(env, mbody, true);
+                    Clove *m = make_fn(env, mbody, true);
                     {
                         const char *st = env_define_root(env_root(env), name, m);
                         if (strchr(st, '/')) mark_private_def(st, mac_private);
@@ -5486,26 +5488,26 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * a docstring rides along in the def rewrite so the DEF
                      * branch records it in the doc registry. */
                     need_args(rest, 2, "defn");
-                    Cljc *name = rest->as.cons.head;
-                    Cljc *fbody = rest->as.cons.tail;
-                    Cljc *fdoc = NIL;
-                    if (fbody->as.cons.head->tag == CLJC_STRING &&
+                    Clove *name = rest->as.cons.head;
+                    Clove *fbody = rest->as.cons.tail;
+                    Clove *fdoc = NIL;
+                    if (fbody->as.cons.head->tag == CLOVE_STRING &&
                         fbody->as.cons.tail != NIL) {
                         fdoc = fbody->as.cons.head;
                         fbody = fbody->as.cons.tail;
                     }
-                    if (fbody->as.cons.head->tag == CLJC_MAP &&
+                    if (fbody->as.cons.head->tag == CLOVE_MAP &&
                         fbody->as.cons.tail != NIL) {
-                        Cljc *dv;                     /* attr-map may carry :doc */
+                        Clove *dv;                     /* attr-map may carry :doc */
                         if (fdoc == NIL &&
                             map_find(fbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
-                            dv != NIL && dv->tag == CLJC_STRING)
+                            dv != NIL && dv->tag == CLOVE_STRING)
                             fdoc = dv;
                         fbody = fbody->as.cons.tail;
                     }
-                    Cljc *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
-                    Cljc *fn_tail = mk_cons(fn_form, NIL);
-                    Cljc *def_form = mk_cons(mk_sym(SYM_DEF),
+                    Clove *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
+                    Clove *fn_tail = mk_cons(fn_form, NIL);
+                    Clove *def_form = mk_cons(mk_sym(SYM_DEF),
                                        mk_cons(name, fdoc == NIL ? fn_tail
                                                      : mk_cons(fdoc, fn_tail)));
                     return eval(env, def_form);
@@ -5513,28 +5515,28 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 if (s == SYM_QUOTE) return rest->as.cons.head;
                 if (s == SYM_IF) {
                     need_args(rest, 2, "if");
-                    Cljc *test = eval(env, rest->as.cons.head);
-                    Cljc *then = rest->as.cons.tail->as.cons.head;
-                    Cljc *els  = rest->as.cons.tail->as.cons.tail;
+                    Clove *test = eval(env, rest->as.cons.head);
+                    Clove *then = rest->as.cons.tail->as.cons.head;
+                    Clove *els  = rest->as.cons.tail->as.cons.tail;
                     if (is_truthy(test)) return eval(env, then);
                     return els == NIL ? NIL : eval(env, els->as.cons.head);
                 }
                 if (s == SYM_DO) return eval_body(env, rest);
                 if (s == SYM_DEF) {
                     need_args(rest, 1, "def");
-                    Cljc *namef = rest->as.cons.head;
+                    Clove *namef = rest->as.cons.head;
                     /* (def ^:dynamic x v): the reader wrapped the name as
                      * (with-meta x m) — unwrap; only :private is retained
                      * (side table keyed by the stored qualified name).
                      * Stacked metadata (^:dynamic ^:no-doc x) nests several
                      * with-meta forms, so peel all of them. */
                     bool def_private = false;
-                    Cljc *def_doc = NIL;
+                    Clove *def_doc = NIL;
                     namef = peel_meta_sym_doc(namef, &def_private, &def_doc);
                     /* a #?(:cljs ..)-only def name elides to nil here — skip it */
                     if (namef == NIL) return NIL;
                     const char *name = sym_name(namef, "def");
-                    Cljc *valf = rest->as.cons.tail;
+                    Clove *valf = rest->as.cons.tail;
                     /* (def name): no value — an unbound-var declaration => nil */
                     if (valf == NIL) {
                         const char *st = env_define_root(env_root(env), name, NIL);
@@ -5543,13 +5545,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     }
                     /* (def name "docstring" value): docstring → doc registry */
                     if (valf->as.cons.tail != NIL &&
-                        valf->as.cons.tail->tag == CLJC_LIST &&
+                        valf->as.cons.tail->tag == CLOVE_LIST &&
                         valf->as.cons.head != NIL &&
-                        valf->as.cons.head->tag == CLJC_STRING) {
+                        valf->as.cons.head->tag == CLOVE_STRING) {
                         def_doc = valf->as.cons.head;
                         valf = valf->as.cons.tail;
                     }
-                    Cljc *val = eval(env, valf->as.cons.head);
+                    Clove *val = eval(env, valf->as.cons.head);
                     /* def is always global; a redef without ^:private clears
                      * the mark (Clojure resets var meta on redef) */
                     {
@@ -5560,16 +5562,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     /* Attach :name metadata to a def'd function (fresh per defn, so
                      * no shared-cell hazard) the first time it's named, so
                      * (:name (meta (resolve sym))) works for potemkin-style
-                     * import-def without cljc having real vars. */
-                    if (val != NIL && val->tag == CLJC_FN) {
+                     * import-def without clove having real vars. */
+                    if (val != NIL && val->tag == CLOVE_FN) {
                         bool has_name = false;
-                        if (val->meta && val->meta->tag == CLJC_MAP) {
-                            Cljc *tmp; has_name = map_find(val->meta, mk_kw(intern("name", 4)), &tmp);
+                        if (val->meta && val->meta->tag == CLOVE_MAP) {
+                            Clove *tmp; has_name = map_find(val->meta, mk_kw(intern("name", 4)), &tmp);
                         }
                         if (!has_name) {
                             const char *slash = strrchr(name, '/');
                             const char *bare = slash ? slash + 1 : name;
-                            Cljc *m = (val->meta && val->meta->tag == CLJC_MAP) ? val->meta : mk_map();
+                            Clove *m = (val->meta && val->meta->tag == CLOVE_MAP) ? val->meta : mk_map();
                             val->meta = map_assoc(m, mk_kw(intern("name", 4)),
                                                   mk_sym(intern(bare, strlen(bare))));
                         }
@@ -5578,13 +5580,13 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 }
                 if (s == SYM_LET && !head_shadowed(env, head->as.sym)) {
                     /* (let [a 1 b 2] body...) — bindings live in a vector. */
-                    Cljc *binds_vec = rest->as.cons.head;
-                    if (binds_vec == NIL || binds_vec->tag != CLJC_VECTOR ||
+                    Clove *binds_vec = rest->as.cons.head;
+                    if (binds_vec == NIL || binds_vec->tag != CLOVE_VECTOR ||
                         vec_len(binds_vec) % 2 != 0)
-                        cljc_error("let needs an even-sized binding vector");
-                    CljcEnv *scope = env_new(env);
+                        clove_error("let needs an even-sized binding vector");
+                    CloveEnv *scope = env_new(env);
                     for (size_t i = 0; i < vec_len(binds_vec); i += 2) {
-                        Cljc *val = eval(scope, vec_nth(binds_vec, i + 1));
+                        Clove *val = eval(scope, vec_nth(binds_vec, i + 1));
                         destructure(scope, vec_nth(binds_vec, i), val);
                     }
                     return eval_body(scope, rest->as.cons.tail);
@@ -5592,16 +5594,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 /* and/or/when/cond are macros in real Clojure; until defmacro
                  * lands they are special forms (they must short-circuit). */
                 if (s == SYM_AND) {
-                    Cljc *r = TRUE;
-                    for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+                    Clove *r = TRUE;
+                    for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
                         r = eval(env, a->as.cons.head);
                         if (!is_truthy(r)) return r;
                     }
                     return r;
                 }
                 if (s == SYM_OR) {
-                    Cljc *r = NIL;
-                    for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+                    Clove *r = NIL;
+                    for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
                         r = eval(env, a->as.cons.head);
                         if (is_truthy(r)) return r;
                     }
@@ -5615,10 +5617,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 if (s == SYM_COND) {
                     static const char *SYM_ELSE;
                     if (!SYM_ELSE) SYM_ELSE = intern("else", 4);
-                    for (Cljc *c = rest; c && c->tag == CLJC_LIST; c = c->as.cons.tail->as.cons.tail) {
-                        if (c->as.cons.tail == NIL) cljc_error("cond requires an even number of forms");
-                        Cljc *test = c->as.cons.head;
-                        bool is_else = test->tag == CLJC_KEYWORD && test->as.kw == SYM_ELSE;
+                    for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail->as.cons.tail) {
+                        if (c->as.cons.tail == NIL) clove_error("cond requires an even number of forms");
+                        Clove *test = c->as.cons.head;
+                        bool is_else = test->tag == CLOVE_KEYWORD && test->as.kw == SYM_ELSE;
                         if (is_else || is_truthy(eval(env, test)))
                             return eval(env, c->as.cons.tail->as.cons.head);
                     }
@@ -5631,16 +5633,16 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * arm of its tag-switch and error out — that's our
                      * runtime tail-position check. */
                     size_t n = list_len(rest);
-                    if (n > 255) cljc_error("recur: too many arguments");
-                    Cljc *r = alloc(CLJC_RECUR);
-                    Cljc **vals = r->as.recur.iv;
+                    if (n > 255) clove_error("recur: too many arguments");
+                    Clove *r = alloc(CLOVE_RECUR);
+                    Clove **vals = r->as.recur.iv;
                     if (n > 3) {  /* spill flag set before any slot fills */
-                        vals = xmalloc(sizeof(Cljc *) * n);
-                        r->as.recur.iv[0] = (Cljc *)vals;
+                        vals = xmalloc(sizeof(Clove *) * n);
+                        r->as.recur.iv[0] = (Clove *)vals;
                         r->as.recur.spill = true;
                     }
                     size_t i = 0;  /* n grows as slots fill — GC safety */
-                    for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail) {
+                    for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
                         vals[i++] = eval(env, a->as.cons.head);
                         r->as.recur.n = (uint8_t)i;
                     }
@@ -5649,10 +5651,10 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                 if (s == SYM_LOOP && !head_shadowed(env, head->as.sym)) {
                     /* (loop [name1 init1 name2 init2 ...] body...) — like let,
                      * but body re-runs whenever it produces a (recur ...) value. */
-                    Cljc *binds_vec = rest->as.cons.head;
-                    if (binds_vec == NIL || binds_vec->tag != CLJC_VECTOR ||
+                    Clove *binds_vec = rest->as.cons.head;
+                    if (binds_vec == NIL || binds_vec->tag != CLOVE_VECTOR ||
                         vec_len(binds_vec) % 2 != 0)
-                        cljc_error("loop needs an even-sized binding vector");
+                        clove_error("loop needs an even-sized binding vector");
                     size_t nparams = vec_len(binds_vec) / 2;
                     /* Destructuring patterns: rewrite to gensym bindings with
                      * an inner let, so recur rebinds the gensyms and the
@@ -5660,23 +5662,23 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                      * the same rewrite). */
                     bool plain = true;
                     for (size_t i = 0; i < nparams; i++)
-                        if (vec_nth(binds_vec, i * 2)->tag != CLJC_SYMBOL) plain = false;
+                        if (vec_nth(binds_vec, i * 2)->tag != CLOVE_SYMBOL) plain = false;
                     if (!plain) {
                         static int loopg;
-                        Cljc *gb[64], *lb[64];   /* new loop binds / let binds */
-                        if (nparams > 32) cljc_error("loop: too many bindings");
+                        Clove *gb[64], *lb[64];   /* new loop binds / let binds */
+                        if (nparams > 32) clove_error("loop: too many bindings");
                         for (size_t i = 0; i < nparams; i++) {
                             char nm[24];
                             snprintf(nm, sizeof nm, "loop__%d", ++loopg);
-                            Cljc *g = mk_sym(intern(nm, strlen(nm)));
+                            Clove *g = mk_sym(intern(nm, strlen(nm)));
                             gb[i * 2] = g;
                             gb[i * 2 + 1] = vec_nth(binds_vec, i * 2 + 1);
                             lb[i * 2] = vec_nth(binds_vec, i * 2);
                             lb[i * 2 + 1] = g;
                         }
-                        Cljc *letform = mk_cons(mk_sym(SYM_LET),
+                        Clove *letform = mk_cons(mk_sym(SYM_LET),
                             mk_cons(mk_vector(lb, nparams * 2), rest->as.cons.tail));
-                        Cljc *newform = mk_cons(mk_sym(SYM_LOOP),
+                        Clove *newform = mk_cons(mk_sym(SYM_LOOP),
                             mk_cons(mk_vector(gb, nparams * 2), mk_cons(letform, NIL)));
                         /* splice: desugar once per site, not per entry */
                         form->as.cons.head = newform->as.cons.head;
@@ -5684,29 +5686,29 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                         return eval(env, newform);
                     }
                     const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
-                    CljcEnv *scope = env_new(env);
+                    CloveEnv *scope = env_new(env);
                     for (size_t i = 0; i < nparams; i++) {
                         names[i] = sym_name(vec_nth(binds_vec, i * 2), "loop binding");
-                        Cljc *val = eval(scope, vec_nth(binds_vec, i * 2 + 1));
+                        Clove *val = eval(scope, vec_nth(binds_vec, i * 2 + 1));
                         env_define(scope, names[i], val);
                     }
-                    Cljc *body = rest->as.cons.tail;
+                    Clove *body = rest->as.cons.tail;
                     /* volatile: the recur sentinel owns the (possibly heap-spilled)
                      * arg array read below, and env_new/env_define can collect —
                      * an optimizer keeping only `rvals` (a malloc interior pointer
                      * the conservative scan can't see) let the sweep free it
                      * under us (ASan -O1 heap-use-after-free). Same as apply's. */
-                    Cljc * volatile recur_keep = NIL;
+                    Clove * volatile recur_keep = NIL;
                     for (;;) {
-                        Cljc *r = eval_body(scope, body);
-                        if (!(r && r->tag == CLJC_RECUR)) { free(names); return r; }
+                        Clove *r = eval_body(scope, body);
+                        if (!(r && r->tag == CLOVE_RECUR)) { free(names); return r; }
                         recur_keep = r;
 
                         if (r->as.recur.n != nparams)
-                            cljc_error("recur arity mismatch: expected %zu, got %d",
+                            clove_error("recur arity mismatch: expected %zu, got %d",
                                        nparams, (int)r->as.recur.n);
-                        Cljc **rvals = r->as.recur.spill
-                            ? (Cljc **)r->as.recur.iv[0] : r->as.recur.iv;
+                        Clove **rvals = r->as.recur.spill
+                            ? (Clove **)r->as.recur.iv[0] : r->as.recur.iv;
                         /* Fresh binding frame each pass — a body that closes over a
                          * loop var (e.g. (loop [x ..] (recur (conj acc (fn [] x))))
                          * must capture THIS iteration's value, not see it mutated by
@@ -5722,8 +5724,8 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     if (!SYM_LAZY_SEQ) SYM_LAZY_SEQ = intern("lazy-seq", 8);
                     if (s == SYM_LAZY_SEQ) {
                         /* (lazy-seq body...) => lazy cell over (fn [] body...) */
-                        Cljc *thunk = make_fn(env, mk_cons(mk_empty_vec(), rest), false);
-                        Cljc *l = alloc(CLJC_LAZY);  /* union zeroed: done=false */
+                        Clove *thunk = make_fn(env, mk_cons(mk_empty_vec(), rest), false);
+                        Clove *l = alloc(CLOVE_LAZY);  /* union zeroed: done=false */
                         l->as.lazy.thunk = thunk;
                         return l;
                     }
@@ -5732,15 +5734,15 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
                     /* (fn [x] ...) | (fn ([x] ...) ...) | (fn name [x] ...)
                      * Named fns see themselves via late binding: the name is
                      * defined into the closure env after construction. */
-                    Cljc *body = rest;
+                    Clove *body = rest;
                     const char *self_name = NULL;
-                    if (body != NIL && body->as.cons.head->tag == CLJC_SYMBOL) {
+                    if (body != NIL && body->as.cons.head->tag == CLOVE_SYMBOL) {
                         self_name = body->as.cons.head->as.sym;
                         body = body->as.cons.tail;
                     }
                     if (!self_name) return make_fn(env, body, false);
-                    CljcEnv *fenv = env_new(env);
-                    Cljc *f = make_fn(fenv, body, false);
+                    CloveEnv *fenv = env_new(env);
+                    Clove *f = make_fn(fenv, body, false);
                     env_define(fenv, self_name, f);
                     return f;
                 }
@@ -5753,32 +5755,32 @@ static Cljc *eval_inner(CljcEnv *env, Cljc *form) {
 
             /* Application. Macros get the unevaluated forms; the expansion
              * is then evaluated in the caller's environment. */
-            Cljc *fn = eval(env, head);
+            Clove *fn = eval(env, head);
             size_t base = vsp;
-            Cljc *mfn = fn->tag == CLJC_FN ? (fn->as.fn.is_macro ? fn : NULL)
-                      : fn->tag == CLJC_VAR ? macro_fn_of(env, fn) : NULL;
+            Clove *mfn = fn->tag == CLOVE_FN ? (fn->as.fn.is_macro ? fn : NULL)
+                      : fn->tag == CLOVE_VAR ? macro_fn_of(env, fn) : NULL;
             if (mfn) {
-                for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+                for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
                     vpush(a->as.cons.head);    /* unevaluated forms */
-                Cljc *expansion = macro_expand1(env, mfn, &vstack[base], (int)(vsp - base), form);
+                Clove *expansion = macro_expand1(env, mfn, &vstack[base], (int)(vsp - base), form);
                 vsp = base;
                 /* Splice the expansion into the call site: each macro use
                  * expands ONCE (like compiled Clojure — re-expansion was
                  * ~5%+ of hot loops). Redefining a macro doesn't reach
                  * already-spliced sites, matching JVM compiled code. */
-                if (expansion != NIL && expansion->tag == CLJC_LIST) {
+                if (expansion != NIL && expansion->tag == CLOVE_LIST) {
                     form->as.cons.head = expansion->as.cons.head;
                     form->as.cons.tail = expansion->as.cons.tail;
                 } else {
-                    Cljc *one = mk_cons(expansion, NIL);  /* (do <atom>) */
+                    Clove *one = mk_cons(expansion, NIL);  /* (do <atom>) */
                     form->as.cons.head = mk_sym(intern("do", 2));
                     form->as.cons.tail = one;
                 }
                 return eval(env, expansion);
             }
-            for (Cljc *a = rest; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+            for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
                 vpush(eval(env, a->as.cons.head));
-            Cljc *result = apply(env, fn, &vstack[base], (int)(vsp - base));
+            Clove *result = apply(env, fn, &vstack[base], (int)(vsp - base));
             vsp = base;
             return result;
         }
@@ -5844,8 +5846,8 @@ static Binding *g_plen_b, *g_plevel_b;
 static int print_var_int(Binding **cache, const char *nm, size_t n) {
     if (!*cache && gc_root_envs[0])
         *cache = root_find(env_root(gc_root_envs[0]), intern(nm, n), NULL, false);
-    Cljc *v = *cache ? (*cache)->value : NIL;
-    return (v != NIL && v->tag == CLJC_INT) ? (int)v->as.i : -1;
+    Clove *v = *cache ? (*cache)->value : NIL;
+    return (v != NIL && v->tag == CLOVE_INT) ? (int)v->as.i : -1;
 }
 #define PRINT_LEN()   print_var_int(&g_plen_b,   "*print-length*", 14)
 #define PRINT_LEVEL() print_var_int(&g_plevel_b, "*print-level*",  13)
@@ -5875,26 +5877,26 @@ static void sb_put_utf8(SBuf *sb, int32_t cp) {
  * Bigints/decimals carry their N/M suffix in BOTH (Clojure's print-method
  * emits it regardless of *print-readably*). `str` is a third thing -- Java's
  * toString -- and lives in str_to below. */
-static void print_to(SBuf *sb, Cljc *v, bool readably) {
+static void print_to(SBuf *sb, Clove *v, bool readably) {
     if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
     switch (v->tag) {
-        case CLJC_NIL: sb_puts(sb, "nil"); break;
-        case CLJC_EMPTY: sb_puts(sb, "()"); break;
-        case CLJC_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
-        case CLJC_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
-        case CLJC_IARRAY: sb_printf(sb, "#<%s-array %u>",
+        case CLOVE_NIL: sb_puts(sb, "nil"); break;
+        case CLOVE_EMPTY: sb_puts(sb, "()"); break;
+        case CLOVE_BOOL: sb_puts(sb, v->as.b ? "true" : "false"); break;
+        case CLOVE_INT: sb_printf(sb, "%lld", (long long)v->as.i); break;
+        case CLOVE_IARRAY: sb_printf(sb, "#<%s-array %u>",
                                     v->as.iarr.dbl ? "double" : "int", v->as.iarr.n); break;
-        case CLJC_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); sb_putc(sb, 'N'); free(s); } break;
-        case CLJC_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
+        case CLOVE_BIGINT: { char *s = big_to_decimal(v); sb_puts(sb, s); sb_putc(sb, 'N'); free(s); } break;
+        case CLOVE_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
-        case CLJC_BIGDEC: bd_print(sb, v); sb_putc(sb, 'M'); break;
-        case CLJC_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
-        case CLJC_DOUBLE: format_double(sb, v->as.d); break;
-        case CLJC_SYMBOL: sb_puts(sb, v->as.sym); break;
-        case CLJC_KEYWORD: sb_putc(sb, ':'); sb_puts(sb, v->as.kw); break;
-        case CLJC_STRING:
+        case CLOVE_BIGDEC: bd_print(sb, v); sb_putc(sb, 'M'); break;
+        case CLOVE_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
+        case CLOVE_DOUBLE: format_double(sb, v->as.d); break;
+        case CLOVE_SYMBOL: sb_puts(sb, v->as.sym); break;
+        case CLOVE_KEYWORD: sb_putc(sb, ':'); sb_puts(sb, v->as.kw); break;
+        case CLOVE_STRING:
             if (v->meta) {   /* a #"..."/re-pattern carries {:regex true} → #"..." */
-                Cljc *rg;
+                Clove *rg;
                 if (map_find(v->meta, mk_kw(intern("regex", 5)), &rg) && is_truthy(rg)) {
                     sb_putc(sb, '#'); sb_putc(sb, '"');
                     sb_puts(sb, v->as.str);
@@ -5917,7 +5919,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
                 sb_putc(sb, '"');
             } else sb_puts(sb, v->as.str);
             break;
-        case CLJC_CHAR: {
+        case CLOVE_CHAR: {
             int32_t cp = v->as.chr;
             if (readably) {
                 /* round-trips through the reader: named, then printable
@@ -5942,13 +5944,13 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             }
             break;
         }
-        case CLJC_LIST: {
+        case CLOVE_LIST: {
             if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_putc(sb, '(');
             bool first = true; int plen = PRINT_LEN(), cnt = 0;
             g_print_depth++;
             /* seq1 step: a lazy tail (cons onto lazy-seq) keeps printing */
-            for (Cljc *l = v; l && l->tag == CLJC_LIST; l = seq1(l->as.cons.tail)) {
+            for (Clove *l = v; l && l->tag == CLOVE_LIST; l = seq1(l->as.cons.tail)) {
                 if (!first) sb_putc(sb, ' ');
                 first = false;
                 if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
@@ -5959,7 +5961,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, ')');
             break;
         }
-        case CLJC_VECTOR: {
+        case CLOVE_VECTOR: {
             if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_putc(sb, '[');
             int plen = PRINT_LEN();
@@ -5973,16 +5975,16 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, ']');
             break;
         }
-        case CLJC_MAP: {
-            /* a StringBuilder ({:cljc/type :StringBuilder :v <atom-of-string>})
+        case CLOVE_MAP: {
+            /* a StringBuilder ({:clove/type :StringBuilder :v <atom-of-string>})
              * renders as its accumulated content — so (str sb) gives the token */
-            Cljc *ty = NULL;
-            if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
+            Clove *ty = NULL;
+            if (map_find(v, mk_kw(intern("clove/type", 10)), &ty) &&
                 ty == mk_kw(intern("StringBuilder", 13))) {
-                Cljc *vv;
+                Clove *vv;
                 if (map_find(v, mk_kw(intern("v", 1)), &vv) && vv != NIL &&
-                    vv->tag == CLJC_ATOM && vv->as.atom.value != NIL &&
-                    vv->as.atom.value->tag == CLJC_STRING)
+                    vv->tag == CLOVE_ATOM && vv->as.atom.value != NIL &&
+                    vv->as.atom.value->tag == CLOVE_STRING)
                     sb_puts(sb, vv->as.atom.value->as.str);
                 break;
             }
@@ -5990,19 +5992,19 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
              * (hiccup's RawString); pr-str / print keep the structural map form.
              * `out != v` guards a toString that returns its own instance. */
             if (!readably && ty != NULL) {
-                Cljc *out;
+                Clove *out;
                 if (dispatch_deftype_method(gc_root_envs[0], v, "toString", NULL, 0, &out) &&
                     out != v) {
                     str_to(sb, out);
                     break;
                 }
-                /* a reify keeps its methods per-instance in :cljc/impls */
-                Cljc *impls, *ts;
-                if (map_find(v, mk_kw(intern("cljc/impls", 10)), &impls) &&
-                    impls != NIL && impls->tag == CLJC_MAP &&
+                /* a reify keeps its methods per-instance in :clove/impls */
+                Clove *impls, *ts;
+                if (map_find(v, mk_kw(intern("clove/impls", 11)), &impls) &&
+                    impls != NIL && impls->tag == CLOVE_MAP &&
                     map_find(impls, mk_sym(intern("toString", 8)), &ts) && ts != NIL) {
-                    Cljc *args1[1] = { v };
-                    Cljc *rr = apply(gc_root_envs[0], ts, args1, 1);
+                    Clove *args1[1] = { v };
+                    Clove *rr = apply(gc_root_envs[0], ts, args1, 1);
                     if (rr != v) { str_to(sb, rr); break; }
                 }
             }
@@ -6011,7 +6013,7 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '{');
             bool first = true; int plen = PRINT_LEN(), cnt = 0;
             g_print_depth++;
-            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
                 if (!first) sb_puts(sb, ", ");
                 first = false;
                 if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
@@ -6024,12 +6026,12 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
-        case CLJC_SET: {
+        case CLOVE_SET: {
             if (print_too_deep()) { sb_putc(sb, '#'); break; }
             sb_puts(sb, "#{");
             bool sfirst = true; int plen = PRINT_LEN(), cnt = 0;
             g_print_depth++;
-            for (Cljc *e = set_element_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            for (Clove *e = set_element_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
                 if (!sfirst) sb_putc(sb, ' ');
                 sfirst = false;
                 if (plen >= 0 && cnt >= plen) { sb_puts(sb, "..."); break; }
@@ -6040,15 +6042,15 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
-        case CLJC_SORTED: {
+        case CLOVE_SORTED: {
             /* a sorted map's entries are [k v] vectors; a sorted set's are bare */
             bool is_map = v->as.sorted.is_map;
             sb_puts(sb, is_map ? "{" : "#{");
             bool first = true;
-            for (Cljc *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
+            for (Clove *e = sorted_entry_list(v); e != NIL; e = e->as.cons.tail) {
                 if (!first) sb_puts(sb, is_map ? ", " : " ");
                 first = false;
-                Cljc *ent = e->as.cons.head;
+                Clove *ent = e->as.cons.head;
                 if (is_map) {
                     print_to(sb, vec_nth(ent, 0), readably);
                     sb_putc(sb, ' ');
@@ -6060,25 +6062,25 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '}');
             break;
         }
-        case CLJC_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
-        case CLJC_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
-        case CLJC_TNODE: sb_puts(sb, "#<tree-node>"); break;  /* never user-visible */
-        case CLJC_FN: {   /* #<fn name [params] ...> when known — REPL/error clarity */
+        case CLOVE_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
+        case CLOVE_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
+        case CLOVE_TNODE: sb_puts(sb, "#<tree-node>"); break;  /* never user-visible */
+        case CLOVE_FN: {   /* #<fn name [params] ...> when known — REPL/error clarity */
             sb_puts(sb, "#<fn");
-            Cljc *nm;
-            if (v->meta && v->meta->tag == CLJC_MAP &&
+            Clove *nm;
+            if (v->meta && v->meta->tag == CLOVE_MAP &&
                 map_find(v->meta, mk_kw(intern("name", 4)), &nm) &&
-                nm != NIL && nm->tag == CLJC_SYMBOL) {
+                nm != NIL && nm->tag == CLOVE_SYMBOL) {
                 sb_putc(sb, ' ');
                 sb_puts(sb, nm->as.sym);
             }
             int shown = 0;
-            for (Cljc *ar = v->as.fn.arities;
-                 ar != NIL && ar->tag == CLJC_LIST && shown < 3; ar = ar->as.cons.tail, shown++) {
+            for (Clove *ar = v->as.fn.arities;
+                 ar != NIL && ar->tag == CLOVE_LIST && shown < 3; ar = ar->as.cons.tail, shown++) {
                 sb_puts(sb, " [");
                 bool first = true;
-                for (Cljc *p = ar->as.cons.head->as.cons.head;
-                     p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail) {
+                for (Clove *p = ar->as.cons.head->as.cons.head;
+                     p != NIL && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
                     if (!first) sb_putc(sb, ' ');
                     first = false;
                     print_to(sb, p->as.cons.head, readably);
@@ -6089,23 +6091,23 @@ static void print_to(SBuf *sb, Cljc *v, bool readably) {
             sb_putc(sb, '>');
             break;
         }
-        case CLJC_NATIVE: sb_puts(sb, "#<native>"); break;
-        case CLJC_CORO:   sb_puts(sb, "#<coroutine>"); break;
-        case CLJC_ATOM:
+        case CLOVE_NATIVE: sb_puts(sb, "#<native>"); break;
+        case CLOVE_CORO:   sb_puts(sb, "#<coroutine>"); break;
+        case CLOVE_ATOM:
             sb_puts(sb, "#atom[");
             print_to(sb, v->as.atom.value, readably);
             sb_putc(sb, ']');
             break;
-        case CLJC_LAZY: { Cljc *s = seq1(v);   /* ONE level: the list loop steps
+        case CLOVE_LAZY: { Clove *s = seq1(v);   /* ONE level: the list loop steps
             lazily and honors *print-length*, so infinite seqs print capped */
             print_to(sb, s == NIL ? EMPTY : s, readably); break; }
-        case CLJC_RECUR:  sb_puts(sb, "#<recur>"); break;
-        case CLJC_CHUNK:  sb_puts(sb, "#<chunk>"); break;
-        case CLJC_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
+        case CLOVE_RECUR:  sb_puts(sb, "#<recur>"); break;
+        case CLOVE_CHUNK:  sb_puts(sb, "#<chunk>"); break;
+        case CLOVE_FREE:   sb_puts(sb, "#<freed!>"); break;  /* seeing this is a GC bug */
     }
 }
 
-static void print(Cljc *v) {
+static void print(Clove *v) {
     SBuf sb = {0};
     print_to(&sb, v, true);
     if (sb.data) { fwrite(sb.data, 1, sb.len, COUT); free(sb.data); }
@@ -6117,17 +6119,17 @@ static void print(Cljc *v) {
  *   - a collection renders as pr would: (str ["a" 1N]) is "[\"a\" 1N]"
  * Tagged maps (records, deftypes, reify, StringBuilder) keep the print path,
  * which is where their toString dispatch lives. */
-static void str_to(SBuf *sb, Cljc *v) {
+static void str_to(SBuf *sb, Clove *v) {
     if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
     switch (v->tag) {
-        case CLJC_BIGINT: { char *d = big_to_decimal(v); sb_puts(sb, d); free(d); } break;
-        case CLJC_BIGDEC: bd_print(sb, v); break;
-        case CLJC_LIST: case CLJC_EMPTY: case CLJC_LAZY: case CLJC_VECTOR:
-        case CLJC_SET: case CLJC_SORTED:
+        case CLOVE_BIGINT: { char *d = big_to_decimal(v); sb_puts(sb, d); free(d); } break;
+        case CLOVE_BIGDEC: bd_print(sb, v); break;
+        case CLOVE_LIST: case CLOVE_EMPTY: case CLOVE_LAZY: case CLOVE_VECTOR:
+        case CLOVE_SET: case CLOVE_SORTED:
             print_to(sb, v, true); break;
-        case CLJC_MAP: {
-            Cljc *ty;
-            print_to(sb, v, !map_find(v, mk_kw(intern("cljc/type", 9)), &ty));
+        case CLOVE_MAP: {
+            Clove *ty;
+            print_to(sb, v, !map_find(v, mk_kw(intern("clove/type", 10)), &ty));
             break;
         }
         default: print_to(sb, v, false); break;
@@ -6150,20 +6152,20 @@ static int pp_cur_col(SBuf *sb) {
     return (int)sb->len;
 }
 
-static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
+static void pp_to(SBuf *sb, Clove *v, int col, int width, int depth) {
     size_t start = sb->len;
     print_to(sb, v, true);
     if ((int)(sb->len - start) <= width - col || depth > 32 || v == NULL || v == NIL)
         return;
     int plen = PRINT_LEN(), cnt = 0;
     switch (v->tag) {
-        case CLJC_MAP: {
-            Cljc *ty;   /* tagged instances render via their flat/toString form */
-            if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty)) return;
+        case CLOVE_MAP: {
+            Clove *ty;   /* tagged instances render via their flat/toString form */
+            if (map_find(v, mk_kw(intern("clove/type", 10)), &ty)) return;
             sb->len = start;
             sb_putc(sb, '{');
             bool first = true;
-            for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+            for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
                 if (!first) { sb_putc(sb, '\n'); pp_spaces(sb, col + 1); }
                 first = false;
                 if (plen >= 0 && cnt++ >= plen) { sb_puts(sb, "..."); break; }
@@ -6176,16 +6178,16 @@ static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
             sb_putc(sb, '}');
             return;
         }
-        case CLJC_SORTED:
+        case CLOVE_SORTED:
             if (v->as.sorted.is_map) {
                 sb->len = start;
                 sb_putc(sb, '{');
                 bool first = true;
-                for (Cljc *e = sorted_entry_list(v); e != NIL && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+                for (Clove *e = sorted_entry_list(v); e != NIL && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
                     if (!first) { sb_putc(sb, '\n'); pp_spaces(sb, col + 1); }
                     first = false;
                     if (plen >= 0 && cnt++ >= plen) { sb_puts(sb, "..."); break; }
-                    Cljc *ent = e->as.cons.head;
+                    Clove *ent = e->as.cons.head;
                     size_t kstart = sb->len;
                     print_to(sb, vec_nth(ent, 0), true);
                     sb_putc(sb, ' ');
@@ -6196,31 +6198,31 @@ static void pp_to(SBuf *sb, Cljc *v, int col, int width, int depth) {
             }
             /* sorted set: fall through to the fill layout below */
             /* FALLTHROUGH */
-        case CLJC_VECTOR: case CLJC_SET: case CLJC_LIST: case CLJC_LAZY: {
+        case CLOVE_VECTOR: case CLOVE_SET: case CLOVE_LIST: case CLOVE_LAZY: {
             /* fill layout: pack elements, breaking the line only before an
              * element whose flat form would overflow — scalars stay dense,
              * oversized children break internally via recursion */
-            bool is_vec = v->tag == CLJC_VECTOR;
-            bool is_set = v->tag == CLJC_SET || v->tag == CLJC_SORTED;
-            Cljc *e = NIL; size_t vn = 0, vi = 0;
+            bool is_vec = v->tag == CLOVE_VECTOR;
+            bool is_set = v->tag == CLOVE_SET || v->tag == CLOVE_SORTED;
+            Clove *e = NIL; size_t vn = 0, vi = 0;
             if (is_vec) vn = vec_len(v);
-            else if (v->tag == CLJC_SORTED) e = sorted_entry_list(v);
-            else if (v->tag == CLJC_LAZY) { e = seq1(v); if (e == NIL) return; }
+            else if (v->tag == CLOVE_SORTED) e = sorted_entry_list(v);
+            else if (v->tag == CLOVE_LAZY) { e = seq1(v); if (e == NIL) return; }
             else { e = to_seq(v); if (e == NIL) return; }
             sb->len = start;
             sb_puts(sb, is_set ? "#{" : is_vec ? "[" : "(");
             int icol = col + (is_set ? 2 : 1);
             bool first = true;
             for (;;) {
-                Cljc *elem;
+                Clove *elem;
                 if (is_vec) {
                     if (vi >= vn) break;
                     elem = vec_nth(v, vi++);
                 } else {
-                    if (e == NIL || e->tag != CLJC_LIST) break;
+                    if (e == NIL || e->tag != CLOVE_LIST) break;
                     elem = e->as.cons.head;
-                    Cljc *t = e->as.cons.tail;
-                    if (t != NIL && t->tag != CLJC_LIST) t = to_seq(t);  /* lazy tails */
+                    Clove *t = e->as.cons.tail;
+                    if (t != NIL && t->tag != CLOVE_LIST) t = to_seq(t);  /* lazy tails */
                     e = t;
                 }
                 if (plen >= 0 && cnt++ >= plen) { if (!first) sb_putc(sb, ' '); sb_puts(sb, "..."); break; }
@@ -6287,7 +6289,7 @@ static const char *suggest(const char *token) {
     int maxd = tlen <= 3 ? 1 : 2;   /* short typos: only 1 edit away is credible */
     int bestd = maxd + 1, bestpre = -1;
     for (Binding *b = gc_root_envs[0]->bindings; b; b = b->next) {
-        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
+        if (strstr(b->name, "**") || !strncmp(b->name, "clove/", 6)) continue;
         int d = lev(token, b->name, maxd);
         if (d > maxd) continue;
         size_t blen = strlen(b->name);
@@ -6320,11 +6322,11 @@ static const char *require_hint(const char *token) {
         rel[i] = token[i] == '.' ? '/' : token[i] == '-' ? '_' : token[i];
     rel[nlen] = '\0';
     Binding *b = root_find(gc_root_envs[0], intern("*load-path*", 11), NULL, false);
-    if (!b || b->value == NIL || b->value->tag != CLJC_VECTOR) return NULL;
-    Cljc *lp = b->value;
+    if (!b || b->value == NIL || b->value->tag != CLOVE_VECTOR) return NULL;
+    Clove *lp = b->value;
     for (size_t i = 0; i < vec_len(lp); i++) {
-        Cljc *d = vec_nth(lp, i);
-        if (d == NIL || d->tag != CLJC_STRING) continue;
+        Clove *d = vec_nth(lp, i);
+        if (d == NIL || d->tag != CLOVE_STRING) continue;
         static const char *ext[2] = { "clj", "cljc" };
         for (int k = 0; k < 2; k++) {
             char path[512];
@@ -6440,18 +6442,18 @@ static void print_error(void) {
  *     (/ 1 3) is the Ratio 1/3, like real Clojure */
 /* ───── Arbitrary-precision integers ─────────────────────────────────────
  * Sign-magnitude, base-2^32 little-endian limbs. Only created when a value
- * exceeds int64; big_norm demotes back to CLJC_INT whenever the result fits,
- * so CLJC_INT vs CLJC_BIGINT is purely a function of magnitude. Local Cljc*
+ * exceeds int64; big_norm demotes back to CLOVE_INT whenever the result fits,
+ * so CLOVE_INT vs CLOVE_BIGINT is purely a function of magnitude. Local Clove*
  * are GC roots (conservative C-stack scan), so no manual rooting is needed;
  * malloc'd limb arrays are owned by their cell and freed in the GC sweep. */
 static uint32_t *umalloc(uint32_t n) { return xmalloc(sizeof(uint32_t) * (n ? n : 1)); }
 
 typedef struct { int sign; uint32_t n; const uint32_t *mag; } BigView;
 
-/* View any integer (CLJC_INT or CLJC_BIGINT) as sign + magnitude limbs. For an
+/* View any integer (CLOVE_INT or CLOVE_BIGINT) as sign + magnitude limbs. For an
  * int64 the up-to-2 limbs land in the caller's scratch. sign==0 means zero. */
-static void big_view(Cljc *v, BigView *bv, uint32_t scratch[2]) {
-    if (v->tag == CLJC_BIGINT) {
+static void big_view(Clove *v, BigView *bv, uint32_t scratch[2]) {
+    if (v->tag == CLOVE_BIGINT) {
         bv->sign = v->as.big.sign; bv->n = v->as.big.n; bv->mag = v->as.big.mag; return;
     }
     int64_t x = v->as.i;
@@ -6463,8 +6465,8 @@ static void big_view(Cljc *v, BigView *bv, uint32_t scratch[2]) {
 }
 
 /* Wrap sign + freshly malloc'd magnitude (n limbs, ownership taken) as a value,
- * trimming leading zero limbs and demoting to CLJC_INT when it fits. */
-static Cljc *big_norm(int sign, uint32_t *mag, uint32_t n) {
+ * trimming leading zero limbs and demoting to CLOVE_INT when it fits. */
+static Clove *big_norm(int sign, uint32_t *mag, uint32_t n) {
     while (n > 0 && mag[n - 1] == 0) n--;
     if (n == 0) { free(mag); return mk_int(0); }
     if (n <= 2) {
@@ -6472,7 +6474,7 @@ static Cljc *big_norm(int sign, uint32_t *mag, uint32_t n) {
         if (u <= (uint64_t)INT64_MAX) { free(mag); return mk_int(sign < 0 ? -(int64_t)u : (int64_t)u); }
         if (sign < 0 && u == (uint64_t)INT64_MAX + 1) { free(mag); return mk_int(INT64_MIN); }
     }
-    Cljc *v = alloc(CLJC_BIGINT);
+    Clove *v = alloc(CLOVE_BIGINT);
     v->as.big.sign = sign < 0 ? -1 : 1; v->as.big.n = n; v->as.big.mag = mag;
     return v;
 }
@@ -6506,7 +6508,7 @@ static uint32_t umag_mul(const uint32_t *a, uint32_t na, const uint32_t *b, uint
     return na + nb;
 }
 
-static Cljc *big_addsub(Cljc *A, Cljc *B, int sub) {
+static Clove *big_addsub(Clove *A, Clove *B, int sub) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
     int bsign = sub ? -b.sign : b.sign;
     if (a.sign == 0) { if (bsign == 0) return mk_int(0); uint32_t *m = umalloc(b.n); memcpy(m, b.mag, b.n * 4); return big_norm(bsign, m, b.n); }
@@ -6518,13 +6520,13 @@ static Cljc *big_addsub(Cljc *A, Cljc *B, int sub) {
     if (c > 0) return big_norm(a.sign, out, umag_sub(a.mag, a.n, b.mag, b.n, out));
     return big_norm(bsign, out, umag_sub(b.mag, b.n, a.mag, a.n, out));
 }
-static Cljc *big_mul(Cljc *A, Cljc *B) {
+static Clove *big_mul(Clove *A, Clove *B) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
     if (a.sign == 0 || b.sign == 0) return mk_int(0);
     uint32_t *out = umalloc(a.n + b.n); uint32_t n = umag_mul(a.mag, a.n, b.mag, b.n, out);
     return big_norm(a.sign * b.sign, out, n);
 }
-static int big_cmp(Cljc *A, Cljc *B) {
+static int big_cmp(Clove *A, Clove *B) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
     if (a.sign != b.sign) return a.sign < b.sign ? -1 : 1;
     if (a.sign == 0) return 0;
@@ -6534,9 +6536,9 @@ static int big_cmp(Cljc *A, Cljc *B) {
 
 /* Truncating divmod (quot toward zero, rem takes the dividend's sign). Bit-by-
  * bit long division on magnitudes — simple and correct; fine at our scale. */
-static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R) {
+static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
-    if (b.sign == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
+    if (b.sign == 0) clove_error_cls("ArithmeticException", "Divide by zero");
     if (a.sign == 0 || umag_cmp(a.mag, a.n, b.mag, b.n) < 0) {
         if (Q) *Q = mk_int(0);
         if (R) { uint32_t *m = umalloc(a.n ? a.n : 1); memcpy(m, a.mag, a.n * 4); *R = big_norm(a.sign, m, a.n); }
@@ -6555,19 +6557,19 @@ static void big_divmod(Cljc *A, Cljc *B, Cljc **Q, Cljc **R) {
     if (Q) *Q = big_norm(a.sign * b.sign, q, qn); else free(q);
     if (R) *R = big_norm(a.sign, r, rn); else free(r);
 }
-static Cljc *big_abs(Cljc *A) {
-    if (A->tag == CLJC_INT) return A->as.i < 0 ? big_addsub(mk_int(0), A, 1) : A;
+static Clove *big_abs(Clove *A) {
+    if (A->tag == CLOVE_INT) return A->as.i < 0 ? big_addsub(mk_int(0), A, 1) : A;
     uint32_t *m = umalloc(A->as.big.n); memcpy(m, A->as.big.mag, A->as.big.n * 4);
     return big_norm(1, m, A->as.big.n);
 }
-static bool big_is_zero(Cljc *A) { return A->tag == CLJC_INT && A->as.i == 0; }
-static Cljc *big_gcd(Cljc *A, Cljc *B) {
-    Cljc *a = big_abs(A), *b = big_abs(B);
-    while (!big_is_zero(b)) { Cljc *r; big_divmod(a, b, NULL, &r); a = b; b = r; }
+static bool big_is_zero(Clove *A) { return A->tag == CLOVE_INT && A->as.i == 0; }
+static Clove *big_gcd(Clove *A, Clove *B) {
+    Clove *a = big_abs(A), *b = big_abs(B);
+    while (!big_is_zero(b)) { Clove *r; big_divmod(a, b, NULL, &r); a = b; b = r; }
     return a;
 }
-static double big_to_double(Cljc *v) {
-    if (v->tag == CLJC_INT) return (double)v->as.i;
+static double big_to_double(Clove *v) {
+    if (v->tag == CLOVE_INT) return (double)v->as.i;
     double d = 0; for (uint32_t i = v->as.big.n; i-- > 0; ) d = d * 4294967296.0 + v->as.big.mag[i];
     return v->as.big.sign < 0 ? -d : d;
 }
@@ -6577,8 +6579,8 @@ static uint32_t udiv_small_inplace(uint32_t *d, uint32_t n, uint32_t div) {
     return (uint32_t)rem;
 }
 /* Decimal text (with sign). Caller frees. */
-static char *big_to_decimal(Cljc *v) {
-    if (v->tag == CLJC_INT) { char *b = xmalloc(24); snprintf(b, 24, "%lld", (long long)v->as.i); return b; }
+static char *big_to_decimal(Clove *v) {
+    if (v->tag == CLOVE_INT) { char *b = xmalloc(24); snprintf(b, 24, "%lld", (long long)v->as.i); return b; }
     uint32_t n = v->as.big.n, tn = n; uint32_t *t = umalloc(n); memcpy(t, v->as.big.mag, n * 4);
     /* each chunk holds 9 decimal digits (~29.9 bits) vs 32 bits per limb */
     uint32_t *chunks = xmalloc(sizeof(uint32_t) * ((size_t)n * 32 / 29 + 2)); size_t nc = 0;
@@ -6591,43 +6593,43 @@ static char *big_to_decimal(Cljc *v) {
     buf[p] = 0; free(chunks); return buf;
 }
 /* Parse a decimal integer (optional sign, all digits) into INT or BIGINT. */
-static Cljc *big_from_decimal(const char *s) {
+static Clove *big_from_decimal(const char *s) {
     int sign = 1; if (*s == '+') s++; else if (*s == '-') { sign = -1; s++; }
-    Cljc *acc = mk_int(0), *ten = mk_int(10);
+    Clove *acc = mk_int(0), *ten = mk_int(10);
     for (; *s; s++) { if (*s < '0' || *s > '9') break; acc = big_addsub(big_mul(acc, ten), mk_int(*s - '0'), 0); }
     return sign < 0 ? big_addsub(mk_int(0), acc, 1) : acc;
 }
 
 /* ───── Exact rationals ──────────────────────────────────────────────── */
-static Cljc *pow10_big(int64_t k);
-static int num_cmp(Cljc *a, Cljc *b);
+static Clove *pow10_big(int64_t k);
+static int num_cmp(Clove *a, Clove *b);
 /* A BIGDEC u*10^-s reads as the (unreduced) fraction u*10^max(0,-s) / 10^max(0,s),
  * so exact comparison and ratio arithmetic need no separate decimal path. */
-static Cljc *rat_num(Cljc *v) {
-    if (v->tag == CLJC_RATIO) return v->as.ratio.num;
-    if (v->tag == CLJC_BIGDEC)
+static Clove *rat_num(Clove *v) {
+    if (v->tag == CLOVE_RATIO) return v->as.ratio.num;
+    if (v->tag == CLOVE_BIGDEC)
         return v->as.bigdec.s < 0 ? big_mul(v->as.bigdec.u, pow10_big(-v->as.bigdec.s)) : v->as.bigdec.u;
     return v;
 }
-static Cljc *rat_den(Cljc *v) {
-    if (v->tag == CLJC_RATIO) return v->as.ratio.den;
-    if (v->tag == CLJC_BIGDEC && v->as.bigdec.s > 0) return pow10_big(v->as.bigdec.s);
+static Clove *rat_den(Clove *v) {
+    if (v->tag == CLOVE_RATIO) return v->as.ratio.den;
+    if (v->tag == CLOVE_BIGDEC && v->as.bigdec.s > 0) return pow10_big(v->as.bigdec.s);
     return mk_int(1);
 }
 
 /* Build a reduced rational from num/den (each INT or BIGINT): force den>0,
  * divide out the gcd, and demote to an integer when den becomes 1. */
-static Cljc *make_ratio(Cljc *num, Cljc *den) {
-    if (big_is_zero(den)) cljc_error_cls("ArithmeticException", "Divide by zero");
+static Clove *make_ratio(Clove *num, Clove *den) {
+    if (big_is_zero(den)) clove_error_cls("ArithmeticException", "Divide by zero");
     if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
     if (big_is_zero(num)) return mk_int(0);
-    Cljc *g = big_gcd(num, den);
-    if (!(g->tag == CLJC_INT && g->as.i == 1)) {
-        Cljc *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
+    Clove *g = big_gcd(num, den);
+    if (!(g->tag == CLOVE_INT && g->as.i == 1)) {
+        Clove *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
         num = qn; den = qd;
     }
-    if (den->tag == CLJC_INT && den->as.i == 1) return num;
-    Cljc *r = alloc(CLJC_RATIO);
+    if (den->tag == CLOVE_INT && den->as.i == 1) return num;
+    Clove *r = alloc(CLOVE_RATIO);
     r->as.ratio.num = num; r->as.ratio.den = den;
     return r;
 }
@@ -6635,23 +6637,23 @@ static Cljc *make_ratio(Cljc *num, Cljc *den) {
  * digits (MathContext.DECIMAL64, HALF_EVEN) and THEN to the nearest double --
  * not the correctly rounded quotient. The two differ in the last bit for some
  * ratios, and (/ 1.5 8/2181825) has to print what the JVM prints. */
-static double ratio_to_double(Cljc *v) {
-    Cljc *an = big_abs(v->as.ratio.num), *ad = big_abs(v->as.ratio.den);
+static double ratio_to_double(Clove *v) {
+    Clove *an = big_abs(v->as.ratio.num), *ad = big_abs(v->as.ratio.den);
     bool neg = (big_cmp(v->as.ratio.num, mk_int(0)) < 0) != (big_cmp(v->as.ratio.den, mk_int(0)) < 0);
     char *sn = big_to_decimal(an), *sd = big_to_decimal(ad);
     /* scale so the integer quotient has 16 digits (17 before the retry) */
     int64_t k = 16 - ((int64_t)strlen(sn) - (int64_t)strlen(sd));
     free(sn); free(sd);
-    Cljc *q, *r, *D, *lim = pow10_big(16);
+    Clove *q, *r, *D, *lim = pow10_big(16);
     for (;;) {
-        Cljc *N = k > 0 ? big_mul(an, pow10_big(k)) : an;
+        Clove *N = k > 0 ? big_mul(an, pow10_big(k)) : an;
         D = k < 0 ? big_mul(ad, pow10_big(-k)) : ad;
         big_divmod(N, D, &q, &r);
         if (big_cmp(q, lim) < 0) break;
         k--;
     }
     int c = big_cmp(big_addsub(r, r, 0), D);          /* remainder vs half */
-    if (c > 0 || (c == 0 && q->tag == CLJC_INT && (q->as.i & 1)))
+    if (c > 0 || (c == 0 && q->tag == CLOVE_INT && (q->as.i & 1)))
         q = big_addsub(q, mk_int(1), 0);
     char *sq = big_to_decimal(q);
     char buf[80];
@@ -6666,13 +6668,13 @@ static double ratio_to_double(Cljc *v) {
  * and / is Java's exact divide -- the quotient at the smallest scale >= the
  * preferred scale (dividend.scale - divisor.scale) that represents it, or an
  * ArithmeticException when the expansion does not terminate (1M/3M). */
-static Cljc *mk_bigdec(Cljc *u, int64_t s) {
-    Cljc *d = alloc(CLJC_BIGDEC);
+static Clove *mk_bigdec(Clove *u, int64_t s) {
+    Clove *d = alloc(CLOVE_BIGDEC);
     d->as.bigdec.u = u; d->as.bigdec.s = s;
     return d;
 }
-static Cljc *pow10_big(int64_t k) {          /* 10^k, k >= 0, by squaring */
-    Cljc *r = mk_int(1), *b = mk_int(10);
+static Clove *pow10_big(int64_t k) {          /* 10^k, k >= 0, by squaring */
+    Clove *r = mk_int(1), *b = mk_int(10);
     for (; k > 0; k >>= 1) {
         if (k & 1) r = big_mul(r, b);
         if (k > 1) b = big_mul(b, b);
@@ -6680,43 +6682,43 @@ static Cljc *pow10_big(int64_t k) {          /* 10^k, k >= 0, by squaring */
     return r;
 }
 /* the unscaled value of x re-expressed at scale s (s >= x's scale) */
-static Cljc *bd_unscaled_at(Cljc *x, int64_t s) {
+static Clove *bd_unscaled_at(Clove *x, int64_t s) {
     return s == x->as.bigdec.s ? x->as.bigdec.u : big_mul(x->as.bigdec.u, pow10_big(s - x->as.bigdec.s));
 }
 /* Exact num/den * 10^-pref as a decimal at the smallest scale >= pref. With
  * num/den reduced, den must be 2^a 5^b, and k = max(a,b) extra digits make it
  * exact; anything else never terminates. */
-static Cljc *bd_exact_quot(Cljc *num, Cljc *den, int64_t pref) {
-    if (big_is_zero(den)) cljc_error_cls("ArithmeticException", "Divide by zero");
+static Clove *bd_exact_quot(Clove *num, Clove *den, int64_t pref) {
+    if (big_is_zero(den)) clove_error_cls("ArithmeticException", "Divide by zero");
     if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
     if (big_is_zero(num)) return mk_bigdec(mk_int(0), pref);
-    Cljc *g = big_gcd(num, den);
-    if (!(g->tag == CLJC_INT && g->as.i == 1)) {
-        Cljc *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
+    Clove *g = big_gcd(num, den);
+    if (!(g->tag == CLOVE_INT && g->as.i == 1)) {
+        Clove *qn, *qd; big_divmod(num, g, &qn, NULL); big_divmod(den, g, &qd, NULL);
         num = qn; den = qd;
     }
     int64_t twos = 0, fives = 0;
-    Cljc *d = den, *q, *r;
+    Clove *d = den, *q, *r;
     for (;;) { big_divmod(d, mk_int(2), &q, &r); if (!big_is_zero(r)) break; d = q; twos++; }
     for (;;) { big_divmod(d, mk_int(5), &q, &r); if (!big_is_zero(r)) break; d = q; fives++; }
-    if (!(d->tag == CLJC_INT && d->as.i == 1))
-        cljc_error("Non-terminating decimal expansion; no exact representable decimal result.");
+    if (!(d->tag == CLOVE_INT && d->as.i == 1))
+        clove_error("Non-terminating decimal expansion; no exact representable decimal result.");
     int64_t k = twos > fives ? twos : fives;
-    Cljc *mult; big_divmod(pow10_big(k), den, &mult, NULL);   /* 10^k / den, exact */
+    Clove *mult; big_divmod(pow10_big(k), den, &mult, NULL);   /* 10^k / den, exact */
     return mk_bigdec(big_mul(num, mult), k + pref);
 }
 /* any exact number -> BIGDEC: integers at scale 0, ratios by exact division */
-static Cljc *to_bigdec(Cljc *v) {
-    if (v->tag == CLJC_BIGDEC) return v;
-    if (v->tag == CLJC_RATIO) return bd_exact_quot(v->as.ratio.num, v->as.ratio.den, 0);
+static Clove *to_bigdec(Clove *v) {
+    if (v->tag == CLOVE_BIGDEC) return v;
+    if (v->tag == CLOVE_RATIO) return bd_exact_quot(v->as.ratio.num, v->as.ratio.den, 0);
     return mk_bigdec(v, 0);
 }
-static Cljc *bd_div(Cljc *a, Cljc *b) {
+static Clove *bd_div(Clove *a, Clove *b) {
     a = to_bigdec(a); b = to_bigdec(b);
     return bd_exact_quot(a->as.bigdec.u, b->as.bigdec.u, a->as.bigdec.s - b->as.bigdec.s);
 }
 /* "1.50", "-2.5e3", "+.5": Java's BigDecimal(String) grammar; NULL if malformed */
-static Cljc *bd_parse(const char *t, size_t n) {
+static Clove *bd_parse(const char *t, size_t n) {
     size_t i = 0; bool neg = false;
     if (i < n && (t[i] == '+' || t[i] == '-')) neg = t[i++] == '-';
     char *digs = xmalloc(n + 2); size_t nd = 0; int64_t frac = 0; bool dot = false, any = false;
@@ -6731,7 +6733,7 @@ static Cljc *bd_parse(const char *t, size_t n) {
         i++; bool eneg = false, edig = false;
         if (i < n && (t[i] == '+' || t[i] == '-')) eneg = t[i++] == '-';
         for (; i < n && t[i] >= '0' && t[i] <= '9'; i++) {
-            if (expo > 100000000) { free(digs); cljc_error("BigDecimal: exponent out of range"); }
+            if (expo > 100000000) { free(digs); clove_error("BigDecimal: exponent out of range"); }
             expo = expo * 10 + (t[i] - '0'); edig = true;
         }
         if (!edig) any = false;
@@ -6739,15 +6741,15 @@ static Cljc *bd_parse(const char *t, size_t n) {
     }
     if (!any || i != n) { free(digs); return NULL; }
     digs[nd] = '\0';
-    Cljc *u = big_from_decimal(digs);
+    Clove *u = big_from_decimal(digs);
     free(digs);
     if (neg) u = big_addsub(mk_int(0), u, 1);
     return mk_bigdec(u, frac - expo);
 }
 /* Java's BigDecimal.toString: plain when scale >= 0 and the adjusted exponent
  * >= -6, otherwise one digit, a point, and E+n/E-n (so 1E+3M stays 1E+3). */
-static void bd_print(SBuf *sb, Cljc *v) {
-    Cljc *u = v->as.bigdec.u; int64_t s = v->as.bigdec.s;
+static void bd_print(SBuf *sb, Clove *v) {
+    Clove *u = v->as.bigdec.u; int64_t s = v->as.bigdec.s;
     char *ds = big_to_decimal(u), *p = ds;
     if (*p == '-') { sb_putc(sb, '-'); p++; }
     int64_t nd = (int64_t)strlen(p), adj = nd - 1 - s;
@@ -6770,18 +6772,18 @@ static void bd_print(SBuf *sb, Cljc *v) {
     free(ds);
 }
 /* value rescaled to scale n, rounding HALF_UP (ties away from zero) */
-static Cljc *bd_round_half_up(Cljc *v, int64_t n) {
+static Clove *bd_round_half_up(Clove *v, int64_t n) {
     int64_t s = v->as.bigdec.s;
     if (n >= s) return mk_bigdec(bd_unscaled_at(v, n), n);
-    Cljc *d = pow10_big(s - n), *q, *r;
+    Clove *d = pow10_big(s - n), *q, *r;
     big_divmod(v->as.bigdec.u, d, &q, &r);
-    Cljc *r2 = big_mul(big_abs(r), mk_int(2));
+    Clove *r2 = big_mul(big_abs(r), mk_int(2));
     if (big_cmp(r2, d) >= 0)
         q = big_addsub(q, mk_int(1), big_cmp(v->as.bigdec.u, mk_int(0)) < 0);
     return mk_bigdec(q, n);
 }
 /* plain notation, never E -- %f output and toPlainString agree on this */
-static void bd_print_plain(SBuf *sb, Cljc *v) {
+static void bd_print_plain(SBuf *sb, Clove *v) {
     int64_t s = v->as.bigdec.s;
     if (s < 0) { v = mk_bigdec(bd_unscaled_at(v, 0), 0); s = 0; }
     char *ds = big_to_decimal(v->as.bigdec.u), *p = ds;
@@ -6799,7 +6801,7 @@ static void bd_print_plain(SBuf *sb, Cljc *v) {
     free(ds);
 }
 /* correctly rounded: let strtod round the exact decimal text */
-static double bd_to_double(Cljc *v) {
+static double bd_to_double(Clove *v) {
     SBuf sb = {0}; bd_print(&sb, v);
     double d = strtod(sb.data, NULL);
     free(sb.data);
@@ -6808,51 +6810,51 @@ static double bd_to_double(Cljc *v) {
 
 /* (bigdec x) / (BigDecimal. x): strings parse exactly; a double goes through
  * its shortest repr, as BigDecimal.valueOf does, so (bigdec 0.1) is 0.1M */
-static Cljc *prim_to_bigdec(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_to_bigdec(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; need_nargs(nargs, 1, "bigdec");
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_STRING) {
-        Cljc *d = bd_parse(v->as.str, strlen(v->as.str));
-        if (!d) cljc_error("NumberFormatException: invalid BigDecimal: \"%s\"", v->as.str);
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_STRING) {
+        Clove *d = bd_parse(v->as.str, strlen(v->as.str));
+        if (!d) clove_error("NumberFormatException: invalid BigDecimal: \"%s\"", v->as.str);
         return d;
     }
-    if (v != NIL && v->tag == CLJC_DOUBLE) {
-        if (!isfinite(v->as.d)) cljc_error("NumberFormatException: infinite or NaN");
+    if (v != NIL && v->tag == CLOVE_DOUBLE) {
+        if (!isfinite(v->as.d)) clove_error("NumberFormatException: infinite or NaN");
         SBuf sb = {0}; format_double(&sb, v->as.d);
-        Cljc *d = bd_parse(sb.data, sb.len);
+        Clove *d = bd_parse(sb.data, sb.len);
         free(sb.data);
         return d;
     }
-    if (v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC))
+    if (v != NIL && (v->tag == CLOVE_INT || v->tag == CLOVE_BIGINT || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC))
         return to_bigdec(v);
-    cljc_error("bigdec: expected a number or string, got %s", val_desc(v));
+    clove_error("bigdec: expected a number or string, got %s", val_desc(v));
     return NIL;
 }
-static Cljc *need_bigdec(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_BIGDEC) cljc_error("%s: expected a BigDecimal, got %s", what, val_desc(v));
+static Clove *need_bigdec(Clove *v, const char *what) {
+    if (v == NIL || v->tag != CLOVE_BIGDEC) clove_error("%s: expected a BigDecimal, got %s", what, val_desc(v));
     return v;
 }
-static Cljc *prim_bd_unscaled(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bd_unscaled(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs; return need_bigdec(argv[0], "unscaledValue")->as.bigdec.u;
 }
-static Cljc *prim_bd_scale(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bd_scale(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs; return mk_int(need_bigdec(argv[0], "scale")->as.bigdec.s);
 }
-static Cljc *prim_mk_bigdec(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; need_nargs(nargs, 2, "cljc/mk-bd");
-    Cljc *u = argv[0];
-    if (u == NIL || (u->tag != CLJC_INT && u->tag != CLJC_BIGINT)) cljc_error("cljc/mk-bd: unscaled must be an integer");
-    return mk_bigdec(u, as_int(argv[1], "cljc/mk-bd"));
+static Clove *prim_mk_bigdec(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; need_nargs(nargs, 2, "clove/mk-bd");
+    Clove *u = argv[0];
+    if (u == NIL || (u->tag != CLOVE_INT && u->tag != CLOVE_BIGINT)) clove_error("clove/mk-bd: unscaled must be an integer");
+    return mk_bigdec(u, as_int(argv[1], "clove/mk-bd"));
 }
-static Cljc *prim_bd_to_ratio(CljcEnv *env, Cljc **argv, int nargs) {   /* (rationalize 1.5M) */
+static Clove *prim_bd_to_ratio(CloveEnv *env, Clove **argv, int nargs) {   /* (rationalize 1.5M) */
     (void)env; (void)nargs;
-    Cljc *v = need_bigdec(argv[0], "rationalize");
+    Clove *v = need_bigdec(argv[0], "rationalize");
     return make_ratio(rat_num(v), rat_den(v));
 }
 
 typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV } ArithOp;
 
-static Cljc *big_binop(ArithOp op, Cljc *a, Cljc *b) {
+static Clove *big_binop(ArithOp op, Clove *a, Clove *b) {
     switch (op) {
         case OP_ADD: return big_addsub(a, b, 0);
         case OP_SUB: return big_addsub(a, b, 1);
@@ -6870,25 +6872,25 @@ typedef enum { AR_WRAP, AR_CHECK, AR_PROMOTE } ArithMode;
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, cold))
 #endif
-static void long_overflow(void) { cljc_error_cls("ArithmeticException", "long overflow"); }
+static void long_overflow(void) { clove_error_cls("ArithmeticException", "long overflow"); }
 
-static Cljc *arith(ArithOp op, Cljc **argv, int nargs, ArithMode mode) {
+static Clove *arith(ArithOp op, Clove **argv, int nargs, ArithMode mode) {
     size_t n = (size_t)nargs;
     bool is_float = false, is_big = false, is_ratio = false, is_dec = false;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
-        Cljc *v = argv[ai_];
-        if (v->tag == CLJC_DOUBLE) is_float = true;
-        else if (v->tag == CLJC_BIGINT) is_big = true;
-        else if (v->tag == CLJC_RATIO) is_ratio = true;
-        else if (v->tag == CLJC_BIGDEC) is_dec = true;
-        else if (v->tag != CLJC_INT)
-            cljc_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
+        Clove *v = argv[ai_];
+        if (v->tag == CLOVE_DOUBLE) is_float = true;
+        else if (v->tag == CLOVE_BIGINT) is_big = true;
+        else if (v->tag == CLOVE_RATIO) is_ratio = true;
+        else if (v->tag == CLOVE_BIGDEC) is_dec = true;
+        else if (v->tag != CLOVE_INT)
+            clove_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
                            "expected a number, got %s", val_desc(v));
     }
     if (n == 0) {
         if (op == OP_ADD) return mk_int(0);
         if (op == OP_MUL) return mk_int(1);
-        cljc_error("wrong number of args (0)");
+        clove_error("wrong number of args (0)");
     }
     if (is_float) goto float_path;
     /* a BigDecimal anywhere makes the result a BigDecimal (doubles aside) */
@@ -6920,7 +6922,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, ArithMode mode) {
                 else ovf = __builtin_mul_overflow(acc, x, &r);
                 if (ovf) {
                     if (mode == AR_CHECK) long_overflow();
-                    Cljc *b = mk_int(acc);
+                    Clove *b = mk_int(acc);
                     for (; ai_ < nargs; ai_++) b = big_binop(op, b, argv[ai_]);
                     return b;
                 }
@@ -6940,7 +6942,7 @@ static Cljc *arith(ArithOp op, Cljc **argv, int nargs, ArithMode mode) {
     }
 
 big_path: {
-        Cljc *acc = argv[0];
+        Clove *acc = argv[0];
         if (n == 1) {
             if (op == OP_SUB) return big_addsub(mk_int(0), acc, 1);
             return acc;           /* OP_DIV never gets here (ratio path) */
@@ -6951,35 +6953,35 @@ big_path: {
     }
 
 ratio_path: {
-        Cljc *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
+        Clove *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
         if (n == 1) {
             if (op == OP_DIV) return make_ratio(rd, rn);                 /* reciprocal */
             if (op == OP_SUB) return make_ratio(big_addsub(mk_int(0), rn, 1), rd);
             return argv[0];
         }
         for (int ai_ = 1; ai_ < nargs; ai_++) {
-            Cljc *n2 = rat_num(argv[ai_]), *d2 = rat_den(argv[ai_]);
+            Clove *n2 = rat_num(argv[ai_]), *d2 = rat_den(argv[ai_]);
             switch (op) {                                               /* a/b OP c/d */
                 case OP_ADD: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 0); rd = big_mul(rd, d2); break;
                 case OP_SUB: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 1); rd = big_mul(rd, d2); break;
                 case OP_MUL: rn = big_mul(rn, n2); rd = big_mul(rd, d2); break;
                 case OP_DIV: rn = big_mul(rn, d2); rd = big_mul(rd, n2); break;
             }
-            Cljc *g = big_gcd(rn, rd);    /* reduce each step to bound intermediates */
-            if (!(g->tag == CLJC_INT && g->as.i == 1)) { Cljc *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
+            Clove *g = big_gcd(rn, rd);    /* reduce each step to bound intermediates */
+            if (!(g->tag == CLOVE_INT && g->as.i == 1)) { Clove *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
         }
         return make_ratio(rn, rd);
     }
 
 dec_path: {
-        Cljc *acc = to_bigdec(argv[0]);
+        Clove *acc = to_bigdec(argv[0]);
         if (n == 1) {
             if (op == OP_SUB) return mk_bigdec(big_addsub(mk_int(0), acc->as.bigdec.u, 1), acc->as.bigdec.s);
             if (op == OP_DIV) return bd_div(mk_int(1), acc);
             return acc;
         }
         for (int ai_ = 1; ai_ < nargs; ai_++) {
-            Cljc *x = to_bigdec(argv[ai_]);
+            Clove *x = to_bigdec(argv[ai_]);
             int64_t sa = acc->as.bigdec.s, sb = x->as.bigdec.s, sm = sa > sb ? sa : sb;
             switch (op) {
                 case OP_ADD: case OP_SUB:
@@ -7012,46 +7014,46 @@ float_path:;
     return mk_double(facc);
 }
 
-static Cljc *prim_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_CHECK); }
-static Cljc *prim_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_CHECK); }
-static Cljc *prim_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_CHECK); }
-static Cljc *prim_div(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs, AR_CHECK); }
+static Clove *prim_add(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_CHECK); }
+static Clove *prim_sub(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_CHECK); }
+static Clove *prim_mul(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_CHECK); }
+static Clove *prim_div(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_DIV, argv, nargs, AR_CHECK); }
 /* auto-promoting +' -' *' (Clojure): int64 overflow grows to bigint */
-static Cljc *prim_addq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_PROMOTE); }
-static Cljc *prim_subq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_PROMOTE); }
-static Cljc *prim_mulq(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_PROMOTE); }
+static Clove *prim_addq(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_PROMOTE); }
+static Clove *prim_subq(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_PROMOTE); }
+static Clove *prim_mulq(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_PROMOTE); }
 /* unchecked-add/-subtract/-multiply (and unchecked-negate, the 1-arg -):
  * wrap like a JVM long. Hash mixers and LCGs depend on exactly this. */
-static Cljc *prim_unchecked_add(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_WRAP); }
-static Cljc *prim_unchecked_sub(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_WRAP); }
-static Cljc *prim_unchecked_mul(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_WRAP); }
-static Cljc *prim_numerator(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)nargs; Cljc *v = argv[0];
-    if (v->tag == CLJC_RATIO) return v->as.ratio.num;
-    if (v->tag == CLJC_INT || v->tag == CLJC_BIGINT) return v;
-    cljc_error("numerator: not a rational");  return NIL;
+static Clove *prim_unchecked_add(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_ADD, argv, nargs, AR_WRAP); }
+static Clove *prim_unchecked_sub(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_SUB, argv, nargs, AR_WRAP); }
+static Clove *prim_unchecked_mul(CloveEnv *env, Clove **argv, int nargs) { (void)env; return arith(OP_MUL, argv, nargs, AR_WRAP); }
+static Clove *prim_numerator(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)nargs; Clove *v = argv[0];
+    if (v->tag == CLOVE_RATIO) return v->as.ratio.num;
+    if (v->tag == CLOVE_INT || v->tag == CLOVE_BIGINT) return v;
+    clove_error("numerator: not a rational");  return NIL;
 }
-static Cljc *prim_denominator(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)nargs; Cljc *v = argv[0];
-    if (v->tag == CLJC_RATIO) return v->as.ratio.den;
-    if (v->tag == CLJC_INT || v->tag == CLJC_BIGINT) return mk_int(1);
-    cljc_error("denominator: not a rational");  return NIL;
+static Clove *prim_denominator(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)nargs; Clove *v = argv[0];
+    if (v->tag == CLOVE_RATIO) return v->as.ratio.den;
+    if (v->tag == CLOVE_INT || v->tag == CLOVE_BIGINT) return mk_int(1);
+    clove_error("denominator: not a rational");  return NIL;
 }
 
 /* Sequential equality across lists and vectors, Clojure-style:
  * (= [1 2 3] '(1 2 3)) is true. */
-static bool seq_eq(Cljc *a, Cljc *b) {
+static bool seq_eq(Clove *a, Clove *b) {
     /* Normalize both to an index/cursor walk. */
-    Cljc *la = (a->tag == CLJC_LIST) ? a : NULL;
-    Cljc *lb = (b->tag == CLJC_LIST) ? b : NULL;
+    Clove *la = (a->tag == CLOVE_LIST) ? a : NULL;
+    Clove *lb = (b->tag == CLOVE_LIST) ? b : NULL;
     size_t ia = 0, ib = 0;
     for (;;) {
         bool done_a = la ? (la == NIL) : (ia >= vec_len(a));
         bool done_b = lb ? (lb == NIL) : (ib >= vec_len(b));
         if (done_a || done_b) return done_a && done_b;
-        Cljc *xa = la ? la->as.cons.head : vec_nth(a, ia);
-        Cljc *xb = lb ? lb->as.cons.head : vec_nth(b, ib);
-        if (!cljc_eq(xa, xb)) return false;
+        Clove *xa = la ? la->as.cons.head : vec_nth(a, ia);
+        Clove *xb = lb ? lb->as.cons.head : vec_nth(b, ib);
+        if (!clove_eq(xa, xb)) return false;
         if (la) la = la->as.cons.tail; else ia++;
         if (lb) lb = lb->as.cons.tail; else ib++;
     }
@@ -7059,49 +7061,49 @@ static bool seq_eq(Cljc *a, Cljc *b) {
 
 /* A sorted set/map is = to a hash set/map (or another sorted coll) with the same
  * contents — Clojure's = compares collections by category, not representation. */
-static size_t collcount_(Cljc *c) {
-    return c->tag == CLJC_SORTED ? sorted_count(c) : c->as.map.count;
+static size_t collcount_(Clove *c) {
+    return c->tag == CLOVE_SORTED ? sorted_count(c) : c->as.map.count;
 }
-static bool setlike_member_(Cljc *s, Cljc *x) {
-    if (s->tag == CLJC_SET) return set_contains(s, x, NULL);
+static bool setlike_member_(Clove *s, Clove *x) {
+    if (s->tag == CLOVE_SET) return set_contains(s, x, NULL);
     return sorted_contains(gc_root_envs[0], s, x);
 }
-static bool setlike_eq_(Cljc *a, Cljc *b) {
+static bool setlike_eq_(Clove *a, Clove *b) {
     if (collcount_(a) != collcount_(b)) return false;
-    Cljc *es = a->tag == CLJC_SORTED ? sorted_entry_list(a) : set_element_list(a);
-    for (Cljc *e = es; e != NIL; e = e->as.cons.tail)
+    Clove *es = a->tag == CLOVE_SORTED ? sorted_entry_list(a) : set_element_list(a);
+    for (Clove *e = es; e != NIL; e = e->as.cons.tail)
         if (!setlike_member_(b, e->as.cons.head)) return false;
     return true;
 }
-static bool maplike_eq_(Cljc *a, Cljc *b) {
+static bool maplike_eq_(Clove *a, Clove *b) {
     if (collcount_(a) != collcount_(b)) return false;
-    Cljc *es = a->tag == CLJC_SORTED ? sorted_entry_list(a) : map_entry_list(a);
-    for (Cljc *e = es; e != NIL; e = e->as.cons.tail) {
-        Cljc *entry = e->as.cons.head, *k, *v, *bv;
-        if (a->tag == CLJC_SORTED) { k = vec_nth(entry, 0); v = vec_nth(entry, 1); }
+    Clove *es = a->tag == CLOVE_SORTED ? sorted_entry_list(a) : map_entry_list(a);
+    for (Clove *e = es; e != NIL; e = e->as.cons.tail) {
+        Clove *entry = e->as.cons.head, *k, *v, *bv;
+        if (a->tag == CLOVE_SORTED) { k = vec_nth(entry, 0); v = vec_nth(entry, 1); }
         else { k = entry->as.cons.head; v = entry->as.cons.tail; }
-        if (b->tag == CLJC_MAP ? !map_find(b, k, &bv)
+        if (b->tag == CLOVE_MAP ? !map_find(b, k, &bv)
                                : !sorted_get(gc_root_envs[0], b, k, &bv)) return false;
-        if (!cljc_eq(v, bv)) return false;
+        if (!clove_eq(v, bv)) return false;
     }
     return true;
 }
 
-static bool cljc_eq(Cljc *a, Cljc *b) {
+static bool clove_eq(Clove *a, Clove *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
-    bool a_seq = a->tag == CLJC_LIST || a->tag == CLJC_VECTOR || a->tag == CLJC_LAZY || a->tag == CLJC_EMPTY;
-    bool b_seq = b->tag == CLJC_LIST || b->tag == CLJC_VECTOR || b->tag == CLJC_LAZY || b->tag == CLJC_EMPTY;
+    bool a_seq = a->tag == CLOVE_LIST || a->tag == CLOVE_VECTOR || a->tag == CLOVE_LAZY || a->tag == CLOVE_EMPTY;
+    bool b_seq = b->tag == CLOVE_LIST || b->tag == CLOVE_VECTOR || b->tag == CLOVE_LAZY || b->tag == CLOVE_EMPTY;
     if (a_seq && b_seq)  /* to_seq also surfaces lazy tails hidden in lists */
-        return seq_eq(a->tag == CLJC_VECTOR ? a : to_seq(a),
-                      b->tag == CLJC_VECTOR ? b : to_seq(b));
+        return seq_eq(a->tag == CLOVE_VECTOR ? a : to_seq(a),
+                      b->tag == CLOVE_VECTOR ? b : to_seq(b));
     /* sorted collections compare as their set/map category, across tags */
-    if (a->tag == CLJC_SORTED || b->tag == CLJC_SORTED) {
-        bool a_set = a->tag == CLJC_SET || (a->tag == CLJC_SORTED && !a->as.sorted.is_map);
-        bool b_set = b->tag == CLJC_SET || (b->tag == CLJC_SORTED && !b->as.sorted.is_map);
+    if (a->tag == CLOVE_SORTED || b->tag == CLOVE_SORTED) {
+        bool a_set = a->tag == CLOVE_SET || (a->tag == CLOVE_SORTED && !a->as.sorted.is_map);
+        bool b_set = b->tag == CLOVE_SET || (b->tag == CLOVE_SORTED && !b->as.sorted.is_map);
         if (a_set && b_set) return setlike_eq_(a, b);
-        bool a_map = a->tag == CLJC_MAP || (a->tag == CLJC_SORTED && a->as.sorted.is_map);
-        bool b_map = b->tag == CLJC_MAP || (b->tag == CLJC_SORTED && b->as.sorted.is_map);
+        bool a_map = a->tag == CLOVE_MAP || (a->tag == CLOVE_SORTED && a->as.sorted.is_map);
+        bool b_map = b->tag == CLOVE_MAP || (b->tag == CLOVE_SORTED && b->as.sorted.is_map);
         if (a_map && b_map) return maplike_eq_(a, b);
         return false;
     }
@@ -7114,43 +7116,43 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
         return false;
     }
     switch (a->tag) {
-        case CLJC_NIL: return true;
-        case CLJC_BOOL: return a->as.b == b->as.b;
-        case CLJC_INT: return a->as.i == b->as.i;
-        case CLJC_BIGINT: return big_cmp(a, b) == 0;
-        case CLJC_RATIO: return big_cmp(a->as.ratio.num, b->as.ratio.num) == 0 &&
+        case CLOVE_NIL: return true;
+        case CLOVE_BOOL: return a->as.b == b->as.b;
+        case CLOVE_INT: return a->as.i == b->as.i;
+        case CLOVE_BIGINT: return big_cmp(a, b) == 0;
+        case CLOVE_RATIO: return big_cmp(a->as.ratio.num, b->as.ratio.num) == 0 &&
                                 big_cmp(a->as.ratio.den, b->as.ratio.den) == 0;
-        case CLJC_DOUBLE: return a->as.d == b->as.d;
-        case CLJC_BIGDEC: return num_cmp(a, b) == 0;   /* (= 1.0M 1.00M), as Clojure */
-        case CLJC_SYMBOL: return a->as.sym == b->as.sym;
-        case CLJC_KEYWORD: return a->as.kw == b->as.kw;
-        case CLJC_STRING: return strcmp(a->as.str, b->as.str) == 0;
-        case CLJC_CHAR: return a->as.chr == b->as.chr;
-        case CLJC_MAP: {
+        case CLOVE_DOUBLE: return a->as.d == b->as.d;
+        case CLOVE_BIGDEC: return num_cmp(a, b) == 0;   /* (= 1.0M 1.00M), as Clojure */
+        case CLOVE_SYMBOL: return a->as.sym == b->as.sym;
+        case CLOVE_KEYWORD: return a->as.kw == b->as.kw;
+        case CLOVE_STRING: return strcmp(a->as.str, b->as.str) == 0;
+        case CLOVE_CHAR: return a->as.chr == b->as.chr;
+        case CLOVE_MAP: {
             /* a deftype with a custom equiv/equals (e.g. DataScript's Datom
              * compares only e/a/v/tx, ignoring its mutable hash/idx cache fields)
              * defines its own equality — Clojure's = dispatches to equiv, so
              * field-by-field map comparison is wrong for it. */
-            { Cljc *ty;
-              static const char *KW_CT; if (!KW_CT) KW_CT = intern("cljc/type", 9);
+            { Clove *ty;
+              static const char *KW_CT; if (!KW_CT) KW_CT = intern("clove/type", 10);
               if (map_find(a, mk_kw(KW_CT), &ty)) {
-                  Cljc *barg[1] = { b }, *out;
+                  Clove *barg[1] = { b }, *out;
                   if (dispatch_deftype_method(gc_root_envs[0], a, "equiv", barg, 1, &out) ||
                       dispatch_deftype_method(gc_root_envs[0], a, "equals", barg, 1, &out))
                       return is_truthy(out);
               }
             }
             if (a->as.map.count != b->as.map.count) return false;
-            for (Cljc *e = map_entry_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-                Cljc *bv;
+            for (Clove *e = map_entry_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+                Clove *bv;
                 if (!map_find(b, e->as.cons.head->as.cons.head, &bv)) return false;
-                if (!cljc_eq(e->as.cons.head->as.cons.tail, bv)) return false;
+                if (!clove_eq(e->as.cons.head->as.cons.tail, bv)) return false;
             }
             return true;
         }
-        case CLJC_SET: {
+        case CLOVE_SET: {
             if (a->as.map.count != b->as.map.count) return false;
-            for (Cljc *e = set_element_list(a); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+            for (Clove *e = set_element_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
                 if (!set_contains(b, e->as.cons.head, NULL)) return false;
             return true;
         }
@@ -7158,22 +7160,22 @@ static bool cljc_eq(Cljc *a, Cljc *b) {
     }
 }
 
-static Cljc *prim_eq(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_eq(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     if (nargs == 0) return TRUE;
-    Cljc *first = argv[0];
+    Clove *first = argv[0];
     for (int i = 1; i < nargs; i++)
-        if (!cljc_eq(first, argv[i])) return FALSE;
+        if (!clove_eq(first, argv[i])) return FALSE;
     return TRUE;
 }
 
-static double as_num(Cljc *v) {
-    if (v->tag == CLJC_INT) return (double)v->as.i;
-    if (v->tag == CLJC_DOUBLE) return v->as.d;
-    if (v->tag == CLJC_BIGINT) return big_to_double(v);
-    if (v->tag == CLJC_RATIO) return ratio_to_double(v);
-    if (v->tag == CLJC_BIGDEC) return bd_to_double(v);
-    cljc_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
+static double as_num(Clove *v) {
+    if (v->tag == CLOVE_INT) return (double)v->as.i;
+    if (v->tag == CLOVE_DOUBLE) return v->as.d;
+    if (v->tag == CLOVE_BIGINT) return big_to_double(v);
+    if (v->tag == CLOVE_RATIO) return ratio_to_double(v);
+    if (v->tag == CLOVE_BIGDEC) return bd_to_double(v);
+    clove_error_cls(v == NIL ? "NullPointerException" : "ClassCastException",
                    "expected a number, got %s", val_desc(v));
     return 0;
 }
@@ -7181,27 +7183,27 @@ static double as_num(Cljc *v) {
 /* Chained comparisons: (< 1 2 3) is true iff each adjacent pair satisfies OP. */
 /* Numeric ordering across int/bigint/double; exact for bigints (a double
  * comparison would lose precision between adjacent large integers). */
-static int num_cmp(Cljc *a, Cljc *b) {
+static int num_cmp(Clove *a, Clove *b) {
     int ta = a->tag, tb = b->tag;
-#define CLJC_ISNUM(t) ((t) == CLJC_INT || (t) == CLJC_DOUBLE || (t) == CLJC_BIGINT || (t) == CLJC_RATIO || (t) == CLJC_BIGDEC)
-    if (!CLJC_ISNUM(ta) || !CLJC_ISNUM(tb))
-        cljc_error("can't compare numerically: got %s", val_desc(!CLJC_ISNUM(ta) ? a : b));
-    if (ta == CLJC_DOUBLE || tb == CLJC_DOUBLE) {
+#define CLOVE_ISNUM(t) ((t) == CLOVE_INT || (t) == CLOVE_DOUBLE || (t) == CLOVE_BIGINT || (t) == CLOVE_RATIO || (t) == CLOVE_BIGDEC)
+    if (!CLOVE_ISNUM(ta) || !CLOVE_ISNUM(tb))
+        clove_error("can't compare numerically: got %s", val_desc(!CLOVE_ISNUM(ta) ? a : b));
+    if (ta == CLOVE_DOUBLE || tb == CLOVE_DOUBLE) {
         double x = as_num(a), y = as_num(b); return x < y ? -1 : (x > y ? 1 : 0);
     }
-    if (ta == CLJC_RATIO || tb == CLJC_RATIO || ta == CLJC_BIGDEC || tb == CLJC_BIGDEC)
+    if (ta == CLOVE_RATIO || tb == CLOVE_RATIO || ta == CLOVE_BIGDEC || tb == CLOVE_BIGDEC)
         /* a/b ? c/d  <=>  a*d ? c*b (dens > 0); decimals read as fractions */
         return big_cmp(big_mul(rat_num(a), rat_den(b)), big_mul(rat_num(b), rat_den(a)));
-    if (ta == CLJC_BIGINT || tb == CLJC_BIGINT) return big_cmp(a, b);
+    if (ta == CLOVE_BIGINT || tb == CLOVE_BIGINT) return big_cmp(a, b);
     int64_t x = a->as.i, y = b->as.i; return x < y ? -1 : (x > y ? 1 : 0);
 }
 
 #define COMPARISON(NAME, OP) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
-        Cljc *prev = NULL; \
+        Clove *prev = NULL; \
         for (int ai_ = 0; ai_ < nargs; ai_++) { \
-            Cljc *v = argv[ai_]; \
+            Clove *v = argv[ai_]; \
             if (prev && !(num_cmp(prev, v) OP 0)) return FALSE; \
             prev = v; \
         } \
@@ -7215,26 +7217,26 @@ COMPARISON(ge, >=)
 COMPARISON(num_eq, ==)   /* == : numeric value-equality across the tower (1 == 1.0) */
 
 /* Write `len` bytes to the current value of *out* (or *err* via binding): the
- * :cljc/stdout / :cljc/stderr sentinels go to the real streams (so nREPL capture
- * via cljc_out still works); a StringWriter (a :StringBuilder) accumulates, which
- * is what binds with-out-str. The *out* binding pointer is cached — cljc's
+ * :clove/stdout / :clove/stderr sentinels go to the real streams (so nREPL capture
+ * via clove_out still works); a StringWriter (a :StringBuilder) accumulates, which
+ * is what binds with-out-str. The *out* binding pointer is cached — clove's
  * `binding` mutates the binding in place, so the cache stays correct. */
 static Binding *g_out_binding;
 static const char *g_kw_stderr;
-static void emit_out(CljcEnv *env, const char *data, size_t len) {
+static void emit_out(CloveEnv *env, const char *data, size_t len) {
     if (!g_out_binding) g_out_binding = root_find(env_root(env), intern("*out*", 5), NULL, false);
-    Cljc *w = g_out_binding ? g_out_binding->value : NIL;
+    Clove *w = g_out_binding ? g_out_binding->value : NIL;
     if (w == NIL) { fwrite(data, 1, len, COUT); return; }
-    if (w->tag == CLJC_KEYWORD) {
-        if (!g_kw_stderr) g_kw_stderr = intern("cljc/stderr", 11);
+    if (w->tag == CLOVE_KEYWORD) {
+        if (!g_kw_stderr) g_kw_stderr = intern("clove/stderr", 12);
         fwrite(data, 1, len, w->as.kw == g_kw_stderr ? CERR : COUT);
         return;
     }
-    if (w->tag == CLJC_MAP) {            /* a StringWriter: append to its :v atom */
-        Cljc *vv;
-        if (map_find(w, mk_kw(intern("v", 1)), &vv) && vv != NIL && vv->tag == CLJC_ATOM) {
-            Cljc *old = vv->as.atom.value;
-            const char *os = (old != NIL && old->tag == CLJC_STRING) ? old->as.str : "";
+    if (w->tag == CLOVE_MAP) {            /* a StringWriter: append to its :v atom */
+        Clove *vv;
+        if (map_find(w, mk_kw(intern("v", 1)), &vv) && vv != NIL && vv->tag == CLOVE_ATOM) {
+            Clove *old = vv->as.atom.value;
+            const char *os = (old != NIL && old->tag == CLOVE_STRING) ? old->as.str : "";
             size_t ol = strlen(os);
             char *buf = xmalloc(ol + len + 1);
             memcpy(buf, os, ol); memcpy(buf + ol, data, len); buf[ol + len] = '\0';
@@ -7246,7 +7248,7 @@ static void emit_out(CljcEnv *env, const char *data, size_t len) {
     fwrite(data, 1, len, COUT);          /* unknown writer: fall back to stdout */
 }
 
-static Cljc *prim_println(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_println(CloveEnv *env, Clove **argv, int nargs) {
     SBuf sb = {0};
     bool first = true;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -7260,15 +7262,15 @@ static Cljc *prim_println(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-static Cljc *prim_str(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_str(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     SBuf sb = {0};
     sb_grow(&sb, 1); sb.data[0] = '\0';
     for (int ai_ = 0; ai_ < nargs; ai_++) {
-        Cljc *v = argv[ai_];
+        Clove *v = argv[ai_];
         if (v != NIL) str_to(&sb, v);  /* (str nil) => "" */
     }
-    Cljc *r = mk_str(sb.data, sb.len);
+    Clove *r = mk_str(sb.data, sb.len);
     free(sb.data);
     return r;
 }
@@ -7276,7 +7278,7 @@ static Cljc *prim_str(CljcEnv *env, Cljc **argv, int nargs) {
 /* print-str / println-str: print semantics (raw strings, N/M suffixes),
  * NOT (str/join " " (map str xs)) -- str drops the suffix and quotes
  * strings nested in collections. */
-static Cljc *print_str_args(Cljc **argv, int nargs, bool newline) {
+static Clove *print_str_args(Clove **argv, int nargs, bool newline) {
     SBuf sb = {0};
     sb_grow(&sb, 1); sb.data[0] = '\0';
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -7284,14 +7286,14 @@ static Cljc *print_str_args(Cljc **argv, int nargs, bool newline) {
         print_to(&sb, argv[ai_], false);
     }
     if (newline) sb_putc(&sb, '\n');
-    Cljc *r = mk_str(sb.data, sb.len);
+    Clove *r = mk_str(sb.data, sb.len);
     free(sb.data);
     return r;
 }
-static Cljc *prim_print_str(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_str_args(argv, nargs, false); }
-static Cljc *prim_println_str(CljcEnv *env, Cljc **argv, int nargs) { (void)env; return print_str_args(argv, nargs, true); }
+static Clove *prim_print_str(CloveEnv *env, Clove **argv, int nargs) { (void)env; return print_str_args(argv, nargs, false); }
+static Clove *prim_println_str(CloveEnv *env, Clove **argv, int nargs) { (void)env; return print_str_args(argv, nargs, true); }
 
-static Cljc *prim_pr_str(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_pr_str(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     SBuf sb = {0};
     sb_grow(&sb, 1); sb.data[0] = '\0';
@@ -7301,162 +7303,162 @@ static Cljc *prim_pr_str(CljcEnv *env, Cljc **argv, int nargs) {
         first = false;
         print_to(&sb, argv[ai_], true);
     }
-    Cljc *r = mk_str(sb.data, sb.len);
+    Clove *r = mk_str(sb.data, sb.len);
     free(sb.data);
     return r;
 }
 
-static Cljc *prim_not(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_not(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_bool(!is_truthy(argv[0]));
 }
 
-static Cljc *prim_count(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_count(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
-    if (argv[0] == NIL || argv[0]->tag == CLJC_EMPTY) return mk_int(0);
+    if (argv[0] == NIL || argv[0]->tag == CLOVE_EMPTY) return mk_int(0);
     /* a deftype that implements Counted/count (e.g. a matrix) counts itself */
-    { Cljc *out; if (dispatch_deftype_method(env, argv[0], "count", NULL, 0, &out)) return out; }
-    /* read the tag as an int — keeping no Cljc* head copy. A live local holding
+    { Clove *out; if (dispatch_deftype_method(env, argv[0], "count", NULL, 0, &out)) return out; }
+    /* read the tag as an int — keeping no Clove* head copy. A live local holding
      * argv[0] would conservatively pin the whole realized chain through the walk
      * below (count O(n) live); the int dispatch leaves nothing for the scan. */
     int tag = argv[0]->tag;
-    if (tag == CLJC_LIST || tag == CLJC_LAZY) {
+    if (tag == CLOVE_LIST || tag == CLOVE_LAZY) {
         /* walk advancing the root — don't materialize the whole seq (to_seq
          * would also make count O(n) live). */
         int64_t n = 0;
-        for (Cljc *s = seq1_slot(&argv[0]); s != NIL; s = seq1_slot(&argv[0])) {
+        for (Clove *s = seq1_slot(&argv[0]); s != NIL; s = seq1_slot(&argv[0])) {
             n++;
             argv[0] = s->as.cons.tail;
         }
         return mk_int(n);
     }
-    if (tag == CLJC_VECTOR || tag == CLJC_TVEC)
+    if (tag == CLOVE_VECTOR || tag == CLOVE_TVEC)
         return mk_int((int64_t)vec_len(argv[0]));
-    if (tag == CLJC_IARRAY)
+    if (tag == CLOVE_IARRAY)
         return mk_int((int64_t)argv[0]->as.iarr.n);
-    if (tag == CLJC_MAP || tag == CLJC_SET)
+    if (tag == CLOVE_MAP || tag == CLOVE_SET)
         return mk_int((int64_t)argv[0]->as.map.count);
-    if (tag == CLJC_SORTED)
+    if (tag == CLOVE_SORTED)
         return mk_int((int64_t)sorted_count(argv[0]));
-    if (tag == CLJC_STRING) return mk_int((int64_t)str_cp_count(argv[0]));
-    cljc_error("count: %s is not countable", val_desc(argv[0]));
+    if (tag == CLOVE_STRING) return mk_int((int64_t)str_cp_count(argv[0]));
+    clove_error("count: %s is not countable", val_desc(argv[0]));
     return NIL;
 }
 
-static Cljc *prim_nth(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_nth(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "nth");
-    Cljc *coll = argv[0];
+    Clove *coll = argv[0];
     int64_t n = as_int(argv[1], "nth");
     int64_t orig_idx = n;            /* n is consumed by the seq loops below */
-    Cljc *not_found = nargs > 2
+    Clove *not_found = nargs > 2
         ? argv[2] : NULL;
     if (coll == NIL) return not_found ? not_found : NIL;  /* (nth nil i) => nil */
     /* a deftype with Indexed/nth uses it; one that is only Sequential (a matrix
      * via its rows) falls back to seq-based nth, like Clojure. */
-    if (coll && coll->tag == CLJC_MAP) {
-        Cljc *out;
+    if (coll && coll->tag == CLOVE_MAP) {
+        Clove *out;
         if (dispatch_deftype_method(env, coll, "nth", argv + 1, nargs - 1, &out)) return out;
         if (dispatch_deftype_method(env, coll, "seq", NULL, 0, &out)) {
-            for (Cljc *l = to_seq(out); l != NIL; l = to_seq(l->as.cons.tail))
+            for (Clove *l = to_seq(out); l != NIL; l = to_seq(l->as.cons.tail))
                 if (n-- == 0) return l->as.cons.head;
             if (not_found) return not_found;
-            cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
+            clove_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
         }
     }
-    if (coll && coll->tag == CLJC_IARRAY) {
+    if (coll && coll->tag == CLOVE_IARRAY) {
         if (n >= 0 && n < (int64_t)coll->as.iarr.n) return iarr_get(coll, n);
         if (not_found) return not_found;
-        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
+        clove_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %u", (long long)orig_idx, coll->as.iarr.n);
     }
-    if (coll && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)) {
+    if (coll && (coll->tag == CLOVE_VECTOR || coll->tag == CLOVE_TVEC)) {
         if (n >= 0 && (size_t)n < vec_len(coll)) return vec_nth(coll, (size_t)n);
         if (not_found) return not_found;
-        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
-    } else if (coll && coll->tag == CLJC_STRING) {
+        clove_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, vec_len(coll));
+    } else if (coll && coll->tag == CLOVE_STRING) {
         size_t ncp = str_cp_count(coll);
         if (n >= 0 && (size_t)n < ncp)
             return mk_char(str_cp_at(coll, (size_t)n));   /* (nth "abc" 1) => \b */
         if (not_found) return not_found;
-        cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, ncp);
-    } else if (coll && (coll->tag == CLJC_LIST || coll->tag == CLJC_LAZY)) {
+        clove_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds for length %zu", (long long)orig_idx, ncp);
+    } else if (coll && (coll->tag == CLOVE_LIST || coll->tag == CLOVE_LAZY)) {
         /* advance argv[0] so a deep index into a lazy seq stays O(1) live */
-        for (Cljc *l = seq1_slot(&argv[0]); l && l->tag == CLJC_LIST;
+        for (Clove *l = seq1_slot(&argv[0]); l && l->tag == CLOVE_LIST;
              argv[0] = l->as.cons.tail, l = seq1_slot(&argv[0]))
             if (n-- == 0) return l->as.cons.head;
     }
     if (not_found) return not_found;
-    cljc_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
+    clove_error_cls("IndexOutOfBoundsException", "nth: index %lld out of bounds", (long long)orig_idx);
     return NIL;
 }
 
-static Cljc *prim_conj(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_conj(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs == 0) return mk_empty_vec();   /* (conj) => [] */
-    Cljc *r = argv[0];  /* nil works: conj onto nil yields a list */
+    Clove *r = argv[0];  /* nil works: conj onto nil yields a list */
     for (int i = 1; i < nargs; i++) {
-        Cljc *x = argv[i];
-        if (r == NIL || r->tag == CLJC_LIST || r->tag == CLJC_LAZY ||
-            r->tag == CLJC_EMPTY) {
-            Cljc *prev = r;                         /* lazy: cons keeps it lazy */
-            r = mk_cons(x, r->tag == CLJC_EMPTY ? NIL : r);  /* () conjs to (x) */
-            if (prev != NIL && prev->tag == CLJC_LIST &&
+        Clove *x = argv[i];
+        if (r == NIL || r->tag == CLOVE_LIST || r->tag == CLOVE_LAZY ||
+            r->tag == CLOVE_EMPTY) {
+            Clove *prev = r;                         /* lazy: cons keeps it lazy */
+            r = mk_cons(x, r->tag == CLOVE_EMPTY ? NIL : r);  /* () conjs to (x) */
+            if (prev != NIL && prev->tag == CLOVE_LIST &&
                 !is_arities_meta(prev->meta))   /* internal marker stays */
                 r->meta = prev->meta;
-        } else if (r->tag == CLJC_VECTOR) {
-            Cljc *prev = r;
+        } else if (r->tag == CLOVE_VECTOR) {
+            Clove *prev = r;
             r = vec_conj1(r, x);                    /* vectors grow at the back */
             if (prev->meta) r->meta = prev->meta;   /* queue tag etc. survive */
-        } else if (r->tag == CLJC_SET) {
+        } else if (r->tag == CLOVE_SET) {
             r = set_conj(r, x);
-        } else if (r->tag == CLJC_SORTED) {
+        } else if (r->tag == CLOVE_SORTED) {
             if (!r->as.sorted.is_map) r = sorted_put(env, r, x, x);
             else if (x == NIL) { /* no-op */ }
-            else if (x->tag == CLJC_VECTOR && vec_len(x) == 2)
+            else if (x->tag == CLOVE_VECTOR && vec_len(x) == 2)
                 r = sorted_put(env, r, vec_nth(x, 0), vec_nth(x, 1));
-            else if (x->tag == CLJC_SORTED || x->tag == CLJC_MAP) {
-                for (Cljc *e = to_seq(x); e != NIL; e = e->as.cons.tail) {
-                    Cljc *kv = e->as.cons.head;   /* [k v] (sorted) or (k . v) (map) */
-                    Cljc *k2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 0) : kv->as.cons.head;
-                    Cljc *v2 = kv->tag == CLJC_VECTOR ? vec_nth(kv, 1) : kv->as.cons.tail;
+            else if (x->tag == CLOVE_SORTED || x->tag == CLOVE_MAP) {
+                for (Clove *e = to_seq(x); e != NIL; e = e->as.cons.tail) {
+                    Clove *kv = e->as.cons.head;   /* [k v] (sorted) or (k . v) (map) */
+                    Clove *k2 = kv->tag == CLOVE_VECTOR ? vec_nth(kv, 0) : kv->as.cons.head;
+                    Clove *v2 = kv->tag == CLOVE_VECTOR ? vec_nth(kv, 1) : kv->as.cons.tail;
                     r = sorted_put(env, r, k2, v2);
                 }
-            } else cljc_error("conj on sorted map: expected a [k v] entry or a map");
-        } else if (r->tag == CLJC_MAP) {
+            } else clove_error("conj on sorted map: expected a [k v] entry or a map");
+        } else if (r->tag == CLOVE_MAP) {
             /* (conj m [k v]) and (conj m {k v ...}) — Clojure semantics; nil is
              * a no-op, and a 2-element seq is accepted like a vector entry. */
             if (x == NIL) { /* no-op */ }
-            else if (x->tag == CLJC_VECTOR && vec_len(x) == 2) {
+            else if (x->tag == CLOVE_VECTOR && vec_len(x) == 2) {
                 r = map_assoc(r, vec_nth(x, 0), vec_nth(x, 1));
-            } else if (x->tag == CLJC_MAP) {
-                for (Cljc *e = map_entry_list(x); e && e->tag == CLJC_LIST; e = e->as.cons.tail)
+            } else if (x->tag == CLOVE_MAP) {
+                for (Clove *e = map_entry_list(x); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
                     r = map_assoc(r, e->as.cons.head->as.cons.head,
                                   e->as.cons.head->as.cons.tail);
-            } else if (x->tag == CLJC_LIST || x->tag == CLJC_LAZY) {
-                Cljc *s = to_seq(x);
+            } else if (x->tag == CLOVE_LIST || x->tag == CLOVE_LAZY) {
+                Clove *s = to_seq(x);
                 if (s != NIL && s->as.cons.tail != NIL)
                     r = map_assoc(r, s->as.cons.head, s->as.cons.tail->as.cons.head);
-                else cljc_error("conj on map: expected a [k v] entry or a map");
-            } else cljc_error("conj on map: expected a [k v] entry or a map");
-        } else cljc_error("conj: can't add to %s", val_desc(r));
+                else clove_error("conj on map: expected a [k v] entry or a map");
+            } else clove_error("conj on map: expected a [k v] entry or a map");
+        } else clove_error("conj: can't add to %s", val_desc(r));
     }
     return r;
 }
 
-static Cljc *prim_vector(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_vector(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     size_t n = (size_t)nargs;
-    Cljc **items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    Clove **items = xmalloc(sizeof(Clove *) * (n ? n : 1));
     size_t i = 0;
     for (int ai_ = 0; ai_ < nargs; ai_++)
         items[i++] = argv[ai_];
-    Cljc *v = mk_vector(items, n);
+    Clove *v = mk_vector(items, n);
     free(items);
     return v;
 }
 
 
-static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_apply(CloveEnv *env, Clove **argv, int nargs) {
     /* (apply f a b [c d]) => (f a b c d) — last arg is spliced. */
-    Cljc *fn = argv[0];
+    Clove *fn = argv[0];
     size_t base = vsp;
     bool overflow = false;
     for (int i = 1; i < nargs - 1; i++) {
@@ -7469,12 +7471,12 @@ static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
      * well before the cap. */
     size_t splice_lim = vstack_cap > 65536 ? vstack_cap - 65536 : vstack_cap;
     if (!overflow && nargs > 1)  /* splice the final collection — any seqable */
-        for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) {
+        for (Clove *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) {
             if (vsp >= splice_lim) { overflow = true; break; }
             vstack[vsp++] = s->as.cons.head;
         }
     if (!overflow) {
-        Cljc *r = apply(env, fn, &vstack[base], (int)(vsp - base));
+        Clove *r = apply(env, fn, &vstack[base], (int)(vsp - base));
         vsp = base;
         return r;
     }
@@ -7484,73 +7486,73 @@ static Cljc *prim_apply(CljcEnv *env, Cljc **argv, int nargs) {
      * argv[nargs-1], so no extra rooting is needed. */
     vsp = base;
     size_t total = (nargs > 2 ? (size_t)(nargs - 2) : 0);
-    for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) total++;
-    Cljc **big = xmalloc(sizeof(Cljc *) * (total ? total : 1));
+    for (Clove *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail)) total++;
+    Clove **big = xmalloc(sizeof(Clove *) * (total ? total : 1));
     size_t k = 0;
     for (int i = 1; i < nargs - 1; i++) big[k++] = argv[i];
-    for (Cljc *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail))
+    for (Clove *s = seq1(argv[nargs - 1]); s != NIL; s = seq1(s->as.cons.tail))
         big[k++] = s->as.cons.head;
-    Cljc *r = apply(env, fn, big, (int)total);
+    Clove *r = apply(env, fn, big, (int)total);
     free(big);
     return r;
 }
 
 #define TYPE_PRED(NAME, EXPR) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
-        (void)env; Cljc *v = argv[0]; (void)v; \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
+        (void)env; Clove *v = argv[0]; (void)v; \
         return mk_bool(EXPR); \
     }
 
 TYPE_PRED(nil_p,     v == NIL)
-TYPE_PRED(map_p,     v != NIL && (v->tag == CLJC_MAP || (v->tag == CLJC_SORTED && v->as.sorted.is_map)))
-TYPE_PRED(set_p,     v != NIL && (v->tag == CLJC_SET || (v->tag == CLJC_SORTED && !v->as.sorted.is_map)))
-TYPE_PRED(sorted_p,  v != NIL && v->tag == CLJC_SORTED)
-TYPE_PRED(list_p,    v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_EMPTY))
-TYPE_PRED(vector_p,  v != NIL && v->tag == CLJC_VECTOR)
-TYPE_PRED(number_p,  v != NIL && (v->tag == CLJC_INT || v->tag == CLJC_DOUBLE || v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC))
-TYPE_PRED(decimal_p, v != NIL && v->tag == CLJC_BIGDEC)
-TYPE_PRED(int_p,     v != NIL && v->tag == CLJC_INT)
-TYPE_PRED(double_p,  v != NIL && v->tag == CLJC_DOUBLE)
-TYPE_PRED(string_p,  v != NIL && v->tag == CLJC_STRING)
-TYPE_PRED(char_p,    v != NIL && v->tag == CLJC_CHAR)
-TYPE_PRED(keyword_p, v != NIL && v->tag == CLJC_KEYWORD)
-TYPE_PRED(symbol_p,  v != NIL && v->tag == CLJC_SYMBOL)
-TYPE_PRED(fn_p,      v != NIL && (v->tag == CLJC_FN || v->tag == CLJC_NATIVE))
+TYPE_PRED(map_p,     v != NIL && (v->tag == CLOVE_MAP || (v->tag == CLOVE_SORTED && v->as.sorted.is_map)))
+TYPE_PRED(set_p,     v != NIL && (v->tag == CLOVE_SET || (v->tag == CLOVE_SORTED && !v->as.sorted.is_map)))
+TYPE_PRED(sorted_p,  v != NIL && v->tag == CLOVE_SORTED)
+TYPE_PRED(list_p,    v != NIL && (v->tag == CLOVE_LIST || v->tag == CLOVE_EMPTY))
+TYPE_PRED(vector_p,  v != NIL && v->tag == CLOVE_VECTOR)
+TYPE_PRED(number_p,  v != NIL && (v->tag == CLOVE_INT || v->tag == CLOVE_DOUBLE || v->tag == CLOVE_BIGINT || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC))
+TYPE_PRED(decimal_p, v != NIL && v->tag == CLOVE_BIGDEC)
+TYPE_PRED(int_p,     v != NIL && v->tag == CLOVE_INT)
+TYPE_PRED(double_p,  v != NIL && v->tag == CLOVE_DOUBLE)
+TYPE_PRED(string_p,  v != NIL && v->tag == CLOVE_STRING)
+TYPE_PRED(char_p,    v != NIL && v->tag == CLOVE_CHAR)
+TYPE_PRED(keyword_p, v != NIL && v->tag == CLOVE_KEYWORD)
+TYPE_PRED(symbol_p,  v != NIL && v->tag == CLOVE_SYMBOL)
+TYPE_PRED(fn_p,      v != NIL && (v->tag == CLOVE_FN || v->tag == CLOVE_NATIVE))
 TYPE_PRED(zero_p,    as_num(v) == 0)
 TYPE_PRED(pos_p,     as_num(v) > 0)
 TYPE_PRED(neg_p,     as_num(v) < 0)
 
-static Cljc *prim_empty_p(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_empty_p(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    if (v == NIL || v->tag == CLJC_EMPTY) return TRUE;
-    if (v->tag == CLJC_LIST) return FALSE;  /* a cons is never empty */
-    if (v->tag == CLJC_LAZY) return mk_bool(seq1(v) == NIL);
-    if (v->tag == CLJC_VECTOR) return mk_bool(vec_len(v) == 0);
-    if (v->tag == CLJC_MAP || v->tag == CLJC_SET) {
+    Clove *v = argv[0];
+    if (v == NIL || v->tag == CLOVE_EMPTY) return TRUE;
+    if (v->tag == CLOVE_LIST) return FALSE;  /* a cons is never empty */
+    if (v->tag == CLOVE_LAZY) return mk_bool(seq1(v) == NIL);
+    if (v->tag == CLOVE_VECTOR) return mk_bool(vec_len(v) == 0);
+    if (v->tag == CLOVE_MAP || v->tag == CLOVE_SET) {
         /* a deftype with its own count (e.g. PriorityMap) is empty by THAT
          * count, not by its field count (which is never zero) */
-        Cljc *out;
-        if (v->tag == CLJC_MAP &&
+        Clove *out;
+        if (v->tag == CLOVE_MAP &&
             dispatch_deftype_method(env, v, "count", NULL, 0, &out))
-            return mk_bool(out != NIL && out->tag == CLJC_INT && out->as.i == 0);
+            return mk_bool(out != NIL && out->tag == CLOVE_INT && out->as.i == 0);
         return mk_bool(v->as.map.count == 0);
     }
-    if (v->tag == CLJC_STRING) return mk_bool(v->as.str[0] == '\0');
-    if (v->tag == CLJC_SORTED) return mk_bool(sorted_count(v) == 0);
-    cljc_error("empty?: %s is not a collection", val_desc(v));
+    if (v->tag == CLOVE_STRING) return mk_bool(v->as.str[0] == '\0');
+    if (v->tag == CLOVE_SORTED) return mk_bool(sorted_count(v) == 0);
+    clove_error("empty?: %s is not a collection", val_desc(v));
     return NIL;
 }
 
-static Cljc *prim_inc(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_inc(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    if (v->tag == CLJC_DOUBLE) return mk_double(v->as.d + 1);
+    Clove *v = argv[0];
+    if (v->tag == CLOVE_DOUBLE) return mk_double(v->as.d + 1);
     /* bigints and ratios take the generic add: (inc 10000000000000000000N)
      * must not fail just because the value outgrew int64, and (inc 1/2) is
      * 3/2. Only the int64 fast path stays inline. */
-    if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
-        Cljc *two[2] = { v, mk_int(1) };
+    if (v->tag == CLOVE_BIGINT || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC) {
+        Clove *two[2] = { v, mk_int(1) };
         return arith(OP_ADD, two, 2, AR_CHECK);
     }
     int64_t r;
@@ -7558,12 +7560,12 @@ static Cljc *prim_inc(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_int(r);
 }
 
-static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_dec(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    if (v->tag == CLJC_DOUBLE) return mk_double(v->as.d - 1);
-    if (v->tag == CLJC_BIGINT || v->tag == CLJC_RATIO || v->tag == CLJC_BIGDEC) {
-        Cljc *two[2] = { v, mk_int(1) };
+    Clove *v = argv[0];
+    if (v->tag == CLOVE_DOUBLE) return mk_double(v->as.d - 1);
+    if (v->tag == CLOVE_BIGINT || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC) {
+        Clove *two[2] = { v, mk_int(1) };
         return arith(OP_SUB, two, 2, AR_CHECK);
     }
     int64_t r;
@@ -7574,44 +7576,44 @@ static Cljc *prim_dec(CljcEnv *env, Cljc **argv, int nargs) {
 /* BigDecimal quot is Java's divideToIntegralValue: the truncated quotient at
  * the preferred scale (a.scale - b.scale), so (quot 7.5M 2) is 3.0M; rem is
  * a - quot*b. Both via the fraction view of each operand. */
-static Cljc *bd_quot(Cljc *a, Cljc *b) {
-    Cljc *A = to_bigdec(a), *B = to_bigdec(b), *q;
+static Clove *bd_quot(Clove *a, Clove *b) {
+    Clove *A = to_bigdec(a), *B = to_bigdec(b), *q;
     big_divmod(big_mul(rat_num(A), rat_den(B)), big_mul(rat_den(A), rat_num(B)), &q, NULL);
     int64_t pref = A->as.bigdec.s - B->as.bigdec.s;
     if (pref >= 0) return mk_bigdec(big_mul(q, pow10_big(pref)), pref);
     if (big_is_zero(q)) return mk_bigdec(q, pref);      /* Java: 0E+3, not 0 */
-    int64_t sc = 0; Cljc *qq, *r;
+    int64_t sc = 0; Clove *qq, *r;
     while (sc > pref && !big_is_zero(q)) {
         big_divmod(q, mk_int(10), &qq, &r); if (!big_is_zero(r)) break; q = qq; sc--;
     }
     return mk_bigdec(q, sc);
 }
-static Cljc *bd_rem(Cljc *a, Cljc *b) {
-    Cljc *m[2] = { bd_quot(a, b), b };
-    Cljc *s[2] = { a, arith(OP_MUL, m, 2, AR_CHECK) };
+static Clove *bd_rem(Clove *a, Clove *b) {
+    Clove *m[2] = { bd_quot(a, b), b };
+    Clove *s[2] = { a, arith(OP_MUL, m, 2, AR_CHECK) };
     return arith(OP_SUB, s, 2, AR_CHECK);
 }
 
-static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_mod(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "mod");
-    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) {
-        Cljc *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
+    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) {
+        Clove *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
         if (num_cmp(r, mk_int(0)) != 0 && (num_cmp(argv[0], mk_int(0)) > 0) != (num_cmp(argv[1], mk_int(0)) > 0)) {
-            Cljc *two[2] = { r, argv[1] };
+            Clove *two[2] = { r, argv[1] };
             r = arith(OP_ADD, two, 2, AR_CHECK);
         }
         return r;
     }
-    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
-        Cljc *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
+    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
+        Clove *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
         if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
             r = big_addsub(r, argv[1], 0);
         return r;
     }
     int64_t a = as_int(argv[0], "mod");
     int64_t b = as_int(argv[1], "mod");
-    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
+    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
     int64_t m = a % b;
     if (m != 0 && ((m < 0) != (b < 0))) m += b;  /* Clojure mod follows divisor's sign */
     return mk_int(m);
@@ -7619,10 +7621,10 @@ static Cljc *prim_mod(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── Map primitives (HAMT engine — see the HAMT section above) ── */
 
-static Cljc *prim_hash_map(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_hash_map(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs % 2 != 0) cljc_error("hash-map needs an even number of arguments");
-    Cljc *m = mk_map();
+    if (nargs % 2 != 0) clove_error("hash-map needs an even number of arguments");
+    Clove *m = mk_map();
     for (int i = 0; i < nargs; i += 2)
         m = map_assoc(m, argv[i], argv[i + 1]);
     return m;
@@ -7632,8 +7634,8 @@ static Cljc *prim_hash_map(CljcEnv *env, Cljc **argv, int nargs) {
  * Flat cell-owned buffer: 8 bytes/element vs ~160 for the old transient-vector
  * shim; aget/aset are O(1) loads/stores with no allocation (beyond the
  * smallint cache covering most aget results). */
-static Cljc *mk_iarray_of(uint32_t n, bool dbl) {
-    Cljc *a = alloc(CLJC_IARRAY);
+static Clove *mk_iarray_of(uint32_t n, bool dbl) {
+    Clove *a = alloc(CLOVE_IARRAY);
     a->as.iarr.n = n;
     a->as.iarr.dbl = dbl;
     a->as.iarr.data = xmalloc(sizeof(int64_t) * (n ? n : 1));
@@ -7641,17 +7643,17 @@ static Cljc *mk_iarray_of(uint32_t n, bool dbl) {
     gc_extra_bytes += sizeof(int64_t) * (n ? n : 1);
     return a;
 }
-static Cljc *mk_iarray(uint32_t n) { return mk_iarray_of(n, false); }
+static Clove *mk_iarray(uint32_t n) { return mk_iarray_of(n, false); }
 
 /* Element access. memcpy rather than a cast through int64_t*: type-punning a
  * double through an integer pointer is undefined, and every compiler folds
  * these into a single load/store anyway. */
-static Cljc *iarr_get(Cljc *a, int64_t i) {
+static Clove *iarr_get(Clove *a, int64_t i) {
     if (!a->as.iarr.dbl) return mk_int(a->as.iarr.data[i]);
     double d; memcpy(&d, &a->as.iarr.data[i], sizeof d);
     return mk_double(d);
 }
-static void iarr_set(Cljc *a, int64_t i, Cljc *v, const char *what) {
+static void iarr_set(Clove *a, int64_t i, Clove *v, const char *what) {
     if (!a->as.iarr.dbl) { a->as.iarr.data[i] = as_int(v, what); return; }
     double d = as_num(v);   /* any number widens in, as Clojure's aset-double does --
                              * deliberately looser than the JVM's reflective aset,
@@ -7661,99 +7663,99 @@ static void iarr_set(Cljc *a, int64_t i, Cljc *v, const char *what) {
 
 /* (T-array n) / (T-array n init) / (T-array coll), shared by both element
  * types -- they differ only in what a slot holds. */
-static Cljc *array_ctor(Cljc **argv, int nargs, bool dbl, const char *name) {
-    Cljc *a0 = argv[0];
-    if (a0 != NIL && a0->tag == CLJC_INT) {
+static Clove *array_ctor(Clove **argv, int nargs, bool dbl, const char *name) {
+    Clove *a0 = argv[0];
+    if (a0 != NIL && a0->tag == CLOVE_INT) {
         if (a0->as.i < 0 || a0->as.i > (int64_t)UINT32_MAX)
-            cljc_error("%s: bad size %lld", name, (long long)a0->as.i);
-        Cljc *arr = mk_iarray_of((uint32_t)a0->as.i, dbl);
+            clove_error("%s: bad size %lld", name, (long long)a0->as.i);
+        Clove *arr = mk_iarray_of((uint32_t)a0->as.i, dbl);
         if (nargs > 1)
             for (uint32_t i = 0; i < arr->as.iarr.n; i++) iarr_set(arr, i, argv[1], name);
         return arr;
     }
-    Cljc *s = to_seq(a0);
+    Clove *s = to_seq(a0);
     size_t n = list_len(s);
-    Cljc *arr = mk_iarray_of((uint32_t)n, dbl);
+    Clove *arr = mk_iarray_of((uint32_t)n, dbl);
     size_t i = 0;
-    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    for (Clove *l = s; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         iarr_set(arr, i++, l->as.cons.head, name);
     return arr;
 }
 
-static Cljc *prim_int_array(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_int_array(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; return array_ctor(argv, nargs, false, "int-array");
 }
 
-static Cljc *prim_double_array(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_double_array(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; return array_ctor(argv, nargs, true, "double-array");
 }
 
-static Cljc *prim_aget(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_aget(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "aget");
-    Cljc *a = argv[0];
-    if (a != NIL && a->tag == CLJC_IARRAY) {
+    Clove *a = argv[0];
+    if (a != NIL && a->tag == CLOVE_IARRAY) {
         int64_t i = as_int(argv[1], "aget");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
-            cljc_error_cls("IndexOutOfBoundsException", "aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+            clove_error_cls("IndexOutOfBoundsException", "aget: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
         return iarr_get(a, i);
     }
     /* legacy path: transient vectors / vectors behave as arrays */
-    Cljc *two[2] = {a, argv[1]};
+    Clove *two[2] = {a, argv[1]};
     return prim_nth(env, two, 2);
 }
 
-static Cljc *prim_aset(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_aset(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 3, "aset");
-    Cljc *a = argv[0];
-    if (a != NIL && a->tag == CLJC_IARRAY) {
+    Clove *a = argv[0];
+    if (a != NIL && a->tag == CLOVE_IARRAY) {
         int64_t i = as_int(argv[1], "aset");
         if (i < 0 || i >= (int64_t)a->as.iarr.n)
-            cljc_error_cls("IndexOutOfBoundsException", "aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
+            clove_error_cls("IndexOutOfBoundsException", "aset: index %lld out of bounds for length %u", (long long)i, a->as.iarr.n);
         /* an int array stores what it is handed or refuses, like the JVM's
          * aset: (aset ints 0 2.5) must not quietly keep 2. The constructors
          * still coerce -- (int-array [1.5]) truncates, as Clojure's does. */
-        if (!a->as.iarr.dbl && (argv[2] == NIL || argv[2]->tag != CLJC_INT))
-            cljc_error("aset: argument type mismatch: an int array can't hold %s", val_desc(argv[2]));
+        if (!a->as.iarr.dbl && (argv[2] == NIL || argv[2]->tag != CLOVE_INT))
+            clove_error("aset: argument type mismatch: an int array can't hold %s", val_desc(argv[2]));
         iarr_set(a, i, argv[2], "aset");
         return argv[2];
     }
-    Cljc *r = prim_assoc_bang(env, argv, 3);          /* legacy transient path */
+    Clove *r = prim_assoc_bang(env, argv, 3);          /* legacy transient path */
     (void)r;
     return argv[2];
 }
 
-static Cljc *prim_alength(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *a = argv[0];
-    if (a != NIL && a->tag == CLJC_IARRAY) return mk_int((int64_t)a->as.iarr.n);
+static Clove *prim_alength(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *a = argv[0];
+    if (a != NIL && a->tag == CLOVE_IARRAY) return mk_int((int64_t)a->as.iarr.n);
     return prim_count(env, argv, nargs);
 }
 
-static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_get(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "get");
-    Cljc *coll = argv[0];
-    Cljc *k = argv[1];
-    Cljc *dflt = nargs > 2
+    Clove *coll = argv[0];
+    Clove *k = argv[1];
+    Clove *dflt = nargs > 2
         ? argv[2] : NIL;
-    if (coll != NIL && coll->tag == CLJC_MAP) {
-        Cljc *out;
+    if (coll != NIL && coll->tag == CLOVE_MAP) {
+        Clove *out;
         if (map_find(coll, k, &out)) return out;
         /* not a field key — a deftype implementing ILookup/valAt (e.g. a matrix
          * indexed by row) gets the lookup; plain maps/records just fall through. */
         if (dispatch_deftype_method(env, coll, "valAt", argv + 1, nargs - 1, &out)) return out;
-    } else if (coll != NIL && coll->tag == CLJC_SET) {
-        Cljc *out;
+    } else if (coll != NIL && coll->tag == CLOVE_SET) {
+        Clove *out;
         if (set_contains(coll, k, &out)) return out;
-    } else if (coll != NIL && coll->tag == CLJC_SORTED) {
-        Cljc *out;
+    } else if (coll != NIL && coll->tag == CLOVE_SORTED) {
+        Clove *out;
         if (sorted_get(env, coll, k, &out)) return out;
-    } else if (coll != NIL && coll->tag == CLJC_IARRAY && k->tag == CLJC_INT) {
+    } else if (coll != NIL && coll->tag == CLOVE_IARRAY && k->tag == CLOVE_INT) {
         if (k->as.i >= 0 && k->as.i < (int64_t)coll->as.iarr.n)
             return iarr_get(coll, k->as.i);
-    } else if (coll != NIL && (coll->tag == CLJC_VECTOR || coll->tag == CLJC_TVEC)
-               && k->tag == CLJC_INT) {
+    } else if (coll != NIL && (coll->tag == CLOVE_VECTOR || coll->tag == CLOVE_TVEC)
+               && k->tag == CLOVE_INT) {
         if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
             return vec_nth(coll, (size_t)k->as.i);
-    } else if (coll != NIL && coll->tag == CLJC_STRING && k->tag == CLJC_INT) {
+    } else if (coll != NIL && coll->tag == CLOVE_STRING && k->tag == CLOVE_INT) {
         size_t len = str_cp_count(coll);     /* (get s i) => char */
         if (k->as.i >= 0 && (size_t)k->as.i < len)
             return mk_char(str_cp_at(coll, (size_t)k->as.i));
@@ -7761,58 +7763,58 @@ static Cljc *prim_get(CljcEnv *env, Cljc **argv, int nargs) {
     return dflt;
 }
 
-static Cljc *prim_assoc(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *coll = argv[0];
+static Clove *prim_assoc(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *coll = argv[0];
     if (coll == NIL) coll = mk_map();
-    Cljc *r = coll;
-    if ((nargs - 1) % 2 != 0) cljc_error("assoc needs key-value pairs");
+    Clove *r = coll;
+    if ((nargs - 1) % 2 != 0) clove_error("assoc needs key-value pairs");
     for (int i = 1; i < nargs; i += 2) {
-        Cljc *k = argv[i], *v = argv[i + 1];
-        if (r->tag == CLJC_MAP) {
+        Clove *k = argv[i], *v = argv[i + 1];
+        if (r->tag == CLOVE_MAP) {
             /* a deftype implementing Associative/assoc (a structure/matrix indexed
              * by position) updates through its own assoc, not the field map. This
              * is what lets reverse-mode AD's (assoc-in x [i] perturbation) work. */
-            Cljc *out, *kv[2] = { k, v };
+            Clove *out, *kv[2] = { k, v };
             if (dispatch_deftype_method(env, r, "assoc", kv, 2, &out)) { r = out; continue; }
             r = map_assoc(r, k, v);
         }
-        else if (r->tag == CLJC_SORTED && r->as.sorted.is_map) {
+        else if (r->tag == CLOVE_SORTED && r->as.sorted.is_map) {
             r = sorted_put(env, r, k, v);
         }
-        else if (r->tag == CLJC_VECTOR) {
-            if (k->tag != CLJC_INT)
-                cljc_error("assoc: vector index must be an integer, got %s", val_desc(k));
+        else if (r->tag == CLOVE_VECTOR) {
+            if (k->tag != CLOVE_INT)
+                clove_error("assoc: vector index must be an integer, got %s", val_desc(k));
             if (k->as.i < 0)
-                cljc_error_cls("IndexOutOfBoundsException", "assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
+                clove_error_cls("IndexOutOfBoundsException", "assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
             r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
-        } else cljc_error("assoc: %s is not associative", val_desc(r));
+        } else clove_error("assoc: %s is not associative", val_desc(r));
     }
     return r;
 }
 
-static Cljc *prim_dissoc(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *m = argv[0];
+static Clove *prim_dissoc(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag == CLJC_SORTED && m->as.sorted.is_map) {
+    if (m->tag == CLOVE_SORTED && m->as.sorted.is_map) {
         for (int i = 1; i < nargs; i++) m = sorted_remove(env, m, argv[i]);
         return m;
     }
-    if (m->tag != CLJC_MAP) cljc_error("dissoc: expected a map, got %s", val_desc(m));
+    if (m->tag != CLOVE_MAP) clove_error("dissoc: expected a map, got %s", val_desc(m));
     for (int i = 1; i < nargs; i++)
         m = map_dissoc_one(m, argv[i]);
     return m;
 }
 
 /* keys (kv=0) / vals (kv=1) for a hash or sorted map. */
-static Cljc *map_kv_list(Cljc *m, int kv) {
-    Cljc *out = NIL, **t = &out;
-    if (m->tag == CLJC_SORTED) {
-        for (Cljc *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
+static Clove *map_kv_list(Clove *m, int kv) {
+    Clove *out = NIL, **t = &out;
+    if (m->tag == CLOVE_SORTED) {
+        for (Clove *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
             *t = mk_cons(vec_nth(e->as.cons.head, kv), NIL);
             t = &(*t)->as.cons.tail;
         }
     } else {
-        for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
+        for (Clove *e = map_entry_list(m); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
             *t = mk_cons(kv ? e->as.cons.head->as.cons.tail : e->as.cons.head->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
         }
@@ -7822,17 +7824,17 @@ static Cljc *map_kv_list(Cljc *m, int kv) {
 
 /* Like Clojure, keys/vals also accept a SEQUENCE of map entries —
  * (vals (sort-by f a-map)) is the canonical producer (meander does this). */
-static Cljc *entry_side_list(Cljc *m, int side, const char *what) {
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *l = to_seq(m); l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
-        Cljc *e = l->as.cons.head;
-        Cljc *v;
-        if (e != NIL && e->tag == CLJC_VECTOR && vec_len(e) == 2)
+static Clove *entry_side_list(Clove *m, int side, const char *what) {
+    Clove *out = NIL, **t = &out;
+    for (Clove *l = to_seq(m); l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
+        Clove *e = l->as.cons.head;
+        Clove *v;
+        if (e != NIL && e->tag == CLOVE_VECTOR && vec_len(e) == 2)
             v = vec_nth(e, (size_t)side);
-        else if (e != NIL && e->tag == CLJC_LIST && e->as.cons.tail != NIL)
+        else if (e != NIL && e->tag == CLOVE_LIST && e->as.cons.tail != NIL)
             v = side == 0 ? e->as.cons.head : e->as.cons.tail->as.cons.head;
         else {
-            cljc_error("%s: expected map entries, got %s", what, val_desc(e));
+            clove_error("%s: expected map entries, got %s", what, val_desc(e));
             return NIL;
         }
         *t = mk_cons(v, NIL);
@@ -7841,57 +7843,57 @@ static Cljc *entry_side_list(Cljc *m, int side, const char *what) {
     return out;
 }
 
-static Cljc *prim_keys(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_keys(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *m = argv[0];
+    Clove *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag == CLJC_LIST || m->tag == CLJC_LAZY || m->tag == CLJC_EMPTY)
+    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY)
         return entry_side_list(m, 0, "keys");
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("keys: expected a map, got %s", val_desc(m));
+    if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("keys: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 0);
 }
 
-static Cljc *prim_vals(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_vals(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *m = argv[0];
+    Clove *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag == CLJC_LIST || m->tag == CLJC_LAZY || m->tag == CLJC_EMPTY)
+    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY)
         return entry_side_list(m, 1, "vals");
-    if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("vals: expected a map, got %s", val_desc(m));
+    if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("vals: expected a map, got %s", val_desc(m));
     return map_kv_list(m, 1);
 }
 
-static Cljc *prim_contains_p(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_contains_p(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "contains?");
-    Cljc *coll = argv[0];
-    Cljc *k = argv[1];
+    Clove *coll = argv[0];
+    Clove *k = argv[1];
     if (coll == NIL) return FALSE;
-    if (coll->tag == CLJC_MAP) return mk_bool(map_find(coll, k, NULL));
-    if (coll->tag == CLJC_SET) return mk_bool(set_contains(coll, k, NULL));
-    if (coll->tag == CLJC_SORTED) return mk_bool(sorted_contains(env, coll, k));
-    if (coll->tag == CLJC_VECTOR)  /* contains? checks INDEX presence on vectors */
-        return mk_bool(k->tag == CLJC_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
-    cljc_error("contains?: %s is not associative", val_desc(coll));
+    if (coll->tag == CLOVE_MAP) return mk_bool(map_find(coll, k, NULL));
+    if (coll->tag == CLOVE_SET) return mk_bool(set_contains(coll, k, NULL));
+    if (coll->tag == CLOVE_SORTED) return mk_bool(sorted_contains(env, coll, k));
+    if (coll->tag == CLOVE_VECTOR)  /* contains? checks INDEX presence on vectors */
+        return mk_bool(k->tag == CLOVE_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
+    clove_error("contains?: %s is not associative", val_desc(coll));
     return NIL;
 }
 
-static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *r = NIL;
+static Clove *prim_merge(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *r = NIL;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
-        Cljc *m = argv[ai_];
+        Clove *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLJC_MAP && m->tag != CLJC_SORTED) cljc_error("merge: %s is not a map", val_desc(m));
+        if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("merge: %s is not a map", val_desc(m));
         if (r == NIL) { r = m; continue; }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
-        if (m->tag == CLJC_SORTED) {
-            for (Cljc *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
-                Cljc *ca[2] = { r, e->as.cons.head };   /* head is a [k v] entry */
+        if (m->tag == CLOVE_SORTED) {
+            for (Clove *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
+                Clove *ca[2] = { r, e->as.cons.head };   /* head is a [k v] entry */
                 r = prim_conj(env, ca, 2);
             }
         } else {
-            for (Cljc *e = map_entry_list(m); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-                Cljc *pair[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
-                Cljc *ca[2] = { r, mk_vector(pair, 2) };
+            for (Clove *e = map_entry_list(m); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+                Clove *pair[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
+                Clove *ca[2] = { r, mk_vector(pair, 2) };
                 r = prim_conj(env, ca, 2);
             }
         }
@@ -7899,69 +7901,69 @@ static Cljc *prim_merge(CljcEnv *env, Cljc **argv, int nargs) {
     return r;
 }
 
-static Cljc *prim_rem(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_rem(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "rem");
-    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) return bd_rem(argv[0], argv[1]);
-    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
-        Cljc *r; big_divmod(argv[0], argv[1], NULL, &r); return r;
+    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_rem(argv[0], argv[1]);
+    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
+        Clove *r; big_divmod(argv[0], argv[1], NULL, &r); return r;
     }
     int64_t a = as_int(argv[0], "rem");
     int64_t b = as_int(argv[1], "rem");
-    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
+    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
     return mk_int(a % b);
 }
 
-static Cljc *prim_list(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_list(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     if (nargs == 0) return EMPTY;   /* (list) => () */
-    Cljc *out = NIL;
+    Clove *out = NIL;
     for (int i = nargs - 1; i >= 0; i--) out = mk_cons(argv[i], out);
     return out;
 }
 
-static Cljc *prim_first(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_first(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     /* sorted colls: O(log n) leftmost walk — (first sorted-map) previously
      * materialized the WHOLE entry list, making priority-queue peek O(n). */
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_SORTED) {
-        Cljc *node = v->as.sorted.root;
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_SORTED) {
+        Clove *node = v->as.sorted.root;
         if (node == NIL) return NIL;
         while (node->as.tnode.left != NIL) node = node->as.tnode.left;
         if (v->as.sorted.is_map) {
-            Cljc *kv[2] = { node->as.tnode.key, node->as.tnode.val };
+            Clove *kv[2] = { node->as.tnode.key, node->as.tnode.val };
             return mk_vector(kv, 2);
         }
         return node->as.tnode.key;
     }
-    Cljc *s = seq1_slot(&argv[0]);  /* advances the root: skipping into a long
+    Clove *s = seq1_slot(&argv[0]);  /* advances the root: skipping into a long
                                        lazy chain (e.g. filter) stays O(1) live */
     return s == NIL ? NIL : s->as.cons.head;
 }
 
-static Cljc *prim_rest(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_rest(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *s = seq1(argv[0]);
+    Clove *s = seq1(argv[0]);
     if (s == NIL) return EMPTY;                 /* (rest ()) / (rest nil) => () */
-    Cljc *t = s->as.cons.tail;                  /* tail may be lazy */
+    Clove *t = s->as.cons.tail;                  /* tail may be lazy */
     return (t == NIL) ? EMPTY : t;              /* a finished list rests to () */
 }
 
-static Cljc *prim_second(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_second(CloveEnv *env, Clove **argv, int nargs) {
     /* (first (rest x)) — go through first so a LAZY rest (e.g. a partition
      * group) is realized rather than reading an unforced cons head. */
-    Cljc *r = prim_rest(env, argv, nargs);
-    Cljc *fargv[1] = { r };
+    Clove *r = prim_rest(env, argv, nargs);
+    Clove *fargv[1] = { r };
     return prim_first(env, fargv, 1);
 }
 
-static Cljc *prim_cons(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_cons(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *h = argv[0];
-    Cljc *t = argv[1];
+    Clove *h = argv[0];
+    Clove *t = argv[1];
     /* Lazy tails stay lazy — the backbone of lazy-seq pipelines. */
-    if (!(t != NIL && (t->tag == CLJC_LAZY || t->tag == CLJC_LIST)))
+    if (!(t != NIL && (t->tag == CLOVE_LAZY || t->tag == CLOVE_LIST)))
         t = to_seq(t);  /* (cons 1 [2 3]) => (1 2 3); (cons 1 2) errors */
     return mk_cons(h, t);
 }
@@ -7975,7 +7977,7 @@ static Cljc *prim_cons(CljcEnv *env, Cljc **argv, int nargs) {
  * `done` stays false during this, so a self-referential seq that re-enters its
  * own force (chunk-map* walking the tail) still sees this cell as unrealized
  * and stops there instead of looping forever. */
-static Cljc *lazy_force(Cljc *l) {
+static Clove *lazy_force(Clove *l) {
     if (l->as.lazy.done) return l->as.lazy.cached;
     /* ITERATIVE chain walk — one C frame total, not one per cell. A filter
      * whose predicate rejects a long stretch yields lazy-of-lazy chains
@@ -7987,19 +7989,19 @@ static Cljc *lazy_force(Cljc *l) {
      * the provisional link keeps the whole chain reachable from l across the
      * GCs a thunk call can trigger. `done` stays false throughout (the
      * self-reference contract in the comment above). */
-    Cljc *cur = l, *r;
+    Clove *cur = l, *r;
     for (;;) {
         r = apply(gc_root_envs[0], cur->as.lazy.thunk, NULL, 0);
-        if (r == NULL || r == NIL || r->tag != CLJC_LAZY) break;
+        if (r == NULL || r == NIL || r->tag != CLOVE_LAZY) break;
         if (r->as.lazy.done) { r = r->as.lazy.cached; break; }
         cur->as.lazy.cached = r;   /* provisional next-link, not a result */
         cur = r;
     }
     /* Phase 2: back-patch every visited cell with the realized result —
      * exactly what the recursive unwind used to do. */
-    Cljc *p = l;
+    Clove *p = l;
     for (;;) {
-        Cljc *next = (p == cur) ? NULL : p->as.lazy.cached;
+        Clove *next = (p == cur) ? NULL : p->as.lazy.cached;
         p->as.lazy.cached = r;
         p->as.lazy.done = true;
         p->as.lazy.thunk = NIL;
@@ -8011,11 +8013,11 @@ static Cljc *lazy_force(Cljc *l) {
 
 /* Single-step seq: force AT MOST the head cell. Returns NIL or a cons whose
  * tail may itself be lazy. This is what keeps pipelines lazy. */
-static Cljc *seq1(Cljc *v) {
+static Clove *seq1(Clove *v) {
     for (;;) {
-        if (v == NULL || v == NIL || v->tag == CLJC_EMPTY) return NIL;
-        if (v->tag == CLJC_LIST) return v;
-        if (v->tag == CLJC_LAZY) { v = lazy_force(v); continue; }
+        if (v == NULL || v == NIL || v->tag == CLOVE_EMPTY) return NIL;
+        if (v->tag == CLOVE_LIST) return v;
+        if (v->tag == CLOVE_LAZY) { v = lazy_force(v); continue; }
         return to_seq(v);  /* finite collections materialize */
     }
 }
@@ -8025,12 +8027,12 @@ static Cljc *seq1(Cljc *v) {
  * vstack arg slot): a single-pass consumer (first/count/reduce/nth/…) walks
  * with seq1_slot(&argv[i]) instead of seq1(argv[i]) and the realized prefix
  * is collected behind it — O(1) live set instead of O(n). */
-static Cljc *seq1_slot(Cljc **slot) {
-    Cljc *v = *slot;
+static Clove *seq1_slot(Clove **slot) {
+    Clove *v = *slot;
     for (;;) {
-        if (v == NULL || v == NIL || v->tag == CLJC_EMPTY) return NIL;
-        if (v->tag == CLJC_LIST) { *slot = v; return v; }
-        if (v->tag == CLJC_LAZY) {
+        if (v == NULL || v == NIL || v->tag == CLOVE_EMPTY) return NIL;
+        if (v->tag == CLOVE_LIST) { *slot = v; return v; }
+        if (v->tag == CLOVE_LAZY) {
             *slot = v;             /* keep the cell being forced rooted... */
             v = lazy_force(v);     /* ...then advance: the old head drops */
             continue;
@@ -8041,40 +8043,40 @@ static Cljc *seq1_slot(Cljc **slot) {
 
 /* Normalize any seqable to a FULLY REALIZED plain list (eager consumers).
  * Plain lists pass through untouched unless a lazy tail hides inside. */
-static Cljc *to_seq(Cljc *v) {
-    if (v == NIL || v->tag == CLJC_EMPTY) return NIL;
-    if (v->tag == CLJC_LAZY || v->tag == CLJC_LIST) {
-        if (v->tag == CLJC_LIST) {  /* fast path: no lazy tails => as-is */
-            Cljc *l = v;
-            while (l->tag == CLJC_LIST) l = l->as.cons.tail;
+static Clove *to_seq(Clove *v) {
+    if (v == NIL || v->tag == CLOVE_EMPTY) return NIL;
+    if (v->tag == CLOVE_LAZY || v->tag == CLOVE_LIST) {
+        if (v->tag == CLOVE_LIST) {  /* fast path: no lazy tails => as-is */
+            Clove *l = v;
+            while (l->tag == CLOVE_LIST) l = l->as.cons.tail;
             if (l == NIL) return v;
         }
-        Cljc *out = NIL, **t = &out;
-        for (Cljc *s = seq1(v); s != NIL; s = seq1(s->as.cons.tail)) {
+        Clove *out = NIL, **t = &out;
+        for (Clove *s = seq1(v); s != NIL; s = seq1(s->as.cons.tail)) {
             *t = mk_cons(s->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
     }
-    if (v->tag == CLJC_VECTOR || v->tag == CLJC_TVEC) {  /* arrays seq too */
-        Cljc *out = NIL, **t = &out;
+    if (v->tag == CLOVE_VECTOR || v->tag == CLOVE_TVEC) {  /* arrays seq too */
+        Clove *out = NIL, **t = &out;
         for (size_t i = 0; i < vec_len(v); i++) {
             *t = mk_cons(vec_nth(v, i), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
     }
-    if (v->tag == CLJC_IARRAY) {
-        Cljc *out = NIL, **t = &out;
+    if (v->tag == CLOVE_IARRAY) {
+        Clove *out = NIL, **t = &out;
         for (uint32_t i = 0; i < v->as.iarr.n; i++) {
             *t = mk_cons(iarr_get(v, i), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
     }
-    if (v->tag == CLJC_STRING) {
+    if (v->tag == CLOVE_STRING) {
         /* Strings seq into chars by CODEPOINT (UTF-8 decoded). */
-        Cljc *out = NIL, **t = &out;
+        Clove *out = NIL, **t = &out;
         const char *p = v->as.str, *end = v->as.str + v->as.strx.nbytes;
         while (p < end) {
             *t = mk_cons(mk_char(utf8_next(&p)), NIL);
@@ -8082,46 +8084,46 @@ static Cljc *to_seq(Cljc *v) {
         }
         return out;
     }
-    if (v->tag == CLJC_SORTED) return sorted_entry_list(v);
-    if (v->tag == CLJC_SET) return set_element_list(v);
-    if (v->tag == CLJC_MAP) {
+    if (v->tag == CLOVE_SORTED) return sorted_entry_list(v);
+    if (v->tag == CLOVE_SET) return set_element_list(v);
+    if (v->tag == CLOVE_MAP) {
         /* A deftype implementing Seqable (its own `seq` method, e.g. instaparse's
          * AutoFlattenSeq): use it instead of seqing the field map. */
-        Cljc *sq;
+        Clove *sq;
         if (dispatch_deftype_method(gc_root_envs[0], v, "seq", NULL, 0, &sq))
             /* seq1, not to_seq: the seq method may return an INFINITE lazy seq
              * (e.g. an Emmy power series' coefficients); keep it lazy rather
              * than realizing the whole thing here. */
             return (sq == NIL || sq == v) ? NIL : seq1(sq);
         /* Maps seq into [k v] entry vectors. */
-        Cljc *out = NIL, **t = &out;
-        for (Cljc *e = map_entry_list(v); e && e->tag == CLJC_LIST; e = e->as.cons.tail) {
-            Cljc *entry_items[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
+        Clove *out = NIL, **t = &out;
+        for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *entry_items[2] = { e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail };
             *t = mk_cons(mk_vector(entry_items, 2), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
     }
-    cljc_error("don't know how to make a seq from %s", val_desc(v));
+    clove_error("don't know how to make a seq from %s", val_desc(v));
     return NIL;
 }
 
-static Cljc *prim_map(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *f = argv[0];
-    Cljc *seq = to_seq(argv[1]);
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *l = seq; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+static Clove *prim_map(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *f = argv[0];
+    Clove *seq = to_seq(argv[1]);
+    Clove *out = NIL, **t = &out;
+    for (Clove *l = seq; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
         *t = mk_cons(apply(env, f, &l->as.cons.head, 1), NIL);
         t = &(*t)->as.cons.tail;
     }
     return out;
 }
 
-static Cljc *prim_filter(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *f = argv[0];
-    Cljc *seq = to_seq(argv[1]);
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *l = seq; l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+static Clove *prim_filter(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *f = argv[0];
+    Clove *seq = to_seq(argv[1]);
+    Clove *out = NIL, **t = &out;
+    for (Clove *l = seq; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
         if (is_truthy(apply(env, f, &l->as.cons.head, 1))) {
             *t = mk_cons(l->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
@@ -8130,24 +8132,24 @@ static Cljc *prim_filter(CljcEnv *env, Cljc **argv, int nargs) {
     return out;
 }
 
-static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_reduce(CloveEnv *env, Clove **argv, int nargs) {
     /* (reduce f coll) or (reduce f init coll) */
-    Cljc *f = argv[0];
+    Clove *f = argv[0];
     {   /* a reify/deftype implementing IReduce reduces itself (specter's
          * traverse-all returns one); records without a `reduce` fall through */
-        Cljc *coll = nargs < 3 ? argv[1] : argv[2];
-        if (coll != NIL && coll->tag == CLJC_MAP) {
-            Cljc *out, *a[2] = { f, nargs < 3 ? NIL : argv[1] };
+        Clove *coll = nargs < 3 ? argv[1] : argv[2];
+        if (coll != NIL && coll->tag == CLOVE_MAP) {
+            Clove *out, *a[2] = { f, nargs < 3 ? NIL : argv[1] };
             if (dispatch_deftype_method(env, coll, "reduce", a, nargs < 3 ? 1 : 2, &out))
                 return out;
         }
     }
-    Cljc *acc;
-    Cljc **slot;                           /* the input-seq arg: advanced as we
+    Clove *acc;
+    Clove **slot;                           /* the input-seq arg: advanced as we
                                               walk so the head isn't pinned */
     if (nargs < 3) {
         slot = &argv[1];
-        Cljc *s = seq1_slot(slot);         /* lazy cursor: no realization */
+        Clove *s = seq1_slot(slot);         /* lazy cursor: no realization */
         if (s == NIL) return apply(env, f, NULL, 0);  /* (reduce f []) => (f) */
         acc = s->as.cons.head;
         *slot = s->as.cons.tail;
@@ -8155,49 +8157,49 @@ static Cljc *prim_reduce(CljcEnv *env, Cljc **argv, int nargs) {
         acc = argv[1];
         slot = &argv[2];
     }
-    for (Cljc *l = seq1_slot(slot); l != NIL; *slot = l->as.cons.tail, l = seq1_slot(slot)) {
-        Cljc *two[2] = {acc, l->as.cons.head};
+    for (Clove *l = seq1_slot(slot); l != NIL; *slot = l->as.cons.tail, l = seq1_slot(slot)) {
+        Clove *two[2] = {acc, l->as.cons.head};
         acc = apply(env, f, two, 2);
         /* (reduced x) terminates early — works on infinite seqs now */
-        if (acc != NIL && acc->tag == CLJC_LIST &&
-            acc->as.cons.head->tag == CLJC_SYMBOL &&
+        if (acc != NIL && acc->tag == CLOVE_LIST &&
+            acc->as.cons.head->tag == CLOVE_SYMBOL &&
             acc->as.cons.head->as.sym == intern("**reduced**", 11))
             return acc->as.cons.tail->as.cons.head;
     }
     return acc;
 }
 
-static Cljc *prim_range(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_range(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     size_t n = (size_t)nargs;
     /* Element type follows start/step promotion only (JVM Range adds per
      * element): a double end just bounds an integer range, and an integer
      * start stays an integer as the first element of a double-step range. */
-    Cljc *sv = n >= 2 ? argv[0] : NIL, *stv = n >= 3 ? argv[2] : NIL;
-    bool flt = (sv != NIL && sv->tag == CLJC_DOUBLE) ||
-               (stv != NIL && stv->tag == CLJC_DOUBLE);
+    Clove *sv = n >= 2 ? argv[0] : NIL, *stv = n >= 3 ? argv[2] : NIL;
+    bool flt = (sv != NIL && sv->tag == CLOVE_DOUBLE) ||
+               (stv != NIL && stv->tag == CLOVE_DOUBLE);
     if (flt) {
         double start = as_num(argv[0]), end = as_num(argv[1]);
         double step = n >= 3 ? as_num(argv[2]) : 1;
-        if (step == 0) cljc_error("range: step must be nonzero");
-        Cljc *out = NIL, **t = &out;
+        if (step == 0) clove_error("range: step must be nonzero");
+        Clove *out = NIL, **t = &out;
         bool first = true;
         for (double i = start; step > 0 ? i < end : i > end; i += step) {
-            Cljc *e = (first && sv->tag != CLJC_DOUBLE) ? sv : mk_double(i);
+            Clove *e = (first && sv->tag != CLOVE_DOUBLE) ? sv : mk_double(i);
             first = false;
             *t = mk_cons(e, NIL); t = &(*t)->as.cons.tail;
         }
         return out;
     }
     int64_t start = 0, step = 1;
-    Cljc *ev = n == 1 ? argv[0] : argv[1];
+    Clove *ev = n == 1 ? argv[0] : argv[1];
     if (n >= 2) {
         start = as_int(argv[0], "range");
         if (n >= 3) step = as_int(argv[2], "range");
     }
-    if (step == 0) cljc_error("range: step must be nonzero");
-    Cljc *out = NIL, **t = &out;
-    if (ev != NIL && ev->tag == CLJC_DOUBLE) {   /* double end only bounds */
+    if (step == 0) clove_error("range: step must be nonzero");
+    Clove *out = NIL, **t = &out;
+    if (ev != NIL && ev->tag == CLOVE_DOUBLE) {   /* double end only bounds */
         double end = ev->as.d;
         for (int64_t i = start; step > 0 ? (double)i < end : (double)i > end; i += step) {
             *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
@@ -8211,118 +8213,118 @@ static Cljc *prim_range(CljcEnv *env, Cljc **argv, int nargs) {
     return out;
 }
 
-/* (cljc/range-chunk* start end step n) => [strict-list-of-up-to-n next-start].
+/* (clove/range-chunk* start end step n) => [strict-list-of-up-to-n next-start].
  * end == nil means an unbounded range. Backs the lazy, chunked `range` so that
  * streaming consumers keep only ~32 elements live (the eager builder above held
  * the whole range, inflating GC and peak memory). */
-static Cljc *prim_range_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_range_chunk(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *sv = argv[0], *ev = argv[1], *stv = argv[2];
+    Clove *sv = argv[0], *ev = argv[1], *stv = argv[2];
     int64_t cnt = as_int(argv[3], "range");
     bool inf = (ev == NIL);
     /* Element type follows start/step promotion only (JVM Range adds per
      * element): a double end just bounds an integer range, and an integer
      * start stays an integer as the first element of a double-step range
      * (the carried next-start is a double from then on). */
-    bool flt = sv->tag == CLJC_DOUBLE || stv->tag == CLJC_DOUBLE;
-    Cljc *out = NIL, **t = &out, *next;
+    bool flt = sv->tag == CLOVE_DOUBLE || stv->tag == CLOVE_DOUBLE;
+    Clove *out = NIL, **t = &out, *next;
     if (flt) {
         double i = as_num(sv), end = inf ? 0 : as_num(ev), step = as_num(stv);
-        if (step == 0) cljc_error("range: step must be nonzero");
+        if (step == 0) clove_error("range: step must be nonzero");
         bool first = true;
         for (; cnt > 0 && (inf || (step > 0 ? i < end : i > end)); cnt--, i += step) {
-            Cljc *e = (first && sv->tag != CLJC_DOUBLE) ? sv : mk_double(i);
+            Clove *e = (first && sv->tag != CLOVE_DOUBLE) ? sv : mk_double(i);
             first = false;
             *t = mk_cons(e, NIL); t = &(*t)->as.cons.tail;
         }
         next = mk_double(i);
-    } else if (!inf && ev->tag == CLJC_DOUBLE) {
+    } else if (!inf && ev->tag == CLOVE_DOUBLE) {
         int64_t i = as_int(sv, "range"), step = as_int(stv, "range");
         double end = ev->as.d;
-        if (step == 0) cljc_error("range: step must be nonzero");
+        if (step == 0) clove_error("range: step must be nonzero");
         for (; cnt > 0 && (step > 0 ? (double)i < end : (double)i > end); cnt--, i += step) {
             *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
         }
         next = mk_int(i);
     } else {
         int64_t i = as_int(sv, "range"), end = inf ? 0 : as_int(ev, "range"), step = as_int(stv, "range");
-        if (step == 0) cljc_error("range: step must be nonzero");
+        if (step == 0) clove_error("range: step must be nonzero");
         for (; cnt > 0 && (inf || (step > 0 ? i < end : i > end)); cnt--, i += step) {
             *t = mk_cons(mk_int(i), NIL); t = &(*t)->as.cons.tail;
         }
         next = mk_int(i);
     }
-    Cljc *pair[2] = {out, next};
+    Clove *pair[2] = {out, next};
     return mk_vector(pair, 2);
 }
 
-/* (cljc/repeat-chunk* x n) => a strict list of n copies of x. Backs the lazy,
+/* (clove/repeat-chunk* x n) => a strict list of n copies of x. Backs the lazy,
  * chunked repeat so (vec (repeat n x)) doesn't pay per-element lazy overhead. */
-static Cljc *prim_repeat_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_repeat_chunk(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *x = argv[0];
+    Clove *x = argv[0];
     int64_t n = as_int(argv[1], "repeat");
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     for (; n > 0; n--) { *t = mk_cons(x, NIL); t = &(*t)->as.cons.tail; }
     return out;
 }
 
-/* (cljc/repeatedly-chunk* f n) => a strict list of n calls to (f) — skips the
+/* (clove/repeatedly-chunk* f n) => a strict list of n calls to (f) — skips the
  * map+wrapper layer of the old (map (fn [_] (f)) (range n)). */
-static Cljc *prim_repeatedly_chunk(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_repeatedly_chunk(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
-    Cljc *f = argv[0];
+    Clove *f = argv[0];
     int64_t n = as_int(argv[1], "repeatedly");
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     for (; n > 0; n--) {
-        Cljc *v = apply(env, f, NULL, 0);
+        Clove *v = apply(env, f, NULL, 0);
         *t = mk_cons(v, NIL); t = &(*t)->as.cons.tail;
     }
     return out;
 }
 
-static Cljc *prim_take(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_take(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int64_t n = as_int(argv[0], "take");
-    Cljc *seq = to_seq(argv[1]);
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *l = seq; n-- > 0 && l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+    Clove *seq = to_seq(argv[1]);
+    Clove *out = NIL, **t = &out;
+    for (Clove *l = seq; n-- > 0 && l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
         *t = mk_cons(l->as.cons.head, NIL);
         t = &(*t)->as.cons.tail;
     }
     return out;
 }
 
-static Cljc *prim_drop(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_drop(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int64_t n = as_int(argv[0], "drop");
-    Cljc *seq = to_seq(argv[1]);
-    while (n-- > 0 && seq != NIL && seq->tag == CLJC_LIST) seq = seq->as.cons.tail;
+    Clove *seq = to_seq(argv[1]);
+    while (n-- > 0 && seq != NIL && seq->tag == CLOVE_LIST) seq = seq->as.cons.tail;
     return seq;
 }
 
-static Cljc *prim_reverse(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_reverse(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *out = NIL;
+    Clove *out = NIL;
     bool any = false;
-    for (Cljc *l = to_seq(argv[0]); l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    for (Clove *l = to_seq(argv[0]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         { out = mk_cons(l->as.cons.head, out); any = true; }
     return any ? out : EMPTY;   /* (reverse []) => () */
 }
 
-static Cljc *prim_last(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_last(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *r = NIL;
-    for (Cljc *l = to_seq(argv[0]); l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    Clove *r = NIL;
+    for (Clove *l = to_seq(argv[0]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         r = l->as.cons.head;
     return r;
 }
 
-static Cljc *prim_concat(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_concat(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
-        for (Cljc *l = to_seq(argv[ai_]); l && l->tag == CLJC_LIST; l = l->as.cons.tail) {
+        for (Clove *l = to_seq(argv[ai_]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
             *t = mk_cons(l->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
         }
@@ -8330,28 +8332,28 @@ static Cljc *prim_concat(CljcEnv *env, Cljc **argv, int nargs) {
     return out;
 }
 
-static Cljc *prim_gensym(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_gensym(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     static int counter = 0;
     char buf[64];
     const char *prefix = "G__";
-    if (nargs > 0 && argv[0]->tag == CLJC_STRING)
+    if (nargs > 0 && argv[0]->tag == CLOVE_STRING)
         prefix = argv[0]->as.str;
     snprintf(buf, sizeof buf, "%s%d", prefix, counter++);
     return mk_sym(intern(buf, strlen(buf)));
 }
 
-static Cljc *prim_seq(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_seq(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *s = seq1(argv[0]);
+    Clove *s = seq1(argv[0]);
     return s == NIL ? NIL : s;  /* (seq []) => nil, matching Clojure */
 }
 
-static Cljc *prim_seq_p(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_seq_p(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    return mk_bool(v != NIL && (v->tag == CLJC_LIST || v->tag == CLJC_LAZY ||
-                                v->tag == CLJC_EMPTY));
+    Clove *v = argv[0];
+    return mk_bool(v != NIL && (v->tag == CLOVE_LIST || v->tag == CLOVE_LAZY ||
+                                v->tag == CLOVE_EMPTY));
 }
 
 /* ───── Regex engine ─────────────────────────────────────────────────── */
@@ -8398,7 +8400,7 @@ typedef struct {
 typedef struct { Rx *h, *t; } RxChain;
 
 static Rx *rx_node(RxC *c, int type) {
-    if (c->npool >= RX_MAX_NODES) cljc_error("regex too complex");
+    if (c->npool >= RX_MAX_NODES) clove_error("regex too complex");
     Rx *r = &c->pool[c->npool++];
     memset(r, 0, sizeof *r);
     r->type = (uint8_t)type;
@@ -8407,7 +8409,7 @@ static Rx *rx_node(RxC *c, int type) {
 
 static void rx_bit(Rx *r, unsigned char ch) { r->bits[ch >> 3] |= (uint8_t)(1u << (ch & 7)); }
 static void rx_urange(Rx *r, int32_t lo, int32_t hi) {
-    if (r->nur >= RX_MAX_URANGES) cljc_error("regex: too many non-ASCII chars in one class");
+    if (r->nur >= RX_MAX_URANGES) clove_error("regex: too many non-ASCII chars in one class");
     r->ur[r->nur * 2] = lo;
     r->ur[r->nur * 2 + 1] = hi;
     r->nur++;
@@ -8428,7 +8430,7 @@ static void rx_class_shorthand(Rx *r, char c) {
                   rx_bit(r, '_'); break;
         case 's': rx_bit(r, ' '); rx_bit(r, '\t'); rx_bit(r, '\n');
                   rx_bit(r, '\r'); rx_bit(r, '\f'); rx_bit(r, '\v'); break;
-        default: cljc_error("regex: unknown class \\%c", c);
+        default: clove_error("regex: unknown class \\%c", c);
     }
 }
 
@@ -8446,7 +8448,7 @@ static RxChain rx_parse_atom(RxC *c) {
             bool neg = c->p[1] == '!';
             c->p += 2;
             RxChain inner = rx_parse_alt(c);
-            if (*c->p != ')') cljc_error("regex: missing )");
+            if (*c->p != ')') clove_error("regex: missing )");
             c->p++;
             Rx *la = rx_node(c, RX_LA);
             la->neg = neg;
@@ -8455,17 +8457,17 @@ static RxChain rx_parse_atom(RxC *c) {
             return ch;
         }
         if (c->p[0] == '?' && c->p[1] == '<')
-            cljc_error("regex: (?<...) is not supported (no lookbehind or "
+            clove_error("regex: (?<...) is not supported (no lookbehind or "
                        "named groups); use the peg battery for lookbehind-style "
                        "matching");
         if (c->p[0] == '?' && c->p[1] == ':') { capture = false; c->p += 2; }
         int idx = 0;
         if (capture) {
-            if (c->ngroups >= RX_MAX_GROUPS) cljc_error("regex: too many groups");
+            if (c->ngroups >= RX_MAX_GROUPS) clove_error("regex: too many groups");
             idx = c->ngroups++;
         }
         RxChain inner = rx_parse_alt(c);
-        if (*c->p != ')') cljc_error("regex: missing )");
+        if (*c->p != ')') clove_error("regex: missing )");
         c->p++;
         if (!capture) return inner;
         Rx *gs = rx_node(c, RX_GS); gs->group = idx;
@@ -8499,14 +8501,14 @@ static RxChain rx_parse_atom(RxC *c) {
             } else if (lo < 256) rx_bit(r, (unsigned char)lo);
             else rx_urange(r, lo, lo);
         }
-        if (*c->p != ']') cljc_error("regex: missing ]");
+        if (*c->p != ']') clove_error("regex: missing ]");
         c->p++;
         ch.h = ch.t = r;
         return ch;
     }
     if (c0 == '\\') {
         char e = c->p[1];
-        if (!e) cljc_error("regex: trailing backslash");
+        if (!e) clove_error("regex: trailing backslash");
         c->p += 2;
         Rx *r;
         if (e == 'd' || e == 'w' || e == 's') {
@@ -8573,14 +8575,14 @@ static RxChain rx_parse_cat(RxC *c) {
                     while (*c->p >= '0' && *c->p <= '9') hi = hi * 10 + (*c->p++ - '0');
                 }
             }
-            if (*c->p != '}') cljc_error("regex: bad {n,m} quantifier");
+            if (*c->p != '}') clove_error("regex: bad {n,m} quantifier");
             c->p++;
             bool qlazy = false;
             if (*c->p == '?') { qlazy = true; c->p++; }   /* {n,m}? lazy */
             else if (*c->p == '+') c->p++;                /* {n,m}+ possessive → greedy */
             if (hi == -1) hi = lo;
             if (lo > 64 || (hi != -2 && (hi > 64 || hi < lo)))
-                cljc_error("regex: {n,m} out of range");
+                clove_error("regex: {n,m} out of range");
             const char *after = c->p;
             RxChain seq = lo > 0 ? atom : (RxChain){NULL, NULL};
             for (int k = 1; k < lo; k++) {       /* required copies 2..n */
@@ -8683,7 +8685,7 @@ static long rx_steps;          /* backtracking budget per match attempt */
 
 static bool rx_m(Rx *r, const char *s) {
     if (++rx_steps > RX_MAX_STEPS)
-        cljc_error("regex: too much backtracking");
+        clove_error("regex: too much backtracking");
     if (!r) { rx_match_end = s; return true; }
     switch (r->type) {
         case RX_CHAR:
@@ -8781,7 +8783,7 @@ static char *rx_preprocess(const char *p, bool *dotall) {
                     else {                            /* i/m/u: loud, not wrong matches */
                         char f = p[k];
                         free(out);
-                        cljc_error("regex: unsupported flag (?%c)", f);
+                        clove_error("regex: unsupported flag (?%c)", f);
                     }
                 }
                 i = j + 1;
@@ -8808,7 +8810,7 @@ static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
     c.npool = 0;
     c.ngroups = 1;  /* group 0 = whole match */
     RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); free(clean); cljc_error("regex: unexpected )"); }
+    if (*c.p) { free(c.pool); free(clean); clove_error("regex: unexpected )"); }
     free(clean);  /* nodes copied what they need; chars no longer referenced */
     *pool_out = c.pool;
     *ngroups_out = c.ngroups;
@@ -8830,7 +8832,7 @@ static Rx *rx_compile_full(const char *pattern, Rx **pool_out, int *ngroups_out)
     c.npool = 0;
     c.ngroups = 1;
     RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); free(clean); cljc_error("regex: unexpected )"); }
+    if (*c.p) { free(c.pool); free(clean); clove_error("regex: unexpected )"); }
     free(clean);
     Rx *eol = rx_node(&c, RX_EOL);
     if (top.t) top.t->next = eol;
@@ -8841,10 +8843,10 @@ static Rx *rx_compile_full(const char *pattern, Rx **pool_out, int *ngroups_out)
 
 /* Build the Clojure-style result: string when no groups, else
  * [full g1 g2 ...] with nil for unmatched groups. */
-static Cljc *rx_result(const char *mstart, int ngroups) {
-    Cljc *full = mk_str(mstart, (size_t)(rx_match_end - mstart));
+static Clove *rx_result(const char *mstart, int ngroups) {
+    Clove *full = mk_str(mstart, (size_t)(rx_match_end - mstart));
     if (ngroups == 1) return full;
-    Cljc *v = mk_empty_vec();
+    Clove *v = mk_empty_vec();
     v = vec_conj1(v, full);
     for (int i = 1; i < ngroups; i++) {
         if (rx_cap_s[i] && rx_cap_e[i] && rx_cap_e[i] >= rx_cap_s[i])
@@ -8861,7 +8863,7 @@ static void rx_reset_caps(void) {
     rx_steps = 0;
 }
 
-static Cljc *prim_re_find(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_find(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *pat = as_str(argv[0], "re-find");
     char *s = as_str(argv[1], "re-find");
@@ -8871,7 +8873,7 @@ static Cljc *prim_re_find(CljcEnv *env, Cljc **argv, int nargs) {
     for (const char *start = s; ; ) {
         rx_reset_caps();
         if (rx_m(prog, start)) {
-            Cljc *r = rx_result(start, ngroups);
+            Clove *r = rx_result(start, ngroups);
             free(pool);
             return r;
         }
@@ -8882,7 +8884,7 @@ static Cljc *prim_re_find(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-static Cljc *prim_re_matches(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_matches(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *pat = as_str(argv[0], "re-matches");
     char *s = as_str(argv[1], "re-matches");
@@ -8891,7 +8893,7 @@ static Cljc *prim_re_matches(CljcEnv *env, Cljc **argv, int nargs) {
     Rx *prog = rx_compile_full(pat, &pool, &ngroups);
     rx_str_begin = s;
     rx_reset_caps();
-    Cljc *r = NIL;
+    Clove *r = NIL;
     if (rx_m(prog, s))
         r = rx_result(s, ngroups);
     free(pool);
@@ -8901,28 +8903,28 @@ static Cljc *prim_re_matches(CljcEnv *env, Cljc **argv, int nargs) {
 /* Front-anchored match (Java Matcher.lookingAt): match at position 0 only, NOT
  * required to reach the end. Returns the matched prefix (string, or [whole g1..]
  * when there are groups) or nil. Backs instaparse's re-match-at-front. */
-static Cljc *prim_re_match_front(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_match_front(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    char *pat = as_str(argv[0], "cljc/re-match-front");
-    char *s = as_str(argv[1], "cljc/re-match-front");
+    char *pat = as_str(argv[0], "clove/re-match-front");
+    char *s = as_str(argv[1], "clove/re-match-front");
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
     rx_reset_caps();
-    Cljc *r = NIL;
+    Clove *r = NIL;
     if (rx_m(prog, s)) r = rx_result(s, ngroups);
     free(pool);
     return r;
 }
 
-static Cljc *prim_re_seq(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_seq(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *pat = as_str(argv[0], "re-seq");
     char *s = as_str(argv[1], "re-seq");
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     const char *pos = s;
     for (;;) {
         /* Find the next match at or after pos. */
@@ -8949,37 +8951,37 @@ static Cljc *prim_re_seq(CljcEnv *env, Cljc **argv, int nargs) {
     return out;
 }
 
-static Cljc *prim_set(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_set(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *s = mk_set();
-    for (Cljc *l = to_seq(argv[0]); l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    Clove *s = mk_set();
+    for (Clove *l = to_seq(argv[0]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         s = set_conj(s, l->as.cons.head);
     return s;
 }
 
-static Cljc *prim_hash_set(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_hash_set(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *s = mk_set();
+    Clove *s = mk_set();
     for (int ai_ = 0; ai_ < nargs; ai_++)
         s = set_conj(s, argv[ai_]);
     return s;
 }
 
-static Cljc *prim_disj(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *s = argv[0];
+static Clove *prim_disj(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *s = argv[0];
     if (s == NIL) return NIL;
-    if (s->tag == CLJC_SORTED && !s->as.sorted.is_map) {
+    if (s->tag == CLOVE_SORTED && !s->as.sorted.is_map) {
         for (int i = 1; i < nargs; i++) s = sorted_remove(env, s, argv[i]);
         return s;
     }
-    if (s->tag != CLJC_SET) cljc_error("disj: not a set");
+    if (s->tag != CLOVE_SET) clove_error("disj: not a set");
     for (int i = 1; i < nargs; i++)
         s = set_disj(s, argv[i]);
     return s;
 }
 
 
-static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_alias(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     const char *a = as_str(argv[0], "alias*");
     const char *ns = as_str(argv[1], "alias*");
@@ -8988,7 +8990,7 @@ static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
     const char *owner = cur_reader_ns;   /* the ns this alias belongs to */
     for (int i = 0; i < n_aliases; i++)
         if (alias_table[i] == in && alias_owner[i] == owner) { alias_ns[i] = nsin; return NIL; }
-    if (n_aliases >= MAX_ALIASES) cljc_error("too many aliases");
+    if (n_aliases >= MAX_ALIASES) clove_error("too many aliases");
     alias_table[n_aliases] = in;
     alias_ns[n_aliases] = nsin;
     alias_owner[n_aliases] = owner;
@@ -8996,8 +8998,8 @@ static Cljc *prim_alias(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-/* (cljc/refer* "from-ns/name" "source-ns/name") — register a refer alias. */
-static Cljc *prim_refer(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/refer* "from-ns/name" "source-ns/name") — register a refer alias. */
+static Clove *prim_refer(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     const char *f = as_str(argv[0], "refer*");
     const char *t = as_str(argv[1], "refer*");
@@ -9005,37 +9007,37 @@ static Cljc *prim_refer(CljcEnv *env, Cljc **argv, int nargs) {
     const char *ti = intern(t, strlen(t));
     for (int i = 0; i < n_refers; i++)
         if (refer_from[i] == fi) { refer_to[i] = ti; return NIL; }
-    if (n_refers >= MAX_REFERS) cljc_error("too many refers");
+    if (n_refers >= MAX_REFERS) clove_error("too many refers");
     refer_from[n_refers] = fi; refer_to[n_refers] = ti; n_refers++;
     return NIL;
 }
 
-/* (cljc/current-ns*) — the namespace being loaded ("user" at the top level). */
-static Cljc *prim_current_ns(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/current-ns*) — the namespace being loaded ("user" at the top level). */
+static Clove *prim_current_ns(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     return cur_reader_ns ? mk_str(cur_reader_ns, strlen(cur_reader_ns))
                          : mk_str("", 0);
 }
 
-/* (cljc/in-ns* name-or-nil) — set the reader/def namespace, return the old.
+/* (clove/in-ns* name-or-nil) — set the reader/def namespace, return the old.
  * nil means "back to the top level", which is the `user` namespace (so a later
  * top-level (:refer [reduce ..]) aliases under user/ instead of clobbering core). */
-static Cljc *prim_in_ns(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_in_ns(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     const char *old = cur_reader_ns;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     set_cur_ns(env_root(env), (v == NIL) ? intern("user", 4)
                                          : intern(v->as.str, strlen(v->as.str)));
     return old ? mk_str(old, strlen(old)) : NIL;
 }
 
-/* (cljc/ns-publics* "ns") — vector of the bare names (strings) of every root
+/* (clove/ns-publics* "ns") — vector of the bare names (strings) of every root
  * binding defined under the "ns/" prefix, skipping ^:private defs. Backs
  * `use` and :refer :all, so privates no longer leak through either.
- * (cljc/ns-interns* "ns") — the same INCLUDING privates (Clojure ns-interns). */
-static Cljc *ns_names_vec(CljcEnv *env, const char *ns, bool include_private) {
+ * (clove/ns-interns* "ns") — the same INCLUDING privates (Clojure ns-interns). */
+static Clove *ns_names_vec(CloveEnv *env, const char *ns, bool include_private) {
     size_t nlen = strlen(ns);
-    Cljc *out = mk_empty_vec();
+    Clove *out = mk_empty_vec();
     for (Binding *b = env_root(env)->bindings; b; b = b->next) {
         const char *nm = b->name;
         /* match "ns/<bare>" but not a deeper "ns/sub/..." qualified name */
@@ -9048,41 +9050,41 @@ static Cljc *ns_names_vec(CljcEnv *env, const char *ns, bool include_private) {
     }
     return out;
 }
-static Cljc *prim_ns_publics(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ns_publics(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     return ns_names_vec(env, as_str(argv[0], "ns-publics*"), false);
 }
-static Cljc *prim_ns_interns(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ns_interns(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     return ns_names_vec(env, as_str(argv[0], "ns-interns*"), true);
 }
 
-/* (cljc/namespaces*) — vector of every registered namespace name (strings).
+/* (clove/namespaces*) — vector of every registered namespace name (strings).
  * Backs all-ns/find-ns/the-ns. */
-static Cljc *prim_namespaces(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_namespaces(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
-    Cljc *out = mk_empty_vec();
+    Clove *out = mk_empty_vec();
     for (int i = 0; i < n_namespaces; i++)
         out = vec_conj1(out, mk_str(ns_registry[i], strlen(ns_registry[i])));
     return out;
 }
 
-/* (cljc/create-ns* "ns") — register without entering (backs create-ns). */
-static Cljc *prim_create_ns(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/create-ns* "ns") — register without entering (backs create-ns). */
+static Clove *prim_create_ns(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     const char *s = as_str(argv[0], "create-ns*");
     register_ns(intern(s, strlen(s)));
     return NIL;
 }
 
-/* (cljc/ns-aliases* "ns") — map of alias string -> target-ns string for the
+/* (clove/ns-aliases* "ns") — map of alias string -> target-ns string for the
  * aliases registered by that namespace ("user" also sees REPL/global ones). */
-static Cljc *prim_ns_aliases(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ns_aliases(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     const char *ns = as_str(argv[0], "ns-aliases*");
     const char *owner = intern(ns, strlen(ns));
     bool user = !strcmp(ns, "user");
-    Cljc *m = mk_map();
+    Clove *m = mk_map();
     for (int i = 0; i < n_aliases; i++)
         if (alias_owner[i] == owner || (user && alias_owner[i] == NULL))
             m = map_assoc(m, mk_str(alias_table[i], strlen(alias_table[i])),
@@ -9090,16 +9092,16 @@ static Cljc *prim_ns_aliases(CljcEnv *env, Cljc **argv, int nargs) {
     return m;
 }
 
-/* (cljc/resolve-maybe "name") — the value bound to that (string) name, or nil
- * if unbound. Used by `cljc -m` to find a namespace's -main without throwing. */
-static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/resolve-maybe "name") — the value bound to that (string) name, or nil
+ * if unbound. Used by `clove -m` to find a namespace's -main without throwing. */
+static Clove *prim_resolve_maybe(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     /* A symbol arg keeps its home_ns so per-ns aliases / home-ns-qualified defs
      * resolve (a stringified name loses it); a string arg resolves globally. */
-    Cljc *arg = argv[0];
+    Clove *arg = argv[0];
     if (arg == NIL) return NIL;
     const char *raw, *home_ns = NULL;
-    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    if (arg->tag == CLOVE_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
     else raw = as_str(arg, "resolve-maybe");
     const char *name = intern(raw, strlen(raw));
     /* root_find handles the (require :as) alias + clojure.core fallbacks, so
@@ -9110,91 +9112,91 @@ static Cljc *prim_resolve_maybe(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── documentation natives (the `doc` / `apropos` substrate) ── */
 
-/* (cljc/doc-put* "name" "text") — register a docstring under a root-binding
+/* (clove/doc-put* "name" "text") — register a docstring under a root-binding
  * name. The docs.clj battery bulk-loads native/prelude docs through this. */
-static Cljc *prim_doc_put(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_doc_put(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    char *name = as_str(argv[0], "cljc/doc-put*");
-    char *text = as_str(argv[1], "cljc/doc-put*");
-    const char *args = (nargs > 2 && argv[2] != NIL) ? as_str(argv[2], "cljc/doc-put*") : NULL;
+    char *name = as_str(argv[0], "clove/doc-put*");
+    char *text = as_str(argv[1], "clove/doc-put*");
+    const char *args = (nargs > 2 && argv[2] != NIL) ? as_str(argv[2], "clove/doc-put*") : NULL;
     doc_put(intern(name, strlen(name)), text, args);
     return NIL;
 }
 
-/* (cljc/fn-source* f) — the fn's arity clauses as FORMS: (([params] body...)
+/* (clove/fn-source* f) — the fn's arity clauses as FORMS: (([params] body...)
  * ...) — the stored source, so `source` can reconstruct a defn. nil for
  * natives/non-fns (no source retained). */
 /* Trace snapshot of the most recent throw (caught or not): the
  * "  at (f ...) line N" block as a string, nil if it had no located frames.
  * Lets user code inspect where a caught exception came from; the top-level
  * error printer renders the same data. */
-static Cljc *prim_last_trace(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_last_trace(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     if (!err_trace[0]) return NIL;
     return mk_str(err_trace, strlen(err_trace));
 }
 
-/* (cljc/pprint-str* x width) — pretty-printed rendering, no trailing \n. */
-static Cljc *prim_pprint_str(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/pprint-str* x width) — pretty-printed rendering, no trailing \n. */
+static Clove *prim_pprint_str(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    int width = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLJC_INT)
+    int width = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLOVE_INT)
         ? (int)argv[1]->as.i : 80;
     if (width < 20) width = 20;
     SBuf sb = {0};
     pp_to(&sb, argv[0], 0, width, 0);
-    Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+    Clove *r = mk_str(sb.data ? sb.data : "", sb.len);
     free(sb.data);
     return r;
 }
 
-/* (cljc/nan?* x) — the one predicate Clojure-level code can't express here:
+/* (clove/nan?* x) — the one predicate Clojure-level code can't express here:
  * = short-circuits on cell identity, and num_cmp treats NaN as equal-to-all. */
-static Cljc *prim_nan_p(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_nan_p(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
-    return mk_bool(v != NIL && v->tag == CLJC_DOUBLE && v->as.d != v->as.d);
+    Clove *v = argv[0];
+    return mk_bool(v != NIL && v->tag == CLOVE_DOUBLE && v->as.d != v->as.d);
 }
 
-static Cljc *prim_fn_source(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_fn_source(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *f = argv[0];
-    if (f == NIL || f->tag != CLJC_FN) return NIL;
+    Clove *f = argv[0];
+    if (f == NIL || f->tag != CLOVE_FN) return NIL;
     return f->as.fn.arities;
 }
 
-/* (cljc/doc-info* sym) — {:name "stored" :doc text|nil :arglists (…)|nil
+/* (clove/doc-info* sym) — {:name "stored" :doc text|nil :arglists (…)|nil
  * :macro? bool :native? bool}, or nil when the symbol neither resolves nor
  * has a doc entry. Resolution mirrors symbol lookup (root_find), so the
  * answer matches what evaluating the symbol would find. */
-static Cljc *prim_doc_info(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_doc_info(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
-    Cljc *arg = argv[0];
+    Clove *arg = argv[0];
     if (arg == NIL) return NIL;
     const char *raw, *home_ns = NULL;
-    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
-    else raw = as_str(arg, "cljc/doc-info*");
+    if (arg->tag == CLOVE_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    else raw = as_str(arg, "clove/doc-info*");
     const char *name = intern(raw, strlen(raw));
     Binding *b = root_find(env_root(env), name, home_ns, false);
     const char *doc = doc_get(b ? b->name : name);
     if (!b && !doc) return NIL;
-    Cljc *v = b ? b->value : NIL;
-    Cljc *arglists = NIL;   /* consed back-to-front → prints in source order */
-    if (v != NIL && v->tag == CLJC_FN) {
-        Cljc *ars[32];      /* C locals/stack arrays are conservatively scanned */
+    Clove *v = b ? b->value : NIL;
+    Clove *arglists = NIL;   /* consed back-to-front → prints in source order */
+    if (v != NIL && v->tag == CLOVE_FN) {
+        Clove *ars[32];      /* C locals/stack arrays are conservatively scanned */
         size_t na = 0;
-        for (Cljc *ar = v->as.fn.arities; ar != NIL && ar->tag == CLJC_LIST && na < 32;
+        for (Clove *ar = v->as.fn.arities; ar != NIL && ar->tag == CLOVE_LIST && na < 32;
              ar = ar->as.cons.tail)
             ars[na++] = ar->as.cons.head;
         for (size_t k = na; k > 0; k--) {
-            Cljc *params = ars[k - 1]->as.cons.head;
+            Clove *params = ars[k - 1]->as.cons.head;
             size_t n = 0;
-            for (Cljc *p = params; p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail) n++;
+            for (Clove *p = params; p != NIL && p->tag == CLOVE_LIST; p = p->as.cons.tail) n++;
             /* items cells stay reachable via the fn itself during allocation */
-            Cljc **items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+            Clove **items = xmalloc(sizeof(Clove *) * (n ? n : 1));
             size_t i = 0;
-            for (Cljc *p = params; p != NIL && p->tag == CLJC_LIST; p = p->as.cons.tail)
+            for (Clove *p = params; p != NIL && p->tag == CLOVE_LIST; p = p->as.cons.tail)
                 items[i++] = p->as.cons.head;
-            Cljc *pv = mk_vector(items, n);
+            Clove *pv = mk_vector(items, n);
             free(items);
             arglists = mk_cons(pv, arglists);
         }
@@ -9204,103 +9206,103 @@ static Cljc *prim_doc_info(CljcEnv *env, Cljc **argv, int nargs) {
         const char *args = doc_args_get(stored);
         if (args) {
             int save_line = rd_line; const char *save_start = rd_line_start;
-            Cljc *save_file = rd_file_cell;
+            Clove *save_file = rd_file_cell;
             rd_line = 0; rd_file_cell = NULL;
             const char *p = args;
-            Cljc *form = read_form(&p);
+            Clove *form = read_form(&p);
             rd_line = save_line; rd_line_start = save_start; rd_file_cell = save_file;
-            if (form && form != NIL && form->tag == CLJC_LIST) arglists = form;
+            if (form && form != NIL && form->tag == CLOVE_LIST) arglists = form;
         }
     }
-    Cljc *m = mk_map();
+    Clove *m = mk_map();
     m = map_assoc(m, mk_kw(intern("name", 4)), mk_str(stored, strlen(stored)));
     m = map_assoc(m, mk_kw(intern("doc", 3)),
                   doc ? mk_str(doc, strlen(doc)) : NIL);
     m = map_assoc(m, mk_kw(intern("macro?", 6)),
                   mk_bool(macro_fn_of(env, v) != NULL));
     m = map_assoc(m, mk_kw(intern("native?", 7)),
-                  mk_bool(v != NIL && v->tag == CLJC_NATIVE));
+                  mk_bool(v != NIL && v->tag == CLOVE_NATIVE));
     m = map_assoc(m, mk_kw(intern("arglists", 8)), arglists);
     return m;
 }
 
-/* (cljc/root-names*) — every root binding's name as a vector of strings
- * (apropos / discovery from cljc code). */
-static Cljc *prim_root_names(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/root-names*) — every root binding's name as a vector of strings
+ * (apropos / discovery from clove code). */
+static Clove *prim_root_names(CloveEnv *env, Clove **argv, int nargs) {
     (void)argv; (void)nargs;
-    CljcEnv *root = env_root(env);
+    CloveEnv *root = env_root(env);
     size_t n = 0;
     for (Binding *b = root->bindings; b; b = b->next) n++;
-    Cljc **items = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    Clove **items = xmalloc(sizeof(Clove *) * (n ? n : 1));
     size_t i = 0;
     /* the heap items array is NOT GC-scanned: root each built string on the
      * value stack until the vector owns them */
     size_t base = vsp;
     for (Binding *b = root->bindings; b && i < n; b = b->next) {
-        Cljc *s = mk_str(b->name, strlen(b->name));
+        Clove *s = mk_str(b->name, strlen(b->name));
         items[i++] = s;
         vpush(s);
     }
-    Cljc *v = mk_vector(items, i);
+    Clove *v = mk_vector(items, i);
     free(items);
     vsp = base;
     return v;
 }
 
-/* (cljc/resolve-var name) -> a Var (named reference to the binding) or nil. The
+/* (clove/resolve-var name) -> a Var (named reference to the binding) or nil. The
  * Var derefs to the binding's CURRENT value (so it tracks redefs) and carries
  * {:name :ns} metadata — this is what the public resolve / (var x) / #'x give,
  * so reflective code like potemkin's import-def can read a def's name. */
-static Cljc *prim_resolve_var(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_resolve_var(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     /* A symbol arg keeps its home_ns so per-ns aliases resolve correctly (a
      * stringified name would lose it); a string arg resolves globally. */
-    Cljc *arg = argv[0];
+    Clove *arg = argv[0];
     if (arg == NIL) return NIL;
     const char *raw, *home_ns = NULL;
-    if (arg->tag == CLJC_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
+    if (arg->tag == CLOVE_SYMBOL) { raw = arg->as.symc.name; home_ns = arg->as.symc.home_ns; }
     else raw = as_str(arg, "resolve");
     const char *name = intern(raw, strlen(raw));
     Binding *b = root_find(env_root(env), name, home_ns, false);
     if (!b) return NIL;
-    Cljc *v = alloc(CLJC_VAR);
+    Clove *v = alloc(CLOVE_VAR);
     v->as.var.name = b->name;
     const char *slash = strrchr(b->name, '/');
     const char *bare = slash ? slash + 1 : b->name;
-    Cljc *m = map_assoc(mk_map(), mk_kw(intern("name", 4)), mk_sym(intern(bare, strlen(bare))));
+    Clove *m = map_assoc(mk_map(), mk_kw(intern("name", 4)), mk_sym(intern(bare, strlen(bare))));
     if (slash)
         m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
     v->meta = m;
     return v;
 }
 
-/* (cljc/fn-arities f) -> [[fixed variadic?] ..] per arity. Lets the reflective
+/* (clove/fn-arities f) -> [[fixed variadic?] ..] per arity. Lets the reflective
  * arity machinery (emmy.function uses .getDeclaredMethods) work without the JVM. */
-static Cljc *prim_fn_arities(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_fn_arities(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *f = argv[0];
-    if (f == NIL || f->tag != CLJC_FN) return mk_empty_vec();
-    Cljc *out = mk_empty_vec();
-    for (Cljc *ar = f->as.fn.arities; ar && ar->tag == CLJC_LIST; ar = ar->as.cons.tail) {
-        Cljc *params = ar->as.cons.head->as.cons.head;
+    Clove *f = argv[0];
+    if (f == NIL || f->tag != CLOVE_FN) return mk_empty_vec();
+    Clove *out = mk_empty_vec();
+    for (Clove *ar = f->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
+        Clove *params = ar->as.cons.head->as.cons.head;
         size_t fixed; bool variadic; arity_info(params, &fixed, &variadic);
-        Cljc *pair[2] = { mk_int((int64_t)fixed), mk_bool(variadic) };
+        Clove *pair[2] = { mk_int((int64_t)fixed), mk_bool(variadic) };
         out = vec_conj1(out, mk_vector(pair, 2));
     }
     return out;
 }
 
-/* (cljc/set-var! var value) — set a Var's binding to value (backs alter-var-root). */
-static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/set-var! var value) — set a Var's binding to value (backs alter-var-root). */
+static Clove *prim_set_var(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
-    Cljc *var = argv[0];
-    if (var == NIL || var->tag != CLJC_VAR) cljc_error("set-var!: not a var");
+    Clove *var = argv[0];
+    if (var == NIL || var->tag != CLOVE_VAR) clove_error("set-var!: not a var");
     Binding *b = root_find(env_root(env), var->as.var.name, NULL, false);
     if (b) b->value = argv[1];
     return argv[1];
 }
 
-/* (cljc/eval-forms* src) or (cljc/eval-forms* src name) — read and eval each
+/* (clove/eval-forms* src) or (clove/eval-forms* src name) — read and eval each
  * top-level form in turn (NOT read-all-then-eval), so a leading (ns ..) is
  * active when later forms are READ — their bare refs to ns-local defs then
  * resolve. cur_reader_ns is saved/restored so loading a file doesn't leak its
@@ -9314,37 +9316,37 @@ static Cljc *prim_set_var(CljcEnv *env, Cljc **argv, int nargs) {
  * its use. Compiled as one chunk, the use site is compiled before the
  * defmacro has run: the head only deopts at runtime, but its args were
  * already compiled as evaluations. */
-static Cljc *eval_toplevel(CljcEnv *root, Cljc *form) {
-    if (form->tag == CLJC_LIST && form->as.cons.head != NIL &&
-        form->as.cons.head->tag == CLJC_SYMBOL &&
+static Clove *eval_toplevel(CloveEnv *root, Clove *form) {
+    if (form->tag == CLOVE_LIST && form->as.cons.head != NIL &&
+        form->as.cons.head->tag == CLOVE_SYMBOL &&
         form->as.cons.head->as.sym == intern("do", 2)) {
-        Cljc *last = NIL;
+        Clove *last = NIL;
         vpush(form);
-        for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+        for (Clove *a = form->as.cons.tail; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
             last = eval_toplevel(root, a->as.cons.head);
         vsp--;
         return last;
     }
-    Cljc *last;
+    Clove *last;
     vpush(form);
     /* (def name <compound-expr>) bails the compiler (def isn't an op);
      * compile just the EXPR and def the quoted result via the tree-walker
      * — (def ans (loop ...)) shapes carry the hot loops in script files. */
-    Cljc *compile_body = form;
-    Cljc *def_name = NULL;
-    if (form->tag == CLJC_LIST && form->as.cons.head->tag == CLJC_SYMBOL &&
+    Clove *compile_body = form;
+    Clove *def_name = NULL;
+    if (form->tag == CLOVE_LIST && form->as.cons.head->tag == CLOVE_SYMBOL &&
         form->as.cons.head->as.sym == intern("def", 3)) {
-        Cljc *t1 = form->as.cons.tail;
-        if (t1 != NIL && t1->tag == CLJC_LIST && t1->as.cons.head->tag == CLJC_SYMBOL &&
-            t1->as.cons.tail != NIL && t1->as.cons.tail->tag == CLJC_LIST &&
+        Clove *t1 = form->as.cons.tail;
+        if (t1 != NIL && t1->tag == CLOVE_LIST && t1->as.cons.head->tag == CLOVE_SYMBOL &&
+            t1->as.cons.tail != NIL && t1->as.cons.tail->tag == CLOVE_LIST &&
             t1->as.cons.tail->as.cons.tail == NIL &&
             t1->as.cons.tail->as.cons.head != NIL &&
-            t1->as.cons.tail->as.cons.head->tag == CLJC_LIST) {
+            t1->as.cons.tail->as.cons.head->tag == CLOVE_LIST) {
             def_name = t1->as.cons.head;
             compile_body = t1->as.cons.tail->as.cons.head;
         }
     }
-    Cljc *chunk = vm_compile(root, NIL, mk_cons(compile_body, NIL));
+    Clove *chunk = vm_compile(root, NIL, mk_cons(compile_body, NIL));
     if (!chunk && def_name) {           /* expr uncompilable: whole-form fallback */
         def_name = NULL;
     }
@@ -9352,25 +9354,25 @@ static Cljc *eval_toplevel(CljcEnv *root, Cljc *form) {
     /* the whole form is the chunk's tail position, so a call form
      * compiles to a TAILCALL sentinel meant for apply's trampoline —
      * dispatch it here (volatile keep: the sentinel owns the argv). */
-    Cljc *volatile sentinel_keep = NIL;
+    Clove *volatile sentinel_keep = NIL;
     int tcf = -1;   /* trace-frame slot for the top-level tail call */
-    while (last && last->tag == CLJC_RECUR && last->meta) {
+    while (last && last->tag == CLOVE_RECUR && last->meta) {
         sentinel_keep = last;
         if (g_tc_form) {
             if (tcf < 0 && eval_sp < EVAL_STACK_MAX) tcf = eval_sp++;
             if (tcf >= 0) eval_stack[tcf] = g_tc_form;
             g_tc_form = NULL;
         }
-        Cljc **av = last->as.recur.spill
-            ? (Cljc **)last->as.recur.iv[0] : last->as.recur.iv;
+        Clove **av = last->as.recur.spill
+            ? (Clove **)last->as.recur.iv[0] : last->as.recur.iv;
         last = apply(root, last->meta, av, (int)last->as.recur.n);
         (void)sentinel_keep;
     }
     if (tcf >= 0) eval_sp = tcf;
     if (chunk && def_name) {            /* now perform the def itself */
         vpush(last);
-        Cljc *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
-        Cljc *d = mk_cons(mk_sym(intern("def", 3)),
+        Clove *q = mk_cons(mk_sym(intern("quote", 5)), mk_cons(last, NIL));
+        Clove *d = mk_cons(mk_sym(intern("def", 3)),
                           mk_cons(def_name, mk_cons(q, NIL)));
         vpush(d);
         last = eval(root, d);
@@ -9380,7 +9382,7 @@ static Cljc *eval_toplevel(CljcEnv *root, Cljc *form) {
     return last;
 }
 
-static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_eval_forms(CloveEnv *env, Clove **argv, int nargs) {
     const char *src = as_str(argv[0], "eval-forms");
     const char *saved_ns = cur_reader_ns;
     /* Fresh line tracking for the nested source (same discipline as
@@ -9388,23 +9390,23 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
      * reader's position and their :line meta lands offset in error traces. */
     int save_line = rd_line;
     const char *save_start = rd_line_start;
-    Cljc *save_file = rd_file_cell;
+    Clove *save_file = rd_file_cell;
     rd_line = 1;
     rd_line_start = src;
-    rd_file_cell = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLJC_STRING)
+    rd_file_cell = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLOVE_STRING)
         ? argv[1] : NULL;
     /* Top-level forms evaluate in the ROOT env, not the caller's lexical
-     * scope — load-file runs inside cljc/require-one's `let`, whose locals
+     * scope — load-file runs inside clove/require-one's `let`, whose locals
      * (paths, hit, rel, ...) would otherwise shadow same-named globals in
      * the loaded file (a file defining (defn paths ..) resolved its own
      * call sites to require-one's candidate-list lazy seq). */
-    CljcEnv *root = env;
+    CloveEnv *root = env;
     while (root->parent) root = root->parent;
-    Cljc *last = NIL;
+    Clove *last = NIL;
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
-        Cljc *form = read_form(&src);
+        Clove *form = read_form(&src);
         if (!form) break;
         /* Top-level forms get VM-compiled as zero-arg chunks (hot loops in
          * (def x (loop ...)) shapes were tree-walked: 2017-AoC-d15's 45M
@@ -9422,17 +9424,17 @@ static Cljc *prim_eval_forms(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* (macroexpand-1 form) — if form is a call to a macro, return its one-step
  * expansion (args unevaluated); otherwise return form unchanged. */
-static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_macroexpand_1(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
-    Cljc *form = argv[0];
-    if (form == NIL || form->tag != CLJC_LIST) return form;
-    Cljc *head = form->as.cons.head;
-    if (head == NIL || head->tag != CLJC_SYMBOL) return form;
+    Clove *form = argv[0];
+    if (form == NIL || form->tag != CLOVE_LIST) return form;
+    Clove *head = form->as.cons.head;
+    if (head == NIL || head->tag != CLOVE_SYMBOL) return form;
     /* resolve head like resolve_symbol (locals, then root with home-ns), but
      * non-throwing — so a namespaced macro (loaded under (ns ..)) is found. */
-    Cljc *fn = NULL;
-    for (CljcEnv *e = env; e->parent; e = e->parent) {
-        Cljc **p = env_local_find(e, head->as.symc.name);
+    Clove *fn = NULL;
+    for (CloveEnv *e = env; e->parent; e = e->parent) {
+        Clove **p = env_local_find(e, head->as.symc.name);
         if (p) { fn = *p; break; }
     }
     if (!fn) {
@@ -9443,33 +9445,33 @@ static Cljc *prim_macroexpand_1(CljcEnv *env, Cljc **argv, int nargs) {
     fn = macro_fn_of(env, fn);
     if (!fn) return form;
     size_t base = vsp;
-    for (Cljc *a = form->as.cons.tail; a && a->tag == CLJC_LIST; a = a->as.cons.tail)
+    for (Clove *a = form->as.cons.tail; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
         vpush(a->as.cons.head);
-    Cljc *expansion = macro_expand1(env, fn, &vstack[base], (int)(vsp - base), form);
+    Clove *expansion = macro_expand1(env, fn, &vstack[base], (int)(vsp - base), form);
     vsp = base;
     return expansion;
 }
 
-static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_with_meta(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
-    Cljc *m = argv[1];
-    if (m != NIL && m->tag != CLJC_MAP) cljc_error("with-meta: meta must be a map");
+    Clove *v = argv[0];
+    Clove *m = argv[1];
+    if (m != NIL && m->tag != CLOVE_MAP) clove_error("with-meta: meta must be a map");
     /* Lenient (Clojure throws on a non-IObj): metadata is advisory, and libraries
      * attach it to immutable scalars they treat as values (Emmy on a ratio
      * coefficient, notebook annotations on nil). Pass the value through. */
-    switch (v == NIL ? CLJC_NIL : v->tag) {
-        case CLJC_LIST: case CLJC_VECTOR: case CLJC_MAP: case CLJC_SET:
-        case CLJC_FN: case CLJC_SYMBOL: case CLJC_STRING: break;
+    switch (v == NIL ? CLOVE_NIL : v->tag) {
+        case CLOVE_LIST: case CLOVE_VECTOR: case CLOVE_MAP: case CLOVE_SET:
+        case CLOVE_FN: case CLOVE_SYMBOL: case CLOVE_STRING: break;
         default: return v;
     }
-    Cljc *c = alloc(v->tag);
+    Clove *c = alloc(v->tag);
     c->as = v->as;
-    if (v->tag == CLJC_VECTOR) {        /* tails are exclusively owned */
+    if (v->tag == CLOVE_VECTOR) {        /* tails are exclusively owned */
         c->as.vec.tail = tail_alloc(v->as.vec.taillen);
-        memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Cljc *) * v->as.vec.taillen);
+        memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Clove *) * v->as.vec.taillen);
     }
-    if (v->tag == CLJC_STRING) {        /* string buffers are owned: copy */
+    if (v->tag == CLOVE_STRING) {        /* string buffers are owned: copy */
         size_t n = strlen(v->as.str);
         c->as.str = xmalloc(n + 1);
         memcpy(c->as.str, v->as.str, n + 1);
@@ -9482,17 +9484,17 @@ static Cljc *prim_with_meta(CljcEnv *env, Cljc **argv, int nargs) {
     return c;
 }
 
-static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_meta(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     /* a deftype instance implementing IMeta keeps its metadata in a :meta field
      * (the convention SCI's Var/Namespace follow) — return that, deref'd if it
      * is a mutable (atom) field. */
-    if (v != NIL && v->tag == CLJC_MAP) {
-        Cljc *ty, *mf;
-        if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
+    if (v != NIL && v->tag == CLOVE_MAP) {
+        Clove *ty, *mf;
+        if (map_find(v, mk_kw(intern("clove/type", 10)), &ty) &&
             map_find(v, mk_kw(intern("meta", 4)), &mf)) {
-            if (mf != NIL && mf->tag == CLJC_ATOM) return mf->as.atom.value;
+            if (mf != NIL && mf->tag == CLOVE_ATOM) return mf->as.atom.value;
             return mf;
         }
     }
@@ -9500,14 +9502,14 @@ static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
      * demand from the doc registry + the binding's fn arities. Core docstrings
      * appear once docs.clj has loaded (any (doc ...)/(find-doc ...) call);
      * user defn docstrings are registered at definition time. */
-    if (v != NIL && v->tag == CLJC_VAR) {
-        Cljc *sym = mk_sym(v->as.var.name);
-        Cljc *args1[1] = { sym };
-        Cljc *info = prim_doc_info(env, args1, 1);
-        Cljc *m = v->meta ? v->meta : mk_map();
+    if (v != NIL && v->tag == CLOVE_VAR) {
+        Clove *sym = mk_sym(v->as.var.name);
+        Clove *args1[1] = { sym };
+        Clove *info = prim_doc_info(env, args1, 1);
+        Clove *m = v->meta ? v->meta : mk_map();
         m = map_assoc(m, mk_kw(intern("name", 4)), sym);
-        if (info != NIL && info->tag == CLJC_MAP) {
-            Cljc *d, *al;
+        if (info != NIL && info->tag == CLOVE_MAP) {
+            Clove *d, *al;
             if (map_find(info, mk_kw(intern("doc", 3)), &d) && d != NIL)
                 m = map_assoc(m, mk_kw(intern("doc", 3)), d);
             if (map_find(info, mk_kw(intern("arglists", 8)), &al) && al != NIL)
@@ -9518,19 +9520,19 @@ static Cljc *prim_meta(CljcEnv *env, Cljc **argv, int nargs) {
     return (v != NIL && v->meta) ? v->meta : NIL;
 }
 
-static Cljc *prim_identical(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_identical(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     return mk_bool(argv[0] == argv[1] ||
-                   (argv[0]->tag == CLJC_INT && argv[1]->tag == CLJC_INT &&
+                   (argv[0]->tag == CLOVE_INT && argv[1]->tag == CLOVE_INT &&
                     argv[0]->as.i == argv[1]->as.i));  /* small-int cache parity */
 }
 
-static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_int(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_INT) return v;
-    if (v != NIL && v->tag == CLJC_CHAR) return mk_int((int64_t)v->as.chr);  /* (int \a) => 97 */
-    if (v != NIL && v->tag == CLJC_DOUBLE) {
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_INT) return v;
+    if (v != NIL && v->tag == CLOVE_CHAR) return mk_int((int64_t)v->as.chr);  /* (int \a) => 97 */
+    if (v != NIL && v->tag == CLOVE_DOUBLE) {
         /* Clojure's RT.longCast: truncate; NaN is 0; outside the long range
          * throws (a bare C cast there is undefined behavior). 2^63 itself
          * passes Java's `x > Long.MAX_VALUE` test and saturates. */
@@ -9541,41 +9543,41 @@ static Cljc *prim_int(CljcEnv *env, Cljc **argv, int nargs) {
             SBuf sb = {0}; format_double(&sb, d);
             char msg[64]; snprintf(msg, sizeof msg, "%s", sb.data ? sb.data : "");
             free(sb.data);
-            cljc_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+            clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
         }
         return mk_int((int64_t)d);
     }
-    if (v != NIL && v->tag == CLJC_BIGINT) {
+    if (v != NIL && v->tag == CLOVE_BIGINT) {
         char *ds = big_to_decimal(v);
         char msg[96]; snprintf(msg, sizeof msg, "%s", ds);
         free(ds);
-        cljc_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
+        clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", msg);
     }
-    if (v != NIL && (v->tag == CLJC_BIGDEC || v->tag == CLJC_RATIO)) {   /* (long 2.7M) => 2 */
-        Cljc *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
-        if (q->tag != CLJC_INT) cljc_error("int: value out of range: %s", val_desc(v));
+    if (v != NIL && (v->tag == CLOVE_BIGDEC || v->tag == CLOVE_RATIO)) {   /* (long 2.7M) => 2 */
+        Clove *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
+        if (q->tag != CLOVE_INT) clove_error("int: value out of range: %s", val_desc(v));
         return q;
     }
-    if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
+    if (v != NIL && v->tag == CLOVE_STRING && v->as.str[0])
         return mk_int((int64_t)(unsigned char)v->as.str[0]);  /* lenient: (int "a") */
-    cljc_error("int: expected a number or character");
+    clove_error("int: expected a number or character");
     return NIL;
 }
 
-static Cljc *prim_getenv_raw(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_getenv_raw(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    const char *v = getenv(as_str(argv[0], "cljc/env*"));
+    const char *v = getenv(as_str(argv[0], "clove/env*"));
     return v ? mk_str(v, strlen(v)) : NIL;
 }
 
-static Cljc *prim_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_sharedir(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
-    return mk_str(CLJC_SHAREDIR, strlen(CLJC_SHAREDIR));
+    return mk_str(CLOVE_SHAREDIR, strlen(CLOVE_SHAREDIR));
 }
 
-/* The share dir relative to THIS executable (PREFIX/bin/cljc -> PREFIX/share/cljc),
+/* The share dir relative to THIS executable (PREFIX/bin/clove -> PREFIX/share/clove),
  * so a binary installed under any PREFIX finds its batteries regardless of the
- * compile-time CLJC_SHAREDIR. nil if the exe path can't be determined. */
+ * compile-time CLOVE_SHAREDIR. nil if the exe path can't be determined. */
 /* Absolute path of the running executable; false when the platform can't say. */
 static bool exe_path(char *buf, size_t bufsz) {
 #if defined(__linux__)
@@ -9600,10 +9602,10 @@ static bool exe_path(char *buf, size_t bufsz) {
 #endif
 }
 
-/* (cljc/exe-dir*) — directory holding the executable. A repo build keeps its
+/* (clove/exe-dir*) — directory holding the executable. A repo build keeps its
  * batteries and vendor/ right next to the binary, so this goes on the load
- * path: an uninstalled ./cljc then resolves requires from any cwd. */
-static Cljc *prim_exe_dir(CljcEnv *env, Cljc **argv, int nargs) {
+ * path: an uninstalled ./clove then resolves requires from any cwd. */
+static Clove *prim_exe_dir(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     char buf[4096];
     if (!exe_path(buf, sizeof buf)) return NIL;
@@ -9613,7 +9615,7 @@ static Cljc *prim_exe_dir(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(buf, strlen(buf));
 }
 
-static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_exe_sharedir(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     char buf[4096];
     if (!exe_path(buf, sizeof buf)) return NIL;
@@ -9624,13 +9626,13 @@ static Cljc *prim_exe_sharedir(CljcEnv *env, Cljc **argv, int nargs) {
     if (!slash) return NIL;
     *slash = '\0';
     char path[sizeof(buf) + 32];
-    snprintf(path, sizeof(path), "%s/share/cljc", buf);
+    snprintf(path, sizeof(path), "%s/share/clove", buf);
     return mk_str(path, strlen(path));
 }
 
-/* (cljc/os*) → :linux | :macos | :windows | :unknown — lets scripts and the
+/* (clove/os*) → :linux | :macos | :windows | :unknown — lets scripts and the
  * test suite skip sections that need a POSIX shell, cc, or coroutines. */
-static Cljc *prim_os(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_os(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #if defined(_WIN32)
     const char *n = "windows";
@@ -9644,107 +9646,107 @@ static Cljc *prim_os(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_kw(intern(n, strlen(n)));
 }
 
-static Cljc *prim_hash(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_hash(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    return mk_int((int64_t)cljc_hash(argv[0]));
+    return mk_int((int64_t)clove_hash(argv[0]));
 }
 
-static Cljc *prim_type(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_type(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     if (v == NIL) return NIL;
-    if (v->tag == CLJC_MAP) {  /* records are maps tagged with :cljc/type */
-        Cljc *t;
-        if (map_find(v, mk_kw(intern("cljc/type", 9)), &t)) return t;
+    if (v->tag == CLOVE_MAP) {  /* records are maps tagged with :clove/type */
+        Clove *t;
+        if (map_find(v, mk_kw(intern("clove/type", 10)), &t)) return t;
         return mk_kw(intern("map", 3));
     }
     const char *n;
     switch (v->tag) {
-        case CLJC_BOOL: n = "boolean"; break;
-        case CLJC_INT: n = "int"; break;
-        case CLJC_BIGINT: n = "bigint"; break;
-        case CLJC_RATIO: n = "ratio"; break;
-        case CLJC_BIGDEC: n = "BigDecimal"; break;
-        case CLJC_VAR: n = "var"; break;
-        case CLJC_DOUBLE: n = "double"; break;
-        case CLJC_STRING: n = "string"; break;
-        case CLJC_CHAR: n = "char"; break;
-        case CLJC_KEYWORD: n = "keyword"; break;
-        case CLJC_SYMBOL: n = "symbol"; break;
-        case CLJC_LIST: case CLJC_EMPTY: n = "list"; break;
-        case CLJC_LAZY: n = "lazy-seq"; break;
-        case CLJC_VECTOR: n = "vector"; break;
-        case CLJC_SET: n = "set"; break;
-        case CLJC_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
-        case CLJC_IARRAY: n = v->as.iarr.dbl ? "double-array" : "int-array"; break;
-        case CLJC_TVEC: n = "transient-vector"; break;
-        case CLJC_ATOM: n = "atom"; break;
-        case CLJC_FN: case CLJC_NATIVE: n = "fn"; break;
-        case CLJC_CORO: n = "coroutine"; break;
+        case CLOVE_BOOL: n = "boolean"; break;
+        case CLOVE_INT: n = "int"; break;
+        case CLOVE_BIGINT: n = "bigint"; break;
+        case CLOVE_RATIO: n = "ratio"; break;
+        case CLOVE_BIGDEC: n = "BigDecimal"; break;
+        case CLOVE_VAR: n = "var"; break;
+        case CLOVE_DOUBLE: n = "double"; break;
+        case CLOVE_STRING: n = "string"; break;
+        case CLOVE_CHAR: n = "char"; break;
+        case CLOVE_KEYWORD: n = "keyword"; break;
+        case CLOVE_SYMBOL: n = "symbol"; break;
+        case CLOVE_LIST: case CLOVE_EMPTY: n = "list"; break;
+        case CLOVE_LAZY: n = "lazy-seq"; break;
+        case CLOVE_VECTOR: n = "vector"; break;
+        case CLOVE_SET: n = "set"; break;
+        case CLOVE_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
+        case CLOVE_IARRAY: n = v->as.iarr.dbl ? "double-array" : "int-array"; break;
+        case CLOVE_TVEC: n = "transient-vector"; break;
+        case CLOVE_ATOM: n = "atom"; break;
+        case CLOVE_FN: case CLOVE_NATIVE: n = "fn"; break;
+        case CLOVE_CORO: n = "coroutine"; break;
         default: n = "unknown"; break;
     }
     return mk_kw(intern(n, strlen(n)));
 }
 
-/* (cljc/chunk-map* f s n) => [strict-result-list rest-seq]; consumes at
+/* (clove/chunk-map* f s n) => [strict-result-list rest-seq]; consumes at
  * most n elements but NEVER FORCES an unrealized lazy tail after the
  * first element. Already-realized list runs chunk at full speed, but
  * (map f (iterate g x)) advances one element per step — over-realizing
  * past a take-while boundary called user fns on values they were never
  * meant to see (JVM map doesn't chunk unchunked sources either). */
-static Cljc *prim_chunk_map(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *f = argv[0];
-    Cljc *s = seq1(argv[1]);
+static Clove *prim_chunk_map(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *f = argv[0];
+    Clove *s = seq1(argv[1]);
     int64_t n = as_int(argv[2], "chunk-map");
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     while (n-- > 0 && s != NIL) {
         *t = mk_cons(apply(env, f, &s->as.cons.head, 1), NIL);
         t = &(*t)->as.cons.tail;
-        Cljc *tail = s->as.cons.tail;
-        if (tail != NIL && tail->tag == CLJC_LAZY &&
+        Clove *tail = s->as.cons.tail;
+        if (tail != NIL && tail->tag == CLOVE_LAZY &&
             !tail->as.lazy.done) { s = tail; break; }
         s = seq1(tail);
     }
-    Cljc *pair[2] = {out, s};
+    Clove *pair[2] = {out, s};
     return mk_vector(pair, 2);
 }
 
-static Cljc *prim_chunk_filter(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *f = argv[0];
-    Cljc *s = seq1(argv[1]);
+static Clove *prim_chunk_filter(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *f = argv[0];
+    Clove *s = seq1(argv[1]);
     int64_t n = as_int(argv[2], "chunk-filter");
-    Cljc *out = NIL, **t = &out;
+    Clove *out = NIL, **t = &out;
     while (n-- > 0 && s != NIL) {
         if (is_truthy(apply(env, f, &s->as.cons.head, 1))) {
             *t = mk_cons(s->as.cons.head, NIL);
             t = &(*t)->as.cons.tail;
         }
-        Cljc *tail = s->as.cons.tail;
-        if (tail != NIL && tail->tag == CLJC_LAZY &&
+        Clove *tail = s->as.cons.tail;
+        if (tail != NIL && tail->tag == CLOVE_LAZY &&
             !tail->as.lazy.done) { s = tail; break; }
         s = seq1(tail);
     }
-    Cljc *pair[2] = {out, s};
+    Clove *pair[2] = {out, s};
     return mk_vector(pair, 2);
 }
 
-/* (cljc/onto strict-list tail) — splice `tail` (possibly lazy) onto the end of
+/* (clove/onto strict-list tail) — splice `tail` (possibly lazy) onto the end of
  * `lst`. lst is a fresh, unshared chunk list from the chunk-map / chunk-filter
  * natives, so we mutate its last cons in place instead of copying every element
  * (this is the hot map/filter chunk-splice — copying doubled conses per item). */
-static Cljc *prim_onto(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_onto(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *lst = argv[0];
-    Cljc *tail = argv[1];
-    if (lst == NIL || lst->tag != CLJC_LIST) return tail;
-    Cljc *l = lst;
-    while (l->as.cons.tail != NIL && l->as.cons.tail->tag == CLJC_LIST)
+    Clove *lst = argv[0];
+    Clove *tail = argv[1];
+    if (lst == NIL || lst->tag != CLOVE_LIST) return tail;
+    Clove *l = lst;
+    while (l->as.cons.tail != NIL && l->as.cons.tail->tag == CLOVE_LIST)
         l = l->as.cons.tail;
     l->as.cons.tail = tail;
     return lst;
 }
 
-static Cljc *prim_gc(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_gc(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     gc_collect();
     return mk_int((int64_t)gc_freed_last);  /* cells freed by this collection */
@@ -9752,20 +9754,20 @@ static Cljc *prim_gc(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── Exceptions ── */
 
-static Cljc *prim_throw(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_throw(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    cljc_throw_value(argv[0]);
+    clove_throw_value(argv[0]);
     return NIL;  /* unreachable */
 }
 
 static const char *kw_message(void) { return intern("message", 7); }
 static const char *kw_data(void)    { return intern("data", 4); }
 
-static Cljc *prim_ex_info(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ex_info(CloveEnv *env, Clove **argv, int nargs) {
     /* (ex-info msg data) => {:message msg :data data} — exceptions are plain
      * maps here, so all map functions work on them. */
     (void)env;
-    Cljc *m = mk_map();
+    Clove *m = mk_map();
     m = map_assoc(m, mk_kw(kw_message()), argv[0]);
     m = map_assoc(m, mk_kw(kw_data()), argv[1]);
     if (nargs >= 3 && argv[2] != NIL)           /* (ex-info msg data cause) */
@@ -9773,51 +9775,51 @@ static Cljc *prim_ex_info(CljcEnv *env, Cljc **argv, int nargs) {
     return exc_with_class(m, "ExceptionInfo");
 }
 
-/* (cljc/ex-isa?* class x) — is x an exception of (a subclass of) class?
+/* (clove/ex-isa?* class x) — is x an exception of (a subclass of) class?
  * Backs instance? for exception classes; false for untyped values. */
-static Cljc *prim_ex_isa(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ex_isa(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    need_nargs(nargs, 2, "cljc/ex-isa?*");
-    Cljc *c = argv[0];
+    need_nargs(nargs, 2, "clove/ex-isa?*");
+    Clove *c = argv[0];
     const char *ec = exc_class_of(argv[1]);
-    if (!ec || c == NIL || (c->tag != CLJC_KEYWORD && c->tag != CLJC_SYMBOL)) return FALSE;
-    return mk_bool(exc_isa(ec, class_simple(c->tag == CLJC_KEYWORD ? c->as.kw : c->as.sym)));
+    if (!ec || c == NIL || (c->tag != CLOVE_KEYWORD && c->tag != CLOVE_SYMBOL)) return FALSE;
+    return mk_bool(exc_isa(ec, class_simple(c->tag == CLOVE_KEYWORD ? c->as.kw : c->as.sym)));
 }
 
-/* (cljc/ex-class* x) — the class keyword recorded on an exception, else nil.
+/* (clove/ex-class* x) — the class keyword recorded on an exception, else nil.
  * `class` consults it; `type` deliberately does not (an ex-info still types
  * as :map, so protocols and multimethods extended to maps keep applying). */
-static Cljc *prim_ex_class(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ex_class(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    need_nargs(nargs, 1, "cljc/ex-class*");
+    need_nargs(nargs, 1, "clove/ex-class*");
     const char *ec = exc_class_of(argv[0]);
     return ec ? mk_kw(intern(ec, strlen(ec))) : NIL;
 }
 
-/* (cljc/ex-typed* class-keyword ex) — ex re-classed (constructor shims). */
-static Cljc *prim_ex_typed(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/ex-typed* class-keyword ex) — ex re-classed (constructor shims). */
+static Clove *prim_ex_typed(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    need_nargs(nargs, 2, "cljc/ex-typed*");
-    if (argv[0] == NIL || argv[0]->tag != CLJC_KEYWORD) cljc_error("cljc/ex-typed*: expected a class keyword");
+    need_nargs(nargs, 2, "clove/ex-typed*");
+    if (argv[0] == NIL || argv[0]->tag != CLOVE_KEYWORD) clove_error("clove/ex-typed*: expected a class keyword");
     return exc_with_class(argv[1], class_simple(argv[0]->as.kw));
 }
 
-static Cljc *prim_ex_message(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ex_message(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *e = argv[0];
-    if (e != NIL && e->tag == CLJC_STRING) return e;  /* interpreter errors are strings */
-    if (e != NIL && e->tag == CLJC_MAP) {
-        Cljc *out;
+    Clove *e = argv[0];
+    if (e != NIL && e->tag == CLOVE_STRING) return e;  /* interpreter errors are strings */
+    if (e != NIL && e->tag == CLOVE_MAP) {
+        Clove *out;
         if (map_find(e, mk_kw(kw_message()), &out)) return out;
     }
     return NIL;
 }
 
-static Cljc *prim_ex_data(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ex_data(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *e = argv[0];
-    if (e != NIL && e->tag == CLJC_MAP) {
-        Cljc *out;
+    Clove *e = argv[0];
+    if (e != NIL && e->tag == CLOVE_MAP) {
+        Clove *out;
         if (map_find(e, mk_kw(kw_data()), &out)) return out;
     }
     return NIL;
@@ -9825,61 +9827,61 @@ static Cljc *prim_ex_data(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── Atoms ── */
 
-static Cljc *as_atom(Cljc *v, const char *what) {
-    if (v == NIL || v->tag != CLJC_ATOM) cljc_error("%s: expected an atom, got %s", what, val_desc(v));
+static Clove *as_atom(Clove *v, const char *what) {
+    if (v == NIL || v->tag != CLOVE_ATOM) clove_error("%s: expected an atom, got %s", what, val_desc(v));
     return v;
 }
 
-static Cljc *prim_atom(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_atom(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 1, "atom");
-    Cljc *a = alloc(CLJC_ATOM);
+    Clove *a = alloc(CLOVE_ATOM);
     a->as.atom.value = argv[0];
     return a;
 }
 
-static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_ATOM) return v->as.atom.value;
-    if (v != NIL && v->tag == CLJC_VAR) {     /* deref a Var -> its current value */
+static Clove *prim_deref(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_ATOM) return v->as.atom.value;
+    if (v != NIL && v->tag == CLOVE_VAR) {     /* deref a Var -> its current value */
         Binding *b = root_find(env_root(env), v->as.var.name, NULL, false);
         return b ? b->value : NIL;
     }
-    if (v != NIL && v->tag == CLJC_MAP) {
-        /* CljcDelay: force in C, independent of the multimethod table — a
+    if (v != NIL && v->tag == CLOVE_MAP) {
+        /* CloveDelay: force in C, independent of the multimethod table — a
          * library that redefines `deref` as a defmulti resets that table, so
-         * delays must not depend on it. {:cljc/type :CljcDelay :f thunk :v val} */
-        Cljc *ty;
-        if (map_find(v, mk_kw(intern("cljc/type", 9)), &ty) &&
-            ty == mk_kw(intern("CljcDelay", 9))) {
-            Cljc *fa = NIL, *va = NIL;
+         * delays must not depend on it. {:clove/type :CloveDelay :f thunk :v val} */
+        Clove *ty;
+        if (map_find(v, mk_kw(intern("clove/type", 10)), &ty) &&
+            ty == mk_kw(intern("CloveDelay", 10))) {
+            Clove *fa = NIL, *va = NIL;
             map_find(v, mk_kw(intern("f", 1)), &fa);
             map_find(v, mk_kw(intern("v", 1)), &va);
-            if (fa != NIL && fa->tag == CLJC_ATOM && fa->as.atom.value != NIL) {
-                Cljc *val = apply(env, fa->as.atom.value, NULL, 0);
-                if (va != NIL && va->tag == CLJC_ATOM) va->as.atom.value = val;
+            if (fa != NIL && fa->tag == CLOVE_ATOM && fa->as.atom.value != NIL) {
+                Clove *val = apply(env, fa->as.atom.value, NULL, 0);
+                if (va != NIL && va->tag == CLOVE_ATOM) va->as.atom.value = val;
                 fa->as.atom.value = NIL;
                 return val;
             }
-            return (va != NIL && va->tag == CLJC_ATOM) ? va->as.atom.value : NIL;
+            return (va != NIL && va->tag == CLOVE_ATOM) ? va->as.atom.value : NIL;
         }
     }
     /* a deftype implementing deref/IDeref (e.g. SCI's Var) */
-    Cljc *out;
+    Clove *out;
     /* (deref x timeout-ms timeout-val) — blocking refs (promise/future) carry
-     * a cljc/deref-timeout method; anything else falls through to plain deref
+     * a clove/deref-timeout method; anything else falls through to plain deref
      * (an atom's value is always "already delivered"). */
     if (nargs >= 3 &&
-        dispatch_deftype_method(env, v, "cljc/deref-timeout", argv + 1, 2, &out))
+        dispatch_deftype_method(env, v, "clove/deref-timeout", argv + 1, 2, &out))
         return out;
     if (dispatch_deftype_method(env, v, "deref", NULL, 0, &out)) return out;
     /* a scalar is clearly not derefable: surface the mistake rather than
      * silently returning it (which becomes a cryptic error downstream). */
     if (v != NIL) switch (v->tag) {
-        case CLJC_INT: case CLJC_BIGINT: case CLJC_DOUBLE: case CLJC_RATIO: case CLJC_BIGDEC:
-        case CLJC_STRING: case CLJC_CHAR: case CLJC_KEYWORD: case CLJC_SYMBOL:
-        case CLJC_BOOL:
-            cljc_error("deref: %s is not derefable (expected an atom, var, or delay)",
+        case CLOVE_INT: case CLOVE_BIGINT: case CLOVE_DOUBLE: case CLOVE_RATIO: case CLOVE_BIGDEC:
+        case CLOVE_STRING: case CLOVE_CHAR: case CLOVE_KEYWORD: case CLOVE_SYMBOL:
+        case CLOVE_BOOL:
+            clove_error("deref: %s is not derefable (expected an atom, var, or delay)",
                        val_type_name(v));
             break;
         default: break;
@@ -9887,46 +9889,46 @@ static Cljc *prim_deref(CljcEnv *env, Cljc **argv, int nargs) {
     return v;   /* otherwise identity: @#'fn (var -> value) derefs to itself */
 }
 
-static Cljc *prim_reset(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_reset(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    /* a deftype with its own atom semantics (a `deref` + `cljc/cas` method, e.g.
+    /* a deftype with its own atom semantics (a `deref` + `clove/cas` method, e.g.
      * DataScript's Conn via extend-clj/deftype-atom): reset! = cas(@x, v). */
-    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP) {
-        Cljc *old, *casout;
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_MAP) {
+        Clove *old, *casout;
         if (dispatch_deftype_method(env, argv[0], "deref", NULL, 0, &old)) {
-            Cljc *cargs[2] = { old, argv[1] };
-            if (dispatch_deftype_method(env, argv[0], "cljc/cas", cargs, 2, &casout))
+            Clove *cargs[2] = { old, argv[1] };
+            if (dispatch_deftype_method(env, argv[0], "clove/cas", cargs, 2, &casout))
                 return argv[1];
         }
     }
-    Cljc *a = as_atom(argv[0], "reset!");
-    Cljc *v = argv[1];
+    Clove *a = as_atom(argv[0], "reset!");
+    Clove *v = argv[1];
     a->as.atom.value = v;
     return v;
 }
 
-static Cljc *prim_swap(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_swap(CloveEnv *env, Clove **argv, int nargs) {
     /* (swap! a f x y) => sets a to (f @a x y), returns the new value. */
     /* deftype atom (Conn): new = (apply f @x args); cas(@x, new). */
-    if (argv[0] != NIL && argv[0]->tag == CLJC_MAP) {
-        Cljc *old;
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_MAP) {
+        Clove *old;
         if (dispatch_deftype_method(env, argv[0], "deref", NULL, 0, &old)) {
             size_t b = vsp;
             vpush(old);
             for (int i = 2; i < nargs; i++) vpush(argv[i]);
-            Cljc *nv = apply(env, argv[1], &vstack[b], (int)(vsp - b));
+            Clove *nv = apply(env, argv[1], &vstack[b], (int)(vsp - b));
             vsp = b;
-            Cljc *cargs[2] = { old, nv }, *casout;
-            if (dispatch_deftype_method(env, argv[0], "cljc/cas", cargs, 2, &casout))
+            Clove *cargs[2] = { old, nv }, *casout;
+            if (dispatch_deftype_method(env, argv[0], "clove/cas", cargs, 2, &casout))
                 return nv;
         }
     }
-    Cljc *a = as_atom(argv[0], "swap!");
-    Cljc *f = argv[1];
+    Clove *a = as_atom(argv[0], "swap!");
+    Clove *f = argv[1];
     size_t base = vsp;
     vpush(a->as.atom.value);
     for (int i = 2; i < nargs; i++) vpush(argv[i]);
-    Cljc *nv = apply(env, f, &vstack[base], (int)(vsp - base));
+    Clove *nv = apply(env, f, &vstack[base], (int)(vsp - base));
     vsp = base;
     a->as.atom.value = nv;
     return nv;
@@ -9961,27 +9963,27 @@ static int str_compare(const char *a, const char *b) {
     return la < lb ? -dd : dd;
 }
 
-static int cmp_values(Cljc *a, Cljc *b) {
+static int cmp_values(Clove *a, Clove *b) {
     if (a == b) return 0;
     if (a == NIL) return -1;          /* nil sorts first */
     if (b == NIL) return 1;
-    bool a_num = CLJC_ISNUM(a->tag), b_num = CLJC_ISNUM(b->tag);
+    bool a_num = CLOVE_ISNUM(a->tag), b_num = CLOVE_ISNUM(b->tag);
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
-    if (a->tag != b->tag) cljc_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
+    if (a->tag != b->tag) clove_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
-        case CLJC_STRING:  return str_compare(a->as.str, b->as.str);
-        case CLJC_CHAR:    return a->as.chr - b->as.chr;
-        case CLJC_KEYWORD: return str_compare(a->as.kw, b->as.kw);
-        case CLJC_SYMBOL:  return str_compare(a->as.sym, b->as.sym);
-        case CLJC_BOOL:    return (int)a->as.b - (int)b->as.b;
-        case CLJC_VECTOR: case CLJC_LIST: {
+        case CLOVE_STRING:  return str_compare(a->as.str, b->as.str);
+        case CLOVE_CHAR:    return a->as.chr - b->as.chr;
+        case CLOVE_KEYWORD: return str_compare(a->as.kw, b->as.kw);
+        case CLOVE_SYMBOL:  return str_compare(a->as.sym, b->as.sym);
+        case CLOVE_BOOL:    return (int)a->as.b - (int)b->as.b;
+        case CLOVE_VECTOR: case CLOVE_LIST: {
             /* Clojure's APersistentVector.compareTo orders by count FIRST,
              * then element-wise: (compare [2] [1 10]) is -1, not 1. */
-            if (a->tag == CLJC_VECTOR && b->tag == CLJC_VECTOR) {
+            if (a->tag == CLOVE_VECTOR && b->tag == CLOVE_VECTOR) {
                 size_t na = vec_len(a), nb = vec_len(b);
                 if (na != nb) return na < nb ? -1 : 1;
             }
-            Cljc *sa = to_seq(a), *sb = to_seq(b);
+            Clove *sa = to_seq(a), *sb = to_seq(b);
             while (sa != NIL && sb != NIL) {
                 int c = cmp_values(sa->as.cons.head, sb->as.cons.head);
                 if (c) return c;
@@ -9989,20 +9991,20 @@ static int cmp_values(Cljc *a, Cljc *b) {
             }
             return sa != NIL ? 1 : sb != NIL ? -1 : 0;  /* shorter sorts first */
         }
-        default: cljc_error("compare: %s is not comparable", val_desc(a));
+        default: clove_error("compare: %s is not comparable", val_desc(a));
     }
     return 0;
 }
 
-static Cljc *prim_compare(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_compare(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(cmp_values(argv[0], argv[1]));
 }
 
-/* ───── Sorted set/map (CLJC_SORTED) ───────────────────────────────────── */
+/* ───── Sorted set/map (CLOVE_SORTED) ───────────────────────────────────── */
 
-static Cljc *mk_sorted(Cljc *cmp, bool is_map) {
-    Cljc *s = alloc(CLJC_SORTED);
+static Clove *mk_sorted(Clove *cmp, bool is_map) {
+    Clove *s = alloc(CLOVE_SORTED);
     s->as.sorted.root = NIL;
     s->as.sorted.cmp = cmp;          /* NIL => default cmp_values */
     s->as.sorted.is_map = is_map;
@@ -10011,25 +10013,25 @@ static Cljc *mk_sorted(Cljc *cmp, bool is_map) {
 
 /* the comparison key of an iteration entry: a set's element is its own key; a
  * map entry is a [k v] vector keyed by element 0. */
-static Cljc *sorted_entry_key(Cljc *coll, Cljc *entry) {
+static Clove *sorted_entry_key(Clove *coll, Clove *entry) {
     return coll->as.sorted.is_map ? vec_nth(entry, 0) : entry;
 }
 
-static int sorted_cmp_call(CljcEnv *env, Cljc *coll, Cljc *a, Cljc *b) {
-    Cljc *cmp = coll->as.sorted.cmp;
+static int sorted_cmp_call(CloveEnv *env, Clove *coll, Clove *a, Clove *b) {
+    Clove *cmp = coll->as.sorted.cmp;
     if (cmp == NIL) return cmp_values(a, b);
-    Cljc *args[2] = { a, b };
-    Cljc *r = apply(env, cmp, args, 2);
+    Clove *args[2] = { a, b };
+    Clove *r = apply(env, cmp, args, 2);
     if (r == NIL) return 0;
-    if (r->tag == CLJC_INT)    return r->as.i < 0 ? -1 : r->as.i > 0 ? 1 : 0;
-    if (r->tag == CLJC_DOUBLE) return r->as.d < 0 ? -1 : r->as.d > 0 ? 1 : 0;
+    if (r->tag == CLOVE_INT)    return r->as.i < 0 ? -1 : r->as.i > 0 ? 1 : 0;
+    if (r->tag == CLOVE_DOUBLE) return r->as.d < 0 ? -1 : r->as.d > 0 ? 1 : 0;
     if (is_truthy(r)) return -1;     /* boolean comparator: true => a before b */
-    Cljc *args2[2] = { b, a };
+    Clove *args2[2] = { b, a };
     return is_truthy(apply(env, cmp, args2, 2)) ? 1 : 0;
 }
 
-static Cljc *mk_map_entry(Cljc *k, Cljc *v) {
-    Cljc *kv[2] = { k, v };
+static Clove *mk_map_entry(Clove *k, Clove *v) {
+    Clove *kv[2] = { k, v };
     return mk_vector(kv, 2);
 }
 
@@ -10039,21 +10041,21 @@ static Cljc *mk_map_entry(Cljc *k, Cljc *v) {
 #define WBT_DELTA 3u
 #define WBT_GAMMA 2u
 
-static uint32_t tree_size(Cljc *n) { return n == NIL ? 0 : n->as.tnode.size; }
+static uint32_t tree_size(Clove *n) { return n == NIL ? 0 : n->as.tnode.size; }
 
-static Cljc *mk_tnode(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
-    Cljc *n = alloc(CLJC_TNODE);
+static Clove *mk_tnode(Clove *l, Clove *key, Clove *val, Clove *r) {
+    Clove *n = alloc(CLOVE_TNODE);
     n->as.tnode.left = l; n->as.tnode.right = r;
     n->as.tnode.key = key; n->as.tnode.val = val;
     n->as.tnode.size = tree_size(l) + tree_size(r) + 1;
     return n;
 }
 
-static Cljc *tnode_balance(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
+static Clove *tnode_balance(Clove *l, Clove *key, Clove *val, Clove *r) {
     uint32_t ln = tree_size(l), rn = tree_size(r);
     if (ln + rn <= 1) return mk_tnode(l, key, val, r);
     if (rn > WBT_DELTA * ln) {                  /* right heavy: rotate left */
-        Cljc *rl = r->as.tnode.left, *rr = r->as.tnode.right;
+        Clove *rl = r->as.tnode.left, *rr = r->as.tnode.right;
         if (tree_size(rl) < WBT_GAMMA * tree_size(rr))            /* single */
             return mk_tnode(mk_tnode(l, key, val, rl),
                             r->as.tnode.key, r->as.tnode.val, rr);
@@ -10062,7 +10064,7 @@ static Cljc *tnode_balance(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
                         mk_tnode(rl->as.tnode.right, r->as.tnode.key, r->as.tnode.val, rr));
     }
     if (ln > WBT_DELTA * rn) {                   /* left heavy: rotate right */
-        Cljc *ll = l->as.tnode.left, *lr = l->as.tnode.right;
+        Clove *ll = l->as.tnode.left, *lr = l->as.tnode.right;
         if (tree_size(lr) < WBT_GAMMA * tree_size(ll))            /* single */
             return mk_tnode(ll, l->as.tnode.key, l->as.tnode.val,
                             mk_tnode(lr, key, val, r));
@@ -10073,7 +10075,7 @@ static Cljc *tnode_balance(Cljc *l, Cljc *key, Cljc *val, Cljc *r) {
     return mk_tnode(l, key, val, r);
 }
 
-static Cljc *tnode_insert(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, Cljc *val) {
+static Clove *tnode_insert(CloveEnv *env, Clove *coll, Clove *n, Clove *key, Clove *val) {
     if (n == NIL) return mk_tnode(NIL, key, val, NIL);
     int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
     if (c < 0) return tnode_balance(tnode_insert(env, coll, n->as.tnode.left, key, val),
@@ -10084,25 +10086,25 @@ static Cljc *tnode_insert(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, Cljc *va
     return mk_tnode(n->as.tnode.left, key, val, n->as.tnode.right);  /* map: update */
 }
 
-static Cljc *tnode_delete_min(Cljc *n, Cljc **ok, Cljc **ov) {
+static Clove *tnode_delete_min(Clove *n, Clove **ok, Clove **ov) {
     if (n->as.tnode.left == NIL) { *ok = n->as.tnode.key; *ov = n->as.tnode.val; return n->as.tnode.right; }
     return tnode_balance(tnode_delete_min(n->as.tnode.left, ok, ov),
                          n->as.tnode.key, n->as.tnode.val, n->as.tnode.right);
 }
-static Cljc *tnode_delete_max(Cljc *n, Cljc **ok, Cljc **ov) {
+static Clove *tnode_delete_max(Clove *n, Clove **ok, Clove **ov) {
     if (n->as.tnode.right == NIL) { *ok = n->as.tnode.key; *ov = n->as.tnode.val; return n->as.tnode.left; }
     return tnode_balance(n->as.tnode.left, n->as.tnode.key, n->as.tnode.val,
                          tnode_delete_max(n->as.tnode.right, ok, ov));
 }
 /* join two subtrees of a removed node (the larger donates its extreme element). */
-static Cljc *tnode_glue(Cljc *l, Cljc *r) {
+static Clove *tnode_glue(Clove *l, Clove *r) {
     if (l == NIL) return r;
     if (r == NIL) return l;
-    Cljc *k, *v;
-    if (tree_size(l) > tree_size(r)) { Cljc *nl = tnode_delete_max(l, &k, &v); return tnode_balance(nl, k, v, r); }
-    Cljc *nr = tnode_delete_min(r, &k, &v); return tnode_balance(l, k, v, nr);
+    Clove *k, *v;
+    if (tree_size(l) > tree_size(r)) { Clove *nl = tnode_delete_max(l, &k, &v); return tnode_balance(nl, k, v, r); }
+    Clove *nr = tnode_delete_min(r, &k, &v); return tnode_balance(l, k, v, nr);
 }
-static Cljc *tnode_delete(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, bool *removed) {
+static Clove *tnode_delete(CloveEnv *env, Clove *coll, Clove *n, Clove *key, bool *removed) {
     if (n == NIL) { *removed = false; return NIL; }
     int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
     if (c < 0) return tnode_balance(tnode_delete(env, coll, n->as.tnode.left, key, removed),
@@ -10113,8 +10115,8 @@ static Cljc *tnode_delete(CljcEnv *env, Cljc *coll, Cljc *n, Cljc *key, bool *re
     return tnode_glue(n->as.tnode.left, n->as.tnode.right);
 }
 
-static Cljc *sorted_clone(Cljc *coll, Cljc *root) {
-    Cljc *s = alloc(CLJC_SORTED);
+static Clove *sorted_clone(Clove *coll, Clove *root) {
+    Clove *s = alloc(CLOVE_SORTED);
     s->as.sorted.root = root;
     s->as.sorted.cmp = coll->as.sorted.cmp;
     s->as.sorted.is_map = coll->as.sorted.is_map;
@@ -10122,19 +10124,19 @@ static Cljc *sorted_clone(Cljc *coll, Cljc *root) {
     return s;
 }
 
-static uint32_t sorted_count(Cljc *coll) { return tree_size(coll->as.sorted.root); }
+static uint32_t sorted_count(Clove *coll) { return tree_size(coll->as.sorted.root); }
 
 /* set conj / map assoc: `val` is the element (set) or the raw value (map). */
-static Cljc *sorted_put(CljcEnv *env, Cljc *coll, Cljc *key, Cljc *val) {
+static Clove *sorted_put(CloveEnv *env, Clove *coll, Clove *key, Clove *val) {
     return sorted_clone(coll, tnode_insert(env, coll, coll->as.sorted.root, key, val));
 }
-static Cljc *sorted_remove(CljcEnv *env, Cljc *coll, Cljc *key) {
+static Clove *sorted_remove(CloveEnv *env, Clove *coll, Clove *key) {
     bool removed = false;
-    Cljc *root = tnode_delete(env, coll, coll->as.sorted.root, key, &removed);
+    Clove *root = tnode_delete(env, coll, coll->as.sorted.root, key, &removed);
     return removed ? sorted_clone(coll, root) : coll;
 }
-static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out) {
-    for (Cljc *n = coll->as.sorted.root; n != NIL; ) {
+static bool sorted_get(CloveEnv *env, Clove *coll, Clove *key, Clove **out) {
+    for (Clove *n = coll->as.sorted.root; n != NIL; ) {
         int c = sorted_cmp_call(env, coll, key, n->as.tnode.key);
         if (c < 0) n = n->as.tnode.left;
         else if (c > 0) n = n->as.tnode.right;
@@ -10142,43 +10144,43 @@ static bool sorted_get(CljcEnv *env, Cljc *coll, Cljc *key, Cljc **out) {
     }
     return false;
 }
-static bool sorted_contains(CljcEnv *env, Cljc *coll, Cljc *key) {
-    Cljc *out; return sorted_get(env, coll, key, &out);
+static bool sorted_contains(CloveEnv *env, Clove *coll, Clove *key) {
+    Clove *out; return sorted_get(env, coll, key, &out);
 }
 
 /* in-order entries (set: elements; map: [k v] vectors) as a cons list. */
-static void tnode_collect(Cljc *coll, Cljc *n, Cljc ***t) {
+static void tnode_collect(Clove *coll, Clove *n, Clove ***t) {
     if (n == NIL) return;
     tnode_collect(coll, n->as.tnode.left, t);
-    Cljc *e = coll->as.sorted.is_map ? mk_map_entry(n->as.tnode.key, n->as.tnode.val) : n->as.tnode.key;
+    Clove *e = coll->as.sorted.is_map ? mk_map_entry(n->as.tnode.key, n->as.tnode.val) : n->as.tnode.key;
     **t = mk_cons(e, NIL);
     *t = &(**t)->as.cons.tail;
     tnode_collect(coll, n->as.tnode.right, t);
 }
-static Cljc *sorted_entry_list(Cljc *coll) {
-    Cljc *out = NIL, **t = &out;
+static Clove *sorted_entry_list(Clove *coll) {
+    Clove *out = NIL, **t = &out;
     tnode_collect(coll, coll->as.sorted.root, &t);
     return out;
 }
 
-static Cljc *prim_sorted_set(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *s = mk_sorted(NIL, false);
+static Clove *prim_sorted_set(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *s = mk_sorted(NIL, false);
     for (int i = 0; i < nargs; i++) s = sorted_put(env, s, argv[i], argv[i]);
     return s;
 }
-static Cljc *prim_sorted_set_by(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *s = mk_sorted(argv[0], false);
+static Clove *prim_sorted_set_by(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *s = mk_sorted(argv[0], false);
     for (int i = 1; i < nargs; i++) s = sorted_put(env, s, argv[i], argv[i]);
     return s;
 }
-static Cljc *prim_sorted_map(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *m = mk_sorted(NIL, true);
+static Clove *prim_sorted_map(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *m = mk_sorted(NIL, true);
     for (int i = 0; i + 1 < nargs; i += 2)
         m = sorted_put(env, m, argv[i], argv[i + 1]);
     return m;
 }
-static Cljc *prim_sorted_map_by(CljcEnv *env, Cljc **argv, int nargs) {
-    Cljc *m = mk_sorted(argv[0], true);
+static Clove *prim_sorted_map_by(CloveEnv *env, Clove **argv, int nargs) {
+    Clove *m = mk_sorted(argv[0], true);
     for (int i = 1; i + 1 < nargs; i += 2)
         m = sorted_put(env, m, argv[i], argv[i + 1]);
     return m;
@@ -10187,21 +10189,21 @@ static Cljc *prim_sorted_map_by(CljcEnv *env, Cljc **argv, int nargs) {
 /* (subseq sc test key) / (subseq sc t1 k1 t2 k2): entries whose key satisfies
  * (test (compare entry-key key) 0). The satisfying set is contiguous (the data
  * is ordered). rev => descending order (rsubseq). */
-static Cljc *sorted_subseq(CljcEnv *env, Cljc **argv, int nargs, bool rev) {
+static Clove *sorted_subseq(CloveEnv *env, Clove **argv, int nargs, bool rev) {
     need_nargs(nargs, 3, "subseq");
-    Cljc *coll = argv[0];
+    Clove *coll = argv[0];
     if (coll == NIL) return NIL;
-    if (coll->tag != CLJC_SORTED) cljc_error("subseq: not a sorted collection");
+    if (coll->tag != CLOVE_SORTED) clove_error("subseq: not a sorted collection");
     bool two = nargs >= 5;
-    Cljc *t1 = argv[1], *k1 = argv[2];
-    Cljc *t2 = two ? argv[3] : NIL, *k2 = two ? argv[4] : NIL;
-    Cljc *out = NIL, **t = &out;
-    for (Cljc *e = sorted_entry_list(coll); e != NIL; e = e->as.cons.tail) {
-        Cljc *entry = e->as.cons.head, *ek = sorted_entry_key(coll, entry);
-        Cljc *a1[2] = { mk_int(sorted_cmp_call(env, coll, ek, k1)), mk_int(0) };
+    Clove *t1 = argv[1], *k1 = argv[2];
+    Clove *t2 = two ? argv[3] : NIL, *k2 = two ? argv[4] : NIL;
+    Clove *out = NIL, **t = &out;
+    for (Clove *e = sorted_entry_list(coll); e != NIL; e = e->as.cons.tail) {
+        Clove *entry = e->as.cons.head, *ek = sorted_entry_key(coll, entry);
+        Clove *a1[2] = { mk_int(sorted_cmp_call(env, coll, ek, k1)), mk_int(0) };
         if (!is_truthy(apply(env, t1, a1, 2))) continue;
         if (two) {
-            Cljc *a2[2] = { mk_int(sorted_cmp_call(env, coll, ek, k2)), mk_int(0) };
+            Clove *a2[2] = { mk_int(sorted_cmp_call(env, coll, ek, k2)), mk_int(0) };
             if (!is_truthy(apply(env, t2, a2, 2))) continue;
         }
         if (rev) { out = mk_cons(entry, out); }          /* prepend => descending */
@@ -10209,10 +10211,10 @@ static Cljc *sorted_subseq(CljcEnv *env, Cljc **argv, int nargs, bool rev) {
     }
     return out;
 }
-static Cljc *prim_subseq(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_subseq(CloveEnv *env, Clove **argv, int nargs) {
     return sorted_subseq(env, argv, nargs, false);
 }
-static Cljc *prim_rsubseq(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_rsubseq(CloveEnv *env, Clove **argv, int nargs) {
     return sorted_subseq(env, argv, nargs, true);
 }
 
@@ -10222,53 +10224,53 @@ static Cljc *prim_rsubseq(CljcEnv *env, Cljc **argv, int nargs) {
  * sort inside the first apply would otherwise clobber them before the
  * tie-break apply — that was a NULL-fn segfault), and prim_sort saves and
  * restores the outer sort's values around its own qsort. */
-static CljcEnv *g_sort_env;
-static Cljc *g_sort_fn;
+static CloveEnv *g_sort_env;
+static Clove *g_sort_fn;
 
 static int sort_adapter(const void *pa, const void *pb) {
-    Cljc *a = *(Cljc *const *)pa, *b = *(Cljc *const *)pb;
-    CljcEnv *env = g_sort_env;           /* snapshot: survive nested sorts */
-    Cljc *fn = g_sort_fn;
+    Clove *a = *(Clove *const *)pa, *b = *(Clove *const *)pb;
+    CloveEnv *env = g_sort_env;           /* snapshot: survive nested sorts */
+    Clove *fn = g_sort_fn;
     if (!fn) return cmp_values(a, b);
-    Cljc *two[2] = {a, b};
-    Cljc *r = apply(env, fn, two, 2);
+    Clove *two[2] = {a, b};
+    Clove *r = apply(env, fn, two, 2);
     g_sort_env = env; g_sort_fn = fn;    /* restore after a possible nested sort */
-    if (r != NIL && r->tag == CLJC_INT) return (int)r->as.i;
+    if (r != NIL && r->tag == CLOVE_INT) return (int)r->as.i;
     /* Boolean comparator: (f a b) true => a first; tie-break with (f b a). */
     if (is_truthy(r)) return -1;
-    Cljc *two2[2] = {b, a};
-    Cljc *r2 = apply(env, fn, two2, 2);
+    Clove *two2[2] = {b, a};
+    Clove *r2 = apply(env, fn, two2, 2);
     g_sort_env = env; g_sort_fn = fn;
     return is_truthy(r2) ? 1 : 0;
 }
 
-static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_sort(CloveEnv *env, Clove **argv, int nargs) {
     /* (sort coll) or (sort comparator coll) — returns a list. */
-    Cljc *fn = NULL, *coll;
+    Clove *fn = NULL, *coll;
     if (nargs > 1) {
         fn = argv[0];
         coll = argv[1];
     } else coll = argv[0];
-    Cljc *s = to_seq(coll);
+    Clove *s = to_seq(coll);
     /* volatile: `arr` is malloc'd — INVISIBLE to the conservative scan — and
      * for maps/sets to_seq builds a FRESH entry chain reachable only through
-     * this local. A cljc comparator allocates on every qsort comparison; if
+     * this local. A clove comparator allocates on every qsort comparison; if
      * -O2 dead-codes `s` after the fill loop, a mid-sort collection frees the
      * entries still sitting in arr (2016-AoC-p04: sort-by over frequencies —
      * the long-standing "-O2-only" crash). The old comment claimed the
      * elements stayed rooted via coll; for non-list colls that was false. */
-    Cljc * volatile s_keep = s;
+    Clove * volatile s_keep = s;
     size_t n = list_len(s);
-    Cljc **arr = xmalloc(sizeof(Cljc *) * (n ? n : 1));
+    Clove **arr = xmalloc(sizeof(Clove *) * (n ? n : 1));
     size_t i = 0;
-    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail) arr[i++] = l->as.cons.head;
-    CljcEnv *saved_env = g_sort_env;     /* re-entrancy: we may BE the nested sort */
-    Cljc *saved_fn = g_sort_fn;
+    for (Clove *l = s; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) arr[i++] = l->as.cons.head;
+    CloveEnv *saved_env = g_sort_env;     /* re-entrancy: we may BE the nested sort */
+    Clove *saved_fn = g_sort_fn;
     g_sort_env = env; g_sort_fn = fn;
-    qsort(arr, n, sizeof(Cljc *), sort_adapter);
+    qsort(arr, n, sizeof(Clove *), sort_adapter);
     g_sort_env = saved_env; g_sort_fn = saved_fn;
     (void)s_keep;                        /* pins the chain through the sort */
-    Cljc *out = n == 0 ? EMPTY : NIL;   /* (sort []) => () */
+    Clove *out = n == 0 ? EMPTY : NIL;   /* (sort []) => () */
     for (size_t j = n; j > 0; j--) out = mk_cons(arr[j - 1], out);
     free(arr);
     return out;
@@ -10276,31 +10278,31 @@ static Cljc *prim_sort(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* ── coercions ── */
 
-static Cljc *prim_vec(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_vec(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *s = to_seq(argv[0]);
-    Cljc *v = mk_empty_vec();
-    for (Cljc *l = s; l && l->tag == CLJC_LIST; l = l->as.cons.tail)
+    Clove *s = to_seq(argv[0]);
+    Clove *v = mk_empty_vec();
+    for (Clove *l = s; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
         v = vec_conj1(v, l->as.cons.head);
     return v;
 }
 
-static const char *as_named(Cljc *v, const char *what) {
+static const char *as_named(Clove *v, const char *what) {
     if (v != NIL) {
-        if (v->tag == CLJC_KEYWORD) return v->as.kw;
-        if (v->tag == CLJC_SYMBOL) return v->as.sym;
-        if (v->tag == CLJC_STRING) return v->as.str;
+        if (v->tag == CLOVE_KEYWORD) return v->as.kw;
+        if (v->tag == CLOVE_SYMBOL) return v->as.sym;
+        if (v->tag == CLOVE_STRING) return v->as.str;
     }
-    cljc_error("%s: expected a string, keyword, or symbol", what);
+    clove_error("%s: expected a string, keyword, or symbol", what);
     return NULL;
 }
 
-static Cljc *prim_name(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_name(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     const char *n = as_named(argv[0], "name");
     /* a symbol/keyword ns/foo has name "foo"; a string and the lone "/" division
      * symbol are returned verbatim. */
-    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) {
+    if (argv[0] != NIL && argv[0]->tag != CLOVE_STRING) {
         const char *slash = strchr(n, '/');
         if (slash && slash != n && slash[1] != '\0')
             return mk_str(slash + 1, strlen(slash + 1));
@@ -10308,10 +10310,10 @@ static Cljc *prim_name(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(n, strlen(n));
 }
 
-static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_keyword(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     /* (keyword \a) => nil, like Clojure — keyword rejects chars. */
-    if (argv[0] != NIL && argv[0]->tag == CLJC_CHAR) return NIL;
+    if (argv[0] != NIL && argv[0]->tag == CLOVE_CHAR) return NIL;
     if (nargs >= 2) {                       /* (keyword ns name) => :ns/name */
         const char *nm = as_named(argv[1], "keyword");
         if (argv[0] == NIL) return mk_kw(intern(nm, strlen(nm)));  /* nil ns: bare kw */
@@ -10320,7 +10322,7 @@ static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
         char *buf = xmalloc(ln + lm + 2);
         memcpy(buf, ns, ln); buf[ln] = '/';
         memcpy(buf + ln + 1, nm, lm); buf[ln + lm + 1] = '\0';
-        Cljc *r = mk_kw(intern(buf, ln + lm + 1));
+        Clove *r = mk_kw(intern(buf, ln + lm + 1));
         free(buf);
         return r;
     }
@@ -10329,21 +10331,21 @@ static Cljc *prim_keyword(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* string/symbol/keyword -> its name; a non-named, non-nil value (e.g. what
- * cljc's var-less `resolve` returns where Clojure would yield a Var) is coerced
+ * clove's var-less `resolve` returns where Clojure would yield a Var) is coerced
  * via its printed form, so (symbol (resolve s)) doesn't crash. nil still errors. */
-static const char *symbol_name_of(Cljc *x) {
-    if (x != NIL && (x->tag == CLJC_STRING || x->tag == CLJC_SYMBOL ||
-                     x->tag == CLJC_KEYWORD))
+static const char *symbol_name_of(Clove *x) {
+    if (x != NIL && (x->tag == CLOVE_STRING || x->tag == CLOVE_SYMBOL ||
+                     x->tag == CLOVE_KEYWORD))
         return as_named(x, "symbol");
     if (x == NIL) return as_named(x, "symbol");   /* keep the Clojure-like error */
     /* A non-named value where Clojure would have a Var (e.g. (symbol (resolve
      * s))). Give it a qualified, deliberately non-(clojure|cljs).core name so
      * callers that branch on (namespace it) treat it as a foreign var rather
      * than a core one — and it never looks like a bare resolvable symbol. */
-    return intern("cljc.opaque/var", 15);
+    return intern("clove.opaque/var", 16);
 }
 
-static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     /* (symbol name) or (symbol ns name) — a nil ns yields the bare name */
     if (nargs >= 2 && argv[0] != NIL) {
@@ -10357,53 +10359,53 @@ static Cljc *prim_symbol(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_sym(intern(n, strlen(n)));
 }
 
-static Cljc *prim_quot(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "quot");
-    if (argv[0]->tag == CLJC_BIGDEC || argv[1]->tag == CLJC_BIGDEC) return bd_quot(argv[0], argv[1]);
-    if (argv[0]->tag == CLJC_BIGINT || argv[1]->tag == CLJC_BIGINT) {
-        Cljc *q; big_divmod(argv[0], argv[1], &q, NULL); return q;
+    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_quot(argv[0], argv[1]);
+    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
+        Clove *q; big_divmod(argv[0], argv[1], &q, NULL); return q;
     }
     int64_t a = as_int(argv[0], "quot");
     int64_t b = as_int(argv[1], "quot");
-    if (b == 0) cljc_error_cls("ArithmeticException", "Divide by zero");
+    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
     return mk_int(a / b);
 }
 
 /* ── strings ── */
 
-static char *as_str(Cljc *v, const char *what) {
-    if (v == NIL) cljc_error_cls("NullPointerException", "%s: expected a string, got nil", what);
-    if (v->tag != CLJC_STRING) cljc_error("%s: expected a string", what);
+static char *as_str(Clove *v, const char *what) {
+    if (v == NIL) clove_error_cls("NullPointerException", "%s: expected a string, got nil", what);
+    if (v->tag != CLOVE_STRING) clove_error("%s: expected a string", what);
     return v->as.str;
 }
 
 /* Byte-level string accessors: strings index/count by codepoint everywhere
  * else, but bundling and HTTP framing need the raw UTF-8 bytes. */
-static Cljc *prim_str_nbytes(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_str_nbytes(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    as_str(argv[0], "cljc/str-nbytes*");
+    as_str(argv[0], "clove/str-nbytes*");
     return mk_int(argv[0]->as.strx.nbytes);
 }
-static Cljc *prim_str_bytes(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_str_bytes(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    const char *s = as_str(argv[0], "cljc/str-bytes*");
+    const char *s = as_str(argv[0], "clove/str-bytes*");
     uint32_t n = argv[0]->as.strx.nbytes;
-    Cljc *v = mk_empty_vec();
+    Clove *v = mk_empty_vec();
     for (uint32_t i = 0; i < n; i++) v = vec_conj1(v, mk_int((unsigned char)s[i]));
     return v;
 }
 
-static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_subs(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     as_str(argv[0], "subs");                 /* type check */
-    Cljc *sv = argv[0];
+    Clove *sv = argv[0];
     size_t len = str_cp_count(sv);           /* codepoint indices, like count */
     int64_t start = as_int(argv[1], "subs");
     int64_t end = nargs > 2
         ? as_int(argv[2], "subs") : (int64_t)len;
     if (start < 0 || end < start || (size_t)end > len)
-        cljc_error_cls("IndexOutOfBoundsException", "subs: start %lld, end %lld out of bounds for length %zu",
+        clove_error_cls("IndexOutOfBoundsException", "subs: start %lld, end %lld out of bounds for length %zu",
                    (long long)start, (long long)end, len);
     size_t b0 = str_cp_to_byte(sv, (size_t)start);
     size_t b1 = str_cp_to_byte(sv, (size_t)end);
@@ -10411,10 +10413,10 @@ static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 #define STR_MAP_FN(NAME, XFORM) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
         char *s = as_str(argv[0], #NAME); \
-        Cljc *r = mk_str(s, strlen(s)); \
+        Clove *r = mk_str(s, strlen(s)); \
         for (char *c = r->as.str; *c; c++) *c = (char)XFORM((unsigned char)*c); \
         return r; \
     }
@@ -10422,7 +10424,7 @@ static Cljc *prim_subs(CljcEnv *env, Cljc **argv, int nargs) {
 STR_MAP_FN(upper_case, toupper)
 STR_MAP_FN(lower_case, tolower)
 
-static Cljc *prim_trim(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_trim(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "trim");
     while (*s && isspace((unsigned char)*s)) s++;
@@ -10431,17 +10433,17 @@ static Cljc *prim_trim(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(s, n);
 }
 
-static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs);
+static Clove *prim_re_split(CloveEnv *env, Clove **argv, int nargs);
 
 /* A pattern is a string tagged {:regex true} (re-pattern / #"..."), the same
  * test the printer uses — any other metadata leaves it a plain string. */
-static bool str_is_regex(Cljc *v) {
-    Cljc *rg;
-    return v != NIL && v->tag == CLJC_STRING && v->meta &&
+static bool str_is_regex(Clove *v) {
+    Clove *rg;
+    return v != NIL && v->tag == CLOVE_STRING && v->meta &&
            map_find(v->meta, mk_kw(intern("regex", 5)), &rg) && is_truthy(rg);
 }
 
-static Cljc *prim_split(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_split(CloveEnv *env, Clove **argv, int nargs) {
     /* (str/split s sep) — regex when sep is a #"..." literal or came
      * through re-pattern (meta-tagged); plain strings split literally. */
     if (str_is_regex(argv[1]))
@@ -10450,8 +10452,8 @@ static Cljc *prim_split(CljcEnv *env, Cljc **argv, int nargs) {
     char *s = as_str(argv[0], "split");
     char *sep = as_str(argv[1], "split");
     size_t seplen = strlen(sep);
-    if (seplen == 0) cljc_error("split: empty separator");
-    Cljc *parts = NIL, **t = &parts;  /* build as list (stack-rooted), then vec */
+    if (seplen == 0) clove_error("split: empty separator");
+    Clove *parts = NIL, **t = &parts;  /* build as list (stack-rooted), then vec */
     const char *p = s;
     for (;;) {
         const char *hit = strstr(p, sep);
@@ -10461,12 +10463,12 @@ static Cljc *prim_split(CljcEnv *env, Cljc **argv, int nargs) {
         if (!hit) break;
         p = hit + seplen;
     }
-    Cljc *one[1] = {parts};
+    Clove *one[1] = {parts};
     return prim_vec(env, one, 1);
 }
 
 #define STR_PRED(NAME, EXPR) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
         char *s = as_str(argv[0], #NAME); \
         char *sub = as_str(argv[1], #NAME); \
@@ -10479,15 +10481,15 @@ STR_PRED(starts_with, strncmp(s, sub, bl) == 0)
 STR_PRED(ends_with,   bl <= sl && strcmp(s + sl - bl, sub) == 0)
 STR_PRED(includes,    strstr(s, sub) != NULL)
 
-/* (cljc/str-starts-at? s prefix i) → does s have prefix at codepoint index i?
+/* (clove/str-starts-at? s prefix i) → does s have prefix at codepoint index i?
  * No substring allocation — backs String.startsWith(prefix, toffset) and the
  * peg battery's literal matcher. Out-of-range i (like Java) is just false. */
-static Cljc *prim_starts_at(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_starts_at(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     as_str(argv[0], "str-starts-at?");
     char *sub = as_str(argv[1], "str-starts-at?");
     int64_t i = as_int(argv[2], "str-starts-at?");
-    Cljc *sv = argv[0];
+    Clove *sv = argv[0];
     if (i < 0 || (size_t)i > str_cp_count(sv)) return mk_bool(false);
     size_t b0 = str_cp_to_byte(sv, (size_t)i), bl = strlen(sub);
     if (b0 + bl > sv->as.strx.nbytes) return mk_bool(false);
@@ -10496,8 +10498,8 @@ static Cljc *prim_starts_at(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* (str/index-of s sub [from]) → first index at/after from, or nil. */
 /* (str/index-of "..." \c) is valid in Clojure — a char search value. */
-static char *strval_or_char(Cljc *v, char buf[5], const char *what) {
-    if (v != NIL && v->tag == CLJC_CHAR) {
+static char *strval_or_char(Clove *v, char buf[5], const char *what) {
+    if (v != NIL && v->tag == CLOVE_CHAR) {
         int cp = v->as.chr, n = 0;
         if (cp < 0x80) buf[n++] = (char)cp;
         else if (cp < 0x800) { buf[n++] = (char)(0xC0|(cp>>6)); buf[n++] = (char)(0x80|(cp&0x3F)); }
@@ -10509,9 +10511,9 @@ static char *strval_or_char(Cljc *v, char buf[5], const char *what) {
     return as_str(v, what);
 }
 
-static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_index_of(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (argv[0] != NIL && argv[0]->tag != CLJC_STRING) cljc_error("str/index-of: expected a string, got %s", val_desc(argv[0]));
+    if (argv[0] != NIL && argv[0]->tag != CLOVE_STRING) clove_error("str/index-of: expected a string, got %s", val_desc(argv[0]));
     char *s = as_str(argv[0], "str/index-of");
     char cb[5];
     char *sub = strval_or_char(argv[1], cb, "str/index-of");
@@ -10523,9 +10525,9 @@ static Cljc *prim_index_of(CljcEnv *env, Cljc **argv, int nargs) {
     return hit ? mk_int((int64_t)str_byte_to_cp(argv[0], (size_t)(hit - s))) : NIL;
 }
 
-static Cljc *prim_blank_p(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_blank_p(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     if (v == NIL) return TRUE;
     char *s = as_str(v, "blank?");
     for (; *s; s++) if (!isspace((unsigned char)*s)) return FALSE;
@@ -10537,33 +10539,33 @@ static Cljc *prim_blank_p(CljcEnv *env, Cljc **argv, int nargs) {
 /* Embedded virtual files for self-contained bundles. A bundle registers its
  * script's transitive .clj dependencies here; slurp checks this table before
  * the filesystem, so require/load-file resolve embedded files even when no
- * vendor/ or share dir is present. Empty in a normal cljc → no effect. */
-typedef struct { const char *name; const char *data; } CljcEmbeddedFile;
-static const CljcEmbeddedFile *cljc_embedded;
-static int cljc_n_embedded;
+ * vendor/ or share dir is present. Empty in a normal clove → no effect. */
+typedef struct { const char *name; const char *data; } CloveEmbeddedFile;
+static const CloveEmbeddedFile *clove_embedded;
+static int clove_n_embedded;
 
 /* Match by exact name or by a '/'-bounded suffix, so a registered
  * "clojure/test.clj" satisfies a lookup of "./clojure/test.clj",
  * "vendor/clojure/test.clj", etc. (the paths require/ builds from *load-path*). */
 static const char *embedded_lookup(const char *path) {
     size_t pl = strlen(path);
-    for (int i = 0; i < cljc_n_embedded; i++) {
-        const char *name = cljc_embedded[i].name;
+    for (int i = 0; i < clove_n_embedded; i++) {
+        const char *name = clove_embedded[i].name;
         size_t nl = strlen(name);
-        if (pl == nl && !strcmp(path, name)) return cljc_embedded[i].data;
+        if (pl == nl && !strcmp(path, name)) return clove_embedded[i].data;
         if (pl > nl && path[pl - nl - 1] == '/' && !strcmp(path + pl - nl, name))
-            return cljc_embedded[i].data;
+            return clove_embedded[i].data;
     }
     return NULL;
 }
 
-static Cljc *prim_slurp(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_slurp(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *path = as_str(argv[0], "slurp");
     const char *emb = embedded_lookup(path);
     if (emb) return mk_str(emb, strlen(emb));   /* bundled dependency */
     FILE *f = fopen(path, "rb");
-    if (!f) cljc_error("slurp: cannot open %s", path);
+    if (!f) clove_error("slurp: cannot open %s", path);
     SBuf sb = {0};
     sb_grow(&sb, 4096);
     size_t n;
@@ -10575,17 +10577,17 @@ static Cljc *prim_slurp(CljcEnv *env, Cljc **argv, int nargs) {
         sb.data[sb.len] = '\0';
     }
     fclose(f);
-    Cljc *r = mk_str(sb.data ? sb.data : "", sb.len);
+    Clove *r = mk_str(sb.data ? sb.data : "", sb.len);
     free(sb.data);
     return r;
 }
 
-static Cljc *prim_spit(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_spit(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *path = as_str(argv[0], "spit");
-    Cljc *content = argv[1];
+    Clove *content = argv[1];
     FILE *f = fopen(path, "wb");
-    if (!f) cljc_error("spit: cannot open %s", path);
+    if (!f) clove_error("spit: cannot open %s", path);
     SBuf sb = {0};
     str_to(&sb, content);
     if (sb.data) fwrite(sb.data, 1, sb.len, f);
@@ -10594,11 +10596,11 @@ static Cljc *prim_spit(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-/* (cljc/mtime* path) → file mtime in milliseconds, or nil if missing.
+/* (clove/mtime* path) → file mtime in milliseconds, or nil if missing.
  * Millisecond resolution so the clerk file watcher sees rapid saves. */
-static Cljc *prim_mtime(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_mtime(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    char *path = as_str(argv[0], "cljc/mtime*");
+    char *path = as_str(argv[0], "clove/mtime*");
     struct stat st;
     if (stat(path, &st) != 0) return NIL;
 #ifdef _WIN32
@@ -10649,10 +10651,10 @@ static void md5_block(uint32_t st[4], const unsigned char *p) {
     st[0] += a; st[1] += b; st[2] += c; st[3] += d;
 }
 
-/* (cljc/md5* s) → 32-char lowercase hex digest. */
-static Cljc *prim_md5(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/md5* s) → 32-char lowercase hex digest. */
+static Clove *prim_md5(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    char *s = as_str(argv[0], "cljc/md5*");
+    char *s = as_str(argv[0], "clove/md5*");
     size_t n = strlen(s);
     uint32_t st[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
     size_t i = 0;
@@ -10674,14 +10676,14 @@ static Cljc *prim_md5(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* (flush) → flush the interpreter's stdout. */
-static Cljc *prim_flush(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_flush(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     fflush(COUT);
     return NIL;
 }
 
 /* (read-line) → next line from stdin (no trailing newline), nil at EOF. */
-static Cljc *prim_read_line(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     char buf[4096];
     SBuf sb = {0};
@@ -10694,13 +10696,13 @@ static Cljc *prim_read_line(CljcEnv *env, Cljc **argv, int nargs) {
         if (len && buf[len - 1] == '\n') { buf[len - 1] = '\0'; sb_puts(&sb, buf); break; }
         sb_puts(&sb, buf);
     }
-    Cljc *res = mk_str(sb.data ? sb.data : "", sb.len);
+    Clove *res = mk_str(sb.data ? sb.data : "", sb.len);
     free(sb.data);
     return res;
 }
 
-/* (cljc/isatty*) → true when stdout is a terminal (color/prompt gating). */
-static Cljc *prim_isatty(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/isatty*) → true when stdout is a terminal (color/prompt gating). */
+static Clove *prim_isatty(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     return mk_bool(isatty(1));
 }
@@ -10709,15 +10711,15 @@ static Cljc *prim_isatty(CljcEnv *env, Cljc **argv, int nargs) {
  * uses (rl_raw_enter below) but exposed as natives so a script can own the
  * screen without the FFI. Three primitives, decoded in Clojure, not here:
  *
- *   (cljc/raw-mode* bool)  enter/leave raw mode; false when stdin isn't a tty.
+ *   (clove/raw-mode* bool)  enter/leave raw mode; false when stdin isn't a tty.
  *                          An atexit hook restores the terminal even if the
  *                          script dies with an uncaught error mid-screen.
- *   (cljc/read-key*)       block for one keypress and return its bytes as a
+ *   (clove/read-key*)       block for one keypress and return its bytes as a
  *                          string: one UTF-8 character (all its continuation
  *                          bytes), or a whole escape sequence ("\e[A" for Up).
  *                          nil on EOF. An ESC that is followed by nothing
  *                          within 30ms is a lone Escape.
- *   (cljc/term-size*)      [rows cols], [24 80] when unknown. */
+ *   (clove/term-size*)      [rows cols], [24 80] when unknown. */
 #ifndef _WIN32
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -10728,7 +10730,7 @@ static void raw_restore(void) {
     if (raw_active) { tcsetattr(0, TCSAFLUSH, &raw_orig); raw_active = false; }
 }
 #endif
-static Cljc *prim_raw_mode(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_raw_mode(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
 #ifdef _WIN32
     (void)argv; (void)nargs; return FALSE;
@@ -10763,7 +10765,7 @@ static bool raw_pending(int ms) {
     return select(1, &fds, NULL, NULL, &tv) > 0;
 }
 #endif
-static Cljc *prim_read_key(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_read_key(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #ifdef _WIN32
     return NIL;
@@ -10794,7 +10796,7 @@ static Cljc *prim_read_key(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(buf, n);
 #endif
 }
-static Cljc *prim_term_size(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_term_size(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     int64_t rows = 24, cols = 80;
 #ifndef _WIN32
@@ -10803,12 +10805,12 @@ static Cljc *prim_term_size(CljcEnv *env, Cljc **argv, int nargs) {
         rows = ws.ws_row; cols = ws.ws_col;
     }
 #endif
-    Cljc *items[2] = { mk_int(rows), mk_int(cols) };
+    Clove *items[2] = { mk_int(rows), mk_int(cols) };
     return mk_vector(items, 2);
 }
 
-/* (cljc/now-ms*) → monotonic milliseconds as a double (for `time`). */
-static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/now-ms*) → monotonic milliseconds as a double (for `time`). */
+static Clove *prim_now_ms(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #ifdef _WIN32
     LARGE_INTEGER freq, ctr;
@@ -10822,14 +10824,14 @@ static Cljc *prim_now_ms(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
-/* (cljc/now-us*) -> WALL-CLOCK microseconds since the Unix epoch, as an int.
+/* (clove/now-us*) -> WALL-CLOCK microseconds since the Unix epoch, as an int.
  * Deliberately separate from now-ms*, which is CLOCK_MONOTONIC: monotonic is
  * the right clock for measuring durations (timers, deadlines -- it cannot jump
  * when NTP steps the clock) but its origin is boot, not 1970, so it can never
  * answer "what time is it". int64 holds epoch micros until AD 294247. Returned
  * as an integer, not a double: at this magnitude a double's ulp is ~0.5us
  * (2^-52 * 2^41 ms), so microseconds would not survive the round trip. */
-static Cljc *prim_now_us(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_now_us(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #ifdef _WIN32
     FILETIME ft;
@@ -10843,11 +10845,11 @@ static Cljc *prim_now_us(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
-/* (cljc/getpid) -> this process's id, as an int. Native rather than the
+/* (clove/getpid) -> this process's id, as an int. Native rather than the
  * libc.clj FFI binding, so it needs no require, costs no dlopen, and works
  * on Windows -- where getpid() lives in <process.h> rather than <unistd.h>,
  * so GetCurrentProcessId is used instead of relying on the mingw shim. */
-static Cljc *prim_getpid(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_getpid(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #ifdef _WIN32
     return mk_int((int64_t)GetCurrentProcessId());
@@ -10856,9 +10858,9 @@ static Cljc *prim_getpid(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
-/* (cljc/getuid) -> the real user id; 0 on Windows, which has no uid. Used to
+/* (clove/getuid) -> the real user id; 0 on Windows, which has no uid. Used to
  * give each user a private scratch dir for the FFI module cache. */
-static Cljc *prim_getuid(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_getuid(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
 #ifdef _WIN32
     return mk_int(0);
@@ -10867,22 +10869,22 @@ static Cljc *prim_getuid(CljcEnv *env, Cljc **argv, int nargs) {
 #endif
 }
 
-/* (cljc/exit* n) -> terminate the process with status n. System/exit is
+/* (clove/exit* n) -> terminate the process with status n. System/exit is
  * defined on top of this. Streams are flushed first: exit() flushes stdio
- * but cljc may hold buffered output of its own. */
-static Cljc *prim_exit(CljcEnv *env, Cljc **argv, int nargs) {
+ * but clove may hold buffered output of its own. */
+static Clove *prim_exit(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    int code = nargs > 0 ? (int)as_int(argv[0], "cljc/exit*") : 0;
-    if (cljc_interactive)
-        cljc_error("System/exit: would exit %d, but a REPL/nREPL session is "
+    int code = nargs > 0 ? (int)as_int(argv[0], "clove/exit*") : 0;
+    if (clove_interactive)
+        clove_error("System/exit: would exit %d, but a REPL/nREPL session is "
                    "not terminated; evaluation unwinds instead", code);
     fflush(stdout);
     fflush(stderr);
     exit(code);
 }
 
-/* (cljc/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
-static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/sleep-ms* ms) → sleep this many milliseconds (csp timeouts). */
+static Clove *prim_sleep_ms(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     if (nargs < 1) return NIL;
     double ms = as_num(argv[0]);
@@ -10898,16 +10900,16 @@ static Cljc *prim_sleep_ms(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-/* (cljc/poll-fds* fds events timeout-ms) → readiness vector for the csp event
+/* (clove/poll-fds* fds events timeout-ms) → readiness vector for the csp event
  * loop. fds/events are parallel vectors; event bit 1 = wait-readable, bit 2 =
  * wait-writable. Returns a vector of ints with bit 1 set when readable (or the
  * peer hung up / errored, so a parked reader wakes to see EOF) and bit 2 when
  * writable. timeout-ms: 0 polls, -1 blocks until something is ready. */
-static Cljc *prim_poll_fds(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_poll_fds(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 3) cljc_error("cljc/poll-fds*: (fds events timeout-ms)");
-    if (argv[0]->tag != CLJC_VECTOR || argv[1]->tag != CLJC_VECTOR)
-        cljc_error("cljc/poll-fds*: fds and events must be vectors");
+    if (nargs < 3) clove_error("clove/poll-fds*: (fds events timeout-ms)");
+    if (argv[0]->tag != CLOVE_VECTOR || argv[1]->tag != CLOVE_VECTOR)
+        clove_error("clove/poll-fds*: fds and events must be vectors");
     size_t n = vec_len(argv[0]);
     int timeout = (int)as_int(argv[2], "poll-fds*");
     if (n == 0) { (void)timeout; return mk_vector(NULL, 0); }
@@ -10921,42 +10923,42 @@ static Cljc *prim_poll_fds(CljcEnv *env, Cljc **argv, int nargs) {
     poll(pfd, (nfds_t)n, timeout);
     /* revents are 0..3 — all smallints (immortal), so building the result
      * vector triggers no GC hazard for the in-flight item array. */
-    Cljc **items = xmalloc(sizeof(Cljc *) * n);
+    Clove **items = xmalloc(sizeof(Clove *) * n);
     for (size_t i = 0; i < n; i++) {
         int re = 0;
         if (pfd[i].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) re |= 1;
         if (pfd[i].revents & POLLOUT) re |= 2;
         items[i] = mk_int(re);
     }
-    Cljc *out = mk_vector(items, n);
+    Clove *out = mk_vector(items, n);
     free(items);
     free(pfd);
     return out;
 }
 
-/* (cljc/epoch*) → unix seconds (libc.clj's now-epoch; the C time symbol
+/* (clove/epoch*) → unix seconds (libc.clj's now-epoch; the C time symbol
  * must not be FFI-bound by name — it would shadow the core time macro). */
-static Cljc *prim_epoch(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_epoch(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     return mk_int((int64_t)time(NULL));
 }
 
-/* (cljc/dir?* path) → true if path exists and is a directory. */
-static Cljc *prim_dir_p(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/dir?* path) → true if path exists and is a directory. */
+static Clove *prim_dir_p(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    char *path = as_str(argv[0], "cljc/dir?*");
+    char *path = as_str(argv[0], "clove/dir?*");
     struct stat st;
     return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? TRUE : FALSE;
 }
 
-/* (cljc/list-dir* path) → vector of entry names (sans . and ..), or nil
+/* (clove/list-dir* path) → vector of entry names (sans . and ..), or nil
  * if path is unreadable / not a directory. */
-static Cljc *prim_list_dir(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_list_dir(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    char *path = as_str(argv[0], "cljc/list-dir*");
+    char *path = as_str(argv[0], "clove/list-dir*");
     DIR *d = opendir(path);
     if (!d) return NIL;
-    Cljc *v = mk_empty_vec();
+    Clove *v = mk_empty_vec();
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
@@ -10971,17 +10973,17 @@ static Cljc *prim_list_dir(CljcEnv *env, Cljc **argv, int nargs) {
  * the nREPL server predates them and keeps its own loop). File descriptors
  * travel as plain ints, mirroring the FFI's pointers-as-ints convention. */
 
-static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_listen(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (cljc_wsa_init() != 0) cljc_error("tcp/listen: winsock init failed");
+    if (clove_wsa_init() != 0) clove_error("tcp/listen: winsock init failed");
     int port = (int)as_int(argv[0], "tcp/listen");
     /* Optional host arg. Default 127.0.0.1 (loopback-only, the safe default
      * that nREPL relies on); pass "0.0.0.0" to listen on all interfaces, or a
      * specific dotted IP (e.g. a tailscale address) to bind just that one. */
     const char *host = nargs > 1 ? as_str(argv[1], "tcp/listen") : NULL;
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) cljc_error("tcp/listen: cannot create socket");
-    cljc_no_sigpipe(srv);
+    if (srv < 0) clove_error("tcp/listen: cannot create socket");
+    clove_no_sigpipe(srv);
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in addr;
@@ -10994,34 +10996,34 @@ static Cljc *prim_tcp_listen(CljcEnv *env, Cljc **argv, int nargs) {
     } else {
         addr.sin_addr.s_addr = inet_addr(host);
         if (addr.sin_addr.s_addr == INADDR_NONE)
-            cljc_error("tcp/listen: bad host address '%s'", host);
+            clove_error("tcp/listen: bad host address '%s'", host);
     }
     addr.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) {
         sock_close(srv);
-        cljc_error("tcp/listen: cannot bind %s:%d (port in use?)",
+        clove_error("tcp/listen: cannot bind %s:%d (port in use?)",
                    host && *host ? host : "127.0.0.1", port);
     }
-    if (listen(srv, 16) < 0) { sock_close(srv); cljc_error("tcp/listen: listen failed"); }
+    if (listen(srv, 16) < 0) { sock_close(srv); clove_error("tcp/listen: listen failed"); }
     return mk_int(srv);
 }
 
 /* (tcp/accept srv timeout-ms) → client fd, or nil on timeout.
  * The timeout makes a single-threaded serve loop possible: each expiry is
  * a tick the caller can spend polling file mtimes. */
-static Cljc *prim_tcp_accept(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_accept(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int srv = (int)as_int(argv[0], "tcp/accept");
     int timeout = nargs > 1 ? (int)as_int(argv[1], "tcp/accept") : -1;
     struct pollfd p = { .fd = srv, .events = POLLIN };
     if (poll(&p, 1, timeout) <= 0) return NIL;
     int fd = accept(srv, NULL, NULL);
-    if (fd >= 0) cljc_no_sigpipe(fd);
+    if (fd >= 0) clove_no_sigpipe(fd);
     return fd < 0 ? NIL : mk_int(fd);
 }
 
 /* (tcp/recv fd) → string from one read (≤64K), or nil on EOF/error. */
-static Cljc *prim_tcp_recv(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_recv(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int fd = (int)as_int(argv[0], "tcp/recv");
     char buf[65536];
@@ -11032,10 +11034,10 @@ static Cljc *prim_tcp_recv(CljcEnv *env, Cljc **argv, int nargs) {
 
 /* (tcp/send fd s) → true if fully sent, false on a dead peer.
  * MSG_NOSIGNAL: a browser closing an SSE stream must not SIGPIPE-kill us. */
-static Cljc *prim_tcp_send(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_send(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int fd = (int)as_int(argv[0], "tcp/send");
-    Cljc *v = argv[1];
+    Clove *v = argv[1];
     SBuf sb = {0};
     str_to(&sb, v);
     const char *p = sb.data ? sb.data : "";
@@ -11050,7 +11052,7 @@ static Cljc *prim_tcp_send(CljcEnv *env, Cljc **argv, int nargs) {
     return TRUE;
 }
 
-static Cljc *prim_tcp_close(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_close(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     sock_close((int)as_int(argv[0], "tcp/close"));
     return NIL;
@@ -11059,9 +11061,9 @@ static Cljc *prim_tcp_close(CljcEnv *env, Cljc **argv, int nargs) {
 /* (tcp/send-some* fd str start) → ONE non-blocking send of str[start..]. Returns
  * bytes written (≥0), -1 if it would block (caller should park on POLLOUT and
  * retry), or -2 on a dead peer. The backpressure primitive for csp's send!. */
-static Cljc *prim_tcp_send_some(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_send_some(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 2) cljc_error("tcp/send-some*: (fd str [start])");
+    if (nargs < 2) clove_error("tcp/send-some*: (fd str [start])");
     int fd = (int)as_int(argv[0], "tcp/send-some*");
     char *s = as_str(argv[1], "tcp/send-some*");
     size_t total = strlen(s);
@@ -11078,15 +11080,15 @@ static Cljc *prim_tcp_send_some(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* (tcp/connect host port) → a connected client fd. */
-static Cljc *prim_tcp_connect(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_tcp_connect(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (cljc_wsa_init() != 0) cljc_error("tcp/connect: winsock init failed");
-    if (nargs < 2) cljc_error("tcp/connect: (host port)");
+    if (clove_wsa_init() != 0) clove_error("tcp/connect: winsock init failed");
+    if (nargs < 2) clove_error("tcp/connect: (host port)");
     const char *host = as_str(argv[0], "tcp/connect");
     int port = (int)as_int(argv[1], "tcp/connect");
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) cljc_error("tcp/connect: cannot create socket");
-    cljc_no_sigpipe(fd);
+    if (fd < 0) clove_error("tcp/connect: cannot create socket");
+    clove_no_sigpipe(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -11094,15 +11096,15 @@ static Cljc *prim_tcp_connect(CljcEnv *env, Cljc **argv, int nargs) {
     addr.sin_addr.s_addr = strcmp(host, "localhost") ? inet_addr(host)
                                                       : htonl(INADDR_LOOPBACK);
     if (addr.sin_addr.s_addr == INADDR_NONE)
-        { sock_close(fd); cljc_error("tcp/connect: bad host '%s'", host); }
+        { sock_close(fd); clove_error("tcp/connect: bad host '%s'", host); }
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0)
-        { sock_close(fd); cljc_error("tcp/connect: cannot reach %s:%d", host, port); }
+        { sock_close(fd); clove_error("tcp/connect: cannot reach %s:%d", host, port); }
     return mk_int(fd);
 }
 
 /* ── printing variants ── */
 
-static Cljc *print_args(CljcEnv *env, Cljc **argv, int nargs, bool readably, bool newline) {
+static Clove *print_args(CloveEnv *env, Clove **argv, int nargs, bool readably, bool newline) {
     SBuf sb = {0};
     bool first = true;
     for (int ai_ = 0; ai_ < nargs; ai_++) {
@@ -11116,8 +11118,8 @@ static Cljc *print_args(CljcEnv *env, Cljc **argv, int nargs, bool readably, boo
     return NIL;
 }
 
-/* (cljc/eprintln* ..) — like println but always to stderr (diagnostics). */
-static Cljc *prim_eprintln(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/eprintln* ..) — like println but always to stderr (diagnostics). */
+static Clove *prim_eprintln(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     SBuf sb = {0};
     for (int i = 0; i < nargs; i++) { if (i) sb_putc(&sb, ' '); print_to(&sb, argv[i], false); }
@@ -11126,14 +11128,14 @@ static Cljc *prim_eprintln(CljcEnv *env, Cljc **argv, int nargs) {
     return NIL;
 }
 
-static Cljc *prim_pr(CljcEnv *env, Cljc **argv, int nargs)    { return print_args(env, argv, nargs, true, false); }
-static Cljc *prim_prn(CljcEnv *env, Cljc **argv, int nargs)   { return print_args(env, argv, nargs, true, true); }
-static Cljc *prim_print(CljcEnv *env, Cljc **argv, int nargs) { return print_args(env, argv, nargs, false, false); }
+static Clove *prim_pr(CloveEnv *env, Clove **argv, int nargs)    { return print_args(env, argv, nargs, true, false); }
+static Clove *prim_prn(CloveEnv *env, Clove **argv, int nargs)   { return print_args(env, argv, nargs, true, true); }
+static Clove *prim_print(CloveEnv *env, Clove **argv, int nargs) { return print_args(env, argv, nargs, false, false); }
 
 
 /* ── format / string-replace / regex string ops ── */
 
-static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *fmt = as_str(argv[0], "format");
     int ai = 1;
@@ -11147,9 +11149,9 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
         while (*f && strchr("-+ 0#.0123456789", *f) && si < 16) spec[si++] = *f++;
         spec[si] = '\0';
         char conv = *f++;
-        if (!conv) cljc_error("format: dangling %%");
-        if (ai >= nargs) cljc_error("format: not enough arguments");
-        Cljc *v = argv[ai++];
+        if (!conv) clove_error("format: dangling %%");
+        if (ai >= nargs) clove_error("format: not enough arguments");
+        Clove *v = argv[ai++];
         char cfmt[32], tmp[512];
         switch (conv) {
             case 's': {
@@ -11168,7 +11170,7 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
             case 'd': case 'x': case 'X': case 'o':
                 /* %x with a pre-formatted string (e.g. an md5 hex digest
                  * standing in for BigInteger): zero-pad and pass through. */
-                if (v != NIL && v->tag == CLJC_STRING && (conv == 'x' || conv == 'X')) {
+                if (v != NIL && v->tag == CLOVE_STRING && (conv == 'x' || conv == 'X')) {
                     size_t want = (size_t)atoi(*spec == '0' ? spec + 1 : spec);
                     for (size_t k = strlen(v->as.str); k < want; k++) sb_putc(&out, '0');
                     sb_puts(&out, v->as.str);
@@ -11183,11 +11185,11 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
                  * (format "%.2f" 1.005M) is "1.01", where the double 1.005 is
                  * really 1.00499... and gives "1.00". Width and '-' still
                  * apply; the result is padded like any string. */
-                if (conv == 'f' && v != NIL && v->tag == CLJC_BIGDEC) {
+                if (conv == 'f' && v != NIL && v->tag == CLOVE_BIGDEC) {
                     const char *dot = strchr(spec, '.');
                     int64_t prec = dot ? atoi(dot + 1) : 6;
                     SBuf num = {0};
-                    Cljc *rv = bd_round_half_up(v, prec);
+                    Clove *rv = bd_round_half_up(v, prec);
                     /* Java keeps the sign of a negative value that rounds to
                      * zero: (format "%.3f" -8.1E-7M) is "-0.000" */
                     if (big_is_zero(rv->as.bigdec.u) && big_cmp(v->as.bigdec.u, mk_int(0)) < 0) sb_putc(&num, '-');
@@ -11212,17 +11214,17 @@ static Cljc *prim_format(CljcEnv *env, Cljc **argv, int nargs) {
                 sb_puts(&out, tmp);
                 break;
             default:
-                cljc_error("format: unsupported conversion %%%c", conv);
+                clove_error("format: unsupported conversion %%%c", conv);
         }
     }
-    Cljc *r = mk_str(out.data, out.len);
+    Clove *r = mk_str(out.data, out.len);
     free(out.data);
     return r;
 }
 
-static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs);
+static Clove *prim_re_replace(CloveEnv *env, Clove **argv, int nargs);
 
-static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_str_replace(CloveEnv *env, Clove **argv, int nargs) {
     /* (str/replace s match replacement). A #"..." / re-pattern match (a
      * meta-tagged string) does regex replacement with $1..$9 group refs in the
      * replacement; a plain string matches literally. Mirrors Clojure's dispatch
@@ -11246,7 +11248,7 @@ static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
             sb_putc(&out, *p++);
             while (((unsigned char)*p & 0xC0) == 0x80) sb_putc(&out, *p++);   /* rest of the codepoint */
         }
-        Cljc *res0 = mk_str(out.data, out.len);
+        Clove *res0 = mk_str(out.data, out.len);
         free(out.data);
         return res0;
     }
@@ -11257,7 +11259,7 @@ static Cljc *prim_str_replace(CljcEnv *env, Cljc **argv, int nargs) {
         sb_puts(&out, r);
         p += mlen;
     }
-    Cljc *res = mk_str(out.data, out.len);
+    Clove *res = mk_str(out.data, out.len);
     free(out.data);
     return res;
 }
@@ -11281,25 +11283,25 @@ static void rx_subst(SBuf *out, const char *repl) {
 
 /* The value passed to a replacement FUNCTION: the matched string when the
  * pattern has no groups, else [match g1 .. gn] (nil for non-participating). */
-static Cljc *rx_match_value(int ngroups) {
+static Clove *rx_match_value(int ngroups) {
     /* ngroups counts group 0; ==1 means no user groups (pass the match string) */
     if (ngroups == 1)
         return mk_str(rx_cap_s[0], (size_t)(rx_cap_e[0] - rx_cap_s[0]));
-    Cljc *v = mk_empty_vec();
+    Clove *v = mk_empty_vec();
     for (int g = 0; g < ngroups; g++)
         v = vec_conj1(v, (rx_cap_s[g] && rx_cap_e[g] && rx_cap_e[g] >= rx_cap_s[g])
                          ? mk_str(rx_cap_s[g], (size_t)(rx_cap_e[g] - rx_cap_s[g])) : NIL);
     return v;
 }
 
-static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_replace(CloveEnv *env, Clove **argv, int nargs) {
     /* (re-replace s pattern replacement) — all matches. replacement is a string
      * ($1..$9 group refs) or a function (called with the match / [match g1..]). */
     (void)nargs;
     char *s = as_str(argv[0], "re-replace");
     char *pat = as_str(argv[1], "re-replace");
-    Cljc *replv = argv[2];
-    bool is_fn = replv != NIL && (replv->tag == CLJC_FN || replv->tag == CLJC_NATIVE);
+    Clove *replv = argv[2];
+    bool is_fn = replv != NIL && (replv->tag == CLOVE_FN || replv->tag == CLOVE_NATIVE);
     char *repl = is_fn ? NULL : as_str(argv[2], "re-replace");
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
@@ -11315,7 +11317,7 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
             const char *mend = rx_match_end;          /* save: a fn may clobber rx_* */
             rx_cap_e[0] = mend;
             if (is_fn) {
-                Cljc *mv = rx_match_value(ngroups);
+                Clove *mv = rx_match_value(ngroups);
                 sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
                 rx_str_begin = s;                     /* restore after the call */
                 rx_dotall = dotall_save;              /* a nested regex in the fn clobbers it */
@@ -11334,17 +11336,17 @@ static Cljc *prim_re_replace(CljcEnv *env, Cljc **argv, int nargs) {
     if (rx_m(prog, p) && rx_match_end == p) {
         rx_cap_e[0] = p;
         if (is_fn) {
-            Cljc *mv = rx_match_value(ngroups);
+            Clove *mv = rx_match_value(ngroups);
             sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
         } else rx_subst(&out, repl);
     }
     free(pool);
-    Cljc *res = mk_str(out.data, out.len);
+    Clove *res = mk_str(out.data, out.len);
     free(out.data);
     return res;
 }
 
-static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_re_split(CloveEnv *env, Clove **argv, int nargs) {
     /* (split s pattern [limit]) — Java/Clojure semantics: zero-width matches
      * split between chars (empty pattern → chars); limit=0 (default) drops
      * trailing empties, limit>0 caps the count, limit<0 keeps trailing empties.
@@ -11356,7 +11358,7 @@ static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
     rx_str_begin = s;
-    Cljc *segs = NIL, **t = &segs;
+    Clove *segs = NIL, **t = &segs;
     size_t nsegs = 0;
     bool any_match = false;
     const char *seg = s, *p = s, *end = s + strlen(s);
@@ -11381,12 +11383,12 @@ static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
     size_t keep = nsegs;
     if (limit == 0 && any_match) {                         /* drop trailing empties */
         keep = 0; size_t i = 0;
-        for (Cljc *l = segs; l && l->tag == CLJC_LIST; l = l->as.cons.tail, i++)
+        for (Clove *l = segs; l && l->tag == CLOVE_LIST; l = l->as.cons.tail, i++)
             if (l->as.cons.head->as.str[0]) keep = i + 1;
     }
-    Cljc *v = mk_empty_vec();
+    Clove *v = mk_empty_vec();
     size_t i = 0;
-    for (Cljc *l = segs; l && l->tag == CLJC_LIST && i < keep; l = l->as.cons.tail, i++)
+    for (Clove *l = segs; l && l->tag == CLOVE_LIST && i < keep; l = l->as.cons.tail, i++)
         v = vec_conj1(v, l->as.cons.head);
     return v;
 }
@@ -11394,14 +11396,14 @@ static Cljc *prim_re_split(CljcEnv *env, Cljc **argv, int nargs) {
 /* ── math / random ── */
 
 #define MATH1(NAME, FN) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
         return mk_double(FN(as_num(argv[0]))); \
     }
 
 /* Two-arg double->double, same shape as MATH1. */
 #define MATH2(NAME, FN) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; (void)nargs; \
         return mk_double(FN(as_num(argv[0]), as_num(argv[1]))); \
     }
@@ -11454,22 +11456,22 @@ MATH2(pow, pow)
 MATH2(atan2, atan2)     /* note arg order: (atan2 y x) */
 MATH2(hypot, hypot)     /* sqrt(x*x + y*y) without overflow */
 
-static Cljc *prim_round(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_round(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     /* Java's Math.round: floor(x + 0.5) — round half toward +infinity
      * (so -2.5 → -2), not C llround's round-half-away-from-zero. */
     return mk_int((int64_t)floor(as_num(argv[0]) + 0.5));
 }
 
-static Cljc *prim_math_abs(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_math_abs(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_DOUBLE) return mk_double(fabs(v->as.d));
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_DOUBLE) return mk_double(fabs(v->as.d));
     /* unsigned negate avoids UB on INT64_MIN (returns INT64_MIN, as Java does) */
     return mk_int(v->as.i < 0 ? (int64_t)(0u - (uint64_t)v->as.i) : v->as.i);
 }
 
-static Cljc *prim_rand(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_rand(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     double r = (double)rand() / ((double)RAND_MAX + 1.0);
     if (nargs > 0)
@@ -11477,7 +11479,7 @@ static Cljc *prim_rand(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_double(r);
 }
 
-static Cljc *prim_rand_int(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_rand_int(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int64_t n = as_int(argv[0], "rand-int");
     if (n <= 0) return mk_int(0);
@@ -11488,7 +11490,7 @@ static Cljc *prim_rand_int(CljcEnv *env, Cljc **argv, int nargs) {
 /* ── bit operations (int64) ── */
 
 #define BIT_FOLD(NAME, LABEL, OP) \
-    static Cljc *prim_##NAME(CljcEnv *env, Cljc **argv, int nargs) { \
+    static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
         int64_t v = as_int(argv[0], LABEL); \
         for (int bi_ = 1; bi_ < nargs; bi_++) v = v OP as_int(argv[bi_], LABEL); \
@@ -11499,76 +11501,76 @@ BIT_FOLD(bit_and, "bit-and", &)
 BIT_FOLD(bit_or,  "bit-or",  |)
 BIT_FOLD(bit_xor, "bit-xor", ^)
 
-static Cljc *prim_bit_not(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_not(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(~as_int(argv[0], "bit-not"));
 }
 
-static Cljc *prim_bit_and_not(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_and_not(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int64_t v = as_int(argv[0], "bit-and-not");
     for (int bi_ = 1; bi_ < nargs; bi_++) v &= ~as_int(argv[bi_], "bit-and-not");
     return mk_int(v);
 }
 
-static Cljc *prim_bsl(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bsl(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int((int64_t)((uint64_t)as_int(argv[0], "bit-shift-left")
                             << (as_int(argv[1], "bit-shift-left") & 63)));
 }
 
-static Cljc *prim_bsr(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bsr(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(as_int(argv[0], "bit-shift-right")
                   >> (as_int(argv[1], "bit-shift-right") & 63));
 }
 
-static Cljc *prim_ubsr(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_ubsr(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int((int64_t)((uint64_t)as_int(argv[0], "unsigned-bit-shift-right")
                             >> (as_int(argv[1], "unsigned-bit-shift-right") & 63)));
 }
 
-static Cljc *prim_bit_test(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_test(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_bool((as_int(argv[0], "bit-test") >> (as_int(argv[1], "bit-test") & 63)) & 1);
 }
 
-static Cljc *prim_bit_set(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_set(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(as_int(argv[0], "bit-set") | ((int64_t)1 << (as_int(argv[1], "bit-set") & 63)));
 }
 
-static Cljc *prim_bit_clear(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_clear(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(as_int(argv[0], "bit-clear") & ~((int64_t)1 << (as_int(argv[1], "bit-clear") & 63)));
 }
 
-static Cljc *prim_bit_flip(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_bit_flip(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return mk_int(as_int(argv[0], "bit-flip") ^ ((int64_t)1 << (as_int(argv[1], "bit-flip") & 63)));
 }
 
 /* (char 97) → \a — code point to char. A char passes through; a 1-char
  * string is accepted leniently (its first byte). */
-static Cljc *prim_char(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_char(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_CHAR) return v;
-    if (v != NIL && v->tag == CLJC_STRING && v->as.str[0])
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_CHAR) return v;
+    if (v != NIL && v->tag == CLOVE_STRING && v->as.str[0])
         return mk_char((unsigned char)v->as.str[0]);
     return mk_char((int32_t)as_int(v, "char"));
 }
 
 /* (str/replace-first s match repl) — first occurrence only. A #"..."/re-pattern
  * match does a single regex replacement ($1..$9 in repl); a string is literal. */
-static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_replace_first(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     if (str_is_regex(argv[1])) {
         char *s = as_str(argv[0], "str/replace-first");
         char *pat = as_str(argv[1], "str/replace-first");
-        Cljc *replv = argv[2];
-        bool is_fn = replv != NIL && (replv->tag == CLJC_FN || replv->tag == CLJC_NATIVE);
+        Clove *replv = argv[2];
+        bool is_fn = replv != NIL && (replv->tag == CLOVE_FN || replv->tag == CLOVE_NATIVE);
         char *repl = is_fn ? NULL : as_str(argv[2], "str/replace-first");
         Rx *pool; int ngroups;
         Rx *prog = rx_compile(pat, &pool, &ngroups);
@@ -11585,7 +11587,7 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
                 const char *mend = rx_match_end;
                 rx_cap_e[0] = mend;
                 if (is_fn) {
-                    Cljc *mv = rx_match_value(ngroups);
+                    Clove *mv = rx_match_value(ngroups);
                     sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
                     rx_str_begin = s;
                     rx_dotall = dotall_save;
@@ -11598,7 +11600,7 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
         }
         sb_puts(&out, p);                          /* tail after the match */
         free(pool);
-        Cljc *res = mk_str(out.data, out.len);
+        Clove *res = mk_str(out.data, out.len);
         free(out.data);
         return res;
     }
@@ -11615,14 +11617,14 @@ static Cljc *prim_replace_first(CljcEnv *env, Cljc **argv, int nargs) {
     memcpy(sb.data + sb.len, s, pre); sb.len += pre;
     memcpy(sb.data + sb.len, r, rl); sb.len += rl;
     strcpy(sb.data + sb.len, hit + ml); sb.len += strlen(hit + ml);
-    Cljc *out = mk_str(sb.data, sb.len);
+    Clove *out = mk_str(sb.data, sb.len);
     free(sb.data);
     return out;
 }
 
 /* ── read-string / eval / peek / pop / empty ── */
 
-static Cljc *prim_parse_long(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_parse_long(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "parse-long");
     if (isspace((unsigned char)s[0])) return NIL;  /* no leading whitespace (Clojure) */
@@ -11634,7 +11636,7 @@ static Cljc *prim_parse_long(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_int((int64_t)v);
 }
 
-static Cljc *prim_parse_double(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_parse_double(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "parse-double");
     char *end;
@@ -11643,7 +11645,7 @@ static Cljc *prim_parse_double(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_double(v);
 }
 
-static Cljc *prim_read_string(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_read_string(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     const char *p = as_str(argv[0], "read-string");
     /* Nested reads (load-file, require shims) must not disturb the host
@@ -11651,64 +11653,64 @@ static Cljc *prim_read_string(CljcEnv *env, Cljc **argv, int nargs) {
      * line meta and error carets point at the wrong line. */
     int save_line = rd_line;
     const char *save_start = rd_line_start;
-    Cljc *save_file = rd_file_cell;
+    Clove *save_file = rd_file_cell;
     rd_line = 1;
     rd_line_start = p;
     rd_file_cell = NULL;
-    Cljc *form = read_form(&p);
+    Clove *form = read_form(&p);
     rd_line = save_line;
     rd_line_start = save_start;
     rd_file_cell = save_file;
     return form ? form : NIL;
 }
 
-static Cljc *prim_eval(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_eval(CloveEnv *env, Clove **argv, int nargs) {
     /* Like Clojure: evaluates with no access to local lexical scope. */
     return eval(env_root(env), argv[0]);
 }
 
-static Cljc *prim_peek(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_peek(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     if (v == NIL) return NIL;
-    if (v->tag == CLJC_LIST) return v->as.cons.head;          /* list: first */
-    if (v->tag == CLJC_VECTOR)                                 /* vector: last */
+    if (v->tag == CLOVE_LIST) return v->as.cons.head;          /* list: first */
+    if (v->tag == CLOVE_VECTOR)                                 /* vector: last */
         return vec_len(v) ? vec_nth(v, vec_len(v) - 1) : NIL;
-    cljc_error("peek: %s is not a list or vector", val_desc(v));
+    clove_error("peek: %s is not a list or vector", val_desc(v));
     return NIL;
 }
 
-static Cljc *prim_pop(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_pop(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
-    if (v != NIL && v->tag == CLJC_LIST) return v->as.cons.tail;
-    if (v != NIL && v->tag == CLJC_VECTOR) {
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_LIST) return v->as.cons.tail;
+    if (v != NIL && v->tag == CLOVE_VECTOR) {
         uint32_t cnt = v->as.vec.count;
-        if (cnt == 0) cljc_error_cls("IllegalStateException", "Can't pop empty vector");
+        if (cnt == 0) clove_error_cls("IllegalStateException", "Can't pop empty vector");
         if (v->as.vec.taillen > 1)  /* fast path: shrink the tail */
             return vec_cell(v->as.vec.root, v->as.vec.shift, cnt - 1,
                             v->as.vec.tail, (uint8_t)(v->as.vec.taillen - 1), NULL);
         /* tail would empty: rebuild (rare — every 32nd pop) */
-        Cljc *nv = mk_empty_vec();
+        Clove *nv = mk_empty_vec();
         for (size_t i = 0; i + 1 < cnt; i++) nv = vec_conj1(nv, vec_nth(v, i));
         return nv;
     }
     if (v == NIL) return NIL;                       /* (pop nil) is nil */
-    if (v->tag == CLJC_EMPTY) cljc_error_cls("IllegalStateException", "Can't pop empty list");
-    cljc_error_cls("ClassCastException", "pop: %s is not a list or vector", val_desc(v));
+    if (v->tag == CLOVE_EMPTY) clove_error_cls("IllegalStateException", "Can't pop empty list");
+    clove_error_cls("ClassCastException", "pop: %s is not a list or vector", val_desc(v));
     return NIL;
 }
 
-static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_empty(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Cljc *v = argv[0];
+    Clove *v = argv[0];
     if (v == NIL) return NIL;
     switch (v->tag) {
-        case CLJC_LIST: case CLJC_LAZY: case CLJC_EMPTY: return EMPTY;  /* (empty '(1 2)) => () */
-        case CLJC_VECTOR: return mk_empty_vec();
-        case CLJC_MAP:    return mk_map();
-        case CLJC_SET:    return mk_set();
-        case CLJC_SORTED: return mk_sorted(v->as.sorted.cmp, v->as.sorted.is_map);
+        case CLOVE_LIST: case CLOVE_LAZY: case CLOVE_EMPTY: return EMPTY;  /* (empty '(1 2)) => () */
+        case CLOVE_VECTOR: return mk_empty_vec();
+        case CLOVE_MAP:    return mk_map();
+        case CLOVE_SET:    return mk_set();
+        case CLOVE_SORTED: return mk_sorted(v->as.sorted.cmp, v->as.sorted.is_map);
         default:          return NIL;
     }
 }
@@ -11718,7 +11720,7 @@ static Cljc *prim_empty(CljcEnv *env, Cljc **argv, int nargs) {
  * segment + scalar state then swapcontexts; a SWITCH-OUT (yield / die) stashes
  * the leaving coro's segment, installs the resumer's state, then swapcontexts.
  * So each direction restores exactly the context it jumps to. */
-#ifdef CLJC_HAVE_CORO
+#ifdef CLOVE_HAVE_CORO
 #if defined(__APPLE__) && defined(__clang__)
 /* Darwin marks the ucontext family deprecated (since 10.6) yet still ships
  * and supports it; it is this engine's substrate, used deliberately. */
@@ -11749,7 +11751,7 @@ static void state_load(Coro *c) {
 }
 
 /* Switch INTO target, passing val. Runs on the resumer's context. */
-static Cljc *coro_resume(Coro *target, Cljc *val) {
+static Clove *coro_resume(Coro *target, Clove *val) {
     Coro *resumer = coro_current;
     char anchor;
     if (resumer) resumer->saved_sp = &anchor; else coro_main_saved_sp = &anchor;
@@ -11775,9 +11777,9 @@ static void coro_switch_out(Coro *self, CoroStatus st, void *sp) {
     state_load(resumer);
 }
 
-static Cljc *coro_yield(Cljc *val) {
+static Clove *coro_yield(Clove *val) {
     Coro *self = coro_current;
-    if (!self) cljc_error("coro/yield outside a coroutine");
+    if (!self) clove_error("coro/yield outside a coroutine");
     char anchor;
     self->xfer = val;
     coro_switch_out(self, CORO_SUSPENDED, &anchor);
@@ -11808,13 +11810,13 @@ static void coro_trampoline(void) {
     /* unreachable */
 }
 
-static Cljc *coro_new(Cljc *thunk) {
-    Cljc *cell = alloc(CLJC_CORO);     /* as.coro zeroed → GC-safe before attach */
+static Clove *coro_new(Clove *thunk) {
+    Clove *cell = alloc(CLOVE_CORO);     /* as.coro zeroed → GC-safe before attach */
     Coro *co = xmalloc(sizeof(Coro));
     memset(co, 0, sizeof *co);
     co->self = cell; co->thunk = thunk; co->xfer = NIL; co->error = NULL;
     co->s_cur_exc = NIL; co->status = CORO_NEW;
-    co->s_vstack = xmalloc(sizeof(Cljc *) * CORO_VSTACK_CAP);   /* this coro's own vstack */
+    co->s_vstack = xmalloc(sizeof(Clove *) * CORO_VSTACK_CAP);   /* this coro's own vstack */
     co->s_vsp = 0;
     co->s_vstack_cap = CORO_VSTACK_CAP;
     co->stack = xmalloc(CORO_STACK_SIZE);
@@ -11829,32 +11831,32 @@ static Cljc *coro_new(Cljc *thunk) {
     return cell;
 }
 
-static Cljc *prim_coro_new(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_coro_new(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 1) cljc_error("coro/new: needs a thunk");
-    Cljc *f = argv[0];
-    if (!(f->tag == CLJC_FN || f->tag == CLJC_NATIVE))
-        cljc_error("coro/new: argument must be a function");
+    if (nargs < 1) clove_error("coro/new: needs a thunk");
+    Clove *f = argv[0];
+    if (!(f->tag == CLOVE_FN || f->tag == CLOVE_NATIVE))
+        clove_error("coro/new: argument must be a function");
     return coro_new(f);
 }
-static Cljc *prim_coro_resume(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_coro_resume(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/resume: not a coroutine");
+    if (nargs < 1 || argv[0]->tag != CLOVE_CORO) clove_error("coro/resume: not a coroutine");
     Coro *co = argv[0]->as.coro;
-    if (co->status == CORO_DEAD) cljc_error("coro/resume: coroutine is dead");
+    if (co->status == CORO_DEAD) clove_error("coro/resume: coroutine is dead");
     if (co->status == CORO_RUNNING || co->status == CORO_NORMAL)
-        cljc_error("coro/resume: coroutine is already running");
-    Cljc *r = coro_resume(co, nargs > 1 ? argv[1] : NIL);
-    if (co->status == CORO_DEAD && co->error) cljc_throw_value(co->error);  /* propagate */
+        clove_error("coro/resume: coroutine is already running");
+    Clove *r = coro_resume(co, nargs > 1 ? argv[1] : NIL);
+    if (co->status == CORO_DEAD && co->error) clove_throw_value(co->error);  /* propagate */
     return r;
 }
-static Cljc *prim_coro_yield(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_coro_yield(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return coro_yield(nargs > 0 ? argv[0] : NIL);
 }
-static Cljc *prim_coro_status(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_coro_status(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/status: not a coroutine");
+    if (nargs < 1 || argv[0]->tag != CLOVE_CORO) clove_error("coro/status: not a coroutine");
     const char *s;
     switch (argv[0]->as.coro->status) {
         case CORO_NEW: s = "new"; break;
@@ -11865,27 +11867,27 @@ static Cljc *prim_coro_status(CljcEnv *env, Cljc **argv, int nargs) {
     }
     return mk_kw(intern(s, strlen(s)));
 }
-static Cljc *prim_coro_alive(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_coro_alive(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs < 1 || argv[0]->tag != CLJC_CORO) cljc_error("coro/alive?: not a coroutine");
+    if (nargs < 1 || argv[0]->tag != CLOVE_CORO) clove_error("coro/alive?: not a coroutine");
     return argv[0]->as.coro->status == CORO_DEAD ? FALSE : TRUE;
 }
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic pop
 #endif
 #else  /* no coroutine support (e.g. Windows) */
-static Cljc *prim_coro_new(CljcEnv *env, Cljc **argv, int nargs) {
-    (void)env; (void)argv; (void)nargs; cljc_error("coroutines unavailable on this platform");
+static Clove *prim_coro_new(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs; clove_error("coroutines unavailable on this platform");
 }
-static Cljc *prim_coro_resume(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
-static Cljc *prim_coro_yield(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
-static Cljc *prim_coro_status(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
-static Cljc *prim_coro_alive(CljcEnv *env, Cljc **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
-#endif  /* CLJC_HAVE_CORO */
+static Clove *prim_coro_resume(CloveEnv *env, Clove **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Clove *prim_coro_yield(CloveEnv *env, Clove **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Clove *prim_coro_status(CloveEnv *env, Clove **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+static Clove *prim_coro_alive(CloveEnv *env, Clove **argv, int nargs) { return prim_coro_new(env, argv, nargs); }
+#endif  /* CLOVE_HAVE_CORO */
 
 /* ── sh / FFI (the s7 cload model: generate glue C, compile, dlopen) ── */
 
-static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_sh(CloveEnv *env, Clove **argv, int nargs) {
     /* (sh "cmd") => {:exit n :out "captured stdout+stderr"} */
     (void)env;
     char *cmd = as_str(argv[0], "sh");
@@ -11894,7 +11896,7 @@ static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
     sb_puts(&full, " 2>&1");
     FILE *p = popen(full.data, "r");
     free(full.data);
-    if (!p) cljc_error("sh: popen failed");
+    if (!p) clove_error("sh: popen failed");
     SBuf out = {0};
     sb_grow(&out, 1); out.data[0] = '\0';
     char buf[4096];
@@ -11905,34 +11907,34 @@ static Cljc *prim_sh(CljcEnv *env, Cljc **argv, int nargs) {
         out.len += n; out.data[out.len] = '\0';
     }
     int status = pclose(p);
-    Cljc *m = mk_map();
+    Clove *m = mk_map();
     m = map_assoc(m, mk_kw(intern("exit", 4)), mk_int(status == -1 ? -1 : WEXITSTATUS(status)));
-    Cljc *s = mk_str(out.data, out.len);
+    Clove *s = mk_str(out.data, out.len);
     free(out.data);
     m = map_assoc(m, mk_kw(intern("out", 3)), s);
     return m;
 }
 
-#ifndef CLJC_NO_MAIN   /* defined with the REPL */
-static Cljc *prim_repl_edit(CljcEnv *env, Cljc **argv, int nargs);
-static Cljc *prim_repl_log(CljcEnv *env, Cljc **argv, int nargs);
+#ifndef CLOVE_NO_MAIN   /* defined with the REPL */
+static Clove *prim_repl_edit(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_repl_log(CloveEnv *env, Clove **argv, int nargs);
 #endif
 
-/* (cljc/sh-lines* "cmd" f) → exit status. Like sh, but calls (f line) for
+/* (clove/sh-lines* "cmd" f) → exit status. Like sh, but calls (f line) for
  * each line of output (stdout+stderr, newline stripped) as it arrives, so a
  * long-running command — a streaming curl — can be consumed incrementally.
  * An error thrown by f closes the pipe (the child sees SIGPIPE) and
  * propagates. */
-static Cljc *prim_sh_lines(CljcEnv *env, Cljc **argv, int nargs) {
-    if (nargs != 2) cljc_error("cljc/sh-lines*: expected cmd and fn");
-    char *cmd = as_str(argv[0], "cljc/sh-lines*");
-    Cljc *f = argv[1];
+static Clove *prim_sh_lines(CloveEnv *env, Clove **argv, int nargs) {
+    if (nargs != 2) clove_error("clove/sh-lines*: expected cmd and fn");
+    char *cmd = as_str(argv[0], "clove/sh-lines*");
+    Clove *f = argv[1];
     SBuf full = {0};
     sb_puts(&full, cmd);
     sb_puts(&full, " 2>&1");
     FILE *volatile p = popen(full.data, "r");
     free(full.data);
-    if (!p) cljc_error("cljc/sh-lines*: popen failed");
+    if (!p) clove_error("clove/sh-lines*: popen failed");
     ErrFrame fr;
     fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
     fr.vm_tsp_save = vm_tsp; fr.ns_save = cur_reader_ns; fr.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL; fr.rd_line_save = rd_line;
@@ -11941,7 +11943,7 @@ static Cljc *prim_sh_lines(CljcEnv *env, Cljc **argv, int nargs) {
     if (setjmp(fr.jb) != 0) {          /* f threw: close up, then rethrow */
         err_top = fr.prev;
         pclose(p);
-        cljc_raise();
+        clove_raise();
     }
     SBuf line = {0};
     int c;
@@ -11950,7 +11952,7 @@ static Cljc *prim_sh_lines(CljcEnv *env, Cljc **argv, int nargs) {
         if (c == EOF || c == '\n') {
             if (c == EOF && line.len == 0) break;
             if (line.len && line.data[line.len-1] == '\r') line.len--;
-            Cljc *a[1] = { mk_str(line.data ? line.data : "", line.len) };
+            Clove *a[1] = { mk_str(line.data ? line.data : "", line.len) };
             line.len = 0;
             apply(env, f, a, 1);
             if (c == EOF) break;
@@ -11963,7 +11965,7 @@ static Cljc *prim_sh_lines(CljcEnv *env, Cljc **argv, int nargs) {
 }
 
 /* Vtable handed to FFI modules — generated glue marshals exclusively
- * through these, so modules need no cljc symbols or headers. Append-only:
+ * through these, so modules need no clove symbols or headers. Append-only:
  * reordering breaks every compiled module. */
 typedef struct {
     void *(*mk_int)(long long);
@@ -11976,12 +11978,12 @@ typedef struct {
     void *(*nth_arg)(void *args, int i);
     void (*def_native)(void *env, const char *name, void *(*fn)(void *, void *, int));
     void (*error)(const char *msg);
-    /* Appended for struct-by-value marshalling (raylib et al.): build a cljc
+    /* Appended for struct-by-value marshalling (raylib et al.): build a clove
      * vector from struct fields (returns), and read a field out of a passed
      * vector (args). Append-only — never reorder the slots above. */
     void *(*mk_vec)(void **items, int n);
     void *(*nth_elem)(void *vec, int i);
-} CljcFfiApi;
+} CloveFfiApi;
 
 static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
 static void *fa_mk_double(double d) { return mk_double(d); }
@@ -11991,65 +11993,65 @@ static void *fa_nil(void) { return NIL; }
  * JIT-compiled ^long function handed 2.5 must not quietly compute on 2 --
  * its interpreted twin would return a double. Reject instead. */
 static long long fa_as_int(void *v) {
-    Cljc *c = (Cljc *)v;
-    if (c == NULL || c->tag != CLJC_INT)
-        cljc_error("ffi: expected an integer, got %s", val_desc(c));
+    Clove *c = (Clove *)v;
+    if (c == NULL || c->tag != CLOVE_INT)
+        clove_error("ffi: expected an integer, got %s", val_desc(c));
     return (long long)c->as.i;
 }
-static double fa_as_double(void *v) { return as_num((Cljc *)v); }
-static const char *fa_as_str(void *v) { return as_str((Cljc *)v, "ffi"); }
+static double fa_as_double(void *v) { return as_num((Clove *)v); }
+static const char *fa_as_str(void *v) { return as_str((Clove *)v, "ffi"); }
 static void *fa_nth_arg(void *args, int i) {
-    return ((Cljc **)args)[i];   /* glue guards its own arity */
+    return ((Clove **)args)[i];   /* glue guards its own arity */
 }
 static void fa_def_native(void *env, const char *name, void *(*fn)(void *, void *, int)) {
-    cljc_define_native((CljcEnv *)env, name, (CljcNativeFn)fn);
+    clove_define_native((CloveEnv *)env, name, (CloveNativeFn)fn);
 }
-static void fa_error(const char *msg) { cljc_error("%s", msg); }
-static void *fa_mk_vec(void **items, int n) { return mk_vector((Cljc **)items, (size_t)n); }
-static void *fa_nth_elem(void *vec, int i) { return vec_nth((Cljc *)vec, (size_t)i); }
+static void fa_error(const char *msg) { clove_error("%s", msg); }
+static void *fa_mk_vec(void **items, int n) { return mk_vector((Clove **)items, (size_t)n); }
+static void *fa_nth_elem(void *vec, int i) { return vec_nth((Clove *)vec, (size_t)i); }
 
-static CljcFfiApi ffi_api = {
+static CloveFfiApi ffi_api = {
     fa_mk_int, fa_mk_double, fa_mk_str, fa_nil,
     fa_as_int, fa_as_double, fa_as_str, fa_nth_arg, fa_def_native, fa_error,
     fa_mk_vec, fa_nth_elem,
 };
 
-static Cljc *prim_ffi_load(CljcEnv *env, Cljc **argv, int nargs) {
-    /* (ffi-load* "/path/mod.so") — dlopen + call cljc_module_init. */
+static Clove *prim_ffi_load(CloveEnv *env, Clove **argv, int nargs) {
+    /* (ffi-load* "/path/mod.so") — dlopen + call clove_module_init. */
     char *path = as_str(argv[0], "ffi-load*");
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (!h) cljc_error("ffi-load*: %s", dlerror());
-    void (*init)(void *, CljcFfiApi *) =
-        (void (*)(void *, CljcFfiApi *))dlsym(h, "cljc_module_init");
-    if (!init) cljc_error("ffi-load*: no cljc_module_init in %s", path);
+    if (!h) clove_error("ffi-load*: %s", dlerror());
+    void (*init)(void *, CloveFfiApi *) =
+        (void (*)(void *, CloveFfiApi *))dlsym(h, "clove_module_init");
+    if (!init) clove_error("ffi-load*: no clove_module_init in %s", path);
     init(env_root(env), &ffi_api);
     return TRUE;
 }
 
 /* ───── Public C API ─────────────────────────────────────────────────── */
 
-CljcEnv *cljc_new_env(void);
-Cljc    *cljc_eval_string(CljcEnv *env, const char *src);
-void     cljc_print(Cljc *v);
-void     cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn);
-void     cljc_set_stack_base(void *p);
-void     cljc_set_embedded_files(const CljcEmbeddedFile *files, int n);
+CloveEnv *clove_new_env(void);
+Clove    *clove_eval_string(CloveEnv *env, const char *src);
+void     clove_print(Clove *v);
+void     clove_define_native(CloveEnv *env, const char *name, CloveNativeFn fn);
+void     clove_set_stack_base(void *p);
+void     clove_set_embedded_files(const CloveEmbeddedFile *files, int n);
 
-void cljc_define_native(CljcEnv *env, const char *name, CljcNativeFn fn) {
+void clove_define_native(CloveEnv *env, const char *name, CloveNativeFn fn) {
     env_define_root(env_root(env), intern(name, strlen(name)), mk_native(fn));
 }
 
 /* Register bundled .clj dependencies so slurp/require/load-file find them
- * without a filesystem. Call before cljc_eval_string. */
-void cljc_set_embedded_files(const CljcEmbeddedFile *files, int n) {
-    cljc_embedded = files; cljc_n_embedded = n;
+ * without a filesystem. Call before clove_eval_string. */
+void clove_set_embedded_files(const CloveEmbeddedFile *files, int n) {
+    clove_embedded = files; clove_n_embedded = n;
 }
 
 /* Record the high-water mark of the C stack for conservative root scanning.
  * Call with the address of a local near the top of the thread (e.g. &argc in
  * main) before evaluating anything. Safe to call repeatedly — keeps the
  * highest address seen (downward-growing stacks). */
-void cljc_set_stack_base(void *p) {
+void clove_set_stack_base(void *p) {
     if (!gc_stack_base || p > gc_stack_base) {
         gc_stack_base = p;
         stack_floor_init((const char *)p);   /* recompute the C-stack overflow floor */
@@ -12058,7 +12060,7 @@ void cljc_set_stack_base(void *p) {
 
 /* ───── Prelude (Clojure source: core fns and macros) ─────────────────── */
 
-/* Core functions and macros written in cljc itself. Evaluated once at env
+/* Core functions and macros written in clove itself. Evaluated once at env
  * creation — every line here is one we don't maintain as a C primitive. */
 static const char *PRELUDE =
     "(defn identity [x] x)\n"
@@ -12092,7 +12094,7 @@ static const char *PRELUDE =
     "(defn split-at [n coll] [(take n coll) (drop n coll)])\n"
     "(defn str/split-lines [s] (re-split s \"\\r?\\n\"))\n"
     "(defmacro if-not [test then & else] `(if (not ~test) ~then ~@else))\n"
-    "(defmacro fn* [& body] (cons 'fn body))\n"   /* fn* === fn (cljc fn is the special form) */
+    "(defmacro fn* [& body] (cons 'fn body))\n"   /* fn* === fn (clove fn is the special form) */
     /* (. target member ..) interop: (. Class (m a)) -> (Class/m a) when target is
        a class (dotted or Capitalized), else instance (.m target a). */
     "(defmacro . [target member & args]\n"
@@ -12110,7 +12112,7 @@ static const char *PRELUDE =
     "(defmacro let* [& body] (cons 'let body))\n"
     "(defmacro loop* [& body] (cons 'loop body))\n"
     "(defmacro when-not [test & body] `(when (not ~test) ~@body))\n"
-    /* locking: cljc is single-threaded, so it just runs the body */
+    /* locking: clove is single-threaded, so it just runs the body */
     "(defmacro locking [_ & body] `(do ~@body))\n"
     "(defmacro -> [x & forms]\n"
     "  (loop [x x forms forms]\n"
@@ -12303,25 +12305,25 @@ static const char *PRELUDE =
        A host/deftype class resolves to a type keyword: plain type equality. */
     /* protocol (a vector of method syms) -> satisfies?; a class keyword -> the
        type ISA the class, so a supertype like Number matches an int/double too. */
-    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (or (isa? (type x) c) (cljc/ex-isa?* c x))))\n"
+    "(defn instance? [c x] (if (vector? c) (satisfies? c x) (or (isa? (type x) c) (clove/ex-isa?* c x))))\n"
     /* Exception constructors: an ex-info map re-classed, so (catch C e) and
        (instance? C e) see the class the code asked for. */
-    "(defn cljc/ex-ctor [cls]\n"
-    "  (fn ([] (cljc/ex-typed* cls (ex-info \"\" {})))\n"
-    "      ([msg] (cljc/ex-typed* cls (ex-info (str msg) {})))\n"
-    "      ([msg c] (cljc/ex-typed* cls (ex-info (str msg) {} c)))))\n"
-    "(def Throwable. (cljc/ex-ctor :Throwable)) (def Exception. (cljc/ex-ctor :Exception))\n"
-    "(def Error. (cljc/ex-ctor :Error)) (def AssertionError. (cljc/ex-ctor :AssertionError))\n"
-    "(def RuntimeException. (cljc/ex-ctor :RuntimeException))\n"
-    "(def IllegalArgumentException. (cljc/ex-ctor :IllegalArgumentException))\n"
-    "(def IllegalStateException. (cljc/ex-ctor :IllegalStateException))\n"
-    "(def UnsupportedOperationException. (cljc/ex-ctor :UnsupportedOperationException))\n"
-    "(def ArithmeticException. (cljc/ex-ctor :ArithmeticException))\n"
-    "(def NumberFormatException. (cljc/ex-ctor :NumberFormatException))\n"
-    "(def IndexOutOfBoundsException. (cljc/ex-ctor :IndexOutOfBoundsException))\n"
-    "(def NullPointerException. (cljc/ex-ctor :NullPointerException))\n"
-    "(def ClassCastException. (cljc/ex-ctor :ClassCastException))\n"
-    "(def InterruptedException. (cljc/ex-ctor :InterruptedException))\n"
+    "(defn clove/ex-ctor [cls]\n"
+    "  (fn ([] (clove/ex-typed* cls (ex-info \"\" {})))\n"
+    "      ([msg] (clove/ex-typed* cls (ex-info (str msg) {})))\n"
+    "      ([msg c] (clove/ex-typed* cls (ex-info (str msg) {} c)))))\n"
+    "(def Throwable. (clove/ex-ctor :Throwable)) (def Exception. (clove/ex-ctor :Exception))\n"
+    "(def Error. (clove/ex-ctor :Error)) (def AssertionError. (clove/ex-ctor :AssertionError))\n"
+    "(def RuntimeException. (clove/ex-ctor :RuntimeException))\n"
+    "(def IllegalArgumentException. (clove/ex-ctor :IllegalArgumentException))\n"
+    "(def IllegalStateException. (clove/ex-ctor :IllegalStateException))\n"
+    "(def UnsupportedOperationException. (clove/ex-ctor :UnsupportedOperationException))\n"
+    "(def ArithmeticException. (clove/ex-ctor :ArithmeticException))\n"
+    "(def NumberFormatException. (clove/ex-ctor :NumberFormatException))\n"
+    "(def IndexOutOfBoundsException. (clove/ex-ctor :IndexOutOfBoundsException))\n"
+    "(def NullPointerException. (clove/ex-ctor :NullPointerException))\n"
+    "(def ClassCastException. (clove/ex-ctor :ClassCastException))\n"
+    "(def InterruptedException. (clove/ex-ctor :InterruptedException))\n"
     "(defn nnext [s] (next (next s)))\n"
     "(defn find [m k] (when (contains? m k) [k (get m k)]))\n"
     "(defn reduced [x] (cons '**reduced** (cons x nil)))\n"
@@ -12337,19 +12339,19 @@ static const char *PRELUDE =
     "     (throw (IndexOutOfBoundsException. (str \"subvec: \" s \" to \" e \" out of bounds for length \" (count v)))))\n"
     "   (vec (take (- e s) (drop s v)))))\n"
     /* defrecord registers its type here so a deftype can be told apart from a
-       record (both are tagged maps in cljc). map? stays native (records, plain
+       record (both are tagged maps in clove). map? stays native (records, plain
        maps, AND deftypes all read as maps — instaparse relies on this). */
-    "(def cljc/record-types (atom #{}))\n"
-    "(def cljc/map-raw? map?)\n"
+    "(def clove/record-types (atom #{}))\n"
+    "(def clove/map-raw? map?)\n"
     /* coll?, though, must be FALSE for a deftype that isn't a collection (Emmy's
        structures and core.logic's LVar are tagged maps but not collections): a
        tagged map counts as a coll only when it's a record or derives a collection
        interface (Sequential / IPersistentCollection). Plain maps stay colls. */
     "(defn coll? [x]\n"
     "  (or (list? x) (vector? x) (set? x) (sorted? x) (seq? x) (sequential? x)\n"
-    "      (and (cljc/map-raw? x)\n"
-    "           (let [t (get x :cljc/type)]\n"
-    "             (or (nil? t) (contains? (deref cljc/record-types) t)\n"
+    "      (and (clove/map-raw? x)\n"
+    "           (let [t (get x :clove/type)]\n"
+    "             (or (nil? t) (contains? (deref clove/record-types) t)\n"
     "                 (isa? t :clojure.lang.IPersistentCollection))))))\n"
     "(defn map-entry? [x] (and (vector? x) (= 2 (count x))))\n"
     "(defn list* [& args]\n"
@@ -12368,18 +12370,18 @@ static const char *PRELUDE =
     /* a deftype (no longer map?) is sequential? when it derives Sequential —
        check the type tag directly, not map?. */
     "(defn sequential? [x] (boolean (or (list? x) (vector? x) (seq? x)\n"
-    "                          (let [t (get x :cljc/type)] (and t (isa? t :clojure.lang.Sequential))))))\n"
-    "(defn class [x] (if (fn? x) x (or (cljc/ex-class* x) (type x))))\n"   /* fn reflects on itself (below) */
-    /* synthesize java.lang.reflect.Method info from cljc fn arities so libraries
+    "                          (let [t (get x :clove/type)] (and t (isa? t :clojure.lang.Sequential))))))\n"
+    "(defn class [x] (if (fn? x) x (or (clove/ex-class* x) (type x))))\n"   /* fn reflects on itself (below) */
+    /* synthesize java.lang.reflect.Method info from clove fn arities so libraries
        that compute arity by reflection (emmy.function) work without the JVM */
     "(defn .getDeclaredMethods [c]\n"
     "  (if (fn? c)\n"
     "    (vec (mapcat (fn [a] (let [n (first a) v (second a)]\n"
     "                           (if v [{:nm \"doInvoke\" :pt (vec (repeat n nil))} {:nm \"getRequiredArity\"}]\n"
-    "                               [{:nm \"invoke\" :pt (vec (repeat n nil))}]))) (cljc/fn-arities c)))\n"
+    "                               [{:nm \"invoke\" :pt (vec (repeat n nil))}]))) (clove/fn-arities c)))\n"
     "    []))\n"
     "(defn .getParameterTypes [m] (:pt m))\n"
-    "(defn .getRequiredArity [f] (or (some (fn [a] (when (second a) (first a))) (cljc/fn-arities f)) 0))\n"
+    "(defn .getRequiredArity [f] (or (some (fn [a] (when (second a) (first a))) (clove/fn-arities f)) 0))\n"
     /* regexes are strings; the :regex meta makes str/split treat them so */
     "(defn re-pattern [s] (with-meta s {:regex true}))\n"
     "(defn boolean? [x] (or (true? x) (false? x)))\n"
@@ -12388,33 +12390,33 @@ static const char *PRELUDE =
      * *global-hierarchy*: {child #{direct-parents}}. isa? closes it transitively
      * and is vector-aware ([::a ::b] isa [::c ::d] elementwise), which is what
      * multimethod dispatch on multiple args needs. */
-    "(def cljc/global-hierarchy (atom {}))\n"
-    "(defn cljc/tag-isa? [c p]\n"
-    "  (or (= c p) (boolean (some (fn [x] (cljc/tag-isa? x p)) (get (deref cljc/global-hierarchy) c)))))\n"
+    "(def clove/global-hierarchy (atom {}))\n"
+    "(defn clove/tag-isa? [c p]\n"
+    "  (or (= c p) (boolean (some (fn [x] (clove/tag-isa? x p)) (get (deref clove/global-hierarchy) c)))))\n"
     "(defn isa?\n"
     "  ([c p]\n"
-    "   (or (= c p) (= p :default) (cljc/tag-isa? c p)\n"  /* :default = Object, universal super */
+    "   (or (= c p) (= p :default) (clove/tag-isa? c p)\n"  /* :default = Object, universal super */
     "       (and (vector? c) (vector? p) (= (count c) (count p))\n"
     "            (every? identity (map isa? c p)))))\n"
-    "  ([h c p] (isa? c p)))\n"          /* cljc derive always writes the global hierarchy */
-    "(defn parents ([t] (get (deref cljc/global-hierarchy) t)) ([h t] (parents t)))\n"
+    "  ([h c p] (isa? c p)))\n"          /* clove derive always writes the global hierarchy */
+    "(defn parents ([t] (get (deref clove/global-hierarchy) t)) ([h t] (parents t)))\n"
     "(defn ancestors\n"
-    "  ([t] (let [ps (get (deref cljc/global-hierarchy) t)]\n"
+    "  ([t] (let [ps (get (deref clove/global-hierarchy) t)]\n"
     "         (reduce (fn [acc p] (into (conj acc p) (ancestors p))) #{} ps)))\n"
     "  ([h t] (ancestors t)))\n"
     "(defn descendants\n"
-    "  ([t] (set (filter (fn [k] (and (not= k t) (cljc/tag-isa? k t))) (keys (deref cljc/global-hierarchy)))))\n"
+    "  ([t] (set (filter (fn [k] (and (not= k t) (clove/tag-isa? k t))) (keys (deref clove/global-hierarchy)))))\n"
     "  ([h t] (descendants t)))\n"
     "(defn derive\n"
-    "  ([t parent] (swap! cljc/global-hierarchy update t (fn [s] (conj (or s #{}) parent))) nil)\n"
+    "  ([t parent] (swap! clove/global-hierarchy update t (fn [s] (conj (or s #{}) parent))) nil)\n"
     "  ([h t parent] (derive t parent)))\n"
     "(defn underive\n"
-    "  ([t parent] (swap! cljc/global-hierarchy update t disj parent) nil)\n"
+    "  ([t parent] (swap! clove/global-hierarchy update t disj parent) nil)\n"
     "  ([h t parent] (underive t parent)))\n"
     /* resolve a method by walking the hierarchy: among method keys that dv isa?,
      * pick the most specific (the one that isa? all the other matches). */
-    "(defn cljc/multi-find\n"
-    "  ([t dv] (cljc/multi-find t dv nil))\n"
+    "(defn clove/multi-find\n"
+    "  ([t dv] (clove/multi-find t dv nil))\n"
     "  ([t dv prefs]\n"   /* prefs: {dispatch-val #{preferred-over...}} from prefer-method */
     "   (let [ms (filter (fn [e] (isa? dv (key e))) t)]\n"
     "     (when (seq ms)\n"
@@ -12423,7 +12425,7 @@ static const char *PRELUDE =
     "                                                  (contains? (get prefs (key e)) (key e2))))\n"
     "                                            ms) e)) ms)\n"
     "                (first ms)))))))\n"
-    /* cljc's collection types ARE the host's Sequential/collection interfaces, so
+    /* clove's collection types ARE the host's Sequential/collection interfaces, so
        derive them — lets a (defmethod f [.. Sequential]) match a vector/list/seq
        dispatch value (e.g. Emmy's partial-derivative on a vector of selectors). */
     "(doseq [c [:clojure.lang.Sequential :clojure.lang.IPersistentVector :clojure.lang.PersistentVector\n"
@@ -12443,7 +12445,7 @@ static const char *PRELUDE =
     "(doseq [t [:vector :list :lazy-seq :set]]\n"
     "  (derive t :java.lang.Iterable) (derive t :clojure.lang.Seqable))\n"
     "(derive :map :java.util.Map) (derive :map :clojure.lang.Seqable)\n"
-    /* cljc's numeric types are java.lang.Number subclasses, so (instance? Number n)
+    /* clove's numeric types are java.lang.Number subclasses, so (instance? Number n)
        holds — Emmy's v/number? checks exactly this */
     "(doseq [t [:int :double :bigint :ratio]] (derive t :number))\n"
     "(defn every-pred [& ps]\n"
@@ -12453,8 +12455,8 @@ static const char *PRELUDE =
     "(defn memoize [f]\n"
     "  (let [cache (atom {})]\n"
     "    (fn [& args]\n"
-    "      (let [hit (get @cache args :cljc/memo-miss)]\n"
-    "        (if (= hit :cljc/memo-miss)\n"
+    "      (let [hit (get @cache args :clove/memo-miss)]\n"
+    "        (if (= hit :clove/memo-miss)\n"
     "          (let [v (apply f args)] (swap! cache assoc args v) v)\n"
     "          hit)))))\n"
     "(defn take-last [n coll] (drop (max 0 (- (count coll) n)) coll))\n"
@@ -12469,8 +12471,8 @@ static const char *PRELUDE =
      * Keeps atoms etc. alive across re-evaluation (notebook saves, reloads). */
     "(defmacro defonce [n e] `(try ~n (catch Exception ex# (def ~n ~e))))\n"
     "(defmacro time [expr]\n"
-    "  `(let [t0# (cljc/now-ms*) v# ~expr]\n"
-    "     (println (str \"Elapsed time: \" (- (cljc/now-ms*) t0#) \" msecs\"))\n"
+    "  `(let [t0# (clove/now-ms*) v# ~expr]\n"
+    "     (println (str \"Elapsed time: \" (- (clove/now-ms*) t0#) \" msecs\"))\n"
     "     v#))\n"
     /* == (numeric value-equality across the tower, 1 == 1.0) is a native prim. */
     "(defn distinct? [& xs] (= (count xs) (count (set xs))))\n"
@@ -12479,15 +12481,15 @@ static const char *PRELUDE =
     /* deftype, tolerated: defines a Name. constructor returning a plain map
      * of fields; interface method bodies are ignored. Enough for files that
      * define a type they rarely use to still load. */
-    /* Real deftype: an instance is a map tagged {:cljc/type :T} (so `type` and
+    /* Real deftype: an instance is a map tagged {:clove/type :T} (so `type` and
        protocol multimethods dispatch on it) whose MUTABLE fields are atoms.
        Method bodies are rewritten so a field read becomes (:f this) — deref'd
        for mutable fields — and (set! f v) becomes (reset! (:f this) v), then
        registered as defmethods on :T. Field metadata (^:unsynchronized-mutable
        etc.) marks a field mutable; bare fields are immutable values. */
-    "(defn cljc/field-sym [f]\n"
+    "(defn clove/field-sym [f]\n"
     "  (loop [f f] (if (and (list? f) (= 'with-meta (first f))) (recur (second f)) f)))\n"
-    "(defn cljc/field-mut? [f]\n"
+    "(defn clove/field-mut? [f]\n"
     "  (loop [f f]\n"
     "    (if (and (list? f) (= 'with-meta (first f)))\n"
     "      (let [m (nth f 2 nil)]\n"
@@ -12496,13 +12498,13 @@ static const char *PRELUDE =
     "      false)))\n"
     /* symbols bound by a binding pattern (so deftype-walk can drop them from
        fset — a local shadows a same-named field). */
-    "(defn cljc/binding-syms [pat]\n"
+    "(defn clove/binding-syms [pat]\n"
     "  (cond (symbol? pat) (if (= pat '&) #{} #{pat})\n"
-    "        (vector? pat) (reduce into #{} (map cljc/binding-syms pat))\n"
+    "        (vector? pat) (reduce into #{} (map clove/binding-syms pat))\n"
     "        (map? pat) (into (set (concat (:keys pat) (when (symbol? (:as pat)) [(:as pat)])))\n"
-    "                         (mapcat cljc/binding-syms (filter (complement keyword?) (keys pat))))\n"
+    "                         (mapcat clove/binding-syms (filter (complement keyword?) (keys pat))))\n"
     "        :else #{}))\n"
-    "(defn cljc/deftype-walk-qq [form fset mset this]\n"
+    "(defn clove/deftype-walk-qq [form fset mset this]\n"
     /* inside a quasiquote TEMPLATE: everything is data except the payloads of
        unquote / unquote-splicing — only those are live code to rewrite.
        Macroexpanding or field-substituting the template itself mangles it
@@ -12512,13 +12514,13 @@ static const char *PRELUDE =
     "    (and (list? form) (symbol? (first form))\n"
     "         (contains? #{'unquote 'clojure.core/unquote\n"
     "                      'unquote-splicing 'clojure.core/unquote-splicing} (first form)))\n"
-    "      (list (first form) (cljc/deftype-walk (second form) fset mset this))\n"
-    "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk-qq x fset mset this)) form))\n"
-    "    (vector? form) (mapv (fn [x] (cljc/deftype-walk-qq x fset mset this)) form)\n"
-    "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk-qq (first kv) fset mset this)\n"
-    "                                           (cljc/deftype-walk-qq (second kv) fset mset this)]) form))\n"
+    "      (list (first form) (clove/deftype-walk (second form) fset mset this))\n"
+    "    (list? form)   (apply list (map (fn [x] (clove/deftype-walk-qq x fset mset this)) form))\n"
+    "    (vector? form) (mapv (fn [x] (clove/deftype-walk-qq x fset mset this)) form)\n"
+    "    (map? form)    (into {} (map (fn [kv] [(clove/deftype-walk-qq (first kv) fset mset this)\n"
+    "                                           (clove/deftype-walk-qq (second kv) fset mset this)]) form))\n"
     "    :else form))\n"
-    "(defn cljc/deftype-walk [form fset mset this]\n"
+    "(defn clove/deftype-walk [form fset mset this]\n"
     /* macroexpand this node so macros that GENERATE field reads or (set! field
        ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
        form so it stays a set! for the rewrite below (set! is itself a macro). */
@@ -12532,31 +12534,31 @@ static const char *PRELUDE =
     "    (and (list? form) (= 'set! (first form)) (symbol? (second form))\n"
     "         (contains? mset (second form)))\n"
     "      (list 'reset! (list (keyword (str (second form))) this)\n"
-    "            (cljc/deftype-walk (nth form 2) fset mset this))\n"
+    "            (clove/deftype-walk (nth form 2) fset mset this))\n"
     /* let, let-star and loop: binding NAMES shadow fields. Walk each value with
        the fields visible at that point, then walk the body with shadowed fields
        removed, so (loop [state state] ..) keeps the loop var a local. */
     "    (and (list? form) (contains? #{'let 'let* 'loop} (first form)) (vector? (second form)))\n"
     "      (let [acc (reduce (fn [a [b v]]\n"
-    "                          {:fs (reduce disj (:fs a) (cljc/binding-syms b))\n"
-    "                           :bs (conj (:bs a) b (cljc/deftype-walk v (:fs a) mset this))})\n"
+    "                          {:fs (reduce disj (:fs a) (clove/binding-syms b))\n"
+    "                           :bs (conj (:bs a) b (clove/deftype-walk v (:fs a) mset this))})\n"
     "                        {:fs fset :bs []} (partition 2 (second form)))]\n"
     "        (apply list (first form) (vec (:bs acc))\n"
-    "               (map (fn [x] (cljc/deftype-walk x (:fs acc) mset this)) (drop 2 form))))\n"
+    "               (map (fn [x] (clove/deftype-walk x (:fs acc) mset this)) (drop 2 form))))\n"
     "    (and (list? form) (= 'quote (first form))) form\n"
     "    (and (list? form) (= 'quasiquote (first form)))\n"
-    "      (list 'quasiquote (cljc/deftype-walk-qq (second form) fset mset this))\n"
-    "    (list? form)   (apply list (map (fn [x] (cljc/deftype-walk x fset mset this)) form))\n"
-    "    (vector? form) (mapv (fn [x] (cljc/deftype-walk x fset mset this)) form)\n"
-    "    (map? form)    (into {} (map (fn [kv] [(cljc/deftype-walk (first kv) fset mset this)\n"
-    "                                           (cljc/deftype-walk (second kv) fset mset this)]) form))\n"
+    "      (list 'quasiquote (clove/deftype-walk-qq (second form) fset mset this))\n"
+    "    (list? form)   (apply list (map (fn [x] (clove/deftype-walk x fset mset this)) form))\n"
+    "    (vector? form) (mapv (fn [x] (clove/deftype-walk x fset mset this)) form)\n"
+    "    (map? form)    (into {} (map (fn [kv] [(clove/deftype-walk (first kv) fset mset this)\n"
+    "                                           (clove/deftype-walk (second kv) fset mset this)]) form))\n"
     "    :else form)))\n"
     "(defmacro deftype [tname fields & specs]\n"
-    "  (let [tname (cljc/field-sym tname)\n"   /* peel ^{:doc ..} off the name */
+    "  (let [tname (clove/field-sym tname)\n"   /* peel ^{:doc ..} off the name */
     "        tkw   (keyword (str tname))\n"
-    "        fsyms (mapv cljc/field-sym fields)\n"
+    "        fsyms (mapv clove/field-sym fields)\n"
     "        fset  (set fsyms)\n"
-    "        mset  (set (filter some? (map (fn [f] (when (cljc/field-mut? f) (cljc/field-sym f))) fields)))\n"
+    "        mset  (set (filter some? (map (fn [f] (when (clove/field-mut? f) (clove/field-sym f))) fields)))\n"
     "        ms    (filter list? specs)\n"
     /* every declared marker interface / protocol (definterface -> a keyword,
        imported class -> a keyword) becomes a parent of this type, so
@@ -12566,10 +12568,10 @@ static const char *PRELUDE =
     "    `(do\n"
     "       (def ~tname ~tkw)\n"
     "       (defn ~(symbol (str tname \".\")) ~fsyms\n"
-    "         (hash-map :cljc/type ~tkw ~@kvs))\n"
+    "         (hash-map :clove/type ~tkw ~@kvs))\n"
     "       (def ~(symbol (str \"->\" tname)) ~(symbol (str tname \".\")))\n"
-    "       ~@(map (fn [i] `(let [k# (cljc/resolve-maybe '~i)]\n"
-    "                         (when (and (keyword? k#) (not (contains? cljc/no-derive-kinds k#)))\n"
+    "       ~@(map (fn [i] `(let [k# (clove/resolve-maybe '~i)]\n"
+    "                         (when (and (keyword? k#) (not (contains? clove/no-derive-kinds k#)))\n"
     "                           (derive ~tkw k#)))) ifaces)\n"
     /* group method forms by name -> one multi-arity fn per (type,name), so a
        protocol method with several arities (e.g. IFn invoke) doesn't collide */
@@ -12579,17 +12581,17 @@ static const char *PRELUDE =
     "                                     (let [oparams (vec (second m)) othis (first oparams)\n"
     "                                           this (if (= othis '_) (gensym \"this\") othis)\n"
     "                                           params (assoc oparams 0 this)\n"
-    "                                           body (map (fn [x] (cljc/deftype-walk x fset mset this)) (drop 2 m))]\n"
+    "                                           body (map (fn [x] (clove/deftype-walk x fset mset this)) (drop 2 m))]\n"
     "                                       `(~params ~@body)))\n"
     "                                   (second g))]\n"
-    "                  `(cljc/reg-method! '~mname ~tkw (fn ~@arities))))\n"
+    "                  `(clove/reg-method! '~mname ~tkw (fn ~@arities))))\n"
     "              (group-by first ms))\n"
     "       ~tkw)))\n"
-    /* PersistentQueue: a vector tagged {:cljc/queue true} — conj at the
+    /* PersistentQueue: a vector tagged {:clove/queue true} — conj at the
      * back (meta survives), peek/pop at the FRONT (true FIFO; pop is
      * O(n), fine at puzzle scale). */
-    "(def clojure.lang.PersistentQueue/EMPTY (with-meta [] {:cljc/queue true}))\n"
-    "(defn cljc/queue? [x] (and (vector? x) (get (meta x) :cljc/queue)))\n"
+    "(def clojure.lang.PersistentQueue/EMPTY (with-meta [] {:clove/queue true}))\n"
+    "(defn clove/queue? [x] (and (vector? x) (get (meta x) :clove/queue)))\n"
     /* Java-interop shims: enough for the canonical md5 idiom and common
      * static calls to run verbatim. Method symbols (.foo) are plain
      * globals here. */
@@ -12597,7 +12599,7 @@ static const char *PRELUDE =
     "  (if (= (str/upper-case algo) \"MD5\") :md5\n"
     "      (throw (ex-info (str \"MessageDigest: only MD5 (got \" algo \")\") {}))))\n"
     "(defn .getBytes [s] s)\n"
-    "(defn .digest [algo s] (cljc/md5* s))\n"   /* → 32-char hex string */
+    "(defn .digest [algo s] (clove/md5* s))\n"   /* → 32-char hex string */
     "(defn .indexOf [coll x]\n"
     "  (if (string? coll)\n"
     "    (or (str/index-of coll x) -1)\n"
@@ -12608,31 +12610,31 @@ static const char *PRELUDE =
     /* Math/{sqrt,cbrt,pow,floor,ceil,round,abs,trunc}, the trig/hyperbolic
      * family, exp/log{,10,2,1p}/expm1, erf/erfc/gamma/loggamma, and the
      * constants Math/PI and Math/E are all already natives */
-    "(def cljc/digit-chars \"0123456789abcdefghijklmnopqrstuvwxyz\")\n"
+    "(def clove/digit-chars \"0123456789abcdefghijklmnopqrstuvwxyz\")\n"
     "(defn Character/digit [c radix]\n"
-    "  (let [i (str/index-of cljc/digit-chars (str/lower-case (str c)))]\n"
+    "  (let [i (str/index-of clove/digit-chars (str/lower-case (str c)))]\n"
     "    (if (and i (< i radix)) i -1)))\n"
     "(defn Character/isWhitespace [c]\n"
     "  (let [n (int c)] (or (= n 32) (= n 9) (= n 10) (= n 13) (= n 12) (= n 11))))\n"
     "(defn Character/isDigit [c] (let [n (int c)] (and (>= n 48) (<= n 57))))\n"
     "(defn Character/valueOf [c] c)\n"
     /* java.lang.System statics */
-    "(defn System/getenv ([] {}) ([k] (cljc/env* k)))\n"
+    "(defn System/getenv ([] {}) ([k] (clove/env* k)))\n"
     "(defn System/getProperty ([k] nil) ([k d] d))\n"
-    "(defn System/exit ([] (cljc/exit* 0)) ([n] (cljc/exit* n)))\n"
-    "(defn System/currentTimeMillis [] (quot (cljc/now-us*) 1000))\n"
+    "(defn System/exit ([] (clove/exit* 0)) ([n] (clove/exit* n)))\n"
+    "(defn System/currentTimeMillis [] (quot (clove/now-us*) 1000))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
     "(defn ArithmeticUtils/gcd [a b]\n"
     "  (let [a (if (neg? a) (- a) a) b (if (neg? b) (- b) b)]\n"
     "    (loop [a a b b] (if (zero? b) a (recur b (rem a b))))))\n"
     "(defn .gcd [a b] (ArithmeticUtils/gcd a b))\n"
-    /* stopwatch.core/start returns an elapsed-nanos fn; cljc has no real clock,
+    /* stopwatch.core/start returns an elapsed-nanos fn; clove has no real clock,
        so report 0 (Emmy's simplifier stopwatch then never times out) */
     "(defn stopwatch.core/start [] (constantly 0))\n"
-    "(def cljc/uuid-counter (atom 0))\n"
-    "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! cljc/uuid-counter inc))))\n"
-    "(def cljc/rt-id (atom 0))\n"   /* clojure.lang.RT/nextID: monotonic unique ids (core.logic lvars) */
-    "(defn clojure.lang.RT/nextID [] (swap! cljc/rt-id inc))\n"
+    "(def clove/uuid-counter (atom 0))\n"
+    "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! clove/uuid-counter inc))))\n"
+    "(def clove/rt-id (atom 0))\n"   /* clojure.lang.RT/nextID: monotonic unique ids (core.logic lvars) */
+    "(defn clojure.lang.RT/nextID [] (swap! clove/rt-id inc))\n"
     /* RT array ops (persistent-sorted-set's arrays.cljc expands aget/aset to these) */
     "(defn clojure.lang.RT/aget [a i] (aget a i))\n"
     "(defn clojure.lang.RT/aset [a i v] (aset a i v))\n"
@@ -12645,13 +12647,13 @@ static const char *PRELUDE =
     "(defn clojure.lang.RT/seq [c] (seq c))\n"
     "(defn clojure.lang.RT/iter [c] (clojure.lang.RT/seq c))\n"
     "(defn clojure.lang.Numbers/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
-    "(defn clojure.lang.Numbers/toRatio [x] (rationalize x))\n"   /* cljc ratios already support numerator/denominator */
+    "(defn clojure.lang.Numbers/toRatio [x] (rationalize x))\n"   /* clove ratios already support numerator/denominator */
     "(defn clojure.lang.Numbers/divide [x y] (/ x y))\n"
     "(defn Integer/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
     "(defn Long/compare [x y] (cond (< x y) -1 (> x y) 1 :else 0))\n"
     "(defn .compareTo [x y] (compare x y))\n"
     /* mutable java.util collections as atoms over a persistent coll (DataScript's
-       serialization buffers + query_v3). cljc's (pkg.Class. ..) resolves to the
+       serialization buffers + query_v3). clove's (pkg.Class. ..) resolves to the
        short ctor name. */
     "(defn ArrayList. ([] (atom [])) ([_] (atom [])))\n"
     "(defn HashSet. ([] (atom #{})) ([_] (atom #{})))\n"
@@ -12659,13 +12661,13 @@ static const char *PRELUDE =
     "(defn .put [m k v] (swap! m assoc k v) v)\n"
     "(defn .toArray [c] (object-array (deref c)))\n"
     "(defn .contains [c x] (contains? (deref c) x))\n"
-    "(defn .isArray [_] false)\n"   /* cljc arrays are vectors, not host array classes */
+    "(defn .isArray [_] false)\n"   /* clove arrays are vectors, not host array classes */
     /* java.io char readers over a string, for libs like clojure.data.csv: a
-       reader is {:cljc/type <class-kw> :rdr (atom {:s :pos :pb})}; .read returns
+       reader is {:clove/type <class-kw> :rdr (atom {:s :pos :pb})}; .read returns
        the next codepoint (or -1), .unread pushes one back. */
-    "(defn StringReader. [s] {:cljc/type :java.io.Reader :rdr (atom {:s (str s) :pos 0 :pb nil})})\n"
-    "(defn PushbackReader. ([r] (assoc r :cljc/type :java.io.PushbackReader))\n"
-    "                      ([r _] (assoc r :cljc/type :java.io.PushbackReader)))\n"
+    "(defn StringReader. [s] {:clove/type :java.io.Reader :rdr (atom {:s (str s) :pos 0 :pb nil})})\n"
+    "(defn PushbackReader. ([r] (assoc r :clove/type :java.io.PushbackReader))\n"
+    "                      ([r _] (assoc r :clove/type :java.io.PushbackReader)))\n"
     "(defn .read [r] (let [a (:rdr r) m (deref a)]\n"
     "                  (if-some [pb (:pb m)] (do (swap! a assoc :pb nil) pb)\n"
     "                    (let [s (:s m) pos (:pos m)]\n"
@@ -12678,25 +12680,25 @@ static const char *PRELUDE =
     "(defn .write [w x] (.append w (if (number? x) (char x) x)) nil)\n"
     "(defn .flush [_] nil)\n"
     "(defn .first [c] (first c))\n"
-    "(defn System/nanoTime [] (long (* (cljc/now-ms*) 1000000.0)))\n"
+    "(defn System/nanoTime [] (long (* (clove/now-ms*) 1000000.0)))\n"
     "(defn System/lineSeparator [] \"\\n\")\n"
     /* *in* / with-in-str + a LispReader$StringReader shim: instaparse unescapes
-     * grammar strings by reading them through the JVM reader. cljc has no such
+     * grammar strings by reading them through the JVM reader. clove has no such
      * machinery, but unescaping a string literal IS what read-string does, so
      * the StringReader collapses to (read-string (str "\"" *in*)). */
     "(def ^:dynamic *in* nil)\n"
     "(defmacro with-in-str [s & body] `(binding [*in* ~s] ~@body))\n"
     "(defn clojure.lang.LispReader$StringReader. [] (fn [& _] (read-string (str \"\\\"\" *in*))))\n"
     "(defn java.util.LinkedList. [] [])\n"
-    /* java reflection: cljc has no classes — inert */
+    /* java reflection: clove has no classes — inert */
     "(defn Class/forName [& _] nil)\n"
     "(defn .getName [x] (if (and (map? x) (:nm x)) (:nm x) (str x)))\n"   /* :nm = synthetic Method */
     "(defn .getSimpleName [x] (str x))\n"
-    /* threads: cljc is single-threaded, so one stable identity/id */
+    /* threads: clove is single-threaded, so one stable identity/id */
     "(defn Thread/currentThread [] :main-thread)\n"
     "(defn .getId [_] 0)\n"
-    "(defn Thread/sleep [ms & _] (cljc/sleep-ms* ms))\n"
-    /* primitive TYPE fields (reflection tables) -> cljc type keywords */
+    "(defn Thread/sleep [ms & _] (clove/sleep-ms* ms))\n"
+    /* primitive TYPE fields (reflection tables) -> clove type keywords */
     "(def Character/TYPE :char) (def Integer/TYPE :int) (def Long/TYPE :int)\n"
     "(def Double/TYPE :double) (def Float/TYPE :double) (def Boolean/TYPE :bool)\n"
     "(def Byte/TYPE :int) (def Short/TYPE :int) (def Void/TYPE nil)\n"
@@ -12708,7 +12710,7 @@ static const char *PRELUDE =
     "(def Character/MAX_CODE_POINT 1114111)\n"
     "(def Double/POSITIVE_INFINITY ##Inf) (def Double/NEGATIVE_INFINITY ##-Inf)\n"
     "(def Double/NaN ##NaN) (def Double/MAX_VALUE 1.7976931348623157E308) (def Double/MIN_VALUE 4.9E-324)\n"
-    "(defn Double/isNaN [x] (cljc/nan?* x)) (defn Double/isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
+    "(defn Double/isNaN [x] (clove/nan?* x)) (defn Double/isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
     "(defn Long/bitCount [n]\n"
     "  (loop [n n c 0] (if (zero? n) c (recur (unsigned-bit-shift-right n 1) (+ c (bit-and n 1))))))\n"
     "(def bit-count Long/bitCount)\n"
@@ -12720,9 +12722,9 @@ static const char *PRELUDE =
     "(def Integer/bitCount Long/bitCount)\n"
     /* StringBuilder: an atom holding a string; the .methods code uses to build
        tokens. .length/.charAt/.toString also accept a plain string. */
-    "(defn StringBuilder. ([] {:cljc/type :StringBuilder :v (atom \"\")})\n"
-    "  ([s] {:cljc/type :StringBuilder :v (atom (str s))}))\n"
-    "(defn cljc/sb-str [o] (if (and (map? o) (= :StringBuilder (:cljc/type o))) (deref (:v o)) (str o)))\n"
+    "(defn StringBuilder. ([] {:clove/type :StringBuilder :v (atom \"\")})\n"
+    "  ([s] {:clove/type :StringBuilder :v (atom (str s))}))\n"
+    "(defn clove/sb-str [o] (if (and (map? o) (= :StringBuilder (:clove/type o))) (deref (:v o)) (str o)))\n"
     "(defn .append\n"
     "  ([sb x] (swap! (:v sb) str x) sb)\n"
     "  ([sb buf off len]   ; StringBuilder.append(char[] off len) — buf holds codepoints\n"
@@ -12730,25 +12732,25 @@ static const char *PRELUDE =
     /* A deftype that implements an interface method whose name collides with a
        built-in string .method (e.g. CharSequence length/charAt/subSequence on
        instaparse's Segment): prefer the deftype's own method for instances. */
-    "(defn cljc/dt-method [mname o]\n"
-    "  (when (and (map? o) (get o :cljc/type))\n"
-    "    (get-in (deref cljc/deftype-methods) [mname (get o :cljc/type)])))\n"
+    "(defn clove/dt-method [mname o]\n"
+    "  (when (and (map? o) (get o :clove/type))\n"
+    "    (get-in (deref clove/deftype-methods) [mname (get o :clove/type)])))\n"
     /* coerce any CharSequence (a string, or a deftype like Segment with
-       length/charAt) to a plain string — cljc's regex needs a real string */
-    "(defn cljc/cs->str [s]\n"
-    "  (if (and (map? s) (get s :cljc/type))\n"
+       length/charAt) to a plain string — clove's regex needs a real string */
+    "(defn clove/cs->str [s]\n"
+    "  (if (and (map? s) (get s :clove/type))\n"
     "    (apply str (map (fn [i] (.charAt s i)) (range (.length s))))\n"
     "    (str s)))\n"
-    "(defn .length [o] (if-let [m (cljc/dt-method 'length o)] (m o) (count (cljc/sb-str o))))\n"
-    "(defn .charAt [o i] (if-let [m (cljc/dt-method 'charAt o)] (m o i) (nth (cljc/sb-str o) i)))\n"
-    "(defn .toUpperCase [o] (str/upper-case (cljc/sb-str o)))\n"
-    "(defn .toLowerCase [o] (str/lower-case (cljc/sb-str o)))\n"
+    "(defn .length [o] (if-let [m (clove/dt-method 'length o)] (m o) (count (clove/sb-str o))))\n"
+    "(defn .charAt [o i] (if-let [m (clove/dt-method 'charAt o)] (m o i) (nth (clove/sb-str o) i)))\n"
+    "(defn .toUpperCase [o] (str/upper-case (clove/sb-str o)))\n"
+    "(defn .toLowerCase [o] (str/lower-case (clove/sb-str o)))\n"
     "(defn .deleteCharAt [sb i]\n"
     "  (let [s (deref (:v sb))] (reset! (:v sb) (str (subs s 0 i) (subs s (inc i))))) sb)\n"
     "(defn .setLength [sb n] (reset! (:v sb) (subs (deref (:v sb)) 0 n)) sb)\n"
-    /* java.util.regex Matcher over cljc's own regex: re-matches returns the
+    /* java.util.regex Matcher over clove's own regex: re-matches returns the
        whole match (no groups) or a [whole g1 g2 ..] vector. */
-    "(defn .matcher [pat s] (atom {:pat pat :s (cljc/cs->str s) :groups nil}))\n"
+    "(defn .matcher [pat s] (atom {:pat pat :s (clove/cs->str s) :groups nil}))\n"
     "(defn .matches [m]\n"
     "  (let [r (re-matches (:pat (deref m)) (:s (deref m)))]\n"
     "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
@@ -12756,12 +12758,12 @@ static const char *PRELUDE =
     /* Matcher.lookingAt: match anchored at the front (a prefix, not the whole
        string). Stores groups like .matches so .group reads them. */
     "(defn .lookingAt [m]\n"
-    "  (let [r (cljc/re-match-front (:pat (deref m)) (:s (deref m)))]\n"
+    "  (let [r (clove/re-match-front (:pat (deref m)) (:s (deref m)))]\n"
     "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
     "    (boolean r)))\n"
     "(defn .group ([m] (.group m 0))\n"
     "  ([m n] (when-let [g (:groups (deref m))] (nth g n nil))))\n"
-    /* BigInteger / BigInt / Numbers: cljc integers are all int64, so collapse
+    /* BigInteger / BigInt / Numbers: clove integers are all int64, so collapse
        the bignum machinery (used by tools.reader's match-int) to plain ints. */
     /* two Java ctors: (String val, int radix) parses; (int signum, byte[] mag)
        is the MD5 idiom — pass the magnitude through for %0..x formatting. */
@@ -12774,10 +12776,10 @@ static const char *PRELUDE =
     "(defn .intValue [n] n)\n"
     "(def BigInt/fromBigInteger identity)\n"
     "(def Numbers/reduceBigInt identity)\n"
-    /* java.lang.String instance methods over cljc strings */
+    /* java.lang.String instance methods over clove strings */
     "(defn .endsWith [s suf] (str/ends-with? (str s) suf))\n"
     "(defn .startsWith ([s pre] (str/starts-with? (str s) pre))\n"
-    "  ([s pre off] (cljc/str-starts-at? (str s) pre off)))\n"
+    "  ([s pre off] (clove/str-starts-at? (str s) pre off)))\n"
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
     "(defn .replace [s old new] (clojure.string/replace (str s) old new))\n"  /* String.replace: literal */
     "(defn String/valueOf [x] (str x))\n"
@@ -12785,7 +12787,7 @@ static const char *PRELUDE =
     "(defn Long/parseLong ([s] (parse-long s)) ([s _radix] (parse-long s)))\n"
     "(defn .toString [x] (str x))\n"
     "(defn .subSequence [s a b]\n"
-    "  (if-let [m (cljc/dt-method 'subSequence s)] (m s a b) (subs (str s) a b)))\n"
+    "  (if-let [m (clove/dt-method 'subSequence s)] (m s a b) (subs (str s) a b)))\n"
     "(defn .contains [s x]\n"
     "  (cond (string? s) (str/includes? s (str x))\n"
     "        (or (set? s) (map? s)) (contains? s x)\n"
@@ -12796,14 +12798,14 @@ static const char *PRELUDE =
     "(defn Double/parseDouble [s]\n"
     "  (or (parse-double (str s)) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
     "(def Float/parseFloat Double/parseDouble)\n"
-    /* STM refs: cljc is single-threaded, so atoms model refs exactly */
+    /* STM refs: clove is single-threaded, so atoms model refs exactly */
     "(defn ref [x & _] (atom x))\n"
     "(defmacro dosync [& body] `(do ~@body))\n"
     "(defn ref-set [r v] (reset! r v))\n"
     "(defn alter [r f & args] (apply swap! r f args))\n"
     "(defn commute [r f & args] (apply swap! r f args))\n"
     "(defn ensure [r] (deref r))\n"
-    /* sorted colls: approximated as unsorted (cljc has no ordered colls) */
+    /* sorted colls: approximated as unsorted (clove has no ordered colls) */
     /* sorted-set/-by, sorted-map/-by, sorted?, subseq, rsubseq are native */
     "(def clojure.edn/read-string read-string)\n"
     "(def clojure.edn/read read-string)\n"
@@ -12827,14 +12829,14 @@ static const char *PRELUDE =
     "(defn reader-conditional? [_] false) (defn tagged-literal? [_] false)\n"
     "(defn undefined? [x] (nil? x)) (defn keyword-identical? [a b] (= a b))\n"
     "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
-    /* numeric coercions (cljc ints are int64, no bignum/ratio) */
+    /* numeric coercions (clove ints are int64, no bignum/ratio) */
     "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
-    "(defn num [x] x) (defn bigdec [x] (cljc/->bd x))\n"
+    "(defn num [x] x) (defn bigdec [x] (clove/->bd x))\n"
     /* idempotent: (bigint x) on a value that is already a bigint must not
        round-trip through int, which caps at int64 */
     "(defn bigint [x] (cond (string? x) (read-string (str x \"N\"))\n"
     "                       (bigint? x) x\n"
-    "                       (decimal? x) (let [r (cljc/bd->ratio x)]\n"
+    "                       (decimal? x) (let [r (clove/bd->ratio x)]\n"
     "                                      (if (ratio? r) (quot (numerator r) (denominator r)) r))\n"
     "                       :else (int x)))\n"
     "(defn biginteger [x] (bigint x))\n"
@@ -12843,7 +12845,7 @@ static const char *PRELUDE =
      * (rationalize 0.1) => 1/10). Integral results demote to int64 where the
      * JVM keeps BigInt — the documented bigness divergence. */
     "(defn rationalize [x]\n"
-    "  (if (decimal? x) (cljc/bd->ratio x)\n"
+    "  (if (decimal? x) (clove/bd->ratio x)\n"
     "  (if (double? x)\n"
     "    (let [s (str x)\n"
     "          [mant expo] (str/split s \"E\")\n"
@@ -12874,7 +12876,7 @@ static const char *PRELUDE =
     "(def unchecked-short int) (def unchecked-char int)\n"
     "(def unchecked-float float) (def unchecked-double double)\n"
     /* array coercions are identity; the *-array CONSTRUCTORS are defined later,
-       after cljc's real (transient-backed, mutable) int-array exists */
+       after clove's real (transient-backed, mutable) int-array exists */
     "(def booleans identity) (def chars identity) (def doubles identity) (def longs identity)\n"
     "(def ints identity) (def floats identity) (def shorts identity) (def bytes identity)\n"
     /* misc */
@@ -12892,12 +12894,12 @@ static const char *PRELUDE =
     /* promise/deliver/future are real (fiber-scheduler-backed, blocking deref)
        — defined in Tier 3.5 after deftype exists. */
     "(defn line-seq [rdr]\n"
-    "  (if (and (map? rdr) (= :LineReader (get rdr :cljc/type)))\n"
+    "  (if (and (map? rdr) (= :LineReader (get rdr :clove/type)))\n"
     "    (let [ls (deref (get rdr :lines))]\n"
     "      (reset! (get rdr :lines) ())\n"
     "      (seq ls))\n"
     "    (let [s (str rdr)]\n"
-    "      (seq (str/split-lines (or (cljc/slurp-maybe s) s))))))\n"
+    "      (seq (str/split-lines (or (clove/slurp-maybe s) s))))))\n"
     "(defn iterator-seq [x] (seq x)) (defn enumeration-seq [x] (seq x))\n"
     "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
     "(defn re-matcher [pat s] (.matcher pat s))\n"
@@ -12915,7 +12917,7 @@ static const char *PRELUDE =
     "(defn random-sample\n"
     "  ([prob] (filter (fn [_] (< (rand) prob))))\n"
     "  ([prob coll] (filter (fn [_] (< (rand) prob)) coll)))\n"
-    /* chunked-seq stubs (cljc seqs are unchunked) */
+    /* chunked-seq stubs (clove seqs are unchunked) */
     "(defn chunk-buffer [_] (atom [])) (defn chunk-append [b x] (swap! b conj x) nil)\n"
     "(defn chunk [b] (deref b)) (defn chunk-cons [c s] (concat c s))\n"
     "(defn chunk-first [s] (first s)) (defn chunk-rest [s] (rest s)) (defn chunk-next [s] (next s))\n"
@@ -12929,11 +12931,11 @@ static const char *PRELUDE =
     "  ([pred retf]\n"
     "   (fn [rf]\n"
     "     (fn ([] (rf))\n"
-    "       ([result] (if (and (map? result) (contains? result :cljc/halt))\n"
-    "                   (:cljc/halt result) (rf result)))\n"
+    "       ([result] (if (and (map? result) (contains? result :clove/halt))\n"
+    "                   (:clove/halt result) (rf result)))\n"
     "       ([result input]\n"
     "        (if (pred input)\n"
-    "          (reduced {:cljc/halt (if retf (retf (rf result) input) input)})\n"
+    "          (reduced {:clove/halt (if retf (retf (rf result) input) input)})\n"
     "          (rf result input)))))))\n"
 
     "(defn prn-str [& xs] (str (apply pr-str xs) \"\\n\"))\n"
@@ -12966,27 +12968,27 @@ static const char *PRELUDE =
     "            :else (recur (dec i))))))\n"
     "(defn str/escape [s cmap] (apply str (map (fn [c] (or (get cmap c) c)) (seq s))))\n"
     "(defn str/re-quote-replacement [s] (str/replace (str/replace s \"\\\\\" \"\\\\\\\\\") \"$\" \"\\\\$\"))\n"
-    /* clojure.string/foo resolves to cljc's str/foo (same for set/walk) */
-    "(cljc/alias* \"clojure.string\" \"str\")\n"
+    /* clojure.string/foo resolves to clove's str/foo (same for set/walk) */
+    "(clove/alias* \"clojure.string\" \"str\")\n"
     /* These THROW NumberFormatException on junk (parse-long is the one that
        returns nil), and Integer/parseInt also on values outside the int range. */
-    "(defn cljc/nfe [s] (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\"))))\n"
+    "(defn clove/nfe [s] (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\"))))\n"
     "(defn Long/parseLong\n"
-    "  ([s] (or (when (string? s) (parse-long s)) (cljc/nfe s)))\n"
+    "  ([s] (or (when (string? s) (parse-long s)) (clove/nfe s)))\n"
     "  ([s radix]\n"
-    "   (when-not (string? s) (cljc/nfe s))\n"
+    "   (when-not (string? s) (clove/nfe s))\n"
     "   (let [neg (str/starts-with? s \"-\")\n"
     "         digits (if (or neg (str/starts-with? s \"+\")) (subs s 1) s)\n"
-    "         _ (when (= digits \"\") (cljc/nfe s))\n"
+    "         _ (when (= digits \"\") (clove/nfe s))\n"
     "         n (reduce (fn [acc c]\n"
     "                     (let [d (Character/digit c radix)]\n"
-    "                       (when (neg? d) (cljc/nfe s))\n"
+    "                       (when (neg? d) (clove/nfe s))\n"
     "                       (+ (* acc radix) d)))\n"
     "                   0 (seq digits))]\n"
     "     (if neg (- n) n))))\n"
     "(defn Integer/parseInt [s & radix]\n"
     "  (let [n (apply Long/parseLong s radix)]\n"
-    "    (if (<= -2147483648 n 2147483647) n (cljc/nfe s))))\n"
+    "    (if (<= -2147483648 n 2147483647) n (clove/nfe s))))\n"
     /* toString/radix is SIGNED (Java prefixes '-'); toBinaryString is UNSIGNED
      * (Java renders the raw two's-complement word). They are different
      * functions and one cannot be defined as the other. Digits are accumulated
@@ -12999,7 +13001,7 @@ static const char *PRELUDE =
     "         (loop [n (if neg n (- n)) acc \"\"]\n"
     "           (if (zero? n) (if neg (str \"-\" acc) acc)\n"
     "               (recur (quot n radix)\n"
-    "                      (str (get cljc/digit-chars (- (rem n radix))) acc))))))))\n"
+    "                      (str (get clove/digit-chars (- (rem n radix))) acc))))))))\n"
     "(def Long/toString Integer/toString)\n"
     /* Unsigned: shift in with >>> so the sign bit is data, not sign. 64-bit for
      * Long, masked to 32 for Integer -- Java's take an int and a long. */
@@ -13008,7 +13010,7 @@ static const char *PRELUDE =
     "      (loop [n n acc \"\"]\n"
     "        (if (zero? n) acc\n"
     "            (recur (unsigned-bit-shift-right n 1)\n"
-    "                   (str (get cljc/digit-chars (bit-and n 1)) acc))))))\n"
+    "                   (str (get clove/digit-chars (bit-and n 1)) acc))))))\n"
     "(defn Integer/toBinaryString [n] (Long/toBinaryString (bit-and n 4294967295)))\n"
     /* mutable arrays, as transient vectors (assoc! mutates in place) */
     /* int-array/long-array/byte-array are C natives (flat int64 buffers) */
@@ -13050,7 +13052,7 @@ static const char *PRELUDE =
     "(def java.awt.Color/BLUE 0) (def java.awt.Color/GRAY 0)\n"
     "(def java.awt.Color/YELLOW 0) (def java.awt.Color/ORANGE 0)\n"
     /* host-class stubs so libraries that extend protocols to / dispatch on JVM
-       classes load (cljc never has instances of them; each resolves to a
+       classes load (clove never has instances of them; each resolves to a
        distinct keyword token). Mainly for tools.reader's java.io.* readers. */
     "(def java.io.PushbackReader :java.io.PushbackReader)\n"
     "(def java.io.Reader :java.io.Reader)\n"
@@ -13058,8 +13060,8 @@ static const char *PRELUDE =
     "(def java.io.InputStream :java.io.InputStream)\n"
     "(def java.io.BufferedReader :java.io.BufferedReader)\n"
     "(def clojure.lang.LineNumberingPushbackReader :clojure.lang.LineNumberingPushbackReader)\n"
-    /* map host classes to cljc's actual type-keyword dispatch values so a
-       protocol extension to e.g. String actually fires for cljc strings, and
+    /* map host classes to clove's actual type-keyword dispatch values so a
+       protocol extension to e.g. String actually fires for clove strings, and
        Object becomes the multimethod :default catch-all. */
     "(def Object :default) (def java.lang.Object :default) (def clojure.lang.Object :default)\n"
     "(def String :string) (def CharSequence :string)\n"
@@ -13104,21 +13106,21 @@ static const char *PRELUDE =
     "(defn java.util.UUID. [& _] \"00000000-0000-0000-0000-000000000000\")\n"
     "(defn ImageIO/write [img fmt file] true)\n"
     /* :paths from a project's deps.edn / bb.edn feed *load-path*, so the SAME
-       config that drives clj and bb also tells cljc where to find code. Walk
+       config that drives clj and bb also tells clove where to find code. Walk
        UP from the cwd to the nearest dir holding deps.edn/bb.edn (like clj/bb
        find the project root), resolving its :paths relative to that dir. Only
-       :paths is honoured — cljc has no Maven/git resolver, so :deps, :tasks,
+       :paths is honoured — clove has no Maven/git resolver, so :deps, :tasks,
        :aliases are ignored. Read errors degrade to nil (no paths). */
-    /* &env compat shim: cljc doesn't pass a per-expansion macro environment,
+    /* &env compat shim: clove doesn't pass a per-expansion macro environment,
        but portable libraries reference &env to detect cljs-vs-clj at expansion
        time (macrovich: (:ns &env) is truthy on cljs). A global empty map makes
-       those macros take the clj branch — which is what cljc wants. Not a real
+       those macros take the clj branch — which is what clove wants. Not a real
        lexical &env (it has no locals); enough for the common pattern. */
     "(def &env {})\n"
     /* runtime version vars some libraries (tools.reader) gate features on */
     "(def *clojure-version* {:major 1 :minor 11 :incremental 0 :qualifier nil})\n"
     "(defn clojure-version [] \"1.11.0\")\n"
-    /* standard clojure.core dynamic vars libraries reference (cljc's printer /
+    /* standard clojure.core dynamic vars libraries reference (clove's printer /
        reader don't consult most of these; they exist so code that names them
        loads and can rebind them) */
     "(def *unchecked-math* false) (def *warn-on-reflection* false)\n"
@@ -13130,22 +13132,22 @@ static const char *PRELUDE =
     /* print/println/pr/prn write to the current value of the *out* var. The
        default sentinels route to the real streams; bind it to a (StringWriter.)
        to capture (with-out-str), or to the *err* sentinel to reach stderr. */
-    "(def ^:dynamic *out* :cljc/stdout) (def ^:dynamic *err* :cljc/stderr)\n"
+    "(def ^:dynamic *out* :clove/stdout) (def ^:dynamic *err* :clove/stderr)\n"
     "(defmacro with-out-str [& body] `(let [s# (StringWriter.)] (binding [*out* s#] ~@body) (str s#)))\n"
     "(defmacro with-err-str [& body] `(let [s# (StringWriter.)] (binding [*err* s#] ~@body) (str s#)))\n"
     /* &form / &env: Clojure binds these in macro bodies (the call form + compile
-       env). cljc doesn't yet thread them, so a nil global keeps macros that only
+       env). clove doesn't yet thread them, so a nil global keeps macros that only
        read them for metadata/cljs-detection working — nil &env is the clj path. */
     "(def &form nil) (def &env nil)\n"
-    /* ns-name: with cljc's flat namespaces, *ns* carries no Namespace object, so
+    /* ns-name: with clove's flat namespaces, *ns* carries no Namespace object, so
        fall back to the namespace currently being loaded (meander's defsyntax). */
-    "(defn ns-name [n] (symbol (let [s (str n)] (if (or (nil? n) (= \"\" s)) (cljc/current-ns*) s))))\n"
+    "(defn ns-name [n] (symbol (let [s (str n)] (if (or (nil? n) (= \"\" s)) (clove/current-ns*) s))))\n"
     "(def *allow-unresolved-vars* false) (def *suppress-read* nil) (def *verbose-defrecords* false)\n"
     "(def *print-dup* false) (def *print-namespace-maps* true) (def *fn-loader* nil)\n"
     "(def *source-path* \"NO_SOURCE_FILE\") (def *use-context-classloader* true)\n"
     /* proxy: no JVM classes to subclass — stub to nil so (def x (proxy ..))
        loads (the object is unused unless its host methods are called). */
-    /* proxy: cljc has no host classes; model the instance as an atom. If the
+    /* proxy: clove has no host classes; model the instance as an atom. If the
        proxy defines an (initialValue [] BODY) method (the ThreadLocal idiom),
        seed the atom with BODY so .get returns it. .get/.set act on the atom. */
     "(defmacro proxy [_supers _ctor & methods]\n"
@@ -13169,14 +13171,14 @@ static const char *PRELUDE =
     "(defn .entryAt [m k] (find m k))\n"
     "(defn .set [x v] (when (= :atom (type x)) (reset! x v)) nil)\n"
     "(defn .remove [& _] nil)\n"
-    /* exception accessors (cljc errors carry :message/:data; ex-* read them) */
+    /* exception accessors (clove errors carry :message/:data; ex-* read them) */
     "(defn .getMessage [e] (or (ex-message e) (when (map? e) (:message e)) (str e)))\n"
     "(defn .getLocalizedMessage [e] (.getMessage e))\n"
     "(defn .getCause [e] (when (map? e) (:cause e)))\n"
     "(defn .getData [e] (ex-data e))\n"
     "(defn .getStackTrace [_] [])\n"
     "(defn .printStackTrace [& _] nil)\n"
-    /* set! on a var/symbol rebinds the global (cljc vars are mutable globals);
+    /* set! on a var/symbol rebinds the global (clove vars are mutable globals);
        set! on a deftype field is rewritten to reset! before this is reached. */
     "(defmacro set! [place val] (if (symbol? place) `(def ~place ~val) val))\n"
     /* (Object.) is used as a unique sentinel; a fresh atom is a clean identity
@@ -13186,47 +13188,47 @@ static const char *PRELUDE =
        resolve/ns-resolve/requiring-resolve return a Var too (Clojure semantics);
        a Var calls its value in call position and @-derefs to it, so most uses
        work unchanged while reflective code (import-def) can read :name. */
-    "(defmacro var [s] `(cljc/resolve-var '~s))\n"
-    "(defn resolve ([sym] (cljc/resolve-var sym)) ([_ns sym] (cljc/resolve-var sym)))\n"
-    /* The namespace-object layer: cljc has no Namespace type — a namespace IS
+    "(defmacro var [s] `(clove/resolve-var '~s))\n"
+    "(defn resolve ([sym] (clove/resolve-var sym)) ([_ns sym] (clove/resolve-var sym)))\n"
+    /* The namespace-object layer: clove has no Namespace type — a namespace IS
        its symbol (*ns*, find-ns, all-ns all deal in symbols), which covers the
        idioms real code uses: (str *ns*), (ns-name *ns*), (in-ns 'x), ns-publics. */
-    "(defn all-ns [] (map symbol (cljc/namespaces*)))\n"
+    "(defn all-ns [] (map symbol (clove/namespaces*)))\n"
     "(defn find-ns [n] (let [s (symbol (str n))] (when (some #(= % s) (all-ns)) s)))\n"
     "(defn the-ns [n] (or (find-ns n) (throw (ex-info (str \"No namespace: \" n \" found\") {:ns n}))))\n"
-    "(defn create-ns [n] (cljc/create-ns* (str n)) (symbol (str n)))\n"
-    "(defn in-ns [n] (cljc/in-ns* (str n)) (symbol (str n)))\n"
+    "(defn create-ns [n] (clove/create-ns* (str n)) (symbol (str n)))\n"
+    "(defn in-ns [n] (clove/in-ns* (str n)) (symbol (str n)))\n"
     "(defn ns-resolve [n s]\n"
-    "  (or (and (nil? (namespace s)) (cljc/resolve-var (str (ns-name (the-ns n)) \"/\" (name s))))\n"
+    "  (or (and (nil? (namespace s)) (clove/resolve-var (str (ns-name (the-ns n)) \"/\" (name s))))\n"
     "      (resolve s)))\n"
-    "(defn requiring-resolve [sym] (cljc/resolve-var sym))\n"
+    "(defn requiring-resolve [sym] (clove/resolve-var sym))\n"
     "(defn ns-interns [n] (let [ns (str (ns-name (the-ns n)))]\n"
-    "  (into {} (map (fn [nm] [(symbol nm) (cljc/resolve-var (str ns \"/\" nm))])\n"
-    "                (cljc/ns-interns* ns)))))\n"
+    "  (into {} (map (fn [nm] [(symbol nm) (clove/resolve-var (str ns \"/\" nm))])\n"
+    "                (clove/ns-interns* ns)))))\n"
     "(defn ns-publics [n] (let [ns (str (ns-name (the-ns n)))]\n"
-    "  (into {} (map (fn [nm] [(symbol nm) (cljc/resolve-var (str ns \"/\" nm))])\n"
-    "                (cljc/ns-publics* ns)))))\n"
+    "  (into {} (map (fn [nm] [(symbol nm) (clove/resolve-var (str ns \"/\" nm))])\n"
+    "                (clove/ns-publics* ns)))))\n"
     /* flat-global approximation: a namespace's own interns (no core/refer maps) */
     "(defn ns-map [n] (ns-interns n))\n"
     "(defn ns-aliases [n]\n"
     "  (into {} (map (fn [[a t]] [(symbol a) (symbol t)])\n"
-    "                (cljc/ns-aliases* (str (ns-name (the-ns n)))))))\n"
-    "(defn alias [a ns-sym] (cljc/alias* (str a) (str ns-sym)))\n"
+    "                (clove/ns-aliases* (str (ns-name (the-ns n)))))))\n"
+    "(defn alias [a ns-sym] (clove/alias* (str a) (str ns-sym)))\n"
     "(defn var? [x] (= (type x) :var))\n"
     "(defn var-get [v] (deref v))\n"
-    "(defn find-var [sym] (cljc/resolve-var sym))\n"
-    "(defn alter-var-root [v f & args] (cljc/set-var! v (apply f (deref v) args)))\n"
+    "(defn find-var [sym] (clove/resolve-var sym))\n"
+    "(defn alter-var-root [v f & args] (clove/set-var! v (apply f (deref v) args)))\n"
     /* thread-binding primitives (hiccup's binding* / clojure.core internals):
-       cljc is single-threaded, so a global save/restore stack suffices. */
-    "(def cljc/tbind-stack (atom ()))\n"
+       clove is single-threaded, so a global save/restore stack suffices. */
+    "(def clove/tbind-stack (atom ()))\n"
     "(defn push-thread-bindings [m]\n"
-    "  (swap! cljc/tbind-stack conj (into {} (map (fn [[v _]] [v (deref v)]) m)))\n"
-    "  (doseq [[v val] m] (cljc/set-var! v val)))\n"
+    "  (swap! clove/tbind-stack conj (into {} (map (fn [[v _]] [v (deref v)]) m)))\n"
+    "  (doseq [[v val] m] (clove/set-var! v val)))\n"
     "(defn pop-thread-bindings []\n"
-    "  (let [saved (first (deref cljc/tbind-stack))]\n"
-    "    (swap! cljc/tbind-stack rest)\n"
-    "    (doseq [[v val] saved] (cljc/set-var! v val))))\n"
-    "(defn get-thread-bindings [] (apply merge {} (reverse (deref cljc/tbind-stack))))\n"
+    "  (let [saved (first (deref clove/tbind-stack))]\n"
+    "    (swap! clove/tbind-stack rest)\n"
+    "    (doseq [[v val] saved] (clove/set-var! v val))))\n"
+    "(defn get-thread-bindings [] (apply merge {} (reverse (deref clove/tbind-stack))))\n"
     "(defn with-bindings* [m f & args]\n"
     "  (push-thread-bindings m) (try (apply f args) (finally (pop-thread-bindings))))\n"
     "(defmacro with-bindings [m & body] `(with-bindings* ~m (fn [] ~@body)))\n"
@@ -13238,7 +13240,7 @@ static const char *PRELUDE =
     "  (when (= :atom (type (:meta r))) (swap! (:meta r) (fn [m] (apply f m args))))\n"
     "  (when (= :atom (type (:meta r))) (deref (:meta r))))\n"
     "(defn reset-meta! [r m] (when (= :atom (type (:meta r))) (reset! (:meta r) m)) m)\n"
-    /* ad-hoc hierarchies: cljc multimethods don't use them, so these are inert */
+    /* ad-hoc hierarchies: clove multimethods don't use them, so these are inert */
     /* derive/underive/isa?/parents/ancestors are real now — see above */
     "(defn make-hierarchy [] {})\n"
     "(defn ident? [x] (or (symbol? x) (keyword? x)))\n"
@@ -13253,77 +13255,77 @@ static const char *PRELUDE =
     "(defn qualified-ident? [x] (and (ident? x) (str/includes? (str x) \"/\")))\n"
     "(defn simple-ident? [x] (and (ident? x) (not (str/includes? (str x) \"/\"))))\n"
     "(def global-hierarchy (atom {}))\n"
-    "(defn cljc/edn-paths [f]\n"
+    "(defn clove/edn-paths [f]\n"
     "  (try (let [m (read-string (slurp f))]\n"
     "         (when (and (map? m) (vector? (:paths m))) (:paths m)))\n"
     "       (catch Exception e nil)))\n"
-    "(defn cljc/project-paths []\n"
+    "(defn clove/project-paths []\n"
     "  (loop [pre \"\"]\n"                       /* "" -> "../" -> "../../" ... */
-    "    (let [ps (mapcat (fn [n] (cljc/edn-paths (str pre n))) [\"deps.edn\" \"bb.edn\"])]\n"
+    "    (let [ps (mapcat (fn [n] (clove/edn-paths (str pre n))) [\"deps.edn\" \"bb.edn\"])]\n"
     "      (cond\n"
     "        (seq ps) (map (fn [p] (str pre p)) ps)\n"   /* resolve to the config's dir */
     "        (> (count pre) 60) nil\n"            /* stop after ~20 levels */
     "        :else (recur (str pre \"../\"))))))\n"
     "(def *load-path*\n"
     "  (vec (distinct (concat [\".\"]\n"
-    "                         (cljc/project-paths)\n"
+    "                         (clove/project-paths)\n"
     "                         [\"vendor\"]\n"
-    "                         (when-let [p (cljc/env* \"CLJC_PATH\")]\n"
+    "                         (when-let [p (clove/env* \"CLOVE_PATH\")]\n"
     "                           (str/split p \":\"))\n"
     /* exe-relative share dir first (works under any install PREFIX), then the
        compile-time one as a fallback */
-    "                         (when-let [d (cljc/exe-dir*)] [d (str d \"/vendor\")])\n"
-    "                         (when-let [d (cljc/exe-sharedir*)] [d (str d \"/vendor\")])\n"
-    "                         [(cljc/sharedir*) (str (cljc/sharedir*) \"/vendor\")]))))\n"
-    "(def cljc/loaded-namespaces (atom #{}))\n"
-    "(defn cljc/spec-opt [spec k]\n"
+    "                         (when-let [d (clove/exe-dir*)] [d (str d \"/vendor\")])\n"
+    "                         (when-let [d (clove/exe-sharedir*)] [d (str d \"/vendor\")])\n"
+    "                         [(clove/sharedir*) (str (clove/sharedir*) \"/vendor\")]))))\n"
+    "(def clove/loaded-namespaces (atom #{}))\n"
+    "(defn clove/spec-opt [spec k]\n"
     "  (loop [s (seq (rest spec))]\n"
     "    (cond (nil? s) nil\n"
     "          (= k (first s)) (second s)\n"
     "          :else (recur (nnext s)))))\n"
     /* (:import clojure.lang.Foo (java.io Bar Baz)) — bind each short class name
-       to a keyword token so code that names the class loads. cljc has no real
+       to a keyword token so code that names the class loads. clove has no real
        classes; the value just needs to be a stable, distinct placeholder. */
-    /* well-known host scalar classes map to cljc's OWN type keywords, so a
+    /* well-known host scalar classes map to clove's OWN type keywords, so a
        (defmethod f [Keyword] ..) dispatches on the same value (type x) yields —
        this is what makes Emmy's generic-op derivative dispatch (g/add :dfdx) hit. */
-    "(def cljc/class->kind {\"Keyword\" :keyword \"Symbol\" :symbol \"String\" :string\n"
+    "(def clove/class->kind {\"Keyword\" :keyword \"Symbol\" :symbol \"String\" :string\n"
     "  \"Long\" :int \"Integer\" :int \"BigInt\" :bigint \"BigInteger\" :bigint \"Ratio\" :ratio\n"
     "  \"Double\" :double \"Float\" :double \"Number\" :number \"Boolean\" :bool \"Character\" :char\n"
-    /* all the host fn classes collapse to cljc's single :fn type, so an
-       (extend-type MultiFn ..) etc. applies to every cljc function */
+    /* all the host fn classes collapse to clove's single :fn type, so an
+       (extend-type MultiFn ..) etc. applies to every clove function */
     "  \"AFunction\" :fn \"Fn\" :fn \"RestFn\" :fn \"MultiFn\" :fn \"IFn\" :fn \"AFn\" :fn\n"
     "  \"Var\" :var})\n"
-    /* a deftype must NOT derive from these — they're cljc's own native-value
+    /* a deftype must NOT derive from these — they're clove's own native-value
        kinds (and the multimethod :default / nil). Object resolves to :default,
        so without this every deftype would become isa? :default. */
-    "(def cljc/no-derive-kinds (conj (set (vals cljc/class->kind)) :default :nil))\n"
+    "(def clove/no-derive-kinds (conj (set (vals clove/class->kind)) :default :nil))\n"
     /* bind the FULLY-QUALIFIED host class names too, so (extend-type
        clojure.lang.Fn ..) — written without an import — resolves like the short
        name does (core.logic extends clojure.lang.Fn for its delayed streams). */
-    "(doseq [[c k] cljc/class->kind]\n"
+    "(doseq [[c k] clove/class->kind]\n"
     "  (eval (list 'def (symbol (str \"clojure.lang.\" c)) k))\n"
     "  (eval (list 'def (symbol (str \"java.lang.\" c)) k)))\n"
-    "(defn cljc/import-one [spec]\n"
+    "(defn clove/import-one [spec]\n"
     "  (when spec\n"
     "  (if (or (list? spec) (vector? spec) (seq? spec))\n"
-    /* a deftype/record imported from another cljc namespace resolves to its REAL
+    /* a deftype/record imported from another clove namespace resolves to its REAL
        type tag (datascript.parser/BindScalar -> :BindScalar), not a fabricated
        :pkg.Class keyword — otherwise extend-type/instance? key the wrong value. */
     "    (let [pkg (str (first spec))]\n"
     "      (doseq [c (rest spec)]\n"
-    "        (eval (list 'def (symbol (str c)) (or (cljc/class->kind (str c))\n"
-    "                                              (cljc/resolve-maybe (str pkg \"/\" c))\n"
+    "        (eval (list 'def (symbol (str c)) (or (clove/class->kind (str c))\n"
+    "                                              (clove/resolve-maybe (str pkg \"/\" c))\n"
     "                                              (keyword (str pkg \".\" c)))))))\n"
     "    (let [s (str spec) short (last (str/split s #\"\\.\"))]\n"
-    "      (eval (list 'def (symbol short) (or (cljc/class->kind short)\n"
-    "                                          (cljc/resolve-maybe s) (keyword s))))))))\n"
-    "(defn cljc/require-one [spec]\n"
-    "  (when spec\n"   /* a #?(:cljs ..)-only spec reads as nil under cljc */
+    "      (eval (list 'def (symbol short) (or (clove/class->kind short)\n"
+    "                                          (clove/resolve-maybe s) (keyword s))))))))\n"
+    "(defn clove/require-one [spec]\n"
+    "  (when spec\n"   /* a #?(:cljs ..)-only spec reads as nil under clove */
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
-    "    (when-let [a (and (vector? spec) (cljc/spec-opt spec :as))]\n"
-    "      (cljc/alias* (str a) (str nsname)))\n"
-    "    (when-not (contains? @cljc/loaded-namespaces nsname)\n"
+    "    (when-let [a (and (vector? spec) (clove/spec-opt spec :as))]\n"
+    "      (clove/alias* (str a) (str nsname)))\n"
+    "    (when-not (contains? @clove/loaded-namespaces nsname)\n"
     "      (let [rel (str/replace (str/replace (str nsname) \"-\" \"_\") \".\" \"/\")\n"
     "            paths (mapcat (fn [d] [(str d \"/\" rel \".clj\")\n"
     "                                   (str d \"/\" rel \".cljc\")])\n"
@@ -13331,39 +13333,39 @@ static const char *PRELUDE =
     "            hit (some (fn [p] (try (do (slurp p) p) (catch Exception e nil)))\n"
     "                      paths)]\n"
     "        (if hit\n"
-    "          (do (swap! cljc/loaded-namespaces conj nsname)\n"
-    "              (let [old (cljc/in-ns* (str nsname))]\n"
+    "          (do (swap! clove/loaded-namespaces conj nsname)\n"
+    "              (let [old (clove/in-ns* (str nsname))]\n"
     "                (try (load-file hit)\n"
-    "                     (finally (cljc/in-ns* old)))))\n"
+    "                     (finally (clove/in-ns* old)))))\n"
     /* no file found: warn (not throw) — clojure.core & already-interned
        namespaces are native, so only flag genuinely-unknown names */
     "          (when (and (not= (str nsname) \"clojure.core\")\n"
-    "                     (empty? (cljc/ns-publics* (str nsname))))\n"
+    "                     (empty? (clove/ns-publics* (str nsname))))\n"
     "            (binding [*out* *err*]\n"
     "              (println (str \"WARNING: could not locate namespace \" nsname\n"
     "                            \" on the load path (searched \"\n"
     "                            (str/join \" \" *load-path*) \")\")))))))\n"
-    "    (when-let [refers (and (vector? spec) (cljc/spec-opt spec :refer))]\n"
-    "      (let [cur (cljc/current-ns*)]\n"
-    "        (doseq [r (if (= refers :all) (map symbol (cljc/ns-publics* (str nsname))) refers)]\n"
+    "    (when-let [refers (and (vector? spec) (clove/spec-opt spec :refer))]\n"
+    "      (let [cur (clove/current-ns*)]\n"
+    "        (doseq [r (if (= refers :all) (map symbol (clove/ns-publics* (str nsname))) refers)]\n"
     /* inside a ns, alias to the source global (shared identity for dynamic
        vars); at top level (no ns), fall back to a value copy */
     "          (if (seq cur)\n"
-    "            (cljc/refer* (str cur \"/\" r) (str nsname \"/\" r))\n"
+    "            (clove/refer* (str cur \"/\" r) (str nsname \"/\" r))\n"
     "            (eval (list 'def r (symbol (str nsname \"/\" r)))))))))))\n"
     "(defmacro require [& specs]\n"
-    "  `(do ~@(map (fn [s] `(cljc/require-one ~s)) specs) nil))\n"
-    "(defn cljc/use-one [spec]\n"
+    "  `(do ~@(map (fn [s] `(clove/require-one ~s)) specs) nil))\n"
+    "(defn clove/use-one [spec]\n"
     "  (let [nsname (if (vector? spec) (first spec) spec)]\n"
-    "    (cljc/require-one nsname)\n"
-    "    (doseq [r (cljc/ns-publics* (str nsname))]\n"
+    "    (clove/require-one nsname)\n"
+    "    (doseq [r (clove/ns-publics* (str nsname))]\n"
     "      (eval (list 'def (symbol r) (symbol (str nsname \"/\" r)))))))\n"
     /* (use judge) / (use 'judge) / (use [judge ...]) — require then refer ALL
        public names. Strips a leading quote so bare and quoted specs both work. */
     "(defmacro use [& specs]\n"
     "  `(do ~@(map (fn [s]\n"
     "                (let [s (if (and (seq? s) (= (first s) (quote quote))) (second s) s)]\n"
-    "                  `(cljc/use-one (quote ~s))))\n"
+    "                  `(clove/use-one (quote ~s))))\n"
     "              specs)\n"
     "       nil))\n"
     "(defmacro declare [& names]\n"
@@ -13375,10 +13377,10 @@ static const char *PRELUDE =
     "(defn true? [x] (= x true))\n"
     "(defn false? [x] (= x false))\n"
     /* lazy, so (first (map-indexed f (iterate ...))) terminates */
-    "(defn cljc/map-indexed-step [f i coll]\n"
+    "(defn clove/map-indexed-step [f i coll]\n"
     "  (lazy-seq (when-let [s (seq coll)]\n"
-    "              (cons (f i (first s)) (cljc/map-indexed-step f (inc i) (rest s))))))\n"
-    "(defn map-indexed [f coll] (cljc/map-indexed-step f 0 coll))\n"
+    "              (cons (f i (first s)) (clove/map-indexed-step f (inc i) (rest s))))))\n"
+    "(defn map-indexed [f coll] (clove/map-indexed-step f 0 coll))\n"
     "(defn keep-indexed [f coll] (filter some? (map-indexed f coll)))\n"
     "(defn partition-all [n coll]\n"
     "  (loop [s (seq coll) acc (list)]\n"
@@ -13434,12 +13436,12 @@ static const char *PRELUDE =
     /* clojure.core.match subset: match a value against vector patterns. A symbol
        binds (a bare _ is a wildcard), a keyword/number/etc. compares by =, and a
        vector pattern recurses element-wise. Enough for Emmy's arity combination. */
-    "(defn cljc/match-compile [v pat]\n"
+    "(defn clove/match-compile [v pat]\n"
     "  (cond\n"
     "    (= pat '_) {:test true :binds []}\n"
     "    (symbol? pat) {:test true :binds [pat v]}\n"
     "    (vector? pat)\n"
-    "      (let [subs (map-indexed (fn [i p] (cljc/match-compile (list 'nth v i) p)) pat)]\n"
+    "      (let [subs (map-indexed (fn [i p] (clove/match-compile (list 'nth v i) p)) pat)]\n"
     "        {:test (apply list 'and (list 'sequential? v) (list '= (list 'count v) (count pat))\n"
     "                      (map :test subs))\n"
     "         :binds (vec (mapcat :binds subs))})\n"
@@ -13450,7 +13452,7 @@ static const char *PRELUDE =
     "      (cons 'cond\n"
     "        (concat\n"
     "          (mapcat (fn [[pat res]]\n"
-    "                    (let [c (cljc/match-compile v pat)]\n"
+    "                    (let [c (clove/match-compile v pat)]\n"
     "                      [(:test c) (list 'let (:binds c) res)]))\n"
     "                  (partition 2 clauses))\n"
     "          (list :else (list 'throw (list 'ex-info \"no matching clause\" {}))))))))\n"
@@ -13502,7 +13504,7 @@ static const char *PRELUDE =
     "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defn ifn? [x] (or (fn? x) (keyword? x) (symbol? x) (map? x) (set? x) (vector? x)))\n"
-    /* var? is a real predicate now (see CLJC_VAR / resolve-var above) */
+    /* var? is a real predicate now (see CLOVE_VAR / resolve-var above) */
     /* java.util.Iterator over any seqable, as a seq cursor in an atom */
     "(defn .iterator [coll] (atom (seq coll)))\n"
     "(defn .hasNext [it] (boolean (seq (deref it))))\n"
@@ -13528,14 +13530,14 @@ static const char *PRELUDE =
      * shipped in the share dir), lazily loaded on first use so scripts that
      * never call doc pay nothing. User defn/def docstrings are registered
      * eagerly by eval, so (doc my-fn) works even without the battery. */
-    "(def cljc/docs-loaded* (atom false))\n"
-    "(defn cljc/ensure-docs! []\n"
-    "  (when-not @cljc/docs-loaded*\n"
-    "    (reset! cljc/docs-loaded* true)\n"
+    "(def clove/docs-loaded* (atom false))\n"
+    "(defn clove/ensure-docs! []\n"
+    "  (when-not @clove/docs-loaded*\n"
+    "    (reset! clove/docs-loaded* true)\n"
     "    (try (load-file \"docs.clj\") (catch Exception e nil))))\n"
-    "(defn cljc/print-doc* [sym]\n"
-    "  (cljc/ensure-docs!)\n"
-    "  (let [i (cljc/doc-info* sym)]\n"
+    "(defn clove/print-doc* [sym]\n"
+    "  (clove/ensure-docs!)\n"
+    "  (let [i (clove/doc-info* sym)]\n"
     "    (if (nil? i)\n"
     "      (println (str \"No doc or binding found for \" sym))\n"
     "      (do (println \"-------------------------\")\n"
@@ -13547,10 +13549,10 @@ static const char *PRELUDE =
     "    nil))\n"
     "(defmacro doc\n"
     "  \"Prints documentation for the var/binding named by symbol.\"\n"
-    "  [n] (list 'cljc/print-doc* (list 'quote n)))\n"
-    "(defn cljc/print-source* [sym]\n"
-    "  (let [v (cljc/resolve-maybe (str sym))\n"
-    "        ars (and v (cljc/fn-source* v))]\n"
+    "  [n] (list 'clove/print-doc* (list 'quote n)))\n"
+    "(defn clove/print-source* [sym]\n"
+    "  (let [v (clove/resolve-maybe (str sym))\n"
+    "        ars (and v (clove/fn-source* v))]\n"
     "    (if (nil? ars)\n"
     "      (println (str \"Source not available for \" sym\n"
     "                    (if v \" (built-in)\" \" (not found)\")))\n"
@@ -13564,353 +13566,353 @@ static const char *PRELUDE =
     "    nil))\n"
     "(defmacro source\n"
     "  \"Prints the (re-read) source of a fn defined in this session/load.\"\n"
-    "  [n] (list 'cljc/print-source* (list 'quote n)))\n"
+    "  [n] (list 'clove/print-source* (list 'quote n)))\n"
     "(defn apropos\n"
     "  \"All definitions whose name contains str-or-pattern, as sorted symbols.\"\n"
     "  [str-or-pattern]\n"
     "  (let [q (str str-or-pattern)]\n"
-    "    (sort (map symbol (filter (fn [n] (str/includes? n q)) (cljc/root-names*))))))\n"
+    "    (sort (map symbol (filter (fn [n] (str/includes? n q)) (clove/root-names*))))))\n"
     "(defn find-doc\n"
     "  \"Prints documentation for every definition whose name or docstring\\n  contains the string.\"\n"
     "  [s]\n"
-    "  (cljc/ensure-docs!)\n"
-    "  (run! (fn [n] (cljc/print-doc* (symbol n)))\n"
-    "        (filter (fn [n] (let [i (cljc/doc-info* (symbol n))]\n"
+    "  (clove/ensure-docs!)\n"
+    "  (run! (fn [n] (clove/print-doc* (symbol n)))\n"
+    "        (filter (fn [n] (let [i (clove/doc-info* (symbol n))]\n"
     "                          (or (str/includes? n s)\n"
     "                              (and (:doc i) (str/includes? (:doc i) s)))))\n"
-    "                (sort (map str (cljc/root-names*))))))\n"
+    "                (sort (map str (clove/root-names*))))))\n"
     ;
 
 /* ───── Runtime init: native registration, later prelude tiers ────────── */
 
-CljcEnv *cljc_new_env(void) {
+CloveEnv *clove_new_env(void) {
     if (!NIL) {
-        gc_stress = getenv("CLJC_GC_STRESS") != NULL;
+        gc_stress = getenv("CLOVE_GC_STRESS") != NULL;
         srand((unsigned)time(NULL));
-        vstack = xmalloc(sizeof(Cljc *) * VSTACK_CAP);
+        vstack = xmalloc(sizeof(Clove *) * VSTACK_CAP);
         for (int64_t i = SMALLINT_MIN; i <= SMALLINT_MAX; i++) {
-            smallints[i - SMALLINT_MIN].tag = CLJC_INT;
+            smallints[i - SMALLINT_MIN].tag = CLOVE_INT;
             smallints[i - SMALLINT_MIN].gcmark = 1;  /* permanently marked */
             smallints[i - SMALLINT_MIN].as.i = i;
         }
         for (int i = 0; i < 256; i++) {
-            smallchars[i].tag = CLJC_CHAR;
+            smallchars[i].tag = CLOVE_CHAR;
             smallchars[i].gcmark = 1;             /* permanently marked */
             smallchars[i].as.chr = i;
         }
-        NIL = alloc(CLJC_NIL);
+        NIL = alloc(CLOVE_NIL);
         /* Self-referential cons fields: walking off the end of any form
          * (e.g. (def) with no args) yields NIL instead of reading
          * uninitialized union bytes. Safety net, not license — special
          * forms still arity-check for decent error messages. */
         NIL->as.cons.head = NIL;
         NIL->as.cons.tail = NIL;
-        TRUE = alloc(CLJC_BOOL);  TRUE->as.b = true;
-        FALSE = alloc(CLJC_BOOL); FALSE->as.b = false;
-        EMPTY = alloc(CLJC_EMPTY);
+        TRUE = alloc(CLOVE_BOOL);  TRUE->as.b = true;
+        FALSE = alloc(CLOVE_BOOL); FALSE->as.b = false;
+        EMPTY = alloc(CLOVE_EMPTY);
         EMPTY->as.cons.head = NIL;   /* (first ()) => nil */
         EMPTY->as.cons.tail = EMPTY; /* (rest ())  => ()   */
         EMPTY_VEC = vec_cell(NULL, 0, 0, NULL, 0, NULL);
     }
-    CljcEnv *e = env_new(NULL);
+    CloveEnv *e = env_new(NULL);
     /* Register as a GC root immediately — everything defined below
      * (natives, prelude) is kept alive through this env. */
     if (gc_n_root_envs >= (int)(sizeof gc_root_envs / sizeof *gc_root_envs))
-        cljc_error("too many root environments");
+        clove_error("too many root environments");
     gc_root_envs[gc_n_root_envs++] = e;
-    cljc_define_native(e, "+",       prim_add);
-    cljc_define_native(e, "-",       prim_sub);
-    cljc_define_native(e, "*",       prim_mul);
-    cljc_define_native(e, "+'",      prim_addq);
-    cljc_define_native(e, "-'",      prim_subq);
-    cljc_define_native(e, "*'",      prim_mulq);
-    cljc_define_native(e, "unchecked-add",      prim_unchecked_add);
-    cljc_define_native(e, "unchecked-subtract", prim_unchecked_sub);
-    cljc_define_native(e, "unchecked-multiply", prim_unchecked_mul);
-    cljc_define_native(e, "numerator",   prim_numerator);
-    cljc_define_native(e, "denominator", prim_denominator);
-    cljc_define_native(e, "/",       prim_div);
-    cljc_define_native(e, "=",       prim_eq);
-    cljc_define_native(e, "<",       prim_lt);
-    cljc_define_native(e, ">",       prim_gt);
-    cljc_define_native(e, "<=",      prim_le);
-    cljc_define_native(e, ">=",      prim_ge);
-    cljc_define_native(e, "==",      prim_num_eq);
-    cljc_define_native(e, "println", prim_println);
-    cljc_define_native(e, "cljc/eprintln*", prim_eprintln);
-    cljc_define_native(e, "str",     prim_str);
-    cljc_define_native(e, "pr-str",  prim_pr_str);
-    cljc_define_native(e, "print-str",   prim_print_str);
-    cljc_define_native(e, "println-str", prim_println_str);
-    cljc_define_native(e, "list",    prim_list);
-    cljc_define_native(e, "first",   prim_first);
-    cljc_define_native(e, "second",  prim_second);
-    cljc_define_native(e, "rest",    prim_rest);
-    cljc_define_native(e, "cons",    prim_cons);
-    cljc_define_native(e, "conj",    prim_conj);
-    cljc_define_native(e, "count",   prim_count);
-    cljc_define_native(e, "cljc/fn-source*", prim_fn_source);
-    cljc_define_native(e, "cljc/last-trace*", prim_last_trace);
-    cljc_define_native(e, "cljc/pprint-str*", prim_pprint_str);
-    cljc_define_native(e, "cljc/nan?*", prim_nan_p);
-    cljc_define_native(e, "int-array",  prim_int_array);
-    cljc_define_native(e, "double-array", prim_double_array);
-    cljc_define_native(e, "long-array", prim_int_array);
-    cljc_define_native(e, "byte-array", prim_int_array);
-    cljc_define_native(e, "aget",    prim_aget);
-    cljc_define_native(e, "aset",    prim_aset);
-    cljc_define_native(e, "alength", prim_alength);
-    cljc_define_native(e, "nth",     prim_nth);
-    cljc_define_native(e, "vector",  prim_vector);
-    cljc_define_native(e, "apply",   prim_apply);
-    cljc_define_native(e, "not",     prim_not);
-    cljc_define_native(e, "inc",     prim_inc);
-    cljc_define_native(e, "dec",     prim_dec);
-    cljc_define_native(e, "mod",     prim_mod);
-    cljc_define_native(e, "rem",     prim_rem);
-    cljc_define_native(e, "map",     prim_map);
-    cljc_define_native(e, "filter",  prim_filter);
-    cljc_define_native(e, "reduce",  prim_reduce);
-    cljc_define_native(e, "range",   prim_range);  /* eager; used during prelude
+    clove_define_native(e, "+",       prim_add);
+    clove_define_native(e, "-",       prim_sub);
+    clove_define_native(e, "*",       prim_mul);
+    clove_define_native(e, "+'",      prim_addq);
+    clove_define_native(e, "-'",      prim_subq);
+    clove_define_native(e, "*'",      prim_mulq);
+    clove_define_native(e, "unchecked-add",      prim_unchecked_add);
+    clove_define_native(e, "unchecked-subtract", prim_unchecked_sub);
+    clove_define_native(e, "unchecked-multiply", prim_unchecked_mul);
+    clove_define_native(e, "numerator",   prim_numerator);
+    clove_define_native(e, "denominator", prim_denominator);
+    clove_define_native(e, "/",       prim_div);
+    clove_define_native(e, "=",       prim_eq);
+    clove_define_native(e, "<",       prim_lt);
+    clove_define_native(e, ">",       prim_gt);
+    clove_define_native(e, "<=",      prim_le);
+    clove_define_native(e, ">=",      prim_ge);
+    clove_define_native(e, "==",      prim_num_eq);
+    clove_define_native(e, "println", prim_println);
+    clove_define_native(e, "clove/eprintln*", prim_eprintln);
+    clove_define_native(e, "str",     prim_str);
+    clove_define_native(e, "pr-str",  prim_pr_str);
+    clove_define_native(e, "print-str",   prim_print_str);
+    clove_define_native(e, "println-str", prim_println_str);
+    clove_define_native(e, "list",    prim_list);
+    clove_define_native(e, "first",   prim_first);
+    clove_define_native(e, "second",  prim_second);
+    clove_define_native(e, "rest",    prim_rest);
+    clove_define_native(e, "cons",    prim_cons);
+    clove_define_native(e, "conj",    prim_conj);
+    clove_define_native(e, "count",   prim_count);
+    clove_define_native(e, "clove/fn-source*", prim_fn_source);
+    clove_define_native(e, "clove/last-trace*", prim_last_trace);
+    clove_define_native(e, "clove/pprint-str*", prim_pprint_str);
+    clove_define_native(e, "clove/nan?*", prim_nan_p);
+    clove_define_native(e, "int-array",  prim_int_array);
+    clove_define_native(e, "double-array", prim_double_array);
+    clove_define_native(e, "long-array", prim_int_array);
+    clove_define_native(e, "byte-array", prim_int_array);
+    clove_define_native(e, "aget",    prim_aget);
+    clove_define_native(e, "aset",    prim_aset);
+    clove_define_native(e, "alength", prim_alength);
+    clove_define_native(e, "nth",     prim_nth);
+    clove_define_native(e, "vector",  prim_vector);
+    clove_define_native(e, "apply",   prim_apply);
+    clove_define_native(e, "not",     prim_not);
+    clove_define_native(e, "inc",     prim_inc);
+    clove_define_native(e, "dec",     prim_dec);
+    clove_define_native(e, "mod",     prim_mod);
+    clove_define_native(e, "rem",     prim_rem);
+    clove_define_native(e, "map",     prim_map);
+    clove_define_native(e, "filter",  prim_filter);
+    clove_define_native(e, "reduce",  prim_reduce);
+    clove_define_native(e, "range",   prim_range);  /* eager; used during prelude
                                                     * load before the lazy prelude
                                                     * `range` defn shadows it */
-    cljc_define_native(e, "cljc/range-eager",  prim_range);       /* small ranges */
-    cljc_define_native(e, "cljc/range-chunk*", prim_range_chunk); /* lazy chunks */
-    cljc_define_native(e, "cljc/repeat-chunk*", prim_repeat_chunk);
-    cljc_define_native(e, "cljc/repeatedly-chunk*", prim_repeatedly_chunk);
-    cljc_define_native(e, "take",    prim_take);
-    cljc_define_native(e, "drop",    prim_drop);
-    cljc_define_native(e, "reverse", prim_reverse);
-    cljc_define_native(e, "last",    prim_last);
-    cljc_define_native(e, "seq",     prim_seq);
-    cljc_define_native(e, "seq?",    prim_seq_p);
-    cljc_define_native(e, "type",    prim_type);
-    cljc_define_native(e, "sh",        prim_sh);
-    cljc_define_native(e, "coro/new",    prim_coro_new);
-    cljc_define_native(e, "coro/resume", prim_coro_resume);
-    cljc_define_native(e, "coro/yield",  prim_coro_yield);
-    cljc_define_native(e, "coro/status", prim_coro_status);
-    cljc_define_native(e, "coro/alive?", prim_coro_alive);
-    cljc_define_native(e, "hash",      prim_hash);
-    cljc_define_native(e, "cljc/env*",      prim_getenv_raw);
-    cljc_define_native(e, "cljc/os*",       prim_os);
-    cljc_define_native(e, "cljc/sharedir*", prim_sharedir);
-    cljc_define_native(e, "cljc/exe-sharedir*", prim_exe_sharedir);
-    cljc_define_native(e, "cljc/exe-dir*", prim_exe_dir);
-    cljc_define_native(e, "int",       prim_int);
-    cljc_define_native(e, "identical?", prim_identical);
-    cljc_define_native(e, "with-meta",  prim_with_meta);
-    cljc_define_native(e, "meta",       prim_meta);
-    cljc_define_native(e, "cljc/alias*", prim_alias);
-    cljc_define_native(e, "cljc/refer*", prim_refer);
-    cljc_define_native(e, "cljc/current-ns*", prim_current_ns);
-    cljc_define_native(e, "cljc/in-ns*", prim_in_ns);
-    cljc_define_native(e, "cljc/ns-publics*", prim_ns_publics);
-    cljc_define_native(e, "cljc/ns-interns*", prim_ns_interns);
-    cljc_define_native(e, "cljc/namespaces*", prim_namespaces);
-    cljc_define_native(e, "cljc/create-ns*", prim_create_ns);
-    cljc_define_native(e, "cljc/ns-aliases*", prim_ns_aliases);
-    cljc_define_native(e, "cljc/resolve-maybe", prim_resolve_maybe);
-    cljc_define_native(e, "cljc/resolve-var", prim_resolve_var);
-    cljc_define_native(e, "cljc/doc-put*",   prim_doc_put);
-    cljc_define_native(e, "cljc/doc-info*",  prim_doc_info);
-    cljc_define_native(e, "cljc/root-names*", prim_root_names);
-    cljc_define_native(e, "cljc/set-var!", prim_set_var);
-    cljc_define_native(e, "cljc/fn-arities", prim_fn_arities);
-    cljc_define_native(e, "macroexpand-1", prim_macroexpand_1);
-    cljc_define_native(e, "cljc/eval-forms*", prim_eval_forms);
-    cljc_define_native(e, "cljc/chunk-map*",    prim_chunk_map);
-    cljc_define_native(e, "cljc/chunk-filter*", prim_chunk_filter);
-    cljc_define_native(e, "cljc/onto",          prim_onto);
-    cljc_define_native(e, "ffi-load*", prim_ffi_load);
-    cljc_define_native(e, "hash-map",  prim_hash_map);
-    cljc_define_native(e, "get",       prim_get);
-    cljc_define_native(e, "assoc",     prim_assoc);
-    cljc_define_native(e, "dissoc",    prim_dissoc);
-    cljc_define_native(e, "keys",      prim_keys);
-    cljc_define_native(e, "vals",      prim_vals);
-    cljc_define_native(e, "contains?", prim_contains_p);
-    cljc_define_native(e, "merge",     prim_merge);
-    cljc_define_native(e, "map?",      prim_map_p);
-    cljc_define_native(e, "set",       prim_set);
-    cljc_define_native(e, "hash-set",  prim_hash_set);
-    cljc_define_native(e, "disj",      prim_disj);
-    cljc_define_native(e, "set?",      prim_set_p);
-    cljc_define_native(e, "sorted?",   prim_sorted_p);
-    cljc_define_native(e, "re-find",    prim_re_find);
-    cljc_define_native(e, "cljc/re-match-front", prim_re_match_front);
-    cljc_define_native(e, "re-matches", prim_re_matches);
-    cljc_define_native(e, "re-seq",     prim_re_seq);
-    cljc_define_native(e, "re-replace",  prim_re_replace);
-    cljc_define_native(e, "re-split",    prim_re_split);
-    cljc_define_native(e, "format",      prim_format);
-    cljc_define_native(e, "str/replace", prim_str_replace);
-    cljc_define_native(e, "Math/sqrt",  prim_sqrt);
-    cljc_define_native(e, "Math/cbrt",  prim_cbrt);
-    cljc_define_native(e, "Math/pow",   prim_pow);
-    cljc_define_native(e, "Math/floor", prim_floor);
-    cljc_define_native(e, "Math/ceil",  prim_ceil);
-    cljc_define_native(e, "Math/round", prim_round);
-    cljc_define_native(e, "Math/abs",   prim_math_abs);
-    cljc_define_native(e, "Math/trunc", prim_trunc);
-    cljc_define_native(e, "Math/signum", prim_signum);
-    cljc_define_native(e, "Math/sin",   prim_sin);
-    cljc_define_native(e, "Math/cos",   prim_cos);
-    cljc_define_native(e, "Math/tan",   prim_tan);
-    cljc_define_native(e, "Math/asin",  prim_asin);
-    cljc_define_native(e, "Math/acos",  prim_acos);
-    cljc_define_native(e, "Math/atan",  prim_atan);
-    cljc_define_native(e, "Math/atan2", prim_atan2);
-    cljc_define_native(e, "Math/hypot", prim_hypot);
-    cljc_define_native(e, "Math/sinh",  prim_sinh);
-    cljc_define_native(e, "Math/cosh",  prim_cosh);
-    cljc_define_native(e, "Math/tanh",  prim_tanh);
-    cljc_define_native(e, "Math/asinh", prim_asinh);
-    cljc_define_native(e, "Math/acosh", prim_acosh);
-    cljc_define_native(e, "Math/atanh", prim_atanh);
-    cljc_define_native(e, "Math/exp",   prim_exp);
-    cljc_define_native(e, "Math/expm1", prim_expm1);
-    cljc_define_native(e, "Math/log",   prim_log);
-    cljc_define_native(e, "Math/log10", prim_log10);
-    cljc_define_native(e, "Math/log2",  prim_log2);
-    cljc_define_native(e, "Math/log1p", prim_log1p);
-    cljc_define_native(e, "Math/erf",      prim_erf);
-    cljc_define_native(e, "Math/erfc",     prim_erfc);
-    cljc_define_native(e, "Math/gamma",    prim_gamma);
-    cljc_define_native(e, "Math/loggamma", prim_loggamma);
+    clove_define_native(e, "clove/range-eager",  prim_range);       /* small ranges */
+    clove_define_native(e, "clove/range-chunk*", prim_range_chunk); /* lazy chunks */
+    clove_define_native(e, "clove/repeat-chunk*", prim_repeat_chunk);
+    clove_define_native(e, "clove/repeatedly-chunk*", prim_repeatedly_chunk);
+    clove_define_native(e, "take",    prim_take);
+    clove_define_native(e, "drop",    prim_drop);
+    clove_define_native(e, "reverse", prim_reverse);
+    clove_define_native(e, "last",    prim_last);
+    clove_define_native(e, "seq",     prim_seq);
+    clove_define_native(e, "seq?",    prim_seq_p);
+    clove_define_native(e, "type",    prim_type);
+    clove_define_native(e, "sh",        prim_sh);
+    clove_define_native(e, "coro/new",    prim_coro_new);
+    clove_define_native(e, "coro/resume", prim_coro_resume);
+    clove_define_native(e, "coro/yield",  prim_coro_yield);
+    clove_define_native(e, "coro/status", prim_coro_status);
+    clove_define_native(e, "coro/alive?", prim_coro_alive);
+    clove_define_native(e, "hash",      prim_hash);
+    clove_define_native(e, "clove/env*",      prim_getenv_raw);
+    clove_define_native(e, "clove/os*",       prim_os);
+    clove_define_native(e, "clove/sharedir*", prim_sharedir);
+    clove_define_native(e, "clove/exe-sharedir*", prim_exe_sharedir);
+    clove_define_native(e, "clove/exe-dir*", prim_exe_dir);
+    clove_define_native(e, "int",       prim_int);
+    clove_define_native(e, "identical?", prim_identical);
+    clove_define_native(e, "with-meta",  prim_with_meta);
+    clove_define_native(e, "meta",       prim_meta);
+    clove_define_native(e, "clove/alias*", prim_alias);
+    clove_define_native(e, "clove/refer*", prim_refer);
+    clove_define_native(e, "clove/current-ns*", prim_current_ns);
+    clove_define_native(e, "clove/in-ns*", prim_in_ns);
+    clove_define_native(e, "clove/ns-publics*", prim_ns_publics);
+    clove_define_native(e, "clove/ns-interns*", prim_ns_interns);
+    clove_define_native(e, "clove/namespaces*", prim_namespaces);
+    clove_define_native(e, "clove/create-ns*", prim_create_ns);
+    clove_define_native(e, "clove/ns-aliases*", prim_ns_aliases);
+    clove_define_native(e, "clove/resolve-maybe", prim_resolve_maybe);
+    clove_define_native(e, "clove/resolve-var", prim_resolve_var);
+    clove_define_native(e, "clove/doc-put*",   prim_doc_put);
+    clove_define_native(e, "clove/doc-info*",  prim_doc_info);
+    clove_define_native(e, "clove/root-names*", prim_root_names);
+    clove_define_native(e, "clove/set-var!", prim_set_var);
+    clove_define_native(e, "clove/fn-arities", prim_fn_arities);
+    clove_define_native(e, "macroexpand-1", prim_macroexpand_1);
+    clove_define_native(e, "clove/eval-forms*", prim_eval_forms);
+    clove_define_native(e, "clove/chunk-map*",    prim_chunk_map);
+    clove_define_native(e, "clove/chunk-filter*", prim_chunk_filter);
+    clove_define_native(e, "clove/onto",          prim_onto);
+    clove_define_native(e, "ffi-load*", prim_ffi_load);
+    clove_define_native(e, "hash-map",  prim_hash_map);
+    clove_define_native(e, "get",       prim_get);
+    clove_define_native(e, "assoc",     prim_assoc);
+    clove_define_native(e, "dissoc",    prim_dissoc);
+    clove_define_native(e, "keys",      prim_keys);
+    clove_define_native(e, "vals",      prim_vals);
+    clove_define_native(e, "contains?", prim_contains_p);
+    clove_define_native(e, "merge",     prim_merge);
+    clove_define_native(e, "map?",      prim_map_p);
+    clove_define_native(e, "set",       prim_set);
+    clove_define_native(e, "hash-set",  prim_hash_set);
+    clove_define_native(e, "disj",      prim_disj);
+    clove_define_native(e, "set?",      prim_set_p);
+    clove_define_native(e, "sorted?",   prim_sorted_p);
+    clove_define_native(e, "re-find",    prim_re_find);
+    clove_define_native(e, "clove/re-match-front", prim_re_match_front);
+    clove_define_native(e, "re-matches", prim_re_matches);
+    clove_define_native(e, "re-seq",     prim_re_seq);
+    clove_define_native(e, "re-replace",  prim_re_replace);
+    clove_define_native(e, "re-split",    prim_re_split);
+    clove_define_native(e, "format",      prim_format);
+    clove_define_native(e, "str/replace", prim_str_replace);
+    clove_define_native(e, "Math/sqrt",  prim_sqrt);
+    clove_define_native(e, "Math/cbrt",  prim_cbrt);
+    clove_define_native(e, "Math/pow",   prim_pow);
+    clove_define_native(e, "Math/floor", prim_floor);
+    clove_define_native(e, "Math/ceil",  prim_ceil);
+    clove_define_native(e, "Math/round", prim_round);
+    clove_define_native(e, "Math/abs",   prim_math_abs);
+    clove_define_native(e, "Math/trunc", prim_trunc);
+    clove_define_native(e, "Math/signum", prim_signum);
+    clove_define_native(e, "Math/sin",   prim_sin);
+    clove_define_native(e, "Math/cos",   prim_cos);
+    clove_define_native(e, "Math/tan",   prim_tan);
+    clove_define_native(e, "Math/asin",  prim_asin);
+    clove_define_native(e, "Math/acos",  prim_acos);
+    clove_define_native(e, "Math/atan",  prim_atan);
+    clove_define_native(e, "Math/atan2", prim_atan2);
+    clove_define_native(e, "Math/hypot", prim_hypot);
+    clove_define_native(e, "Math/sinh",  prim_sinh);
+    clove_define_native(e, "Math/cosh",  prim_cosh);
+    clove_define_native(e, "Math/tanh",  prim_tanh);
+    clove_define_native(e, "Math/asinh", prim_asinh);
+    clove_define_native(e, "Math/acosh", prim_acosh);
+    clove_define_native(e, "Math/atanh", prim_atanh);
+    clove_define_native(e, "Math/exp",   prim_exp);
+    clove_define_native(e, "Math/expm1", prim_expm1);
+    clove_define_native(e, "Math/log",   prim_log);
+    clove_define_native(e, "Math/log10", prim_log10);
+    clove_define_native(e, "Math/log2",  prim_log2);
+    clove_define_native(e, "Math/log1p", prim_log1p);
+    clove_define_native(e, "Math/erf",      prim_erf);
+    clove_define_native(e, "Math/erfc",     prim_erfc);
+    clove_define_native(e, "Math/gamma",    prim_gamma);
+    clove_define_native(e, "Math/loggamma", prim_loggamma);
     /* constants: bound as plain double globals, like Clojure's Math/PI field */
     env_define_root(env_root(e), intern("Math/PI", 7), mk_double(3.14159265358979323846));
     env_define_root(env_root(e), intern("Math/E",  6), mk_double(2.71828182845904523536));
-    cljc_define_native(e, "rand",       prim_rand);
-    cljc_define_native(e, "rand-int",   prim_rand_int);
-    cljc_define_native(e, "read-string", prim_read_string);
-    cljc_define_native(e, "parse-long",   prim_parse_long);
-    cljc_define_native(e, "parse-double", prim_parse_double);
-    cljc_define_native(e, "eval",        prim_eval);
-    cljc_define_native(e, "peek",        prim_peek);
-    cljc_define_native(e, "pop",         prim_pop);
-    cljc_define_native(e, "empty",       prim_empty);
-    cljc_define_native(e, "nil?",    prim_nil_p);
-    cljc_define_native(e, "list?",   prim_list_p);
-    cljc_define_native(e, "vector?", prim_vector_p);
-    cljc_define_native(e, "number?", prim_number_p);
-    cljc_define_native(e, "decimal?", prim_decimal_p);
-    cljc_define_native(e, "cljc/->bd", prim_to_bigdec);
-    cljc_define_native(e, "cljc/bd-u", prim_bd_unscaled);
-    cljc_define_native(e, "cljc/bd-s", prim_bd_scale);
-    cljc_define_native(e, "cljc/mk-bd", prim_mk_bigdec);
-    cljc_define_native(e, "cljc/bd->ratio", prim_bd_to_ratio);
-    cljc_define_native(e, "int?",    prim_int_p);
-    cljc_define_native(e, "double?", prim_double_p);
-    cljc_define_native(e, "string?", prim_string_p);
-    cljc_define_native(e, "char?",   prim_char_p);
-    cljc_define_native(e, "keyword?", prim_keyword_p);
-    cljc_define_native(e, "symbol?", prim_symbol_p);
-    cljc_define_native(e, "fn?",     prim_fn_p);
-    cljc_define_native(e, "zero?",   prim_zero_p);
-    cljc_define_native(e, "pos?",    prim_pos_p);
-    cljc_define_native(e, "neg?",    prim_neg_p);
-    cljc_define_native(e, "empty?",  prim_empty_p);
-    cljc_define_native(e, "concat",  prim_concat);
-    cljc_define_native(e, "gensym",  prim_gensym);
-    cljc_define_native(e, "gc",      prim_gc);
-    cljc_define_native(e, "throw",      prim_throw);
-    cljc_define_native(e, "ex-info",    prim_ex_info);
-    cljc_define_native(e, "cljc/ex-isa?*",   prim_ex_isa);
-    cljc_define_native(e, "cljc/ex-class*",  prim_ex_class);
-    cljc_define_native(e, "cljc/ex-typed*",  prim_ex_typed);
-    cljc_define_native(e, "ex-message", prim_ex_message);
-    cljc_define_native(e, "ex-data",    prim_ex_data);
-    cljc_define_native(e, "atom",    prim_atom);
-    cljc_define_native(e, "deref",   prim_deref);
-    cljc_define_native(e, "reset!",  prim_reset);
-    cljc_define_native(e, "swap!",   prim_swap);
-    cljc_define_native(e, "compare", prim_compare);
-    cljc_define_native(e, "sort",    prim_sort);
-    cljc_define_native(e, "sorted-set",    prim_sorted_set);
-    cljc_define_native(e, "sorted-set-by", prim_sorted_set_by);
-    cljc_define_native(e, "sorted-map",    prim_sorted_map);
-    cljc_define_native(e, "sorted-map-by", prim_sorted_map_by);
-    cljc_define_native(e, "subseq",        prim_subseq);
-    cljc_define_native(e, "rsubseq",       prim_rsubseq);
-    cljc_define_native(e, "vec",     prim_vec);
-    cljc_define_native(e, "transient",   prim_transient);
-    cljc_define_native(e, "persistent!", prim_persistent_bang);
-    cljc_define_native(e, "conj!",       prim_conj_bang);
-    cljc_define_native(e, "assoc!",      prim_assoc_bang);
-    cljc_define_native(e, "dissoc!",     prim_dissoc);  /* shim: persistent */
-    cljc_define_native(e, "disj!",       prim_disj);    /* shim: persistent */
-    cljc_define_native(e, "name",    prim_name);
-    cljc_define_native(e, "keyword", prim_keyword);
-    cljc_define_native(e, "symbol",  prim_symbol);
-    cljc_define_native(e, "quot",    prim_quot);
-    cljc_define_native(e, "subs",    prim_subs);
-    cljc_define_native(e, "slurp",   prim_slurp);
-    cljc_define_native(e, "spit",    prim_spit);
-    cljc_define_native(e, "cljc/mtime*", prim_mtime);
-    cljc_define_native(e, "cljc/now-ms*", prim_now_ms);
-    cljc_define_native(e, "cljc/now-us*", prim_now_us);
-    cljc_define_native(e, "cljc/getpid", prim_getpid);
-    cljc_define_native(e, "cljc/getuid", prim_getuid);
-    cljc_define_native(e, "cljc/exit*", prim_exit);
-    cljc_define_native(e, "cljc/sleep-ms*", prim_sleep_ms);
-    cljc_define_native(e, "cljc/poll-fds*", prim_poll_fds);
-    cljc_define_native(e, "cljc/epoch*", prim_epoch);
-    cljc_define_native(e, "cljc/md5*", prim_md5);
-    cljc_define_native(e, "read-line", prim_read_line);
-    cljc_define_native(e, "flush", prim_flush);
-    cljc_define_native(e, "cljc/isatty*", prim_isatty);
-    cljc_define_native(e, "cljc/raw-mode*", prim_raw_mode);
-    cljc_define_native(e, "cljc/sh-lines*", prim_sh_lines);
-#ifndef CLJC_NO_MAIN
-    cljc_define_native(e, "cljc/repl-edit*", prim_repl_edit);
-    cljc_define_native(e, "cljc/repl-log*", prim_repl_log);
+    clove_define_native(e, "rand",       prim_rand);
+    clove_define_native(e, "rand-int",   prim_rand_int);
+    clove_define_native(e, "read-string", prim_read_string);
+    clove_define_native(e, "parse-long",   prim_parse_long);
+    clove_define_native(e, "parse-double", prim_parse_double);
+    clove_define_native(e, "eval",        prim_eval);
+    clove_define_native(e, "peek",        prim_peek);
+    clove_define_native(e, "pop",         prim_pop);
+    clove_define_native(e, "empty",       prim_empty);
+    clove_define_native(e, "nil?",    prim_nil_p);
+    clove_define_native(e, "list?",   prim_list_p);
+    clove_define_native(e, "vector?", prim_vector_p);
+    clove_define_native(e, "number?", prim_number_p);
+    clove_define_native(e, "decimal?", prim_decimal_p);
+    clove_define_native(e, "clove/->bd", prim_to_bigdec);
+    clove_define_native(e, "clove/bd-u", prim_bd_unscaled);
+    clove_define_native(e, "clove/bd-s", prim_bd_scale);
+    clove_define_native(e, "clove/mk-bd", prim_mk_bigdec);
+    clove_define_native(e, "clove/bd->ratio", prim_bd_to_ratio);
+    clove_define_native(e, "int?",    prim_int_p);
+    clove_define_native(e, "double?", prim_double_p);
+    clove_define_native(e, "string?", prim_string_p);
+    clove_define_native(e, "char?",   prim_char_p);
+    clove_define_native(e, "keyword?", prim_keyword_p);
+    clove_define_native(e, "symbol?", prim_symbol_p);
+    clove_define_native(e, "fn?",     prim_fn_p);
+    clove_define_native(e, "zero?",   prim_zero_p);
+    clove_define_native(e, "pos?",    prim_pos_p);
+    clove_define_native(e, "neg?",    prim_neg_p);
+    clove_define_native(e, "empty?",  prim_empty_p);
+    clove_define_native(e, "concat",  prim_concat);
+    clove_define_native(e, "gensym",  prim_gensym);
+    clove_define_native(e, "gc",      prim_gc);
+    clove_define_native(e, "throw",      prim_throw);
+    clove_define_native(e, "ex-info",    prim_ex_info);
+    clove_define_native(e, "clove/ex-isa?*",   prim_ex_isa);
+    clove_define_native(e, "clove/ex-class*",  prim_ex_class);
+    clove_define_native(e, "clove/ex-typed*",  prim_ex_typed);
+    clove_define_native(e, "ex-message", prim_ex_message);
+    clove_define_native(e, "ex-data",    prim_ex_data);
+    clove_define_native(e, "atom",    prim_atom);
+    clove_define_native(e, "deref",   prim_deref);
+    clove_define_native(e, "reset!",  prim_reset);
+    clove_define_native(e, "swap!",   prim_swap);
+    clove_define_native(e, "compare", prim_compare);
+    clove_define_native(e, "sort",    prim_sort);
+    clove_define_native(e, "sorted-set",    prim_sorted_set);
+    clove_define_native(e, "sorted-set-by", prim_sorted_set_by);
+    clove_define_native(e, "sorted-map",    prim_sorted_map);
+    clove_define_native(e, "sorted-map-by", prim_sorted_map_by);
+    clove_define_native(e, "subseq",        prim_subseq);
+    clove_define_native(e, "rsubseq",       prim_rsubseq);
+    clove_define_native(e, "vec",     prim_vec);
+    clove_define_native(e, "transient",   prim_transient);
+    clove_define_native(e, "persistent!", prim_persistent_bang);
+    clove_define_native(e, "conj!",       prim_conj_bang);
+    clove_define_native(e, "assoc!",      prim_assoc_bang);
+    clove_define_native(e, "dissoc!",     prim_dissoc);  /* shim: persistent */
+    clove_define_native(e, "disj!",       prim_disj);    /* shim: persistent */
+    clove_define_native(e, "name",    prim_name);
+    clove_define_native(e, "keyword", prim_keyword);
+    clove_define_native(e, "symbol",  prim_symbol);
+    clove_define_native(e, "quot",    prim_quot);
+    clove_define_native(e, "subs",    prim_subs);
+    clove_define_native(e, "slurp",   prim_slurp);
+    clove_define_native(e, "spit",    prim_spit);
+    clove_define_native(e, "clove/mtime*", prim_mtime);
+    clove_define_native(e, "clove/now-ms*", prim_now_ms);
+    clove_define_native(e, "clove/now-us*", prim_now_us);
+    clove_define_native(e, "clove/getpid", prim_getpid);
+    clove_define_native(e, "clove/getuid", prim_getuid);
+    clove_define_native(e, "clove/exit*", prim_exit);
+    clove_define_native(e, "clove/sleep-ms*", prim_sleep_ms);
+    clove_define_native(e, "clove/poll-fds*", prim_poll_fds);
+    clove_define_native(e, "clove/epoch*", prim_epoch);
+    clove_define_native(e, "clove/md5*", prim_md5);
+    clove_define_native(e, "read-line", prim_read_line);
+    clove_define_native(e, "flush", prim_flush);
+    clove_define_native(e, "clove/isatty*", prim_isatty);
+    clove_define_native(e, "clove/raw-mode*", prim_raw_mode);
+    clove_define_native(e, "clove/sh-lines*", prim_sh_lines);
+#ifndef CLOVE_NO_MAIN
+    clove_define_native(e, "clove/repl-edit*", prim_repl_edit);
+    clove_define_native(e, "clove/repl-log*", prim_repl_log);
 #endif
-    cljc_define_native(e, "cljc/read-key*", prim_read_key);
-    cljc_define_native(e, "cljc/term-size*", prim_term_size);
-    cljc_define_native(e, "cljc/dir?*",  prim_dir_p);
-    cljc_define_native(e, "cljc/list-dir*", prim_list_dir);
-    cljc_define_native(e, "tcp/listen", prim_tcp_listen);
-    cljc_define_native(e, "tcp/accept", prim_tcp_accept);
-    cljc_define_native(e, "tcp/recv",   prim_tcp_recv);
-    cljc_define_native(e, "tcp/send",   prim_tcp_send);
-    cljc_define_native(e, "tcp/close",  prim_tcp_close);
-    cljc_define_native(e, "tcp/connect", prim_tcp_connect);
-    cljc_define_native(e, "tcp/send-some*", prim_tcp_send_some);
-    cljc_define_native(e, "pr",      prim_pr);
-    cljc_define_native(e, "prn",     prim_prn);
-    cljc_define_native(e, "print",   prim_print);
-    cljc_define_native(e, "str/upper-case",   prim_upper_case);
-    cljc_define_native(e, "str/lower-case",   prim_lower_case);
-    cljc_define_native(e, "str/trim",         prim_trim);
-    cljc_define_native(e, "str/split",        prim_split);
-    cljc_define_native(e, "str/starts-with?", prim_starts_with);
-    cljc_define_native(e, "cljc/str-starts-at?", prim_starts_at);
-    cljc_define_native(e, "str/ends-with?",   prim_ends_with);
-    cljc_define_native(e, "str/includes?",    prim_includes);
-    cljc_define_native(e, "cljc/str-nbytes*", prim_str_nbytes);
-    cljc_define_native(e, "cljc/str-bytes*",  prim_str_bytes);
-    cljc_define_native(e, "str/index-of",     prim_index_of);
-    cljc_define_native(e, "str/replace-first", prim_replace_first);
-    cljc_define_native(e, "bit-and", prim_bit_and);
-    cljc_define_native(e, "bit-or",  prim_bit_or);
-    cljc_define_native(e, "bit-xor", prim_bit_xor);
-    cljc_define_native(e, "bit-not", prim_bit_not);
-    cljc_define_native(e, "bit-and-not", prim_bit_and_not);
-    cljc_define_native(e, "bit-shift-left",  prim_bsl);
-    cljc_define_native(e, "bit-shift-right", prim_bsr);
-    cljc_define_native(e, "unsigned-bit-shift-right", prim_ubsr);
-    cljc_define_native(e, "bit-test",  prim_bit_test);
-    cljc_define_native(e, "bit-set",   prim_bit_set);
-    cljc_define_native(e, "bit-clear", prim_bit_clear);
-    cljc_define_native(e, "bit-flip",  prim_bit_flip);
-    cljc_define_native(e, "char", prim_char);
-    cljc_define_native(e, "str/blank?",       prim_blank_p);
-    cljc_eval_string(e, PRELUDE);
+    clove_define_native(e, "clove/read-key*", prim_read_key);
+    clove_define_native(e, "clove/term-size*", prim_term_size);
+    clove_define_native(e, "clove/dir?*",  prim_dir_p);
+    clove_define_native(e, "clove/list-dir*", prim_list_dir);
+    clove_define_native(e, "tcp/listen", prim_tcp_listen);
+    clove_define_native(e, "tcp/accept", prim_tcp_accept);
+    clove_define_native(e, "tcp/recv",   prim_tcp_recv);
+    clove_define_native(e, "tcp/send",   prim_tcp_send);
+    clove_define_native(e, "tcp/close",  prim_tcp_close);
+    clove_define_native(e, "tcp/connect", prim_tcp_connect);
+    clove_define_native(e, "tcp/send-some*", prim_tcp_send_some);
+    clove_define_native(e, "pr",      prim_pr);
+    clove_define_native(e, "prn",     prim_prn);
+    clove_define_native(e, "print",   prim_print);
+    clove_define_native(e, "str/upper-case",   prim_upper_case);
+    clove_define_native(e, "str/lower-case",   prim_lower_case);
+    clove_define_native(e, "str/trim",         prim_trim);
+    clove_define_native(e, "str/split",        prim_split);
+    clove_define_native(e, "str/starts-with?", prim_starts_with);
+    clove_define_native(e, "clove/str-starts-at?", prim_starts_at);
+    clove_define_native(e, "str/ends-with?",   prim_ends_with);
+    clove_define_native(e, "str/includes?",    prim_includes);
+    clove_define_native(e, "clove/str-nbytes*", prim_str_nbytes);
+    clove_define_native(e, "clove/str-bytes*",  prim_str_bytes);
+    clove_define_native(e, "str/index-of",     prim_index_of);
+    clove_define_native(e, "str/replace-first", prim_replace_first);
+    clove_define_native(e, "bit-and", prim_bit_and);
+    clove_define_native(e, "bit-or",  prim_bit_or);
+    clove_define_native(e, "bit-xor", prim_bit_xor);
+    clove_define_native(e, "bit-not", prim_bit_not);
+    clove_define_native(e, "bit-and-not", prim_bit_and_not);
+    clove_define_native(e, "bit-shift-left",  prim_bsl);
+    clove_define_native(e, "bit-shift-right", prim_bsr);
+    clove_define_native(e, "unsigned-bit-shift-right", prim_ubsr);
+    clove_define_native(e, "bit-test",  prim_bit_test);
+    clove_define_native(e, "bit-set",   prim_bit_set);
+    clove_define_native(e, "bit-clear", prim_bit_clear);
+    clove_define_native(e, "bit-flip",  prim_bit_flip);
+    clove_define_native(e, "char", prim_char);
+    clove_define_native(e, "str/blank?",       prim_blank_p);
+    clove_eval_string(e, PRELUDE);
     /* Lazy core: shadows the eager natives so pipelines compose lazily.
      * Eager consumers (reduce, count, into, vec, sort...) realize via
      * to_seq, so finite pipelines behave identically. */
-    cljc_eval_string(e,
+    clove_eval_string(e,
         "(def range* range)\n"
         "(defn range\n"
         "  ([] (iterate inc 0))\n"
@@ -13938,16 +13940,16 @@ CljcEnv *cljc_new_env(void) {
         "  (lazy-seq (when-let [s (seq c)]\n"
         "              (when (pred (first s))\n"
         "                (cons (first s) (take-while pred (rest s)))))))\n"
-        /* lazy + chunked (256/chunk), spliced in place via cljc/onto, so
+        /* lazy + chunked (256/chunk), spliced in place via clove/onto, so
            (vec (repeat n x)) builds a vector without per-element lazy overhead */
-        "(defn cljc/repeat* [x n]\n"
+        "(defn clove/repeat* [x n]\n"
         "  (lazy-seq\n"
         "    (when (or (nil? n) (pos? n))\n"
         "      (let [k (if n (min n 256) 256)]\n"
-        "        (cljc/onto (cljc/repeat-chunk* x k) (cljc/repeat* x (when n (- n k))))))))\n"
+        "        (clove/onto (clove/repeat-chunk* x k) (clove/repeat* x (when n (- n k))))))))\n"
         "(defn repeat\n"
-        "  ([x] (cljc/repeat* x nil))\n"
-        "  ([n x] (if (pos? n) (cljc/repeat* x n) ())))\n"
+        "  ([x] (clove/repeat* x nil))\n"
+        "  ([n x] (if (pos? n) (clove/repeat* x n) ())))\n"
         "(defn concat\n"
         "  ([] (list))\n"
         "  ([a] (lazy-seq (seq a)))\n"
@@ -14029,7 +14031,7 @@ CljcEnv *cljc_new_env(void) {
         "(defn not-any? [pred coll] (not (some pred coll)))\n"
         "(defn not-every? [pred coll] (not (every? pred coll)))\n"
         "(defn edn/read-string [s] (read-string s))\n"
-        "(defn pprint ([x] (pprint x 80)) ([x w] (println (cljc/pprint-str* x (if (int? w) w 80)))))\n"
+        "(defn pprint ([x] (pprint x 80)) ([x w] (println (clove/pprint-str* x (if (int? w) w 80)))))\n"
         "(def *e nil)\n"
         "(defn pst\n"
         "  \"Prints the message and trace of the most recent error (or of e).\"\n"
@@ -14038,15 +14040,15 @@ CljcEnv *cljc_new_env(void) {
         "   (when e\n"
         "     (println (or (and (map? e) (ex-message e))\n"
         "                  (if (string? e) e (pr-str e)))))\n"
-        "   (when-let [t (cljc/last-trace*)] (print t))\n"
+        "   (when-let [t (clove/last-trace*)] (print t))\n"
         "   nil))\n"
-        "(defn cljc/dir* [n]\n"
+        "(defn clove/dir* [n]\n"
         "  (when-not (find-ns n) (try (require n) (catch Exception e nil)))\n"
         "  (run! println (sort (map str (keys (ns-publics n)))))\n"
         "  nil)\n"
         "(defmacro dir\n"
         "  \"Prints the sorted public names of a namespace: (dir clojure.string).\"\n"
-        "  [n] (list 'cljc/dir* (list 'quote n)))\n"
+        "  [n] (list 'clove/dir* (list 'quote n)))\n"
         "(defmacro dbg\n"
         "  \"Prints file:line, the expression, and its value; returns the value.\n"
         "  Wrap any subexpression: (+ 1 (dbg (* 2 3))). Reader shorthand: #p expr.\"\n"
@@ -14057,21 +14059,21 @@ CljcEnv *cljc_new_env(void) {
         "    (list 'let [v expr]\n"
         "          (list 'println (str \"#dbg \" loc (pr-str expr) \" =>\") (list 'pr-str v))\n"
         "          v)))\n"
-            "(defn cljc/vendor-walk* [d]\n"
+            "(defn clove/vendor-walk* [d]\n"
             "  (mapcat (fn [n] (let [p (str d \"/\" n)]\n"
-            "                    (if (fs/directory? p) (cljc/vendor-walk* p) [p])))\n"
+            "                    (if (fs/directory? p) (clove/vendor-walk* p) [p])))\n"
             "          (fs/list-dir d)))\n"
-            "(defn cljc/vendor-unjar* [jar dir]\n"
+            "(defn clove/vendor-unjar* [jar dir]\n"
             "  (fs/create-dir dir)\n"
             "  (or (zero? (:exit (process/sh \"unzip\" \"-q\" \"-o\" jar \"-d\" dir)))\n"
             "      (zero? (:exit (process/sh \"bsdtar\" \"-xf\" jar \"-C\" dir)))\n"
             "      (throw (ex-info \"cannot extract jar: need unzip or bsdtar on PATH\" {}))))\n"
-            "(def cljc/vendor-repos*\n"
+            "(def clove/vendor-repos*\n"
             "  ;; [url display-name] pairs tried in order; an atom so tests (or users\n"
             "  ;; with a mirror) can point maven resolution elsewhere, incl. file:// dirs\n"
             "  (atom [[\"https://repo.clojars.org/\" \"Clojars\"]\n"
             "         [\"https://repo1.maven.org/maven2/\" \"Maven Central\"]]))\n"
-            "(defn cljc/vendor-maven* [repo repo-name coord tmp ver]\n"
+            "(defn clove/vendor-maven* [repo repo-name coord tmp ver]\n"
             "  ;; nil when the coord (at ver, if pinned) isn't in this maven repo;\n"
             "  ;; else the extracted root\n"
             "  (let [[g a] (str/split coord \"/\")\n"
@@ -14085,14 +14087,14 @@ CljcEnv *cljc_new_env(void) {
             "            url (str base \"/\" ver \"/\" a \"-\" ver \".jar\")]\n"
             "        (println (str \"Fetching \" repo-name \" \" coord \" \" ver \" ...\"))\n"
             "        (if (zero? (:exit (process/sh \"curl\" \"-fsSL\" url \"-o\" jar)))\n"
-            "          (do (cljc/vendor-unjar* jar tmp)\n"
+            "          (do (clove/vendor-unjar* jar tmp)\n"
             "              (process/sh \"rm\" \"-f\" jar)\n"
             "              tmp)\n"
             "          (do (process/sh \"rm\" \"-f\" jar) nil))))))\n"
-            "(defn cljc/vendor-clojars* [coord tmp & [ver]]\n"
-            "  (some (fn [[repo nm]] (cljc/vendor-maven* repo nm coord tmp ver))\n"
-            "        (deref cljc/vendor-repos*)))\n"
-            "(defn cljc/vendor-git* [url tmp]\n"
+            "(defn clove/vendor-clojars* [coord tmp & [ver]]\n"
+            "  (some (fn [[repo nm]] (clove/vendor-maven* repo nm coord tmp ver))\n"
+            "        (deref clove/vendor-repos*)))\n"
+            "(defn clove/vendor-git* [url tmp]\n"
             "  (println (str \"Cloning \" url \" ...\"))\n"
             "  (let [r (process/sh \"git\" \"clone\" \"--depth\" \"1\" \"--quiet\" url tmp)]\n"
             "    (when-not (zero? (:exit r))\n"
@@ -14101,9 +14103,9 @@ CljcEnv *cljc_new_env(void) {
             "  (cond (fs/directory? (str tmp \"/src/main/clojure\")) (str tmp \"/src/main/clojure\")\n"
             "        (fs/directory? (str tmp \"/src\"))              (str tmp \"/src\")\n"
             "        :else tmp))\n"
-            "(defn cljc/vendor-copy* [root]\n"
+            "(defn clove/vendor-copy* [root]\n"
             "  ;; copy root's .clj/.cljc sources into ./vendor/, returning the rel paths\n"
-            "  (let [rels (->> (cljc/vendor-walk* root)\n"
+            "  (let [rels (->> (clove/vendor-walk* root)\n"
             "                  (map (fn [p] (subs p (inc (count root)))))\n"
             "                  (filter (fn [rel]\n"
             "                    (and (re-find #\"\\.cljc?$\" rel)\n"
@@ -14116,7 +14118,7 @@ CljcEnv *cljc_new_env(void) {
             "        (when-let [dir (fs/parent dst)] (fs/create-dir dir))\n"
             "        (spit dst (slurp (str root \"/\" rel)))))\n"
             "    (vec rels)))\n"
-            "(defn cljc/vendor-report* [rels]\n"
+            "(defn clove/vendor-report* [rels]\n"
             "  (let [nss (map (fn [rel] (-> rel (str/replace #\"\\.cljc?$\" \"\")\n"
             "                                   (str/replace \"/\" \".\")\n"
             "                                   (str/replace \"_\" \"-\")))\n"
@@ -14133,7 +14135,7 @@ CljcEnv *cljc_new_env(void) {
             "        (println (str \"  (require '\" n \")   ; loads OK\"))\n"
             "        (println (str \"  (require '\" n \")   ; FAILS: \" r\n"
             "                      \" — JVM-interop-heavy libraries may need porting\"))))))\n"
-            "(defn cljc/vendor!\n"
+            "(defn clove/vendor!\n"
             "  \"Fetch a pure-Clojure library into ./vendor/ and report which of its\n"
             "  namespaces load. Accepts Clojars group/artifact or GitHub user/repo\n"
             "  coordinates, a git URL, or a .jar URL.\"\n"
@@ -14142,33 +14144,33 @@ CljcEnv *cljc_new_env(void) {
             "  (let [src (str src)\n"
             "      coord? (re-matches #\"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\" src)\n"
             "      nm  (str/replace (last (str/split src \"/\")) #\"\\.(git|jar)$\" \"\")\n"
-            "      tmp (str (fs/temp-dir) \"/cljc-vendor-\" nm)]\n"
+            "      tmp (str (fs/temp-dir) \"/clove-vendor-\" nm)]\n"
             "  (process/sh \"rm\" \"-rf\" tmp)\n"
             "  (let [root (cond\n"
             "               (re-find #\"\\.jar$\" src)\n"
             "               (do (when-not (zero? (:exit (process/sh \"curl\" \"-fsSL\" src \"-o\" (str tmp \".jar\"))))\n"
             "                     (throw (ex-info (str \"download failed: \" src) {})))\n"
-            "                   (cljc/vendor-unjar* (str tmp \".jar\") tmp)\n"
+            "                   (clove/vendor-unjar* (str tmp \".jar\") tmp)\n"
             "                   (process/sh \"rm\" \"-f\" (str tmp \".jar\"))\n"
             "                   tmp)\n"
             "               coord?\n"
-            "               (or (cljc/vendor-clojars* src tmp)\n"
-            "                   (cljc/vendor-git* (str \"https://github.com/\" src) tmp))\n"
-            "               :else (cljc/vendor-git* src tmp))\n"
-            "        rels (cljc/vendor-copy* root)]\n"
+            "               (or (clove/vendor-clojars* src tmp)\n"
+            "                   (clove/vendor-git* (str \"https://github.com/\" src) tmp))\n"
+            "               :else (clove/vendor-git* src tmp))\n"
+            "        rels (clove/vendor-copy* root)]\n"
             "    (when (empty? rels)\n"
             "      (throw (ex-info (str \"no .clj/.cljc sources found under \" root) {})))\n"
             "    (process/sh \"rm\" \"-rf\" tmp)\n"
             "    (println (str \"Vendored \" (count rels) \" file(s) into vendor/.\"))\n"
-            "    (cljc/vendor-report* rels)\n"
+            "    (clove/vendor-report* rels)\n"
             "    true)))"
-            "(def vendor! cljc/vendor!)\n"
-            /* deps.edn mode: `cljc vendor` with no argument (or a deps.edn path)
+            "(def vendor! clove/vendor!)\n"
+            /* deps.edn mode: `clove vendor` with no argument (or a deps.edn path)
              * resolves :deps — :mvn/version from the maven repos (transitively,
              * via the jars' poms), :git/url + :git/sha|:git/tag via clone
              * (io.github and com.github lib names infer the URL), :local/root
              * by copy; git and local deps recurse into their own deps.edn. */
-            "(defn cljc/pom-parse-deps* [xml]\n"
+            "(defn clove/pom-parse-deps* [xml]\n"
             "  ;; compile/runtime-scope, non-optional, property-free deps of one pom\n"
             "  (when-let [block (second (re-find #\"(?s)<dependencies>(.*?)</dependencies>\" xml))]\n"
             "    (keep (fn [d]\n"
@@ -14181,18 +14183,18 @@ CljcEnv *cljc_new_env(void) {
             "                         (not= (str g \"/\" a) \"org.clojure/clojure\"))\n"
             "                [(symbol (str g \"/\" a)) {:mvn/version v}])))\n"
             "          (map second (re-seq #\"(?s)<dependency>(.*?)</dependency>\" block)))))\n"
-            "(defn cljc/pom-deps* [root]\n"
-            "  (vec (mapcat (fn [p] (cljc/pom-parse-deps* (slurp p)))\n"
+            "(defn clove/pom-deps* [root]\n"
+            "  (vec (mapcat (fn [p] (clove/pom-parse-deps* (slurp p)))\n"
             "               (filter (fn [p] (re-find #\"pom\\.xml$\" p))\n"
-            "                       (cljc/vendor-walk* root)))))\n"
-            "(defn cljc/deps-file-deps* [path]\n"
+            "                       (clove/vendor-walk* root)))))\n"
+            "(defn clove/deps-file-deps* [path]\n"
             "  ;; [[lib coord] ...] from a deps.edn's :deps, nil if absent/unreadable\n"
-            "  (when-let [s (cljc/slurp-maybe path)]\n"
+            "  (when-let [s (clove/slurp-maybe path)]\n"
             "    (try (seq (get (read-string s) :deps))\n"
             "         (catch Exception e\n"
             "           (println (str \"  warning: unreadable \" path \": \" (ex-message e)))\n"
             "           nil))))\n"
-            "(defn cljc/vendor-git-dep* [lib coord tmp]\n"
+            "(defn clove/vendor-git-dep* [lib coord tmp]\n"
             "  ;; clone lib at :git/sha (or :git/tag); => [src-root project-root]\n"
             "  (let [url (or (get coord :git/url)\n"
             "                (let [g (namespace lib) n (name lib)]\n"
@@ -14216,9 +14218,9 @@ CljcEnv *cljc_new_env(void) {
             "             (fs/directory? (str proot \"/src\"))              (str proot \"/src\")\n"
             "             :else proot)\n"
             "       proot])))\n"
-            "(defn cljc/vendor-dep-1* [lib coord basedir]\n"
+            "(defn clove/vendor-dep-1* [lib coord basedir]\n"
             "  ;; vendor one dep; => [rels next-deps next-basedir]\n"
-            "  (let [tmp (str (fs/temp-dir) \"/cljc-vendor-\" (str/replace (str lib) \"/\" \"_\"))]\n"
+            "  (let [tmp (str (fs/temp-dir) \"/clove-vendor-\" (str/replace (str lib) \"/\" \"_\"))]\n"
             "    (process/sh \"rm\" \"-rf\" tmp)\n"
             "    (cond\n"
             "      (get coord :local/root)\n"
@@ -14227,27 +14229,27 @@ CljcEnv *cljc_new_env(void) {
             "            src (cond (fs/directory? (str proot \"/src/main/clojure\")) (str proot \"/src/main/clojure\")\n"
             "                      (fs/directory? (str proot \"/src\"))              (str proot \"/src\")\n"
             "                      :else proot)]\n"
-            "        [(cljc/vendor-copy* src) (cljc/deps-file-deps* (str proot \"/deps.edn\")) proot])\n"
+            "        [(clove/vendor-copy* src) (clove/deps-file-deps* (str proot \"/deps.edn\")) proot])\n"
             "      (get coord :mvn/version)\n"
-            "      (let [root (or (cljc/vendor-clojars* (str lib) tmp (get coord :mvn/version))\n"
+            "      (let [root (or (clove/vendor-clojars* (str lib) tmp (get coord :mvn/version))\n"
             "                     (throw (ex-info (str \"vendor: cannot fetch \" lib \" \"\n"
             "                                          (get coord :mvn/version)) {})))\n"
-            "            rels (cljc/vendor-copy* root)\n"
-            "            next (cljc/pom-deps* root)]\n"
+            "            rels (clove/vendor-copy* root)\n"
+            "            next (clove/pom-deps* root)]\n"
             "        (process/sh \"rm\" \"-rf\" tmp)\n"
             "        [rels next nil])\n"
             "      :else\n"
-            "      (let [[src proot] (cljc/vendor-git-dep* lib coord tmp)\n"
-            "            rels (cljc/vendor-copy* src)\n"
-            "            next (vec (cljc/deps-file-deps* (str proot \"/deps.edn\")))]\n"
+            "      (let [[src proot] (clove/vendor-git-dep* lib coord tmp)\n"
+            "            rels (clove/vendor-copy* src)\n"
+            "            next (vec (clove/deps-file-deps* (str proot \"/deps.edn\")))]\n"
             "        (process/sh \"rm\" \"-rf\" tmp)\n"
             "        [rels next nil]))))\n"
-            "(defn cljc/vendor-deps!\n"
+            "(defn clove/vendor-deps!\n"
             "  \"Vendor every dependency of a deps.edn (its :deps map, transitively)\n"
             "  into ./vendor/ and report which namespaces load.\"\n"
             "  [deps-path]\n"
             "  (require 'fs) (require 'process)\n"
-            "  (let [deps (cljc/deps-file-deps* deps-path)]\n"
+            "  (let [deps (clove/deps-file-deps* deps-path)]\n"
             "    (when-not deps\n"
             "      (throw (ex-info (str \"vendor: no :deps map found in \" deps-path) {})))\n"
             "    (let [basedir (or (fs/parent deps-path) \".\")\n"
@@ -14262,110 +14264,110 @@ CljcEnv *cljc_new_env(void) {
             "                  (recur more))\n"
             "              (do (swap! seen assoc lib coord)\n"
             "                  (println (str \"Vendoring \" lib \" \" (pr-str coord)))\n"
-            "                  (let [[rs next nbase] (cljc/vendor-dep-1* lib coord bdir)]\n"
+            "                  (let [[rs next nbase] (clove/vendor-dep-1* lib coord bdir)]\n"
             "                    (when (empty? rs)\n"
             "                      (println (str \"  (no Clojure sources in \" lib \" — a Java library?)\")))\n"
             "                    (swap! rels into rs)\n"
             "                    (recur (into more (mapv (fn [[l c]] [l c nbase]) (vec next))))))))))\n"
             "      (println (str \"Vendored \" (count (distinct (deref rels))) \" file(s) into vendor/ \"\n"
             "                    \"from \" (count (deref seen)) \" dep(s).\"))\n"
-            "      (cljc/vendor-report* (deref rels))\n"
+            "      (clove/vendor-report* (deref rels))\n"
             "      true)))\n"
-            "(defn cljc/vendor-main! []\n"
-            "  ;; `cljc vendor` CLI entry: no arg => ./deps.edn; a deps.edn path => that\n"
+            "(defn clove/vendor-main! []\n"
+            "  ;; `clove vendor` CLI entry: no arg => ./deps.edn; a deps.edn path => that\n"
             "  ;; file; anything else => the single-library vendor! path\n"
             "  (let [a (first *args*)]\n"
             "    (cond\n"
             "      (nil? a)\n"
-            "      (if (cljc/slurp-maybe \"deps.edn\")\n"
-            "        (cljc/vendor-deps! \"deps.edn\")\n"
-            "        (throw (ex-info (str \"usage: cljc vendor [deps.edn | group/artifact | git-url | jar-url]\"\n"
+            "      (if (clove/slurp-maybe \"deps.edn\")\n"
+            "        (clove/vendor-deps! \"deps.edn\")\n"
+            "        (throw (ex-info (str \"usage: clove vendor [deps.edn | group/artifact | git-url | jar-url]\"\n"
             "                             \" (no deps.edn in the current directory)\") {})))\n"
-            "      (re-find #\"deps\\.edn$\" (str a)) (cljc/vendor-deps! (str a))\n"
-            "      :else (cljc/vendor! a))))\n"
-        "(def cljc/trace-depth* (atom 0))\n"
-        "(def cljc/traced* (atom {}))\n"
-        "(defn cljc/trace-wrap* [nm f]\n"
+            "      (re-find #\"deps\\.edn$\" (str a)) (clove/vendor-deps! (str a))\n"
+            "      :else (clove/vendor! a))))\n"
+        "(def clove/trace-depth* (atom 0))\n"
+        "(def clove/traced* (atom {}))\n"
+        "(defn clove/trace-wrap* [nm f]\n"
         "  (fn [& args]\n"
-        "    (let [pad (apply str (repeat (deref cljc/trace-depth*) \"|  \"))]\n"
+        "    (let [pad (apply str (repeat (deref clove/trace-depth*) \"|  \"))]\n"
         "      (println (str \"TRACE \" pad \"(\" nm\n"
         "                    (apply str (map (fn [a] (str \" \" (pr-str a))) args)) \")\"))\n"
-        "      (swap! cljc/trace-depth* inc)\n"
+        "      (swap! clove/trace-depth* inc)\n"
         "      (try\n"
         "        (let [r (apply f args)]\n"
         "          (println (str \"TRACE \" pad \"=> \" (pr-str r)))\n"
         "          r)\n"
-        "        (finally (swap! cljc/trace-depth* dec))))))\n"
-        "(defn cljc/trace-var* [sym]\n"
+        "        (finally (swap! clove/trace-depth* dec))))))\n"
+        "(defn clove/trace-var* [sym]\n"
         "  (let [v (resolve sym)]\n"
         "    (cond (nil? v) (println (str \"trace-vars: no var named \" sym))\n"
-        "          (contains? (deref cljc/traced*) sym) nil\n"
+        "          (contains? (deref clove/traced*) sym) nil\n"
         "          :else (let [orig (deref v)]\n"
         "                  (if (fn? orig)\n"
-        "                    (do (swap! cljc/traced* assoc sym orig)\n"
-        "                        (alter-var-root v (fn [_] (cljc/trace-wrap* sym orig))))\n"
+        "                    (do (swap! clove/traced* assoc sym orig)\n"
+        "                        (alter-var-root v (fn [_] (clove/trace-wrap* sym orig))))\n"
         "                    (println (str \"trace-vars: \" sym \" is not a fn\"))))))\n"
         "  sym)\n"
-        "(defn cljc/untrace-var* [sym]\n"
-        "  (when-let [orig (get (deref cljc/traced*) sym)]\n"
+        "(defn clove/untrace-var* [sym]\n"
+        "  (when-let [orig (get (deref clove/traced*) sym)]\n"
         "    (alter-var-root (resolve sym) (fn [_] orig))\n"
-        "    (swap! cljc/traced* dissoc sym))\n"
+        "    (swap! clove/traced* dissoc sym))\n"
         "  sym)\n"
         "(defmacro trace-vars\n"
         "  \"Wraps the named fns to print depth-indented call/return lines.\n"
         "  Undo with untrace-vars. (trace-vars f g)\"\n"
         "  [& syms]\n"
-        "  (cons 'do (map (fn [s] (list 'cljc/trace-var* (list 'quote s))) syms)))\n"
+        "  (cons 'do (map (fn [s] (list 'clove/trace-var* (list 'quote s))) syms)))\n"
         "(defmacro untrace-vars\n"
         "  \"Restores fns wrapped by trace-vars. With no args, untraces everything.\"\n"
         "  [& syms]\n"
         "  (if (seq syms)\n"
-        "    (cons 'do (map (fn [s] (list 'cljc/untrace-var* (list 'quote s))) syms))\n"
-        "    (list 'run! 'cljc/untrace-var* (list 'keys (list 'deref 'cljc/traced*)))))\n"
-        "(defn cljc/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
+        "    (cons 'do (map (fn [s] (list 'clove/untrace-var* (list 'quote s))) syms))\n"
+        "    (list 'run! 'clove/untrace-var* (list 'keys (list 'deref 'clove/traced*)))))\n"
+        "(defn clove/repeatedly* [f n]\n"   /* lazy + chunked, like repeat */
         "  (lazy-seq\n"
         "    (when (or (nil? n) (pos? n))\n"
         "      (let [k (if n (min n 256) 256)]\n"
-        "        (cljc/onto (cljc/repeatedly-chunk* f k) (cljc/repeatedly* f (when n (- n k))))))))\n"
+        "        (clove/onto (clove/repeatedly-chunk* f k) (clove/repeatedly* f (when n (- n k))))))))\n"
         "(defn repeatedly\n"
-        "  ([f] (cljc/repeatedly* f nil))\n"
-        "  ([n f] (if (pos? n) (cljc/repeatedly* f n) ())))\n"
+        "  ([f] (clove/repeatedly* f nil))\n"
+        "  ([n f] (if (pos? n) (clove/repeatedly* f n) ())))\n"
         "(defn drop [n c]\n"
         "  (lazy-seq (loop [n n s (seq c)]\n"
         "              (if (and (pos? n) s) (recur (dec n) (seq (rest s))) s))))\n"
         "(defn mapcat [f c]\n"
         "  (lazy-seq (when-let [s (seq c)]\n"
         "              (concat (f (first s)) (mapcat f (rest s))))))\n"
-        "(defn cljc/chunked [step f c]\n"
+        "(defn clove/chunked [step f c]\n"
         "  (lazy-seq (when-let [s (seq c)]\n"
         "              (let [pair (step f s 32)]\n"
-        "                (cljc/onto (nth pair 0)\n"
-        "                           (cljc/chunked step f (nth pair 1)))))))\n"
-        "(def cljc/map2 map)\n"
+        "                (clove/onto (nth pair 0)\n"
+        "                           (clove/chunked step f (nth pair 1)))))))\n"
+        "(def clove/map2 map)\n"
         "(defn map\n"
-        "  ([f c] (cljc/chunked cljc/chunk-map* f c))\n"
-        "  ([f c1 c2] (cljc/map2 f c1 c2)))\n"
-        "(defn filter [pred c] (cljc/chunked cljc/chunk-filter* pred c))\n"
+        "  ([f c] (clove/chunked clove/chunk-map* f c))\n"
+        "  ([f c1 c2] (clove/map2 f c1 c2)))\n"
+        "(defn filter [pred c] (clove/chunked clove/chunk-filter* pred c))\n"
         /* range: lazy + chunked (4096/chunk) so streaming consumers keep only a
            chunk live instead of the whole range; small bounded INTEGER ranges
            stay eager (no lazy-seq overhead in hot loops). (range) is infinite. */
-        "(defn cljc/range* [start end step]\n"
+        "(defn clove/range* [start end step]\n"
         "  (lazy-seq\n"
-        "    (let [pair (cljc/range-chunk* start end step 4096)\n"
+        "    (let [pair (clove/range-chunk* start end step 4096)\n"
         "          chunk (nth pair 0)]\n"
         "      (when (seq chunk)\n"
-        "        (cljc/onto chunk (cljc/range* (nth pair 1) end step))))))\n"
-        "(defn cljc/range-small? [start end step]\n"
+        "        (clove/onto chunk (clove/range* (nth pair 1) end step))))))\n"
+        "(defn clove/range-small? [start end step]\n"
         "  (and (integer? start) (integer? end) (integer? step) (not (zero? step))\n"
         "       (let [n (quot (- end start) step)] (and (> n 0) (<= n 4096)))))\n"
         "(defn range\n"
-        "  ([] (cljc/range* 0 nil 1))\n"
+        "  ([] (clove/range* 0 nil 1))\n"
         "  ([end] (range 0 end 1))\n"
         "  ([start end] (range start end 1))\n"
         "  ([start end step]\n"
-        "   (if (cljc/range-small? start end step)\n"
-        "     (cljc/range-eager start end step)\n"
-        "     (cljc/range* start end step))))\n"
+        "   (if (clove/range-small? start end step)\n"
+        "     (clove/range-eager start end step)\n"
+        "     (clove/range* start end step))))\n"
         "(defn interleave\n"
         "  ([] (list)) ([c1] (lazy-seq c1))\n"
         "  ([c1 c2]\n"
@@ -14382,7 +14384,7 @@ CljcEnv *cljc_new_env(void) {
         /* ── transducer arities ──
          * The xf builders above become the 1-arity of the seq functions,
          * Clojure-style: (map f) is a transducer. Current impls are
-         * captured under cljc/ names first, then each fn is redefined
+         * captured under clove/ names first, then each fn is redefined
          * with the extra arity (root redefinition is late-bound). */
         "(defn remove-xf [pred] (filter-xf (complement pred)))\n"
         "(defn take-while-xf [pred]\n"
@@ -14407,7 +14409,7 @@ CljcEnv *cljc_new_env(void) {
         "                   (if (nil? v) acc (rf acc v))))))))\n"
         "(defn dedupe-xf []\n"
         "  (fn [rf]\n"
-        "    (let [prev (volatile! :cljc/xf-none)]\n"
+        "    (let [prev (volatile! :clove/xf-none)]\n"
         "      (fn ([] (rf)) ([acc] (rf acc))\n"
         "        ([acc x] (let [p @prev]\n"
         "                   (vreset! prev x)\n"
@@ -14433,7 +14435,7 @@ CljcEnv *cljc_new_env(void) {
         "                     (do (vreset! buf b) acc))))))))\n"
         "(defn partition-by-xf [f]\n"
         "  (fn [rf]\n"
-        "    (let [buf (volatile! []) pv (volatile! :cljc/xf-none)]\n"
+        "    (let [buf (volatile! []) pv (volatile! :clove/xf-none)]\n"
         "      (fn ([] (rf))\n"
         "        ([acc] (let [b @buf\n"
         "                     acc (if (seq b) (unreduced (rf acc b)) acc)]\n"
@@ -14441,7 +14443,7 @@ CljcEnv *cljc_new_env(void) {
         "        ([acc x]\n"
         "         (let [v (f x) p @pv]\n"
         "           (vreset! pv v)\n"
-        "           (if (or (= p :cljc/xf-none) (= p v))\n"
+        "           (if (or (= p :clove/xf-none) (= p v))\n"
         "             (do (vswap! buf conj x) acc)\n"
         "             (let [b @buf]\n"
         "               (vreset! buf [x])\n"
@@ -14454,57 +14456,57 @@ CljcEnv *cljc_new_env(void) {
         "                   (let [r (rf acc (first s))]\n"
         "                     (if (reduced? r) r (recur r (next s))))\n"
         "                   acc))))))\n"
-        "(def cljc/map-impl map)\n"
+        "(def clove/map-impl map)\n"
         "(defn map\n"
         "  ([f] (map-xf f))\n"
-        "  ([f c] (cljc/map-impl f c))\n"
-        "  ([f c1 c2] (cljc/map-impl f c1 c2))\n"
+        "  ([f c] (clove/map-impl f c))\n"
+        "  ([f c1 c2] (clove/map-impl f c1 c2))\n"
         "  ([f c1 c2 & more]\n"        /* n-coll: (apply map list rows) transpose */
         "   (let [cs (cons c1 (cons c2 more))]\n"
         "     (lazy-seq (when (every? seq cs)\n"
         "                 (cons (apply f (map first cs))\n"
         "                       (apply map f (map rest cs))))))))\n"
-        "(def cljc/filter-impl filter)\n"
-        "(defn filter ([pred] (filter-xf pred)) ([pred c] (cljc/filter-impl pred c)))\n"
-        "(defn remove ([pred] (remove-xf pred)) ([pred c] (cljc/filter-impl (complement pred) c)))\n"
-        "(def cljc/take-impl take)\n"
-        "(defn take ([n] (take-xf n)) ([n c] (cljc/take-impl n c)))\n"
-        "(def cljc/drop-impl drop)\n"
-        "(defn drop ([n] (drop-xf n)) ([n c] (cljc/drop-impl n c)))\n"
-        "(def cljc/take-while-impl take-while)\n"
-        "(defn take-while ([pred] (take-while-xf pred)) ([pred c] (cljc/take-while-impl pred c)))\n"
-        "(def cljc/drop-while-impl drop-while)\n"
-        "(defn drop-while ([pred] (drop-while-xf pred)) ([pred c] (cljc/drop-while-impl pred c)))\n"
-        "(def cljc/keep-impl keep)\n"
-        "(defn keep ([f] (keep-xf f)) ([f c] (cljc/keep-impl f c)))\n"
-        "(def cljc/mapcat-impl mapcat)\n"
+        "(def clove/filter-impl filter)\n"
+        "(defn filter ([pred] (filter-xf pred)) ([pred c] (clove/filter-impl pred c)))\n"
+        "(defn remove ([pred] (remove-xf pred)) ([pred c] (clove/filter-impl (complement pred) c)))\n"
+        "(def clove/take-impl take)\n"
+        "(defn take ([n] (take-xf n)) ([n c] (clove/take-impl n c)))\n"
+        "(def clove/drop-impl drop)\n"
+        "(defn drop ([n] (drop-xf n)) ([n c] (clove/drop-impl n c)))\n"
+        "(def clove/take-while-impl take-while)\n"
+        "(defn take-while ([pred] (take-while-xf pred)) ([pred c] (clove/take-while-impl pred c)))\n"
+        "(def clove/drop-while-impl drop-while)\n"
+        "(defn drop-while ([pred] (drop-while-xf pred)) ([pred c] (clove/drop-while-impl pred c)))\n"
+        "(def clove/keep-impl keep)\n"
+        "(defn keep ([f] (keep-xf f)) ([f c] (clove/keep-impl f c)))\n"
+        "(def clove/mapcat-impl mapcat)\n"
         "(defn mapcat\n"
         "  ([f] (mapcat-xf f))\n"
-        "  ([f c] (cljc/mapcat-impl f c))\n"
+        "  ([f c] (clove/mapcat-impl f c))\n"
         "  ([f c1 c2 & more]\n"        /* lazy: works on infinite colls */
         "   (let [cs (cons c1 (cons c2 more))]\n"
         "     (lazy-seq (when (every? seq cs)\n"
         "                 (concat (apply f (map first cs))\n"
         "                         (apply mapcat f (map rest cs))))))))\n"
-        "(def cljc/map-indexed-impl map-indexed)\n"
-        "(defn map-indexed ([f] (map-indexed-xf f)) ([f c] (cljc/map-indexed-impl f c)))\n"
-        "(def cljc/keep-indexed-impl keep-indexed)\n"
-        "(defn keep-indexed ([f] (keep-indexed-xf f)) ([f c] (cljc/keep-indexed-impl f c)))\n"
-        "(def cljc/distinct-impl distinct)\n"
-        "(defn distinct ([] (distinct-xf)) ([c] (cljc/distinct-impl c)))\n"
-        "(def cljc/dedupe-impl dedupe)\n"
-        "(defn dedupe ([] (dedupe-xf)) ([c] (cljc/dedupe-impl c)))\n"
-        "(def cljc/interpose-impl interpose)\n"
-        "(defn interpose ([sep] (interpose-xf sep)) ([sep c] (cljc/interpose-impl sep c)))\n"
-        "(def cljc/partition-all-impl partition-all)\n"
-        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (cljc/partition-all-impl n c))\n"
+        "(def clove/map-indexed-impl map-indexed)\n"
+        "(defn map-indexed ([f] (map-indexed-xf f)) ([f c] (clove/map-indexed-impl f c)))\n"
+        "(def clove/keep-indexed-impl keep-indexed)\n"
+        "(defn keep-indexed ([f] (keep-indexed-xf f)) ([f c] (clove/keep-indexed-impl f c)))\n"
+        "(def clove/distinct-impl distinct)\n"
+        "(defn distinct ([] (distinct-xf)) ([c] (clove/distinct-impl c)))\n"
+        "(def clove/dedupe-impl dedupe)\n"
+        "(defn dedupe ([] (dedupe-xf)) ([c] (clove/dedupe-impl c)))\n"
+        "(def clove/interpose-impl interpose)\n"
+        "(defn interpose ([sep] (interpose-xf sep)) ([sep c] (clove/interpose-impl sep c)))\n"
+        "(def clove/partition-all-impl partition-all)\n"
+        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (clove/partition-all-impl n c))\n"
         "  ([n step c] (lazy-seq (when-let [s (seq c)]\n"
         "                          (cons (take n s) (partition-all n step (drop step s)))))))\n"
-        "(def cljc/partition-by-impl partition-by)\n"
-        "(defn partition-by ([f] (partition-by-xf f)) ([f c] (cljc/partition-by-impl f c)))\n"
+        "(def clove/partition-by-impl partition-by)\n"
+        "(defn partition-by ([f] (partition-by-xf f)) ([f c] (clove/partition-by-impl f c)))\n"
         /* multi-coll transduce: step every coll in parallel, feeding the xform's
            reducing fn multiple inputs ((sequence (map conj) c1 c2) — meander). */
-        "(defn cljc/transduce-n [xform rf init colls]\n"
+        "(defn clove/transduce-n [xform rf init colls]\n"
         "  (let [f (xform rf)]\n"
         "    (loop [acc init css colls]\n"
         "      (if (every? seq css)\n"
@@ -14514,15 +14516,15 @@ CljcEnv *cljc_new_env(void) {
         "(defn sequence\n"
         "  ([c] (seq c))\n"
         "  ([xform c] (sequence*2 xform c))\n"
-        "  ([xform c1 c2 & more] (seq (cljc/transduce-n xform conj [] (list* c1 c2 more)))))\n"
+        "  ([xform c1 c2 & more] (seq (clove/transduce-n xform conj [] (list* c1 c2 more)))))\n"
         "(defn completing\n"
         "  ([f] (completing f identity))\n"
         "  ([f cf] (fn ([] (f)) ([x] (cf x)) ([x y] (f x y)))))\n"
-        "(def cljc/into-impl into)\n"
+        "(def clove/into-impl into)\n"
         "(defn into\n"
         "  ([] [])\n"
         "  ([to] to)\n"
-        "  ([to from] (cljc/into-impl to from))\n"
+        "  ([to from] (clove/into-impl to from))\n"
         "  ([to xform from] (transduce xform conj to from)))\n"
         "(defn reductions\n"
         "  ([f coll] (lazy-seq (if-let [s (seq coll)]\n"
@@ -14545,42 +14547,42 @@ CljcEnv *cljc_new_env(void) {
         "(def pmap map)\n"   /* single-threaded: same results, no parallelism */
         /* peek/pop on maps: priority-map semantics — the entry with the
          * smallest value. O(n) scan; backs clojure.data.priority-map. */
-        "(def cljc/peek-impl peek)\n"
+        "(def clove/peek-impl peek)\n"
         "(defn peek [c]\n"
         "  (cond\n"
-        "    (cljc/dt-method 'peek c) ((cljc/dt-method 'peek c) c)\n"
+        "    (clove/dt-method 'peek c) ((clove/dt-method 'peek c) c)\n"
         "    (map? c) (when (seq c) (apply min-key second (seq c)))\n"
-        "    (cljc/queue? c) (first c)\n"            /* queue: FIFO front */
-        "    :else (cljc/peek-impl c)))\n"
-        "(def cljc/pop-impl pop)\n"
+        "    (clove/queue? c) (first c)\n"            /* queue: FIFO front */
+        "    :else (clove/peek-impl c)))\n"
+        "(def clove/pop-impl pop)\n"
         "(defn pop [c]\n"
         "  (cond\n"
-        "    (cljc/dt-method 'pop c) ((cljc/dt-method 'pop c) c)\n"
+        "    (clove/dt-method 'pop c) ((clove/dt-method 'pop c) c)\n"
         "    (map? c) (dissoc c (first (peek c)))\n"
-        "    (cljc/queue? c) (with-meta (vec (rest c)) {:cljc/queue true})\n"
-        "    :else (cljc/pop-impl c)))\n");
+        "    (clove/queue? c) (with-meta (vec (rest c)) {:clove/queue true})\n"
+        "    :else (clove/pop-impl c)))\n");
     /* Tier 3: multimethods, minimal protocols, records — pure prelude. */
-    cljc_eval_string(e,
-        "(def cljc/multi-tables (atom {}))\n"
+    clove_eval_string(e,
+        "(def clove/multi-tables (atom {}))\n"
         /* Multimethod tables are keyed by the BARE method name (no namespace) —
            the model deftype/extend-type/reify/protocol-vectors already use. This
            is what lets a (defmulti add ..) in one ns and a (defmethod g/add ..)
            in another (via the g alias, e.g. Emmy's emmy.generic vs emmy.numbers)
            share a table: both normalize to `add`. */
-        "(defn cljc/mmk [s] (if (symbol? s) (symbol (name s)) s))\n"
+        "(defn clove/mmk [s] (if (symbol? s) (symbol (name s)) s))\n"
         /* deftype protocol methods live in a SEPARATE registry the special
            invoke/deref dispatch reads, so a library redefining a method name as
            a defmulti (which resets multi-tables for that name) can't wipe them. */
-        "(def cljc/deftype-methods (atom {}))\n"
-        "(defn cljc/reg-method! [mname tkw f]\n"
-        "  (swap! cljc/multi-tables update mname assoc tkw f)\n"
-        "  (swap! cljc/deftype-methods update mname assoc tkw f))\n"
+        "(def clove/deftype-methods (atom {}))\n"
+        "(defn clove/reg-method! [mname tkw f]\n"
+        "  (swap! clove/multi-tables update mname assoc tkw f)\n"
+        "  (swap! clove/deftype-methods update mname assoc tkw f))\n"
         /* ── java.time / java.util.UUID / java class-key shims ──
-           Instants are {:cljc/type :Instant :ms epoch-millis}; formatting uses
+           Instants are {:clove/type :Instant :ms epoch-millis}; formatting uses
            Hinnant's civil_from_days. Class names are def'd to the keyword that
            (type instance) reports, so ported libraries' top-level
            (extend Cls Proto {..}) forms resolve and dispatch. */
-        "(defn cljc/civil-from-ms* [ms]\n"
+        "(defn clove/civil-from-ms* [ms]\n"
         "  (let [days0 (quot ms 86400000) rem0 (- ms (* days0 86400000))\n"
         "        days (if (neg? rem0) (dec days0) days0)\n"
         "        msod (if (neg? rem0) (+ rem0 86400000) rem0)\n"
@@ -14594,31 +14596,31 @@ CljcEnv *cljc_new_env(void) {
         "        d (inc (- doy (quot (+ (* 153 mp) 2) 5)))\n"
         "        m (+ mp (if (< mp 10) 3 -9))]\n"
         "    [(if (<= m 2) (inc y) y) m d msod]))\n"
-        "(defn cljc/instant-iso* [ms]\n"
-        "  (let [[y m d msod] (cljc/civil-from-ms* ms)\n"
+        "(defn clove/instant-iso* [ms]\n"
+        "  (let [[y m d msod] (clove/civil-from-ms* ms)\n"
         "        sec (quot msod 1000) frac (rem msod 1000)\n"
         "        hh (quot sec 3600) mi (quot (rem sec 3600) 60) ss (rem sec 60)]\n"
         "    (if (zero? frac)\n"
         "      (format \"%04d-%02d-%02dT%02d:%02d:%02dZ\" y m d hh mi ss)\n"
         "      (format \"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ\" y m d hh mi ss frac))))\n"
         "(def java.time.Instant :Instant)\n"
-        "(defn java.time.Instant/now [] {:cljc/type :Instant :ms (quot (cljc/now-us*) 1000)})\n"
-        "(defn java.time.Instant/ofEpochMilli [ms] {:cljc/type :Instant :ms (long ms)})\n"
-        "(cljc/reg-method! 'toEpochMilli :Instant (fn [this] (:ms this)))\n"
-        "(cljc/reg-method! 'getEpochSecond :Instant (fn [this] (quot (:ms this) 1000)))\n"
-        "(cljc/reg-method! 'toString :Instant (fn [this] (cljc/instant-iso* (:ms this))))\n"
+        "(defn java.time.Instant/now [] {:clove/type :Instant :ms (quot (clove/now-us*) 1000)})\n"
+        "(defn java.time.Instant/ofEpochMilli [ms] {:clove/type :Instant :ms (long ms)})\n"
+        "(clove/reg-method! 'toEpochMilli :Instant (fn [this] (:ms this)))\n"
+        "(clove/reg-method! 'getEpochSecond :Instant (fn [this] (quot (:ms this) 1000)))\n"
+        "(clove/reg-method! 'toString :Instant (fn [this] (clove/instant-iso* (:ms this))))\n"
         "(def java.time.format.DateTimeFormatter :DateTimeFormatter)\n"
-        "(def java.time.format.DateTimeFormatter/ISO_INSTANT {:cljc/type :DateTimeFormatter :kind :iso-instant})\n"
-        "(cljc/reg-method! 'format :DateTimeFormatter (fn [this t] (cljc/instant-iso* (:ms t))))\n"
+        "(def java.time.format.DateTimeFormatter/ISO_INSTANT {:clove/type :DateTimeFormatter :kind :iso-instant})\n"
+        "(clove/reg-method! 'format :DateTimeFormatter (fn [this t] (clove/instant-iso* (:ms t))))\n"
         "(def java.util.Date :Date)\n"
-        "(defn java.util.Date. ([] {:cljc/type :Date :ms (quot (cljc/now-us*) 1000)})\n"
-        "                      ([ms] {:cljc/type :Date :ms (long ms)}))\n"
-        "(cljc/reg-method! 'toInstant :Date (fn [this] {:cljc/type :Instant :ms (:ms this)}))\n"
-        "(cljc/reg-method! 'getTime :Date (fn [this] (:ms this)))\n"
-        "(cljc/reg-method! 'toString :Date (fn [this] (cljc/instant-iso* (:ms this))))\n"
+        "(defn java.util.Date. ([] {:clove/type :Date :ms (quot (clove/now-us*) 1000)})\n"
+        "                      ([ms] {:clove/type :Date :ms (long ms)}))\n"
+        "(clove/reg-method! 'toInstant :Date (fn [this] {:clove/type :Instant :ms (:ms this)}))\n"
+        "(clove/reg-method! 'getTime :Date (fn [this] (:ms this)))\n"
+        "(clove/reg-method! 'toString :Date (fn [this] (clove/instant-iso* (:ms this))))\n"
         "(def java.sql.Date :SqlDate)\n"
         "(def java.time.ZoneId :ZoneId)\n"
-        "(defn java.time.ZoneId/systemDefault [] {:cljc/type :ZoneId})\n"
+        "(defn java.time.ZoneId/systemDefault [] {:clove/type :ZoneId})\n"
         "(def java.util.UUID :UUID)\n"
         "(defn java.util.UUID/randomUUID [] (random-uuid))\n"
         "(defn java.util.UUID/fromString [s] s)\n"
@@ -14626,17 +14628,17 @@ CljcEnv *cljc_new_env(void) {
         /* java.util.Random: the JVM's exact 48-bit LCG (seed scramble,
            multiplier 0x5DEECE66D, addend 0xB), so a seeded stream matches
            the JVM value-for-value -- ported numeric code often pins test
-           expectations to it. cljc's `*` wraps at int64 exactly like Java's
+           expectations to it. clove's `*` wraps at int64 exactly like Java's
            long, which is what makes the mod-2^48 step come out right. */
         "(def java.util.Random :Random)\n"
         "(defn java.util.Random.\n"
         "  ([] (java.util.Random. (long (* (rand) 9007199254740992))))\n"
-        "  ([seed] {:cljc/type :Random\n"
+        "  ([seed] {:clove/type :Random\n"
         "           :seed (atom (bit-and (bit-xor (long seed) 25214903917) 281474976710655))\n"
         "           :spare (atom nil)}))\n"
         /* next(bits): advance, take the high `bits`, return it as a signed
            32-bit int (only bits=32 can actually go negative). */
-        "(defn cljc/rnd-next* [r bits]\n"
+        "(defn clove/rnd-next* [r bits]\n"
         "  (let [s (swap! (:seed r) (fn [x] (bit-and (unchecked-add (unchecked-multiply x 25214903917) 11) 281474976710655)))\n"
         "        v (bit-shift-right s (- 48 bits))]\n"
         "    (if (>= v 2147483648) (- v 4294967296) v)))\n"
@@ -14644,23 +14646,23 @@ CljcEnv *cljc_new_env(void) {
         "  (reset! (:seed r) (bit-and (bit-xor (long seed) 25214903917) 281474976710655))\n"
         "  (reset! (:spare r) nil) nil)\n"
         "(defn .nextDouble [r]\n"
-        "  (/ (+ (* (cljc/rnd-next* r 26) 134217728) (cljc/rnd-next* r 27)) 9007199254740992.0))\n"
-        "(defn .nextFloat [r] (/ (cljc/rnd-next* r 24) 16777216.0))\n"
-        "(defn .nextLong [r] (+ (* (cljc/rnd-next* r 32) 4294967296) (cljc/rnd-next* r 32)))\n"
-        "(defn .nextBoolean [r] (not= 0 (cljc/rnd-next* r 1)))\n"
+        "  (/ (+ (* (clove/rnd-next* r 26) 134217728) (clove/rnd-next* r 27)) 9007199254740992.0))\n"
+        "(defn .nextFloat [r] (/ (clove/rnd-next* r 24) 16777216.0))\n"
+        "(defn .nextLong [r] (+ (* (clove/rnd-next* r 32) 4294967296) (clove/rnd-next* r 32)))\n"
+        "(defn .nextBoolean [r] (not= 0 (clove/rnd-next* r 1)))\n"
         /* nextInt(n): power-of-two bounds take the high bits; otherwise reject
            the last partial block so the distribution stays uniform (Java's loop).
-           Java detects that block by u - v + (n-1) overflowing int; cljc's
+           Java detects that block by u - v + (n-1) overflowing int; clove's
            int64 never overflows there, so test the 2^31 crossing directly. */
         "(defn .nextInt\n"
-        "  ([r] (cljc/rnd-next* r 32))\n"
+        "  ([r] (clove/rnd-next* r 32))\n"
         "  ([r n]\n"
         "   (when-not (pos? n) (throw (IllegalArgumentException. \"bound must be positive\")))\n"
         "   (if (zero? (bit-and n (dec n)))\n"
-        "     (bit-shift-right (* n (cljc/rnd-next* r 31)) 31)\n"
-        "     (loop [u (cljc/rnd-next* r 31)]\n"
+        "     (bit-shift-right (* n (clove/rnd-next* r 31)) 31)\n"
+        "     (loop [u (clove/rnd-next* r 31)]\n"
         "       (let [v (mod u n)]\n"
-        "         (if (>= (+ (- u v) (dec n)) 2147483648) (recur (cljc/rnd-next* r 31)) v))))))\n"
+        "         (if (>= (+ (- u v) (dec n)) 2147483648) (recur (clove/rnd-next* r 31)) v))))))\n"
         /* nextGaussian: Java's Marsaglia polar method, including the cached
            second deviate -- drop it and the stream desynchronises from the JVM. */
         "(defn .nextGaussian [r]\n"
@@ -14675,7 +14677,7 @@ CljcEnv *cljc_new_env(void) {
         "          (let [m (Math/sqrt (/ (* -2 (Math/log s)) s))]\n"
         "            (reset! (:spare r) (* v2 m))\n"
         "            (* v1 m)))))))\n"
-        "(defn class [x] (or (cljc/ex-class* x) (type x)))\n"
+        "(defn class [x] (or (clove/ex-class* x) (type x)))\n"
         "(def java.lang.CharSequence :java.lang.CharSequence)\n"
         "(derive :string :java.lang.CharSequence)\n"
         "(def clojure.lang.Named :clojure.lang.Named)\n"
@@ -14694,31 +14696,31 @@ CljcEnv *cljc_new_env(void) {
            these directly */
         "(defn .without [m k] (dissoc m k))\n"
         "(defn .entryAt [m k] (find m k))\n"
-        "(defn cljc/reader-content* [x]\n"
+        "(defn clove/reader-content* [x]\n"
         "  (cond (string? x) x\n"
-        "        (and (map? x) (= :java.io.Reader (:cljc/type x))) (:s (deref (:rdr x)))\n"
-        "        (and (map? x) (= :LineReader (:cljc/type x))) (str/join \"\\n\" (deref (:lines x)))\n"
-        "        (and (map? x) (= :StringBuilder (:cljc/type x))) (str x)\n"
+        "        (and (map? x) (= :java.io.Reader (:clove/type x))) (:s (deref (:rdr x)))\n"
+        "        (and (map? x) (= :LineReader (:clove/type x))) (str/join \"\\n\" (deref (:lines x)))\n"
+        "        (and (map? x) (= :StringBuilder (:clove/type x))) (str x)\n"
         "        :else (str x)))\n"
         "(defn java.io.BufferedReader. [x]\n"
-        "  {:cljc/type :LineReader :lines (atom (str/split-lines (cljc/reader-content* x)))})\n"
+        "  {:clove/type :LineReader :lines (atom (str/split-lines (clove/reader-content* x)))})\n"
         "(def BufferedReader. java.io.BufferedReader.)\n"
-        "(cljc/reg-method! 'readLine :LineReader\n"
+        "(clove/reg-method! 'readLine :LineReader\n"
         "  (fn [this]\n"
         "    (let [ls (deref (:lines this))]\n"
         "      (when (seq ls)\n"
         "        (swap! (:lines this) rest)\n"
         "        (first ls)))))\n"
-        "(def clojure.lang.ILookup :cljc/ILookup)\n"
-        "(derive :map :cljc/ILookup) (derive :vector :cljc/ILookup)\n"
-        "(derive :set :cljc/ILookup) (derive :sorted-map :cljc/ILookup)\n"
+        "(def clojure.lang.ILookup :clove/ILookup)\n"
+        "(derive :map :clove/ILookup) (derive :vector :clove/ILookup)\n"
+        "(derive :set :clove/ILookup) (derive :sorted-map :clove/ILookup)\n"
         "(def java.util.Collection :java.util.Collection)\n"
         "(derive :vector :java.util.Collection) (derive :list :java.util.Collection)\n"
         "(derive :set :java.util.Collection) (derive :lazy-seq :java.util.Collection)\n"
         /* specter's extend-protocol clauses (bring-up 2026-08-27): List/Set,
            the sorted collections' concrete classes, IReduce, IRecord (every
            defrecord derives it), transients. MapEntry stays an inert
-           placeholder — cljc map entries are plain vectors, and mapping it
+           placeholder — clove map entries are plain vectors, and mapping it
            to :vector would let a MapEntry clause clobber a sibling
            IPersistentVector clause in the same extend-protocol. */
         "(def java.util.List :java.util.List) (def java.util.Set :java.util.Set)\n"
@@ -14757,16 +14759,16 @@ CljcEnv *cljc_new_env(void) {
         "(defn Integer/toHexString [n] (format \"%x\" n))\n"
         "(defn Long/toHexString [n] (format \"%x\" n))\n"
         "(defn Double/valueOf [s] (or (parse-double s) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
-        "(defn EOFException. [msg] (cljc/ex-typed* :EOFException (ex-info msg {:type :eof})))\n"
-        "(def cljc/compiler-specials*\n"
+        "(defn EOFException. [msg] (clove/ex-typed* :EOFException (ex-info msg {:type :eof})))\n"
+        "(def clove/compiler-specials*\n"
         "  ;; the JVM compiler's special-form table (riddley walks against it):\n"
         "  ;; a map of special symbols -> truthy is all consumers look for\n"
         "  (zipmap '[def loop* recur if case* let* letfn* do fn* quote var\n"
         "            clojure.core/import* . set! deftype* reify* try throw\n"
         "            monitor-enter monitor-exit catch finally new &]\n"
         "          (repeat true)))\n"
-        "(defn clojure.lang.Compiler/specials [] cljc/compiler-specials*)\n"
-        "(defn .close [o] (if-let [m (cljc/dt-method 'close o)] (m o) nil))\n"
+        "(defn clojure.lang.Compiler/specials [] clove/compiler-specials*)\n"
+        "(defn .close [o] (if-let [m (clove/dt-method 'close o)] (m o) nil))\n"
         "(defmacro with-open\n"
         "  \"Binds, evaluates body, .closes the bindings in reverse order (finally).\"\n"
         "  [bindings & body]\n"
@@ -14777,21 +14779,21 @@ CljcEnv *cljc_new_env(void) {
         "                (cons 'with-open (cons (vec (drop 2 bindings)) body))\n"
         "                (list 'finally (list '.close (first bindings)))))))\n"
         "(defmacro new\n"
-        "  \"(new Cls args*) => (Cls. args*) — cljc constructors are dot-suffixed fns.\"\n"
+        "  \"(new Cls args*) => (Cls. args*) — clove constructors are dot-suffixed fns.\"\n"
         "  [cls & args]\n"
         "  (cons (symbol (str cls \".\")) args))\n"
         "(defn .isInfinite [x] (or (= x ##Inf) (= x ##-Inf)))\n"
-        "(defn .isNaN [x] (cljc/nan?* x))\n"
+        "(defn .isNaN [x] (clove/nan?* x))\n"
         "(defn .doubleValue [x] (double x))\n"
         "(defn .longValue [x] (long x))\n"
         "(defn .intValue [x] (int x))\n"
         /* ── java.math.BigDecimal ──
-           The type itself is C (CLJC_BIGDEC): + - * / quot rem mod with Java's
+           The type itself is C (CLOVE_BIGDEC): + - * / quot rem mod with Java's
            scale rules and exact division, =/compare/hash by value, printing,
            and 1.5M literals. What stays here is the MathContext layer --
            precision-limited HALF_UP rounding -- and the instance methods,
            checked against the JVM over a 250-case random corpus x 10 ops. */
-        "(defn cljc/pow10 [k]\n"
+        "(defn clove/pow10 [k]\n"
         "  (loop [r 1N b 10N k k]\n"
         "    (cond (zero? k) r\n"
         "          (odd? k)  (recur (*' r b) (*' b b) (quot k 2))\n"
@@ -14800,112 +14802,112 @@ CljcEnv *cljc_new_env(void) {
         /* private abs/max: prelude internals must not route through names a
            program may shadow -- (:refer-clojure :exclude [abs max min]) is
            common in numeric code, and tests.clj rebinds abs to C's int abs. */
-        "(defn cljc/bd-abs [x] (if (neg? x) (-' 0 x) x))\n"
-        "(defn cljc/bd-max [a b] (if (> a b) a b))\n"
-        "(defn cljc/bd-digits [u] (if (zero? u) 1 (count (str (cljc/bd-abs u)))))\n"
+        "(defn clove/bd-abs [x] (if (neg? x) (-' 0 x) x))\n"
+        "(defn clove/bd-max [a b] (if (> a b) a b))\n"
+        "(defn clove/bd-digits [u] (if (zero? u) 1 (count (str (clove/bd-abs u)))))\n"
         "\n"
         ";; HALF_UP: ties round away from zero\n"
-        "(defn cljc/bd-rescale [x n]\n"
-        "  (let [s (cljc/bd-s x) u (cljc/bd-u x)]\n"
+        "(defn clove/bd-rescale [x n]\n"
+        "  (let [s (clove/bd-s x) u (clove/bd-u x)]\n"
         "    (if (>= n s)\n"
-        "      (cljc/mk-bd (*' u (cljc/pow10 (- n s))) n)\n"
-        "      (let [d (cljc/pow10 (- s n))\n"
+        "      (clove/mk-bd (*' u (clove/pow10 (- n s))) n)\n"
+        "      (let [d (clove/pow10 (- s n))\n"
         "            q (quot u d)\n"
-        "            r (cljc/bd-abs (rem u d))]\n"
-        "        (cljc/mk-bd (if (>= (*' 2 r) d) (if (neg? u) (dec q) (inc q)) q) n)))))\n"
+        "            r (clove/bd-abs (rem u d))]\n"
+        "        (clove/mk-bd (if (>= (*' 2 r) d) (if (neg? u) (dec q) (inc q)) q) n)))))\n"
         "\n"
-        "(defn cljc/bd-round [x prec]\n"
-        "  (let [d (cljc/bd-digits (cljc/bd-u x))]\n"
-        "    (if (and (pos? prec) (> d prec)) (cljc/bd-rescale x (- (cljc/bd-s x) (- d prec))) x)))\n"
+        "(defn clove/bd-round [x prec]\n"
+        "  (let [d (clove/bd-digits (clove/bd-u x))]\n"
+        "    (if (and (pos? prec) (> d prec)) (clove/bd-rescale x (- (clove/bd-s x) (- d prec))) x)))\n"
         "\n"
-        "(defn cljc/bd-strip\n"
+        "(defn clove/bd-strip\n"
         "  \"Drop trailing zeros from the unscaled value, but never past scale `pref`.\"\n"
         "  [x pref]\n"
-        "  (loop [u (cljc/bd-u x) s (cljc/bd-s x)]\n"
+        "  (loop [u (clove/bd-u x) s (clove/bd-s x)]\n"
         "    (if (and (> s pref) (not (zero? u)) (zero? (rem u 10)))\n"
         "      (recur (quot u 10) (dec s))\n"
-        "      (cljc/mk-bd u s))))\n"
+        "      (clove/mk-bd u s))))\n"
         "\n"
         ";; division under a MathContext: round to `prec` significant digits\n"
         ";; instead of throwing on a non-terminating expansion\n"
-        "(defn cljc/bd-div [a b prec]\n"
-        "  (let [a (cljc/->bd a) b (cljc/->bd b)\n"
-        "        ua (cljc/bd-u a) ub (cljc/bd-u b) sa (cljc/bd-s a) sb (cljc/bd-s b)]\n"
+        "(defn clove/bd-div [a b prec]\n"
+        "  (let [a (clove/->bd a) b (clove/->bd b)\n"
+        "        ua (clove/bd-u a) ub (clove/bd-u b) sa (clove/bd-s a) sb (clove/bd-s b)]\n"
         "    (when (zero? ub) (throw (ArithmeticException. \"Division by zero\")))\n"
         "    ;; A zero dividend short-circuits to zero at the preferred scale, the\n"
         "    ;; way Java normalizes it -- the general path would invent a scale\n"
         "    ;; from the guard digits and print 0E-45 instead of 0.\n"
         "    (if (zero? ua)\n"
-        "      (cljc/mk-bd 0 (- sa sb))\n"
+        "      (clove/mk-bd 0 (- sa sb))\n"
         "    (let [prec  (if (pos? prec) prec 34)\n"
-        "          shift (cljc/bd-max 0 (+ (- prec (cljc/bd-digits ua)) (cljc/bd-digits ub) 2))\n"
-        "          n     (*' ua (cljc/pow10 shift))\n"
+        "          shift (clove/bd-max 0 (+ (- prec (clove/bd-digits ua)) (clove/bd-digits ub) 2))\n"
+        "          n     (*' ua (clove/pow10 shift))\n"
         "          q     (quot n ub)\n"
-        "          r     (cljc/bd-abs (rem n ub))\n"
+        "          r     (clove/bd-abs (rem n ub))\n"
         "          scale (+ shift sa (- sb))]\n"
         "      (if (zero? r)\n"
         "        ;; Exact: Java returns the exact quotient reduced toward the preferred\n"
         "        ;; scale (this.scale - divisor.scale), so 2/8 is 0.25, not 0.25000.\n"
         "        ;; Strip BEFORE the precision test -- trailing zeros are not\n"
         "        ;; significant digits, and 2500000E-7 only looks like 7 of them.\n"
-        "        (let [st (cljc/bd-strip (cljc/mk-bd q scale) (- sa sb))]\n"
-        "          (if (<= (cljc/bd-digits (cljc/bd-u st)) prec) st (cljc/bd-round st prec)))\n"
+        "        (let [st (clove/bd-strip (clove/mk-bd q scale) (- sa sb))]\n"
+        "          (if (<= (clove/bd-digits (clove/bd-u st)) prec) st (clove/bd-round st prec)))\n"
         /* Inexact: q carries >= prec+1 digits; round ONCE to `prec`. Rounding
            the guard digit first and then trimming double-rounds (a dropped
            tail of 0.49 -> 0.5 -> up). The nonzero remainder r is a sticky bit,
            so a dropped tail of exactly half still rounds up. */
-        "        (let [qa (cljc/bd-abs q)\n"
-        "              ex (- (cljc/bd-digits qa) prec)\n"
-        "              p  (cljc/pow10 ex)\n"
+        "        (let [qa (clove/bd-abs q)\n"
+        "              ex (- (clove/bd-digits qa) prec)\n"
+        "              p  (clove/pow10 ex)\n"
         "              k  (quot qa p)\n"
         "              k  (if (>= (*' 2 (rem qa p)) p) (inc k) k)\n"
         "              sc (- scale ex)\n"
-        "              [k sc] (if (> (cljc/bd-digits k) prec) [(quot k 10) (dec sc)] [k sc])]\n"
-        "          (cljc/mk-bd (if (neg? q) (-' 0 k) k) sc)))))))\n"
+        "              [k sc] (if (> (clove/bd-digits k) prec) [(quot k 10) (dec sc)] [k sc])]\n"
+        "          (clove/mk-bd (if (neg? q) (-' 0 k) k) sc)))))))\n"
         "\n"
         ";; ── surface ──\n"
-        "(defn BigDecimal. [x] (cljc/->bd x))\n"
-        "(defn java.math.BigDecimal. [x] (cljc/->bd x))\n"
+        "(defn BigDecimal. [x] (clove/->bd x))\n"
+        "(defn java.math.BigDecimal. [x] (clove/->bd x))\n"
         "(def BigDecimal/ONE 1M)\n"
         "(def BigDecimal/ZERO 0M)\n"
         "(def BigDecimal/TEN 10M)\n"
         "(def java.math.BigDecimal/ONE BigDecimal/ONE)\n"
         "(def java.math.BigDecimal/ZERO BigDecimal/ZERO)\n"
         "(def java.math.BigDecimal/TEN BigDecimal/TEN)\n"
-        "(defn java.math.MathContext. [p] {:cljc/type :MathContext :precision p})\n"
-        "(defn MathContext. [p] {:cljc/type :MathContext :precision p})\n"
+        "(defn java.math.MathContext. [p] {:clove/type :MathContext :precision p})\n"
+        "(defn MathContext. [p] {:clove/type :MathContext :precision p})\n"
         "(def RoundingMode/HALF_UP :half-up)\n"
         "(def java.math.RoundingMode/HALF_UP :half-up)\n"
-        "(defn .setScale ([x n] (cljc/bd-rescale (cljc/->bd x) n))\n"
-        "                ([x n _mode] (cljc/bd-rescale (cljc/->bd x) n)))\n"
-        "(defn .scaleByPowerOfTen [x n] (let [x (cljc/->bd x)] (cljc/mk-bd (cljc/bd-u x) (- (cljc/bd-s x) n))))\n"
-        "(defn .unscaledValue [x] (cljc/bd-u (cljc/->bd x)))\n"
-        "(defn .scale [x] (cljc/bd-s (cljc/->bd x)))\n"
-        "(defn .precision [x] (cljc/bd-digits (cljc/bd-u (cljc/->bd x))))\n"
+        "(defn .setScale ([x n] (clove/bd-rescale (clove/->bd x) n))\n"
+        "                ([x n _mode] (clove/bd-rescale (clove/->bd x) n)))\n"
+        "(defn .scaleByPowerOfTen [x n] (let [x (clove/->bd x)] (clove/mk-bd (clove/bd-u x) (- (clove/bd-s x) n))))\n"
+        "(defn .unscaledValue [x] (clove/bd-u (clove/->bd x)))\n"
+        "(defn .scale [x] (clove/bd-s (clove/->bd x)))\n"
+        "(defn .precision [x] (clove/bd-digits (clove/bd-u (clove/->bd x))))\n"
         "(defn .abs [x] (if (neg? x) (- x) x))\n"
         ";; toPlainString never switches to E notation, unlike toString\n"
         "(defn .toPlainString [x]\n"
-        "  (let [x (cljc/->bd x) s (cljc/bd-s x) u (cljc/bd-u x)]\n"
+        "  (let [x (clove/->bd x) s (clove/bd-s x) u (clove/bd-u x)]\n"
         "    (cond (zero? s) (str u)\n"
         "          (neg? s)  (if (zero? u) \"0\" (apply str u (repeat (- s) \"0\")))\n"
-        "          :else (let [ds (str (cljc/bd-abs u))\n"
+        "          :else (let [ds (str (clove/bd-abs u))\n"
         "                      ds (if (<= (count ds) s) (str (apply str (repeat (- (inc s) (count ds)) \"0\")) ds) ds)\n"
         "                      i  (- (count ds) s)]\n"
         "                  (str (when (neg? u) \"-\") (subs ds 0 i) \".\" (subs ds i))))))\n"
-        "(defn .subtract ([a b] (- (cljc/->bd a) b))\n"
-        "                ([a b mc] (cljc/bd-round (- (cljc/->bd a) b) (:precision mc))))\n"
-        "(defn .multiply ([a b] (* (cljc/->bd a) b))\n"
-        "                ([a b mc] (cljc/bd-round (* (cljc/->bd a) b) (:precision mc))))\n"
+        "(defn .subtract ([a b] (- (clove/->bd a) b))\n"
+        "                ([a b mc] (clove/bd-round (- (clove/->bd a) b) (:precision mc))))\n"
+        "(defn .multiply ([a b] (* (clove/->bd a) b))\n"
+        "                ([a b mc] (clove/bd-round (* (clove/->bd a) b) (:precision mc))))\n"
         ";; no MathContext: Java's exact divide, which throws on 1/3\n"
-        "(defn .divide ([a b] (/ (cljc/->bd a) b))\n"
+        "(defn .divide ([a b] (/ (clove/->bd a) b))\n"
         "              ([a b mc] (if (map? mc)\n"
-        "                          (cljc/bd-div a b (:precision mc))\n"
-        "                          (cljc/bd-rescale (cljc/bd-div a b (+ mc 10)) mc)))\n"
-        "              ([a b sc _mode] (cljc/bd-rescale (cljc/bd-div a b (+ sc 10)) sc)))\n"
+        "                          (clove/bd-div a b (:precision mc))\n"
+        "                          (clove/bd-rescale (clove/bd-div a b (+ mc 10)) mc)))\n"
+        "              ([a b sc _mode] (clove/bd-rescale (clove/bd-div a b (+ sc 10)) sc)))\n"
         ";; .add is already a collection shim -- extend it, don't replace it\n"
         "(defn .add\n"
         "  ([a b] (if (decimal? a) (+ a b) (do (swap! a clojure.core/conj b) true)))\n"
-        "  ([a b mc] (cljc/bd-round (+ (cljc/->bd a) b) (:precision mc))))\n"
+        "  ([a b mc] (clove/bd-round (+ (clove/->bd a) b) (:precision mc))))\n"
         /* Clojure signature: (defmulti name docstring? attr-map? dispatch-fn
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
@@ -14915,65 +14917,65 @@ CljcEnv *cljc_new_env(void) {
          * name; otherwise methods register under `add` but dispatch reads the
          * (with-meta add ..) form's empty table. */
         "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))\n"
-        "        key (cljc/mmk name)\n"
+        "        key (clove/mmk name)\n"
         "        args (if (string? (first args)) (rest args) args)\n"
         "        args (if (map? (first args)) (rest args) args)\n"
         "        dispatch (first args)\n"
         "        opts (apply hash-map (rest args))\n"
         "        default (get opts :default :default)]\n"
-        /* preserve any methods already registered under this name: cljc's flat
+        /* preserve any methods already registered under this name: clove's flat
            globals share the table between deftype protocol methods and a later
            (defmulti same-name) a library may declare (e.g. SCI redefining deref);
            resetting would wipe deftype deref/invoke/etc. methods. */
-        "  `(do (swap! cljc/multi-tables update '~key (fn [t#] (or t# {})))\n"
+        "  `(do (swap! clove/multi-tables update '~key (fn [t#] (or t# {})))\n"
         "       (def ~name\n"
         "         (with-meta\n"   /* carry the table key so (defmethod multifn ..) on a
                                   * runtime multimethod value can find it (Emmy defunary) */
         "         (let [d# ~dispatch]\n"
         "           (fn [& args#]\n"
-        "             (let [t# (get @cljc/multi-tables '~key)\n"
+        "             (let [t# (get @clove/multi-tables '~key)\n"
         "                   dv# (apply d# args#)\n"
         "                   m# (or (get t# dv#)\n"
-        "                          (cljc/multi-find t# dv# (get (deref cljc/multi-prefs) '~key))\n"
+        "                          (clove/multi-find t# dv# (get (deref clove/multi-prefs) '~key))\n"
         "                          (get t# ~default))]\n"
         "               (if m#\n"
         "                 (apply m# args#)\n"
         "                 (throw (IllegalArgumentException. (str \"No method in \" '~name\n"
         "                                      \" for \" (pr-str dv#))))))))\n"
-        "         {:cljc/mm-key '~key})))))\n"
+        "         {:clove/mm-key '~key})))))\n"
         "(defmacro defmethod [name dval params & body]\n"
         /* peel reader metadata off the multimethod name (e.g. defgeneric passes
            ^:no-doc add): otherwise ~name evaluates to (with-meta add ..), losing
-           the :cljc/mm-key and keying the method under the wrong table entry */
+           the :clove/mm-key and keying the method under the wrong table entry */
         "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))]\n"
-        /* skip a host-class dispatch value (dotted / $-inner-class) that cljc
+        /* skip a host-class dispatch value (dotted / $-inner-class) that clove
            can't resolve — it would never match anyway; bare typos still error */
         "  (if (and (symbol? dval)\n"
         "           (or (str/includes? (str dval) \".\") (str/includes? (str dval) \"$\"))\n"
-        "           (not (cljc/resolve-maybe (str dval))))\n"
+        "           (not (clove/resolve-maybe (str dval))))\n"
         "    nil\n"
         /* Clojure evaluates the multifn (so it can be a runtime value, e.g. Emmy's
        defunary passes the multimethod as a fn arg). Read its table key from the
        dispatch fn's metadata; fall back to the literal name for a plain symbol. */
     "    `(let [mm# ~name\n"
-        "           key# (or (:cljc/mm-key (meta mm#)) (cljc/mmk '~name))]\n"
-        "       (swap! cljc/multi-tables update key# assoc ~dval (fn ~params ~@body))\n"
+        "           key# (or (:clove/mm-key (meta mm#)) (clove/mmk '~name))]\n"
+        "       (swap! clove/multi-tables update key# assoc ~dval (fn ~params ~@body))\n"
         "       mm#))))\n"
-        /* multimethod API. The table key lives in the multifn's :cljc/mm-key
+        /* multimethod API. The table key lives in the multifn's :clove/mm-key
            meta (set by defmulti/read by defmethod) — introspection must use the
-           SAME key, not (cljc/mmk mm) on the fn value (which differs). */
-        "(defn cljc/mm-key [mm] (or (:cljc/mm-key (meta mm)) (cljc/mmk mm)))\n"
-        "(def cljc/multi-prefs (atom {}))\n"
+           SAME key, not (clove/mmk mm) on the fn value (which differs). */
+        "(defn clove/mm-key [mm] (or (:clove/mm-key (meta mm)) (clove/mmk mm)))\n"
+        "(def clove/multi-prefs (atom {}))\n"
         "(defn prefer-method [mm x y]\n"
-        "  (swap! cljc/multi-prefs update (cljc/mm-key mm)\n"
+        "  (swap! clove/multi-prefs update (clove/mm-key mm)\n"
         "         (fn [p] (update (or p {}) x (fn [s] (conj (or s #{}) y))))) mm)\n"
-        "(defn prefers [mm] (get @cljc/multi-prefs (cljc/mm-key mm) {}))\n"
-        "(defn remove-method [mm dval] (swap! cljc/multi-tables update (cljc/mm-key mm) dissoc dval) mm)\n"
-        "(defn remove-all-methods [mm] (swap! cljc/multi-tables assoc (cljc/mm-key mm) {}) mm)\n"
-        "(defn get-method [mm dval] (get (get @cljc/multi-tables (cljc/mm-key mm)) dval))\n"
-        "(defn methods [mm] (get @cljc/multi-tables (cljc/mm-key mm)))\n"
+        "(defn prefers [mm] (get @clove/multi-prefs (clove/mm-key mm) {}))\n"
+        "(defn remove-method [mm dval] (swap! clove/multi-tables update (clove/mm-key mm) dissoc dval) mm)\n"
+        "(defn remove-all-methods [mm] (swap! clove/multi-tables assoc (clove/mm-key mm) {}) mm)\n"
+        "(defn get-method [mm dval] (get (get @clove/multi-tables (clove/mm-key mm)) dval))\n"
+        "(defn methods [mm] (get @clove/multi-tables (clove/mm-key mm)))\n"
         /* print-method/print-dup: Clojure printing multimethods libraries extend
-           (cljc prints via print_to; these just need to exist + be defmethod-able) */
+           (clove prints via print_to; these just need to exist + be defmethod-able) */
         "(defmulti print-method (fn [x & _] (type x)))\n"
         "(defmulti print-dup (fn [x & _] (type x)))\n"
         /* minimal clojure.pprint: simple-dispatch is a multimethod libraries
@@ -14992,16 +14994,16 @@ CljcEnv *cljc_new_env(void) {
         "                  `(defmulti ~m (fn [& args#] (type (first args#))))))\n"
         "              sigs)\n"
         "       (def ~pname '~(mapv first sigs)))))\n"
-        /* definterface: cljc has no host interfaces — bind the name to a type
+        /* definterface: clove has no host interfaces — bind the name to a type
            keyword so deftype/instance?/extend references to it resolve. */
         "(defmacro definterface [iname & sigs] `(def ~iname ~(keyword (str iname))))\n"
         "(defmacro extend-type [t & impls]\n"
         /* Skip interleaved protocol-name symbols (Clojure syntax: (extend-type
-           T Proto (m [this] ..) ..)); cljc dispatches per method. A keyword type
-           (cljc-native, e.g. :string) dispatches directly; a symbol type (host
+           T Proto (m [this] ..) ..)); clove dispatches per method. A keyword type
+           (clove-native, e.g. :string) dispatches directly; a symbol type (host
            class / deftype name) is resolved to its dispatch value at runtime and
            SKIPPED if unresolved — so extensions to classes/protocol-interfaces
-           cljc lacks are quietly ignored rather than erroring. */
+           clove lacks are quietly ignored rather than erroring. */
         /* group arities by method name so a multi-arity protocol method
            (e.g. IFn invoke) becomes one multi-arity fn, not colliding entries */
         "  (let [ms (filter list? impls)\n"
@@ -15014,19 +15016,19 @@ CljcEnv *cljc_new_env(void) {
         "                          arities (mapcat (fn [form] (if (vector? (second form))\n"
         "                                                       [`(~(vec (second form)) ~@(drop 2 form))]\n"
         "                                                       (map (fn [a] `(~(vec (first a)) ~@(rest a))) (rest form)))) g)]\n"
-        "                      `(cljc/reg-method! '~m ~t (fn ~@arities))))\n"
+        "                      `(clove/reg-method! '~m ~t (fn ~@arities))))\n"
         "                  groups))\n"
-        "      `(when-let [tv# (cljc/resolve-maybe '~t)]\n"
+        "      `(when-let [tv# (clove/resolve-maybe '~t)]\n"
         "         ~@(map (fn [g]\n"
         "                  (let [m (first (first g))\n"
         "                        arities (mapcat (fn [form] (if (vector? (second form))\n"
         "                                                     [`(~(vec (second form)) ~@(drop 2 form))]\n"
         "                                                     (map (fn [a] `(~(vec (first a)) ~@(rest a))) (rest form)))) g)]\n"
-        "                    `(cljc/reg-method! '~m tv# (fn ~@arities))))\n"
+        "                    `(clove/reg-method! '~m tv# (fn ~@arities))))\n"
         "                groups)))))\n"
         /* (extend-protocol P T1 (m [x] ...) (m2 [x] ...) T2 (m [x] ...)) —
            grouped by TYPE; expands to one extend-type per type. The protocol
-           name is ignored (cljc methods dispatch globally on type). */
+           name is ignored (clove methods dispatch globally on type). */
         "(defmacro extend-protocol [p & specs]\n"
         "  (let [groups (loop [s specs acc [] cur nil]\n"
         "                 (cond\n"
@@ -15042,78 +15044,78 @@ CljcEnv *cljc_new_env(void) {
         "(defn extend [t & proto+maps]\n"
         "  (doseq [pm (partition 2 proto+maps)]\n"
         "    (doseq [e (second pm)]\n"
-        "      (swap! cljc/multi-tables update (symbol (name (first e))) assoc t (second e)))))\n"
-        /* A type satisfies a protocol if it participates in it. cljc tracks
+        "      (swap! clove/multi-tables update (symbol (name (first e))) assoc t (second e)))))\n"
+        /* A type satisfies a protocol if it participates in it. clove tracks
            per-method registration, so test whether x's type implements ANY of
            the protocol's methods — a reify/extend may legally omit some (they'd
            throw only if called), and `every?` would wrongly reject it. */
         "(defn satisfies? [proto x]\n"
-        "  (boolean (some (fn [m] (contains? (get @cljc/multi-tables (cljc/mmk m)) (type x))) proto)))\n"
-        /* records: maps tagged with :cljc/type */
+        "  (boolean (some (fn [m] (contains? (get @clove/multi-tables (clove/mmk m)) (type x))) proto)))\n"
+        /* records: maps tagged with :clove/type */
         /* defrecord: like deftype but immutable (fields are direct values, no
            atoms) and with both ->R (positional) and map->R (from a map) ctors.
            Protocol method bodies are field-rewritten and registered like
            deftype's. */
         "(defmacro defrecord [rname fields & specs]\n"
-        "  (let [rname (cljc/field-sym rname)\n"
+        "  (let [rname (clove/field-sym rname)\n"
         "        kw    (keyword (str rname))\n"
-        "        fsyms (mapv cljc/field-sym fields)\n"
+        "        fsyms (mapv clove/field-sym fields)\n"
         "        fset  (set fsyms)\n"
         "        ms    (filter list? specs)\n"
         "        kvs   (mapcat (fn [s] [(keyword (str s)) s]) fsyms)]\n"
         "    `(do\n"
         "       (def ~rname ~kw)\n"
-        "       (swap! cljc/record-types conj ~kw)\n"   /* records ARE maps; deftypes aren't */
+        "       (swap! clove/record-types conj ~kw)\n"   /* records ARE maps; deftypes aren't */
         "       (derive ~kw :clojure.lang.IRecord)\n"
-        "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :cljc/type ~kw ~@kvs))\n"
+        "       (defn ~(symbol (str \"->\" rname)) ~fsyms (hash-map :clove/type ~kw ~@kvs))\n"
         "       (def ~(symbol (str rname \".\")) ~(symbol (str \"->\" rname)))\n"
-        "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :cljc/type ~kw))\n"
+        "       (defn ~(symbol (str \"map->\" rname)) [m] (assoc m :clove/type ~kw))\n"
         "       ~@(map (fn [g]\n"
         "                (let [mn (first g)\n"
         "                      arities (map (fn [m]\n"
         "                                     (let [oparams (vec (second m)) othis (first oparams)\n"
         "                                           this (if (= othis '_) (gensym \"this\") othis)\n"
         "                                           params (assoc oparams 0 this)\n"
-        "                                           body (map (fn [x] (cljc/deftype-walk x fset #{} this)) (drop 2 m))]\n"
+        "                                           body (map (fn [x] (clove/deftype-walk x fset #{} this)) (drop 2 m))]\n"
         "                                       `(~params ~@body)))\n"
         "                                   (second g))]\n"
-        "                  `(cljc/reg-method! '~mn ~kw (fn ~@arities))))\n"
+        "                  `(clove/reg-method! '~mn ~kw (fn ~@arities))))\n"
         "              (group-by first ms))\n"
         "       ~kw)))\n"
         /* delay/force: a deftype whose IDeref forces the thunk once, memoized
-           (cljc's deref dispatch handles @d). Defined here — after multi-tables
+           (clove's deref dispatch handles @d). Defined here — after multi-tables
            and the deftype machinery exist. */
-        "(deftype CljcDelay [^:unsynchronized-mutable f ^:unsynchronized-mutable v]\n"
+        "(deftype CloveDelay [^:unsynchronized-mutable f ^:unsynchronized-mutable v]\n"
         "  clojure.lang.IDeref\n"
         "  (deref [_] (when f (set! v (f)) (set! f nil)) v))\n"
-        "(defmacro delay [& body] `(CljcDelay. (fn [] ~@body) nil))\n"
-        "(defn delay? [x] (= :CljcDelay (type x)))\n"
-        "(defn force [x] (if (= :CljcDelay (type x)) (deref x) x))\n"
+        "(defmacro delay [& body] `(CloveDelay. (fn [] ~@body) nil))\n"
+        "(defn delay? [x] (= :CloveDelay (type x)))\n"
+        "(defn force [x] (if (= :CloveDelay (type x)) (deref x) x))\n"
         "(defn record? [x]\n"
-        "  (and (map? x) (contains? (deref cljc/record-types) (get x :cljc/type))))\n"
+        "  (and (map? x) (contains? (deref clove/record-types) (get x :clove/type))))\n"
         /* reify: a form's type keyword t is fixed at macroexpand time, so EVERY
            instance of one (reify ..) form shares t. Methods must therefore live
-           PER INSTANCE (in :cljc/impls), not in the global method table keyed by
+           PER INSTANCE (in :clove/impls), not in the global method table keyed by
            t — else a second instance's methods clobber the first's. We register
            one delegating dispatch method per (proto-method, t) that forwards to
            the receiver's own impl, and store each instance's closures in it. */
-        "(defn cljc/reg-reify-method! [mname t]\n"
-        "  (when-not (contains? (get (deref cljc/multi-tables) mname) t)\n"
-        "    (swap! cljc/multi-tables update mname\n"
+        "(defn clove/reg-reify-method! [mname t]\n"
+        "  (when-not (contains? (get (deref clove/multi-tables) mname) t)\n"
+        "    (swap! clove/multi-tables update mname\n"
         "           (fn [tb] (assoc (or tb {}) t\n"
-        "                       (fn [& args] (apply (get (:cljc/impls (first args)) mname) args)))))))\n"
+        "                       (fn [& args] (apply (get (:clove/impls (first args)) mname) args)))))))\n"
         /* same-name clauses (e.g. IReduce's 2- and 3-arg `reduce`) become ONE
            multi-arity fn, as deftype does — a plain hash-map kept only the last */
         "(defmacro reify [& clauses]\n"
         "  (let [t (keyword (str (gensym)))\n"
         "        ms (filter list? clauses)\n"
         "        groups (reduce (fn [acc m] (update acc (first m) (fn [v] (conj (or v []) m)))) {} ms)\n"
-        "        regs (map (fn [mname] (list 'cljc/reg-reify-method! (list 'quote mname) t)) (keys groups))\n"
+        "        regs (map (fn [mname] (list 'clove/reg-reify-method! (list 'quote mname) t)) (keys groups))\n"
         "        impls (mapcat (fn [[mname cs]]\n"
         "                        (list (list 'quote mname)\n"
         "                              (cons 'fn (map (fn [m] (cons (vec (second m)) (drop 2 m))) cs))))\n"
         "                      groups)\n"
-        "        inst (list 'hash-map :cljc/type t :cljc/impls (cons 'hash-map impls))]\n"
+        "        inst (list 'hash-map :clove/type t :clove/impls (cons 'hash-map impls))]\n"
         "    (concat (list 'do) regs (list inst))))\n");
     /* Tier 3.5: the fiber scheduler + Clojure's blocking concurrency API.
      * One shared cooperative scheduler (ready queue of thunks, timer wheel,
@@ -15122,7 +15124,7 @@ CljcEnv *cljc_new_env(void) {
      * go blocks and a <!! runs pending futures. Janet's ev/ model: blocking
      * ops park the current fiber when inside one, and drive the loop when on
      * the main thread. Defined after deftype (promise/future are deftypes). */
-    cljc_eval_string(e,
+    clove_eval_string(e,
         "(def ^:dynamic fiber/*self* nil)\n"   /* coroutine currently running */
         "(def fiber/ready (atom []))\n"        /* queue of ready 0-arg thunks */
         "(def fiber/timers (atom []))\n"       /* vector of [deadline-ms wake-fn] */
@@ -15141,7 +15143,7 @@ CljcEnv *cljc_new_env(void) {
         "      ((nth q 0))\n"
         "      true)))\n"
         "(defn fiber/fire-timers! []\n"
-        "  (let [now (cljc/now-ms*)\n"
+        "  (let [now (clove/now-ms*)\n"
         "        due (filterv (fn [t] (<= (first t) now)) (deref fiber/timers))]\n"
         "    (when (seq due)\n"
         "      (swap! fiber/timers (fn [ts] (filterv (fn [t] (> (first t) now)) ts)))\n"
@@ -15155,8 +15157,8 @@ CljcEnv *cljc_new_env(void) {
         "  (let [ws (deref fiber/io-waiters)]\n"
         "    (when (seq ws)\n"
         "      (let [nd (fiber/next-deadline)\n"
-        "            tmo (if nd (long (max 0 (- nd (cljc/now-ms*)))) -1)\n"
-        "            revents (cljc/poll-fds* (mapv :fd ws) (mapv :ev ws) tmo)\n"
+        "            tmo (if nd (long (max 0 (- nd (clove/now-ms*)))) -1)\n"
+        "            revents (clove/poll-fds* (mapv :fd ws) (mapv :ev ws) tmo)\n"
         "            kept (atom [])]\n"
         "        (dotimes [i (count ws)]\n"
         "          (let [w (nth ws i)]\n"
@@ -15170,14 +15172,14 @@ CljcEnv *cljc_new_env(void) {
         "  (coro/yield nil))\n"
         "(defn fiber/idle! []\n"               /* nothing runnable: sleep till nearest timer */
         "  (when-let [nd (fiber/next-deadline)]\n"
-        "    (cljc/sleep-ms* (max 0 (- nd (cljc/now-ms*))))\n"
+        "    (clove/sleep-ms* (max 0 (- nd (clove/now-ms*))))\n"
         "    true))\n"
         /* one scheduler step; false only when NOTHING can ever make progress */
         "(defn fiber/pump! []\n"
         "  (or (fiber/run-one!) (fiber/fire-timers!) (fiber/io-poll!) (fiber/idle!) false))\n"
         "(defn fiber/sleep! [ms]\n"            /* park the current fiber for ms */
         "  (let [self fiber/*self*]\n"
-        "    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (fiber/schedule! self nil)))\n"
+        "    (fiber/timer! (+ (clove/now-ms*) ms) (fn [] (fiber/schedule! self nil)))\n"
         "    (coro/yield nil)))\n"
         /* one-shot wake for the current fiber: registered with several sources
            (a promise's waiter list AND a timeout timer) — first to fire wins */
@@ -15185,8 +15187,8 @@ CljcEnv *cljc_new_env(void) {
         "  (let [done (atom false) self fiber/*self*]\n"
         "    (fn [] (when-not (deref done) (reset! done true) (fiber/schedule! self nil)))))\n"
         /* ── pending cells: the shared engine under promise and future ── */
-        "(defn cljc/pending* [] (atom {:realized false :val nil :err nil :waiters []}))\n"
-        "(defn cljc/pending-realize! [state v err]\n"
+        "(defn clove/pending* [] (atom {:realized false :val nil :err nil :waiters []}))\n"
+        "(defn clove/pending-realize! [state v err]\n"
         "  (let [s (deref state)]\n"
         "    (when-not (:realized s)\n"
         "      (swap! state assoc :realized true :val v :err err :waiters [])\n"
@@ -15194,7 +15196,7 @@ CljcEnv *cljc_new_env(void) {
         "      true)))\n"
         /* blocking deref: in a fiber, park on the waiter list; on the main
            thread, drive the scheduler until delivered (or provably stuck). */
-        "(defn cljc/pending-await [state what]\n"
+        "(defn clove/pending-await [state what]\n"
         "  (loop []\n"
         "    (let [s (deref state)]\n"
         "      (cond\n"
@@ -15203,14 +15205,14 @@ CljcEnv *cljc_new_env(void) {
         "                         (coro/yield nil) (recur))\n"
         "        (fiber/pump!) (recur)\n"
         "        :else (throw (ex-info (str \"deref: deadlock - nothing can deliver this \" what) {}))))))\n"
-        "(defn cljc/pending-await-tmo [state ms tval]\n"
-        "  (let [deadline (+ (cljc/now-ms*) ms)]\n"
+        "(defn clove/pending-await-tmo [state ms tval]\n"
+        "  (let [deadline (+ (clove/now-ms*) ms)]\n"
         "    (if fiber/*self*\n"
         "      (loop [armed false]\n"
         "        (let [s (deref state)]\n"
         "          (cond\n"
         "            (:realized s) (if (:err s) (throw (:err s)) (:val s))\n"
-        "            (or armed (>= (cljc/now-ms*) deadline)) tval\n"
+        "            (or armed (>= (clove/now-ms*) deadline)) tval\n"
         "            :else (let [w (fiber/waker)]\n"
         "                    (swap! state update :waiters conj w)\n"
         "                    (fiber/timer! deadline w)\n"
@@ -15221,34 +15223,34 @@ CljcEnv *cljc_new_env(void) {
         "            (let [s (deref state)]\n"
         "              (cond\n"
         "                (:realized s) (if (:err s) (throw (:err s)) (:val s))\n"
-        "                (>= (cljc/now-ms*) deadline) tval\n"
+        "                (>= (clove/now-ms*) deadline) tval\n"
         "                :else (do (fiber/pump!) (recur)))))))))\n"
         /* ── promise / future (Clojure API, cooperative semantics) ── */
-        "(deftype CljcPromise [state]\n"
+        "(deftype ClovePromise [state]\n"
         "  clojure.lang.IDeref\n"
-        "  (deref [_] (cljc/pending-await state \"promise\"))\n"
-        "  (cljc/deref-timeout [_ ms tval] (cljc/pending-await-tmo state ms tval)))\n"
-        "(defn promise [] (CljcPromise. (cljc/pending*)))\n"
+        "  (deref [_] (clove/pending-await state \"promise\"))\n"
+        "  (clove/deref-timeout [_ ms tval] (clove/pending-await-tmo state ms tval)))\n"
+        "(defn promise [] (ClovePromise. (clove/pending*)))\n"
         "(defn deliver [p v]\n"
-        "  (if (and (map? p) (= :CljcPromise (:cljc/type p)))\n"
-        "    (when (cljc/pending-realize! (:state p) v nil) p)\n"   /* nil if already delivered */
+        "  (if (and (map? p) (= :ClovePromise (:clove/type p)))\n"
+        "    (when (clove/pending-realize! (:state p) v nil) p)\n"   /* nil if already delivered */
         "    (do (reset! p v) p)))\n"                               /* legacy atom-as-promise */
-        "(deftype CljcFuture [state]\n"
+        "(deftype CloveFuture [state]\n"
         "  clojure.lang.IDeref\n"
-        "  (deref [_] (cljc/pending-await state \"future\"))\n"
-        "  (cljc/deref-timeout [_ ms tval] (cljc/pending-await-tmo state ms tval)))\n"
+        "  (deref [_] (clove/pending-await state \"future\"))\n"
+        "  (clove/deref-timeout [_ ms tval] (clove/pending-await-tmo state ms tval)))\n"
         "(defn future-call [f]\n"
-        "  (let [state (cljc/pending*)]\n"
+        "  (let [state (clove/pending*)]\n"
         "    (fiber/spawn!\n"
         "      (fn []\n"
         "        (if (:cancelled (deref state))\n"
-        "          (cljc/pending-realize! state nil (ex-info \"future cancelled\" {:cljc/cancelled true}))\n"
+        "          (clove/pending-realize! state nil (ex-info \"future cancelled\" {:clove/cancelled true}))\n"
         "          (do (swap! state assoc :started true)\n"
-        "              (try (cljc/pending-realize! state (f) nil)\n"
-        "                   (catch Throwable e (cljc/pending-realize! state nil e)))))))\n"
-        "    (CljcFuture. state)))\n"
+        "              (try (clove/pending-realize! state (f) nil)\n"
+        "                   (catch Throwable e (clove/pending-realize! state nil e)))))))\n"
+        "    (CloveFuture. state)))\n"
         "(defmacro future [& body] `(future-call (fn [] ~@body)))\n"
-        "(defn future? [x] (and (map? x) (= :CljcFuture (:cljc/type x))))\n"
+        "(defn future? [x] (and (map? x) (= :CloveFuture (:clove/type x))))\n"
         "(defn future-done? [fut]\n"
         "  (let [s (deref (:state fut))] (boolean (or (:realized s) (:cancelled s)))))\n"
         /* cancel only wins before the fiber first runs — a running fiber is
@@ -15262,11 +15264,11 @@ CljcEnv *cljc_new_env(void) {
         "(defn pcalls [& fns] (map deref (mapv future-call fns)))\n"
         "(defmacro pvalues [& exprs] `(pcalls ~@(map (fn [e] `(fn [] ~e)) exprs)))\n"
         "(defn realized? [x]\n"
-        "  (if (and (map? x) (contains? x :cljc/type))\n"
+        "  (if (and (map? x) (contains? x :clove/type))\n"
         "    (cond\n"
-        "      (= :CljcPromise (:cljc/type x)) (:realized (deref (:state x)))\n"
-        "      (= :CljcFuture  (:cljc/type x)) (:realized (deref (:state x)))\n"
-        "      (= :CljcDelay   (:cljc/type x)) (nil? (deref (:f x)))\n"
+        "      (= :ClovePromise (:clove/type x)) (:realized (deref (:state x)))\n"
+        "      (= :CloveFuture  (:clove/type x)) (:realized (deref (:state x)))\n"
+        "      (= :CloveDelay   (:clove/type x)) (nil? (deref (:f x)))\n"
         "      :else true)\n"
         "    true))\n"
         /* Thread/sleep, fiber-aware (shadows the PRELUDE stub): in a fiber,
@@ -15275,9 +15277,9 @@ CljcEnv *cljc_new_env(void) {
         "(defn Thread/sleep [ms & _]\n"
         "  (if fiber/*self*\n"
         "    (fiber/sleep! ms)\n"
-        "    (let [deadline (+ (cljc/now-ms*) ms)]\n"
+        "    (let [deadline (+ (clove/now-ms*) ms)]\n"
         "      (fiber/timer! deadline (fn [] nil))\n"
-        "      (loop [] (when (< (cljc/now-ms*) deadline) (fiber/pump!) (recur)))))\n"
+        "      (loop [] (when (< (clove/now-ms*) deadline) (fiber/pump!) (recur)))))\n"
         "  nil)\n");
     /* Tier 3.6: agents + STM refs (shadow the PRELUDE's degenerate shims).
      * Agents: a deftype over a state atom {:val :queue :running :error ...};
@@ -15296,7 +15298,7 @@ CljcEnv *cljc_new_env(void) {
      * inside agent ACTIONS dispatch immediately (Clojure holds them); watches
      * are real on agents/refs but remain no-ops on atoms (swap! is a C
      * native that predates any watch registry). */
-    cljc_eval_string(e,
+    clove_eval_string(e,
         /* The current STM transaction must be FIBER-local, not a dynamic var:
          * `binding` is a global stack, so a tx body that yields (sleep, deref,
          * io) would leak its binding to whichever context runs next — the main
@@ -15304,28 +15306,28 @@ CljcEnv *cljc_new_env(void) {
          * (found by the retry test). The fiber *self* var is rebound around
          * every resume (item 46), so a map keyed by it (nil = main thread) is
          * correct across yields; coros hash by identity. */
-        "(def cljc/txs (atom {}))\n"
-        "(defn cljc/tx [] (get (deref cljc/txs) fiber/*self*))\n"
-        "(defn cljc/tx-deref [r]\n"            /* first touch records the version */
-        "  (let [tx (cljc/tx) id (:id r)]\n"
+        "(def clove/txs (atom {}))\n"
+        "(defn clove/tx [] (get (deref clove/txs) fiber/*self*))\n"
+        "(defn clove/tx-deref [r]\n"            /* first touch records the version */
+        "  (let [tx (clove/tx) id (:id r)]\n"
         "    (if (contains? (deref (:vals tx)) id)\n"
         "      (get (deref (:vals tx)) id)\n"
         "      (let [s (deref (:state r))]\n"
         "        (swap! (:readv tx) assoc id (:version s))\n"
         "        (swap! (:vals tx) assoc id (:val s))\n"
         "        (:val s)))))\n"
-        "(defn cljc/fire-watches! [r old new]\n"
+        "(defn clove/fire-watches! [r old new]\n"
         "  (doseq [kv (:watches (deref (:state r)))] ((second kv) (first kv) r old new)))\n"
         "(defn add-watch [r k f]\n"           /* shadows the PRELUDE no-op */
-        "  (when (and (map? r) (#{:CljcAgent :CljcRef} (:cljc/type r)))\n"
+        "  (when (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
         "    (swap! (:state r) update :watches assoc k f))\n"
         "  r)\n"
         "(defn remove-watch [r k]\n"
-        "  (when (and (map? r) (#{:CljcAgent :CljcRef} (:cljc/type r)))\n"
+        "  (when (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
         "    (swap! (:state r) update :watches dissoc k))\n"
         "  r)\n"
         /* ── agents ── */
-        "(deftype CljcAgent [state]\n"
+        "(deftype CloveAgent [state]\n"
         "  clojure.lang.IDeref\n"
         "  (deref [_] (:val (deref state))))\n"
         "(defn agent [v & opts]\n"
@@ -15333,9 +15335,9 @@ CljcEnv *cljc_new_env(void) {
         "        handler (:error-handler o)\n"
         /* Clojure's default: a supplied handler implies :continue */
         "        mode (or (:error-mode o) (if handler :continue :fail))]\n"
-        "    (CljcAgent. (atom {:val v :queue [] :running false :error nil\n"
+        "    (CloveAgent. (atom {:val v :queue [] :running false :error nil\n"
         "                       :error-mode mode :error-handler handler :watches {}}))))\n"
-        "(defn cljc/agent-drain! [a]\n"        /* runs as a fiber; serial per agent */
+        "(defn clove/agent-drain! [a]\n"        /* runs as a fiber; serial per agent */
         "  (let [st (:state a)]\n"
         "    (loop []\n"
         "      (if-let [action (first (:queue (deref st)))]\n"
@@ -15344,7 +15346,7 @@ CljcEnv *cljc_new_env(void) {
         "                  (let [old (:val (deref st))\n"
         "                        nv (apply (first action) old (second action))]\n"
         "                    (swap! st assoc :val nv)\n"
-        "                    (cljc/fire-watches! a old nv)\n"
+        "                    (clove/fire-watches! a old nv)\n"
         "                    true)\n"
         "                  (catch Throwable e\n"
         "                    (let [m (deref st)]\n"
@@ -15357,18 +15359,18 @@ CljcEnv *cljc_new_env(void) {
         "              (recur)\n"
         "              (swap! st assoc :running false)))\n"
         "        (swap! st assoc :running false)))))\n"
-        "(defn cljc/agent-enqueue! [a f args]\n"
+        "(defn clove/agent-enqueue! [a f args]\n"
         "  (let [st (:state a)]\n"
         "    (swap! st update :queue conj [f args])\n"
         "    (when-not (or (:running (deref st)) (:error (deref st)))\n"
         "      (swap! st assoc :running true)\n"
-        "      (fiber/spawn! (fn [] (cljc/agent-drain! a))))\n"
+        "      (fiber/spawn! (fn [] (clove/agent-drain! a))))\n"
         "    a))\n"
         "(defn send [a f & args]\n"
         "  (when-let [e (:error (deref (:state a)))] (throw e))\n"
-        "  (if (cljc/tx)\n"                    /* in-tx sends held until commit */
-        "    (do (swap! (:sends (cljc/tx)) conj [a f args]) a)\n"
-        "    (cljc/agent-enqueue! a f args)))\n"
+        "  (if (clove/tx)\n"                    /* in-tx sends held until commit */
+        "    (do (swap! (:sends (clove/tx)) conj [a f args]) a)\n"
+        "    (clove/agent-enqueue! a f args)))\n"
         "(def send-off send)\n"                /* no blocking-vs-cpu pools here */
         "(defn send-via [_ a f & args] (apply send a f args))\n"
         "(defn agent-error [a] (:error (deref (:state a))))\n"
@@ -15381,7 +15383,7 @@ CljcEnv *cljc_new_env(void) {
         "    (when (:clear-actions o) (swap! st assoc :queue []))\n"
         "    (when (and (seq (:queue (deref st))) (not (:running (deref st))))\n"
         "      (swap! st assoc :running true)\n"
-        "      (fiber/spawn! (fn [] (cljc/agent-drain! a))))\n"
+        "      (fiber/spawn! (fn [] (clove/agent-drain! a))))\n"
         "    v))\n"
         "(defn clear-agent-errors [a] (restart-agent a (:val (deref (:state a)))))\n"
         "(defn set-error-handler! [a h] (swap! (:state a) assoc :error-handler h) nil)\n"
@@ -15390,66 +15392,66 @@ CljcEnv *cljc_new_env(void) {
         "(defn error-mode [a] (:error-mode (deref (:state a))))\n"
         /* await: piggyback a marker action per agent; its promise delivers
            when everything enqueued before it has run. deref drives the pump. */
-        "(defn cljc/await-marker! [a]\n"
+        "(defn clove/await-marker! [a]\n"
         "  (when-let [e (agent-error a)] (throw e))\n"
         "  (let [p (promise)]\n"
-        "    (cljc/agent-enqueue! a (fn [v] (deliver p true) v) [])\n"
+        "    (clove/agent-enqueue! a (fn [v] (deliver p true) v) [])\n"
         "    p))\n"
         "(defn await [& agents]\n"
-        "  (doseq [p (mapv cljc/await-marker! agents)] (deref p))\n"
+        "  (doseq [p (mapv clove/await-marker! agents)] (deref p))\n"
         "  nil)\n"
         "(defn await-for [ms & agents]\n"
-        "  (let [deadline (+ (cljc/now-ms*) ms)]\n"
-        "    (loop [ps (seq (mapv cljc/await-marker! agents))]\n"
+        "  (let [deadline (+ (clove/now-ms*) ms)]\n"
+        "    (loop [ps (seq (mapv clove/await-marker! agents))]\n"
         "      (if ps\n"
-        "        (if (= :cljc/tmo (deref (first ps)\n"
-        "                                (max 0 (- deadline (cljc/now-ms*)))\n"
-        "                                :cljc/tmo))\n"
+        "        (if (= :clove/tmo (deref (first ps)\n"
+        "                                (max 0 (- deadline (clove/now-ms*)))\n"
+        "                                :clove/tmo))\n"
         "          false\n"
         "          (recur (next ps)))\n"
         "        true))))\n"
         "(defn release-pending-sends []\n"
-        "  (if (cljc/tx)\n"
-        "    (let [sends (deref (:sends (cljc/tx)))]\n"
-        "      (reset! (:sends (cljc/tx)) [])\n"
-        "      (doseq [s sends] (cljc/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
+        "  (if (clove/tx)\n"
+        "    (let [sends (deref (:sends (clove/tx)))]\n"
+        "      (reset! (:sends (clove/tx)) [])\n"
+        "      (doseq [s sends] (clove/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
         "      (count sends))\n"
         "    0))\n"
         "(defn shutdown-agents [] nil)\n"      /* cooperative: nothing to stop */
         /* ── STM refs ── */
-        "(def cljc/ref-counter (atom 0))\n"
-        "(deftype CljcRef [id state]\n"
+        "(def clove/ref-counter (atom 0))\n"
+        "(deftype CloveRef [id state]\n"
         "  clojure.lang.IDeref\n"
-        "  (deref [this] (if (cljc/tx) (cljc/tx-deref this) (:val (deref state)))))\n"
-        "(defn ref [v & _] (CljcRef. (swap! cljc/ref-counter inc) (atom {:val v :version 0 :watches {}})))\n"
-        "(defn cljc/tx-check! [op]\n"
-        "  (when-not (cljc/tx)\n"
+        "  (deref [this] (if (clove/tx) (clove/tx-deref this) (:val (deref state)))))\n"
+        "(defn ref [v & _] (CloveRef. (swap! clove/ref-counter inc) (atom {:val v :version 0 :watches {}})))\n"
+        "(defn clove/tx-check! [op]\n"
+        "  (when-not (clove/tx)\n"
         "    (throw (IllegalStateException. (str op \": no transaction running (use dosync)\")))))\n"
         "(defn ref-set [r v]\n"
-        "  (cljc/tx-check! \"ref-set\")\n"
-        "  (let [tx (cljc/tx) id (:id r)]\n"
+        "  (clove/tx-check! \"ref-set\")\n"
+        "  (let [tx (clove/tx) id (:id r)]\n"
         "    (when-not (contains? (deref (:readv tx)) id)\n"
         "      (swap! (:readv tx) assoc id (:version (deref (:state r)))))\n"
         "    (swap! (:vals tx) assoc id v)\n"
         "    (swap! (:writes tx) conj id)\n"
         "    (swap! (:refs tx) assoc id r)\n"
         "    v))\n"
-        "(defn alter [r f & args] (ref-set r (apply f (do (cljc/tx-check! \"alter\") (cljc/tx-deref r)) args)))\n"
+        "(defn alter [r f & args] (ref-set r (apply f (do (clove/tx-check! \"alter\") (clove/tx-deref r)) args)))\n"
         "(defn commute [r f & args]\n"         /* re-applied on latest at commit; never conflicts */
-        "  (cljc/tx-check! \"commute\")\n"
-        "  (let [tx (cljc/tx) id (:id r)\n"
-        "        nv (apply f (cljc/tx-deref r) args)]\n"
+        "  (clove/tx-check! \"commute\")\n"
+        "  (let [tx (clove/tx) id (:id r)\n"
+        "        nv (apply f (clove/tx-deref r) args)]\n"
         "    (swap! (:vals tx) assoc id nv)\n"  /* tentative, for in-tx reads */
         "    (swap! (:refs tx) assoc id r)\n"
         "    (swap! (:commutes tx) conj [id f args])\n"
         "    nv))\n"
         "(defn ensure [r]\n"                   /* read that participates in conflict detection */
-        "  (cljc/tx-check! \"ensure\")\n"
-        "  (let [v (cljc/tx-deref r)]\n"
-        "    (swap! (:ensures (cljc/tx)) conj (:id r))\n"
-        "    (swap! (:refs (cljc/tx)) assoc (:id r) r)\n"
+        "  (clove/tx-check! \"ensure\")\n"
+        "  (let [v (clove/tx-deref r)]\n"
+        "    (swap! (:ensures (clove/tx)) conj (:id r))\n"
+        "    (swap! (:refs (clove/tx)) assoc (:id r) r)\n"
         "    v))\n"
-        "(defn cljc/tx-commit! [tx]\n"
+        "(defn clove/tx-commit! [tx]\n"
         "  (let [ids (into (deref (:writes tx)) (deref (:ensures tx)))]\n"
         "    (if (some (fn [id] (not= (get (deref (:readv tx)) id)\n"
         "                             (:version (deref (:state (get (deref (:refs tx)) id))))))\n"
@@ -15460,19 +15462,19 @@ CljcEnv *cljc_new_env(void) {
         "          (let [r (get (deref (:refs tx)) id) st (:state r)\n"
         "                old (:val (deref st)) nv (get (deref (:vals tx)) id)]\n"
         "            (swap! st assoc :val nv :version (inc (:version (deref st))))\n"
-        "            (cljc/fire-watches! r old nv)))\n"
+        "            (clove/fire-watches! r old nv)))\n"
         "        (doseq [c (deref (:commutes tx))\n"
         "                :when (not (contains? (deref (:writes tx)) (nth c 0)))]\n" /* alter/ref-set already committed it (Clojure: sets.contains(ref)) */
         "          (let [r (get (deref (:refs tx)) (nth c 0)) st (:state r)\n"
         "                old (:val (deref st))\n"
         "                nv (apply (nth c 1) old (nth c 2))]\n"
         "            (swap! st assoc :val nv :version (inc (:version (deref st))))\n"
-        "            (cljc/fire-watches! r old nv)))\n"
+        "            (clove/fire-watches! r old nv)))\n"
         "        (doseq [s (deref (:sends tx))]\n"   /* held sends fire on success only */
-        "          (cljc/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
+        "          (clove/agent-enqueue! (nth s 0) (nth s 1) (nth s 2)))\n"
         "        true))))\n"
-        "(defn cljc/tx-run [f]\n"
-        "  (if (cljc/tx)\n"
+        "(defn clove/tx-run [f]\n"
+        "  (if (clove/tx)\n"
         "    (f)\n"                            /* nested dosync joins the outer tx */
         "    (loop [attempt 0]\n"
         "      (when (> attempt 100)\n"
@@ -15480,14 +15482,14 @@ CljcEnv *cljc_new_env(void) {
         "      (let [tx {:vals (atom {}) :readv (atom {}) :writes (atom #{})\n"
         "                :ensures (atom #{}) :commutes (atom []) :refs (atom {})\n"
         "                :sends (atom [])}\n"
-        "            result (do (swap! cljc/txs assoc fiber/*self* tx)\n"
+        "            result (do (swap! clove/txs assoc fiber/*self* tx)\n"
         "                       (try (f)\n"
-        "                         (finally (swap! cljc/txs dissoc fiber/*self*))))]\n"
-        "        (if (cljc/tx-commit! tx) result (recur (inc attempt)))))))\n"
-        "(defmacro dosync [& body] `(cljc/tx-run (fn [] ~@body)))\n"
-        "(defmacro sync [_ & body] `(cljc/tx-run (fn [] ~@body)))\n"
+        "                         (finally (swap! clove/txs dissoc fiber/*self*))))]\n"
+        "        (if (clove/tx-commit! tx) result (recur (inc attempt)))))))\n"
+        "(defmacro dosync [& body] `(clove/tx-run (fn [] ~@body)))\n"
+        "(defmacro sync [_ & body] `(clove/tx-run (fn [] ~@body)))\n"
         "(defmacro io! [& body]\n"
-        "  `(if (cljc/tx)\n"
+        "  `(if (clove/tx)\n"
         "     (throw (IllegalStateException. \"io! block inside a transaction\"))\n"
         "     (do ~@body)))\n"
         "(defn ref-history-count [_] 0)\n"
@@ -15496,9 +15498,9 @@ CljcEnv *cljc_new_env(void) {
     /* FFI glue generator — declare C signatures as data, compile, load:
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */
-    cljc_eval_string(e,
-        "(def cljc/ffi-counter (atom 0))\n"
-        "(def cljc/ffi-api-decl\n"
+    clove_eval_string(e,
+        "(def clove/ffi-counter (atom 0))\n"
+        "(def clove/ffi-api-decl\n"
         "  (str \"typedef struct { void*(*mk_int)(long long);\"\n"
         "       \" void*(*mk_double)(double); void*(*mk_str)(const char*);\"\n"
         "       \" void*(*nil)(void); long long(*as_int)(void*);\"\n"
@@ -15507,28 +15509,28 @@ CljcEnv *cljc_new_env(void) {
         "       \" void(*def_native)(void*,const char*,void*(*)(void*,void*,int));\"\n"
         "       \" void(*error)(const char*);\"\n"
         "       \" void*(*mk_vec)(void**,int); void*(*nth_elem)(void*,int);\"\n"
-        "       \" } CljcFfiApi;\\n\"\n"
-        "       \"static CljcFfiApi *api;\\n\"))\n"
+        "       \" } CloveFfiApi;\\n\"\n"
+        "       \"static CloveFfiApi *api;\\n\"))\n"
         /* A private 0700 scratch dir per user. The FFI cache below is dlopen'd,
          * so a path shared across users in a world-writable /tmp lets anyone
          * plant a .so and get it executed in another user's process. Created
          * and ownership-checked once, then memoised. */
-        "(def cljc/user-tmp-dir-cache (atom nil))\n"
-        "(defn cljc/user-tmp-dir* []\n"
-        "  (or @cljc/user-tmp-dir-cache\n"
-        "      (let [d (str (or (cljc/env* \"TMPDIR\") \"/tmp\") \"/cljc-\" (cljc/getuid))]\n"
+        "(def clove/user-tmp-dir-cache (atom nil))\n"
+        "(defn clove/user-tmp-dir* []\n"
+        "  (or @clove/user-tmp-dir-cache\n"
+        "      (let [d (str (or (clove/env* \"TMPDIR\") \"/tmp\") \"/clove-\" (clove/getuid))]\n"
         "        (sh (str \"mkdir -p \" d \" && chmod 700 \" d))\n"
         "        (when-not (zero? (:exit (sh (str \"test -d \" d \" && test -O \" d))))\n"
-        "          (throw (ex-info (str \"cljc: \" d \" exists but is not a directory \"\n"
+        "          (throw (ex-info (str \"clove: \" d \" exists but is not a directory \"\n"
         "                               \"owned by this user; refusing to use it\") {})))\n"
-        "        (reset! cljc/user-tmp-dir-cache d)\n"
+        "        (reset! clove/user-tmp-dir-cache d)\n"
         "        d)))\n"
-        "(defn cljc/ffi-build [code libs]\n"
-        ";; CLJC_CC (same env var bundle.clj honors) overrides the glue compiler —\n"
+        "(defn clove/ffi-build [code libs]\n"
+        ";; CLOVE_CC (same env var bundle.clj honors) overrides the glue compiler —\n"
         ";; needed e.g. under Rosetta, where plain cc emits the wrong architecture.\n"
         ";; It participates in the cache key so two arches can't share a module.\n"
-        "  (let [cc (or (cljc/env* \"CLJC_CC\") \"cc\")\n"
-        "        base (str (cljc/user-tmp-dir*) \"/ffi4-\" (Math/abs (hash (str code libs cc))))]\n"
+        "  (let [cc (or (clove/env* \"CLOVE_CC\") \"cc\")\n"
+        "        base (str (clove/user-tmp-dir*) \"/ffi4-\" (Math/abs (hash (str code libs cc))))]\n"
         /* test -O, not -f: the module is dlopen'd, so loading one this user
          * does not own would execute someone else's code in this process. */
         "    (when-not (zero? (:exit (sh (str \"test -O \" base \".so\"))))\n"
@@ -15537,14 +15539,14 @@ CljcEnv *cljc_new_env(void) {
         "        (when-not (zero? (:exit r))\n"
         "          (throw (ex-info (str \"ffi: compile failed:\\n\" (:out r)) {})))))\n"
         "    (ffi-load* (str base \".so\"))))\n"
-        "(defn cljc/ffi-scalar-in [t expr]\n"
+        "(defn clove/ffi-scalar-in [t expr]\n"
         "  (case t\n"
         "    :int (str \"api->as_int(\" expr \")\")\n"
         "    :double (str \"api->as_double(\" expr \")\")\n"
         "    :float (str \"(float)api->as_double(\" expr \")\")\n"
         "    :string (str \"api->as_str(\" expr \")\")\n"
         "    :pointer (str \"(void*)api->as_int(\" expr \")\")))\n"
-        "(defn cljc/ffi-scalar-out [t expr]\n"
+        "(defn clove/ffi-scalar-out [t expr]\n"
         "  (case t\n"
         "    :int (str \"api->mk_int(\" expr \")\")\n"
         "    :double (str \"api->mk_double(\" expr \")\")\n"
@@ -15553,32 +15555,32 @@ CljcEnv *cljc_new_env(void) {
         "    :pointer (str \"api->mk_int((long long)(\" expr \"))\")))\n"
         /* A type is a scalar keyword (:int etc.) or a struct reference (a
          * string/symbol) that keys into the :structs registry. */
-        "(defn cljc/ffi-ret [structs t expr]\n"
+        "(defn clove/ffi-ret [structs t expr]\n"
         "  (cond\n"
         "    (= t :void) (str expr \"; return api->nil();\")\n"
-        "    (keyword? t) (str \"return \" (cljc/ffi-scalar-out t expr) \";\")\n"
+        "    (keyword? t) (str \"return \" (clove/ffi-scalar-out t expr) \";\")\n"
         "    :else\n"
         "    (let [fields (get structs (str t)) n (count fields)]\n"
         "      (str \"{ \" t \" _r = \" expr \"; void *_i[\" n \"]; \"\n"
         "           (str/join \" \" (map-indexed (fn [j [ft fnm]]\n"
-        "                            (str \"_i[\" j \"] = \" (cljc/ffi-scalar-out ft (str \"_r.\" fnm)) \";\"))\n"
+        "                            (str \"_i[\" j \"] = \" (clove/ffi-scalar-out ft (str \"_r.\" fnm)) \";\"))\n"
         "                          fields))\n"
         "           \" return api->mk_vec(_i, \" n \"); }\"))))\n"
-        "(defn cljc/ffi-arg [structs t i]\n"
+        "(defn clove/ffi-arg [structs t i]\n"
         "  (if (keyword? t)\n"
-        "    (cljc/ffi-scalar-in t (str \"api->nth_arg(args, \" i \")\"))\n"
+        "    (clove/ffi-scalar-in t (str \"api->nth_arg(args, \" i \")\"))\n"
         "    (let [fields (get structs (str t)) a (str \"api->nth_arg(args, \" i \")\")]\n"
         "      (str \"(\" t \"){\"\n"
         "           (str/join \", \" (map-indexed (fn [j [ft _]]\n"
-        "                            (cljc/ffi-scalar-in ft (str \"api->nth_elem(\" a \", \" j \")\")))\n"
+        "                            (clove/ffi-scalar-in ft (str \"api->nth_elem(\" a \", \" j \")\")))\n"
         "                          fields))\n"
         "           \"}\"))))\n"
-        "(defn cljc/ffi-wrapper [structs sig]\n"
+        "(defn clove/ffi-wrapper [structs sig]\n"
         "  (let [[ret cname argts] sig]\n"
         "    (str \"static void *w_\" cname \"(void *env, void *args, int nargs) { (void)env; \"\n"
         "         \"if (nargs < \" (count argts) \") api->error(\\\"\" cname \": too few args\\\"); \"\n"
-        "         (cljc/ffi-ret structs ret (str cname \"(\"\n"
-        "                              (str/join \", \" (map-indexed (fn [i t] (cljc/ffi-arg structs t i)) argts))\n"
+        "         (clove/ffi-ret structs ret (str cname \"(\"\n"
+        "                              (str/join \", \" (map-indexed (fn [i t] (clove/ffi-arg structs t i)) argts))\n"
         "                              \")\"))\n"
         "         \" }\\n\")))\n"
         "(defn ffi/define*\n"
@@ -15586,14 +15588,14 @@ CljcEnv *cljc_new_env(void) {
         "  ([sigs {:keys [headers libs prefix structs] :or {headers [] libs \"\" prefix \"\" structs {}}}]\n"
         "   (let [code (str \"#define _GNU_SOURCE\\n\"\n"
         "                   (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
-        "                   cljc/ffi-api-decl\n"
-        "                   (str/join \"\" (map (fn [s] (cljc/ffi-wrapper structs s)) sigs))\n"
-        "                   \"void cljc_module_init(void *env, CljcFfiApi *a) { api = a;\\n\"\n"
+        "                   clove/ffi-api-decl\n"
+        "                   (str/join \"\" (map (fn [s] (clove/ffi-wrapper structs s)) sigs))\n"
+        "                   \"void clove_module_init(void *env, CloveFfiApi *a) { api = a;\\n\"\n"
         "                   (str/join \"\" (map (fn [[_ cname _]]\n"
         "                                        (str \"  api->def_native(env, \\\"\" prefix cname \"\\\", w_\" cname \");\\n\"))\n"
         "                                      sigs))\n"
         "                   \"}\\n\")]\n"
-        "     (cljc/ffi-build code libs))))\n"
+        "     (clove/ffi-build code libs))))\n"
         "(defmacro ffi/define [sigs & opts]\n"
         "  `(ffi/define* '~sigs ~@opts))\n"
         "(defn ffi/defstruct*\n"
@@ -15603,19 +15605,19 @@ CljcEnv *cljc_new_env(void) {
         "         pfx (str \"struct \" sn \" *p = (struct \" sn \"*)(long long)api->as_int(api->nth_arg(args,0)); \")\n"
         "         getter (fn [[t f]]\n"
         "                  (str \"static void *w_get_\" sn \"_\" f \"(void *env, void *args, int nargs) { (void)env; (void)nargs; \"\n"
-        "                       pfx (cljc/ffi-ret {} t (str \"p->\" f)) \" }\\n\"))\n"
+        "                       pfx (clove/ffi-ret {} t (str \"p->\" f)) \" }\\n\"))\n"
         "         setter (fn [[t f]]\n"
         "                  (str \"static void *w_set_\" sn \"_\" f \"(void *env, void *args, int nargs) { (void)env; (void)nargs; \"\n"
-        "                       pfx \"p->\" f \" = \" (cljc/ffi-arg {} t 1) \"; return api->nil(); }\\n\"))\n"
+        "                       pfx \"p->\" f \" = \" (clove/ffi-arg {} t 1) \"; return api->nil(); }\\n\"))\n"
         "         code (str \"#define _GNU_SOURCE\\n\"\n"
         "                   (str/join \"\" (map (fn [h] (str \"#include <\" h \">\\n\")) headers))\n"
         "                   \"#include <stdlib.h>\\n\"\n"
-        "                   cljc/ffi-api-decl\n"
+        "                   clove/ffi-api-decl\n"
         "                   \"static void *w_make_\" sn \"(void *env, void *args, int nargs) { (void)env; (void)args; (void)nargs;\"\n"
         "                   \" return api->mk_int((long long)calloc(1, sizeof(struct \" sn \"))); }\\n\"\n"
         "                   (str/join \"\" (map getter fields))\n"
         "                   (str/join \"\" (map setter (remove (fn [[t _]] (= t :string)) fields)))\n"
-        "                   \"void cljc_module_init(void *env, CljcFfiApi *a) { api = a;\\n\"\n"
+        "                   \"void clove_module_init(void *env, CloveFfiApi *a) { api = a;\\n\"\n"
         "                   \"  api->def_native(env, \\\"make-\" sn \"\\\", w_make_\" sn \");\\n\"\n"
         "                   (str/join \"\" (map (fn [[_ f]]\n"
         "                                        (str \"  api->def_native(env, \\\"\" sn \"-\" f \"\\\", w_get_\" sn \"_\" f \");\\n\"))\n"
@@ -15624,16 +15626,16 @@ CljcEnv *cljc_new_env(void) {
         "                                        (str \"  api->def_native(env, \\\"set-\" sn \"-\" f \"!\\\", w_set_\" sn \"_\" f \");\\n\"))\n"
         "                                      (remove (fn [[t _]] (= t :string)) fields)))\n"
         "                   \"}\\n\")]\n"
-        "     (cljc/ffi-build code libs))))\n"
+        "     (clove/ffi-build code libs))))\n"
         "(defmacro ffi/defstruct [sname fields & opts]\n"
         "  `(ffi/defstruct* '~sname '~fields ~@opts))\n"
-        "(defn cljc/slurp-maybe [p] (try (slurp p) (catch Exception e nil)))\n"
+        "(defn clove/slurp-maybe [p] (try (slurp p) (catch Exception e nil)))\n"
     "(defn load-file [path]\n"
-    "  (let [src (or (cljc/slurp-maybe path)\n"
-    "                (some (fn [d] (cljc/slurp-maybe (str d \"/\" path))) *load-path*)\n"
+    "  (let [src (or (clove/slurp-maybe path)\n"
+    "                (some (fn [d] (clove/slurp-maybe (str d \"/\" path))) *load-path*)\n"
     "                (throw (ex-info (str \"load-file: not found on *load-path*: \" path) {})))]\n"
     /* incremental: a leading (ns ..) is active when later forms are read */
-    "    (cljc/eval-forms* src path)))\n");
+    "    (clove/eval-forms* src path)))\n");
     /* Top-level user code runs in the `user` namespace (like Clojure's REPL), so
      * a top-level (:refer [reduce ..]) of a core-shadowing name registers a
      * "user/reduce" refer ALIAS instead of clobbering the global core binding.
@@ -15645,38 +15647,38 @@ CljcEnv *cljc_new_env(void) {
     return e;
 }
 
-/* Set true when the most recent cljc_eval_string raised (vs returned nil).
+/* Set true when the most recent clove_eval_string raised (vs returned nil).
  * The nREPL uses it to send eval-error instead of a bogus value=nil. */
-bool cljc_eval_errored;
+bool clove_eval_errored;
 
-Cljc *cljc_eval_string(CljcEnv *env, const char *src) {
+Clove *clove_eval_string(CloveEnv *env, const char *src) {
     char stack_anchor;
-    cljc_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
-    Cljc * volatile result = NIL;  /* survives the error longjmp */
-    cljc_eval_errored = false;
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; cljc_eval_errored = true; return NIL; }
+    clove_set_stack_base(&stack_anchor);  /* ensure at least this frame is scanned */
+    Clove * volatile result = NIL;  /* survives the error longjmp */
+    clove_eval_errored = false;
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; clove_eval_errored = true; return NIL; }
     while (*src) {
         skip_ws(&src);
         if (!*src) break;
-        Cljc *form = read_form(&src);
+        Clove *form = read_form(&src);
         if (!form) break;
         result = eval(env, form);
     }
     return result;
 }
 
-void cljc_print(Cljc *v) { print(v); }
+void clove_print(Clove *v) { print(v); }
 
 /* ───── REPL ─────────────────────────────────────────────────────────── */
 
-#ifndef CLJC_NO_MAIN
+#ifndef CLOVE_NO_MAIN
 
 /* Script mode: read entire stream, eval every form, print nothing but what
  * the script prints itself (babashka-style). Errors abort with status 1. */
-static int run_stream(CljcEnv *env, FILE *f, const char *name) {
+static int run_stream(CloveEnv *env, FILE *f, const char *name) {
     /* Slurp — scripts are small; streams (stdin) can't be sized up front. */
     size_t cap = 1 << 16, len = 0;
-    /* volatile: src must survive the longjmp from cljc_error intact. */
+    /* volatile: src must survive the longjmp from clove_error intact. */
     char * volatile src = malloc(cap);
     if (!src) { fputs("out of memory\n", stderr); return 1; }
     size_t n;
@@ -15705,7 +15707,7 @@ static int run_stream(CljcEnv *env, FILE *f, const char *name) {
     while (*p) {
         skip_ws(&p);
         if (!*p) break;
-        Cljc *form = read_form(&p);
+        Clove *form = read_form(&p);
         if (!form) break;
         eval(env, form);
     }
@@ -15735,8 +15737,13 @@ static void hist_load(void) {
     const char *home = getenv("HOME");
     if (!home) return;
     char path[512];
-    snprintf(path, sizeof path, "%s/.cljc_history", home);
+    snprintf(path, sizeof path, "%s/.clove_history", home);
     FILE *f = fopen(path, "r");
+    if (!f) {   /* carry over the history from before the cljc → clove rename */
+        char old[512];
+        snprintf(old, sizeof old, "%s/.cljc_history", home);
+        if (rename(old, path) == 0) f = fopen(path, "r");
+    }
     if (!f) return;
     char line[RL_MAX];
     while (fgets(line, sizeof line, f) && rl_hist_n < HIST_MAX) {
@@ -15759,7 +15766,7 @@ static void hist_add(const char *line) {
     const char *home = getenv("HOME");
     if (!home) return;
     char path[512];
-    snprintf(path, sizeof path, "%s/.cljc_history", home);
+    snprintf(path, sizeof path, "%s/.clove_history", home);
     FILE *f = fopen(path, "a");
     if (f) { fprintf(f, "%s\n", line); fclose(f); }
 }
@@ -15889,7 +15896,7 @@ static void rl_complete(char *buf, size_t *len, size_t *pos, const char *prompt)
     const char *matches[64];
     int nm = 0;
     for (Binding *b = gc_root_envs[0]->bindings; b && nm < 64; b = b->next) {
-        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
+        if (strstr(b->name, "**") || !strncmp(b->name, "clove/", 6)) continue;
         if (!strncmp(b->name, buf + start, fraglen)) matches[nm++] = b->name;
     }
     for (int i = 0; rl_specials[i] && nm < 64; i++)
@@ -16141,16 +16148,16 @@ static int open_depth(const char *s) {
  * (*results* n) retrieves by prompt number because vectors are callable.
  * Index 0 is a nil spacer so numbers match the prompt. (*out* was
  * deliberately avoided — Clojure reserves it for the stdout stream.) */
-static void repl_record(CljcEnv *env, Cljc *result) {
-    Cljc *outv = env_lookup_maybe(env, "*results*");
-    if (!outv || outv->tag != CLJC_VECTOR) {
+static void repl_record(CloveEnv *env, Clove *result) {
+    Clove *outv = env_lookup_maybe(env, "*results*");
+    if (!outv || outv->tag != CLOVE_VECTOR) {
         outv = mk_empty_vec();
         outv = vec_conj1(outv, NIL);
     }
     outv = vec_conj1(outv, result);
     env_define_root(env_root(env), intern("*results*", 9), outv);
-    Cljc *star2 = env_lookup_maybe(env, "*1");
-    Cljc *star3 = env_lookup_maybe(env, "*2");
+    Clove *star2 = env_lookup_maybe(env, "*1");
+    Clove *star3 = env_lookup_maybe(env, "*2");
     if (star3) env_define_root(env_root(env), intern("*3", 2), star3);
     if (star2) env_define_root(env_root(env), intern("*2", 2), star2);
     env_define_root(env_root(env), intern("*1", 2), result);
@@ -16158,7 +16165,7 @@ static void repl_record(CljcEnv *env, Cljc *result) {
 
 /* The session transcript `? question` hands to Claude: inputs, rendered
  * results, errors and earlier answers, as the user saw them. Plain malloc
- * memory (never a Cljc value), capped by dropping the oldest whole lines. */
+ * memory (never a Clove value), capped by dropping the oldest whole lines. */
 #define REPL_LOG_MAX (32 * 1024)
 static SBuf repl_log;
 static void repl_log_add(const char *pfx, const char *s, size_t n) {
@@ -16176,15 +16183,15 @@ static void repl_log_add(const char *pfx, const char *s, size_t n) {
     }
 }
 
-/* (cljc/repl-edit* prompt init) → the line as edited (Enter accepts), or
+/* (clove/repl-edit* prompt init) → the line as edited (Enter accepts), or
  * nil when it comes back empty (^C clears) or on EOF. A non-empty line also
  * joins the ↑ history. Used by claude.clj to propose a form for the user to
  * run. */
-static Cljc *prim_repl_edit(CljcEnv *env, Cljc **argv, int nargs) {
+static Clove *prim_repl_edit(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs != 2) cljc_error("cljc/repl-edit*: expected prompt and initial text");
-    const char *prompt = as_str(argv[0], "cljc/repl-edit*");
-    const char *init = argv[1] == NIL ? NULL : as_str(argv[1], "cljc/repl-edit*");
+    if (nargs != 2) clove_error("clove/repl-edit*: expected prompt and initial text");
+    const char *prompt = as_str(argv[0], "clove/repl-edit*");
+    const char *init = argv[1] == NIL ? NULL : as_str(argv[1], "clove/repl-edit*");
     char line[RL_MAX];
     fflush(stdout);
     if (!rl_edit_init(prompt, line, sizeof line, init)) return NIL;
@@ -16195,11 +16202,11 @@ static Cljc *prim_repl_edit(CljcEnv *env, Cljc **argv, int nargs) {
     return mk_str(line, strlen(line));
 }
 
-/* (cljc/repl-log* s) → nil; append s to the transcript `? ` sends along. */
-static Cljc *prim_repl_log(CljcEnv *env, Cljc **argv, int nargs) {
+/* (clove/repl-log* s) → nil; append s to the transcript `? ` sends along. */
+static Clove *prim_repl_log(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    if (nargs != 1) cljc_error("cljc/repl-log*: expected a string");
-    const char *s = as_str(argv[0], "cljc/repl-log*");
+    if (nargs != 1) clove_error("clove/repl-log*: expected a string");
+    const char *s = as_str(argv[0], "clove/repl-log*");
     repl_log_add("", s, strlen(s));
     return NIL;
 }
@@ -16207,15 +16214,15 @@ static Cljc *prim_repl_log(CljcEnv *env, Cljc **argv, int nargs) {
 /* `? question`: answer via claude.clj's claude/ask (loaded on first use),
  * passing the transcript. Errors (no key, curl failure) longjmp to the
  * REPL's handler like any eval error. */
-static Cljc *repl_ask_claude(CljcEnv *env, const char *q) {
+static Clove *repl_ask_claude(CloveEnv *env, const char *q) {
     Binding *b = root_find(env_root(env), intern("claude/ask", 10), NULL, false);
     if (!b || b->value == NIL) {
         const char *src = "(require '[claude])";
         eval(env, read_form(&src));
         b = root_find(env_root(env), intern("claude/ask", 10), NULL, false);
-        if (!b || b->value == NIL) cljc_error("claude.clj did not define claude/ask");
+        if (!b || b->value == NIL) clove_error("claude.clj did not define claude/ask");
     }
-    Cljc *argv[2] = { mk_str(q, strlen(q)),
+    Clove *argv[2] = { mk_str(q, strlen(q)),
                       mk_str(repl_log.data ? repl_log.data : "", repl_log.len) };
     return apply(env_root(env), b->value, argv, 2);
 }
@@ -16223,27 +16230,27 @@ static Cljc *repl_ask_claude(CljcEnv *env, const char *q) {
 /* `? ...` is prose for Claude, not code — but `?x` stays a symbol (logic vars) */
 static bool is_ask_line(const char *s) { return s[0] == '?' && (s[1] == ' ' || s[1] == 0); }
 
-static int run_repl(CljcEnv *env) {
-    cljc_interactive = true;
+static int run_repl(CloveEnv *env) {
+    clove_interactive = true;
     hist_load();
 #ifdef _WIN32
-    SetConsoleCtrlHandler(cljc_ctrl_handler, 1);
+    SetConsoleCtrlHandler(clove_ctrl_handler, 1);
 #else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
-    sa.sa_handler = cljc_on_sigint;
+    sa.sa_handler = clove_on_sigint;
     sa.sa_flags = SA_RESTART;
     sigaction(SIGINT, &sa, NULL);
 #endif
-    printf("cljc %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out, ? question asks Claude\n",
-           CLJC_VERSION);
+    printf("clove %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out, ? question asks Claude\n",
+           CLOVE_VERSION);
     char form[RL_MAX * 4];
     char line[RL_MAX];
     int out_n = 1;
     char prompt[48];
     for (;;) {
         form[0] = 0;
-        snprintf(prompt, sizeof prompt, "cljc[%d]> ", out_n);
+        snprintf(prompt, sizeof prompt, "clove[%d]> ", out_n);
         if (!rl_edit(prompt, line, sizeof line)) break;
         snprintf(form, sizeof form, "%s", line);
         while (form[0] != '!' && !is_ask_line(form) && !balanced(form)) {
@@ -16259,7 +16266,7 @@ static int run_repl(CljcEnv *env) {
         hist_add(form);
         if (setjmp(err_jmp) != 0) {
             /* *e / (pst): keep the exception around for the post-mortem */
-            Cljc *exc = err_as_value();
+            Clove *exc = err_as_value();
             env_define_root(env_root(env), intern("*e", 2), exc);
             {
                 SBuf eb = {0};
@@ -16281,7 +16288,7 @@ static int run_repl(CljcEnv *env) {
         rd_file_cell = NULL;   /* typed forms have no :file (a stale one would mislabel) */
         {   /* log the input, numbered like the prompt it was typed at */
             char pfx[32];
-            snprintf(pfx, sizeof pfx, "cljc[%d]> ", out_n);
+            snprintf(pfx, sizeof pfx, "clove[%d]> ", out_n);
             repl_log_add(pfx, form, strlen(form));
         }
         if (is_ask_line(form)) {               /* ask mode: ? why did [3] fail */
@@ -16292,8 +16299,8 @@ static int run_repl(CljcEnv *env) {
                        "(needs curl + ANTHROPIC_API_KEY; see claude.clj)\n");
                 continue;
             }
-            Cljc *ans = repl_ask_claude(env, q);
-            if (ans->tag == CLJC_STRING)   /* already streamed to the terminal */
+            Clove *ans = repl_ask_claude(env, q);
+            if (ans->tag == CLOVE_STRING)   /* already streamed to the terminal */
                 repl_log_add("claude: ", ans->as.str, strlen(ans->as.str));
             repl_record(env, ans);   /* *1 is the answer */
             out_n++;
@@ -16303,15 +16310,15 @@ static int run_repl(CljcEnv *env) {
             const char *cmd = form + 1;
             while (*cmd == ' ') cmd++;
             if (!*cmd) continue;
-            Cljc *carg[1] = {mk_str(cmd, strlen(cmd))};
-            Cljc *r = prim_sh(env, carg, 1);   /* {:exit n :out s} */
-            Cljc *out, *exitc;
-            if (map_find(r, mk_kw(intern("out", 3)), &out) && out->tag == CLJC_STRING) {
+            Clove *carg[1] = {mk_str(cmd, strlen(cmd))};
+            Clove *r = prim_sh(env, carg, 1);   /* {:exit n :out s} */
+            Clove *out, *exitc;
+            if (map_find(r, mk_kw(intern("out", 3)), &out) && out->tag == CLOVE_STRING) {
                 fputs(out->as.str, stdout);
                 repl_log_add("", out->as.str, strlen(out->as.str));
             }
             if (map_find(r, mk_kw(intern("exit", 4)), &exitc) &&
-                exitc->tag == CLJC_INT && exitc->as.i != 0)
+                exitc->tag == CLOVE_INT && exitc->as.i != 0)
                 printf("\x1b[31m[exit %lld]\x1b[0m\n", (long long)exitc->as.i);
             repl_record(env, r);   /* shell results are numbered too */
             out_n++;
@@ -16322,16 +16329,16 @@ static int run_repl(CljcEnv *env) {
         while (*p) {
             skip_ws(&p);
             if (!*p) break;
-            Cljc *f = read_form(&p);
+            Clove *f = read_form(&p);
             if (!f) break;
-            Cljc *result = eval(env, f);
+            Clove *result = eval(env, f);
             repl_record(env, result);
             printf("\x1b[2m[%d]\x1b[0m ", out_n);
             {   /* wide results pretty-print instead of wrapping mid-token;
                  * *print-length* defaults to 100 for THIS print only, so an
                  * infinite seq shows (0 1 ... 99 ...) instead of hanging */
                 Binding *plb = root_find(env_root(env), intern("*print-length*", 14), NULL, false);
-                Cljc *saved_pl = plb ? plb->value : NULL;
+                Clove *saved_pl = plb ? plb->value : NULL;
                 bool guard = plb && (saved_pl == NULL || saved_pl == NIL);
                 if (guard) plb->value = mk_int(100);
                 SBuf sb = {0};
@@ -16358,7 +16365,7 @@ static int run_repl(CljcEnv *env) {
 /* ───── nREPL server ─────────────────────────────────────────────────── */
 
 /* Minimal nREPL-over-bencode so editors (Conjure, CIDER, Calva) can talk
- * to cljc: ./cljc --nrepl [port]. Single client at a time, blocking IO.
+ * to clove: ./clove --nrepl [port]. Single client at a time, blocking IO.
  * Ops: clone, describe, eval, load-file, close, ls-sessions, interrupt. */
 
 #ifndef _WIN32   /* the server loop relies on fdopen() over a socket fd */
@@ -16467,7 +16474,7 @@ static void resp_field(FILE *f, NreplMsg *m, const char *key, const char *val, s
 
 /* nREPL 0.8 "completions" (and cider-style "complete"): candidates from the
  * flat root bindings — a qualified prefix like "str/jo" matches naturally. */
-static void nrepl_completions(FILE *out, NreplMsg *m, CljcEnv *env, const char *prefix) {
+static void nrepl_completions(FILE *out, NreplMsg *m, CloveEnv *env, const char *prefix) {
     resp_head(out, m);
     bw_cstr(out, "completions");
     fputc('l', out);
@@ -16475,11 +16482,11 @@ static void nrepl_completions(FILE *out, NreplMsg *m, CljcEnv *env, const char *
     int shown = 0;
     for (Binding *b = env_root(env)->bindings; b && shown < 200; b = b->next) {
         if (strncmp(b->name, prefix, plen)) continue;
-        if (strstr(b->name, "**") || !strncmp(b->name, "cljc/", 5)) continue;
-        Cljc *v = b->value;
+        if (strstr(b->name, "**") || !strncmp(b->name, "clove/", 6)) continue;
+        Clove *v = b->value;
         const char *ty = "var";
-        if (v != NIL && v->tag == CLJC_FN) ty = v->as.fn.is_macro ? "macro" : "function";
-        else if (v != NIL && v->tag == CLJC_NATIVE) ty = "function";
+        if (v != NIL && v->tag == CLOVE_FN) ty = v->as.fn.is_macro ? "macro" : "function";
+        else if (v != NIL && v->tag == CLOVE_NATIVE) ty = "function";
         fputc('d', out);
         bw_kv(out, "candidate", b->name);
         bw_kv(out, "type", ty);
@@ -16495,20 +16502,20 @@ static void nrepl_completions(FILE *out, NreplMsg *m, CljcEnv *env, const char *
 
 /* nREPL 0.8 "lookup" (nested info dict) and cider-style "info" (flat keys):
  * name/doc/arglists from the doc registry + fn arities. */
-static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symname,
+static void nrepl_lookup(FILE *out, NreplMsg *m, CloveEnv *env, const char *symname,
                          bool nested) {
     /* core docstrings live in docs.clj, lazily loaded; run the loader under a
      * handler frame so a broken docs file can't longjmp past the server loop */
-    Cljc *volatile info = NIL;
+    Clove *volatile info = NIL;
     ErrFrame fr;
     fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
     fr.vm_tsp_save = vm_tsp; fr.ns_save = cur_reader_ns; fr.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL; fr.rd_line_save = rd_line;
     fr.rd_start_save = rd_line_start; fr.rd_file_save = rd_file_cell;
     err_top = &fr;
     if (setjmp(fr.jb) == 0) {
-        Binding *ed = root_find(env_root(env), intern("cljc/ensure-docs!", 17), NULL, false);
+        Binding *ed = root_find(env_root(env), intern("clove/ensure-docs!", 18), NULL, false);
         if (ed && ed->value != NIL) apply(env_root(env), ed->value, NULL, 0);
-        Cljc *a1[1] = { mk_sym(intern(symname, strlen(symname))) };
+        Clove *a1[1] = { mk_sym(intern(symname, strlen(symname))) };
         info = prim_doc_info(env_root(env), a1, 1);
         err_top = fr.prev;
     } else {
@@ -16519,14 +16526,14 @@ static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symna
         info = NIL;
     }
     resp_head(out, m);
-    if (info != NIL && info->tag == CLJC_MAP) {
+    if (info != NIL && info->tag == CLOVE_MAP) {
         if (nested) { bw_cstr(out, "info"); fputc('d', out); }
-        Cljc *v;
-        if (map_find(info, mk_kw(intern("name", 4)), &v) && v->tag == CLJC_STRING)
+        Clove *v;
+        if (map_find(info, mk_kw(intern("name", 4)), &v) && v->tag == CLOVE_STRING)
             bw_kv(out, "name", v->as.str);
-        if (map_find(info, mk_kw(intern("doc", 3)), &v) && v != NIL && v->tag == CLJC_STRING)
+        if (map_find(info, mk_kw(intern("doc", 3)), &v) && v != NIL && v->tag == CLOVE_STRING)
             bw_kv(out, "doc", v->as.str);
-        if (map_find(info, mk_kw(intern("arglists", 8)), &v) && v != NIL && v->tag == CLJC_LIST) {
+        if (map_find(info, mk_kw(intern("arglists", 8)), &v) && v != NIL && v->tag == CLOVE_LIST) {
             SBuf sb = {0};
             print_to(&sb, v, true);
             bw_cstr(out, "arglists-str");
@@ -16543,20 +16550,20 @@ static void nrepl_lookup(FILE *out, NreplMsg *m, CljcEnv *env, const char *symna
     fflush(out);
 }
 
-static void nrepl_eval(FILE *out, NreplMsg *m, CljcEnv *env, const char *code) {
+static void nrepl_eval(FILE *out, NreplMsg *m, CloveEnv *env, const char *code) {
     /* Capture interpreter stdout/stderr into protocol messages. */
     char *obuf = NULL, *ebuf = NULL;
     size_t olen = 0, elen = 0;
     FILE *oms = open_memstream(&obuf, &olen);
     FILE *ems = open_memstream(&ebuf, &elen);
-    cljc_out = oms; cljc_err = ems;
-    Cljc *result = cljc_eval_string(env, code);
-    cljc_out = NULL; cljc_err = NULL;
+    clove_out = oms; clove_err = ems;
+    Clove *result = clove_eval_string(env, code);
+    clove_out = NULL; clove_err = NULL;
     fclose(oms); fclose(ems);
     if (olen) resp_field(out, m, "out", obuf, olen);
     if (elen) resp_field(out, m, "err", ebuf, elen);
     free(obuf); free(ebuf);
-    if (cljc_eval_errored) {
+    if (clove_eval_errored) {
         /* a throw/undefined-symbol: report eval-error, NOT a bogus value=nil */
         resp_status2(out, m, "eval-error", "done");
         return;
@@ -16568,7 +16575,7 @@ static void nrepl_eval(FILE *out, NreplMsg *m, CljcEnv *env, const char *code) {
     resp_status(out, m, "done");
 }
 
-static void nrepl_serve_client(int fd, CljcEnv *env) {
+static void nrepl_serve_client(int fd, CloveEnv *env) {
     FILE *in = fdopen(fd, "r");
     FILE *out = fdopen(dup(fd), "w");
     if (!in || !out) { if (in) fclose(in); if (out) fclose(out); return; }
@@ -16578,7 +16585,7 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
         const char *op = m.op ? m.op : "";
         if (!strcmp(op, "clone")) {
             char sid[32];
-            snprintf(sid, sizeof sid, "cljc-session-%d", ++session_counter);
+            snprintf(sid, sizeof sid, "clove-session-%d", ++session_counter);
             resp_head(out, &m);
             bw_kv(out, "new-session", sid);
             bw_cstr(out, "status");
@@ -16596,7 +16603,7 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
             fputc('e', out);
             bw_cstr(out, "versions");
             fputc('d', out);
-            bw_cstr(out, "cljc"); fputc('d', out);
+            bw_cstr(out, "clove"); fputc('d', out);
             bw_kv(out, "version-string", "0.1");
             fputc('e', out);
             fputc('e', out);
@@ -16626,8 +16633,8 @@ static void nrepl_serve_client(int fd, CljcEnv *env) {
 
 #endif  /* _WIN32 (nREPL helpers) */
 
-static int nrepl_server(CljcEnv *env, int port) {
-    cljc_interactive = true;
+static int nrepl_server(CloveEnv *env, int port) {
+    clove_interactive = true;
 #ifdef _WIN32
     /* nREPL wraps the client socket in a FILE* via fdopen(); Windows sockets
      * are not C file descriptors, so this loop can't run as-is. */
@@ -16637,7 +16644,7 @@ static int nrepl_server(CljcEnv *env, int port) {
 #else
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
-    cljc_no_sigpipe(srv);
+    clove_no_sigpipe(srv);
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in addr;
@@ -16649,11 +16656,11 @@ static int nrepl_server(CljcEnv *env, int port) {
     if (listen(srv, 1) < 0) { perror("listen"); return 1; }
     FILE *pf = fopen(".nrepl-port", "w");   /* editors auto-discover this */
     if (pf) { fprintf(pf, "%d", port); fclose(pf); }
-    fprintf(stderr, "cljc nREPL server on 127.0.0.1:%d\n", port);
+    fprintf(stderr, "clove nREPL server on 127.0.0.1:%d\n", port);
     for (;;) {
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
-        cljc_no_sigpipe(fd);
+        clove_no_sigpipe(fd);
         nrepl_serve_client(fd, env);   /* one client at a time */
     }
 #endif  /* _WIN32 */
@@ -16663,12 +16670,12 @@ static int nrepl_server(CljcEnv *env, int port) {
 
 static void usage(FILE *f) {
     fputs(
-        "cljc " CLJC_VERSION " — a small Clojure in C\n"
+        "clove " CLOVE_VERSION " — a small Clojure in C\n"
         "\n"
-        "usage: cljc [subcommand] [args]\n"
+        "usage: clove [subcommand] [args]\n"
         "\n"
-        "  cljc                       interactive REPL (piped stdin: run it)\n"
-        "  cljc <file.clj> [args]     run a script (args land in *args*)\n"
+        "  clove                       interactive REPL (piped stdin: run it)\n"
+        "  clove <file.clj> [args]     run a script (args land in *args*)\n"
         "\n"
         "subcommands:\n"
         "  run <file> [args]          run a script (explicit form)\n"
@@ -16697,8 +16704,8 @@ static void usage(FILE *f) {
         f);
 }
 
-static void set_args(CljcEnv *env, int argc, char **argv, int from) {
-    Cljc *as = mk_empty_vec();
+static void set_args(CloveEnv *env, int argc, char **argv, int from) {
+    Clove *as = mk_empty_vec();
     for (int i = from; i < argc; i++)
         as = vec_conj1(as, mk_str(argv[i], strlen(argv[i])));
     env_define_root(env, intern("*args*", 6), as);
@@ -16706,14 +16713,14 @@ static void set_args(CljcEnv *env, int argc, char **argv, int from) {
 
 /* Run an internal clj program string. Errors render and exit 1; with
  * truthy_exit, a falsy final value also exits 1 (e.g. run-tests). */
-static int run_subprogram(CljcEnv *env, const char *src, bool truthy_exit) {
+static int run_subprogram(CloveEnv *env, const char *src, bool truthy_exit) {
     if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
     const char *p = src;
-    Cljc *volatile last = TRUE;
+    Clove *volatile last = TRUE;
     while (*p) {
         skip_ws(&p);
         if (!*p) break;
-        Cljc *form = read_form(&p);
+        Clove *form = read_form(&p);
         if (!form) break;
         last = eval(env, form);
     }
@@ -16722,22 +16729,22 @@ static int run_subprogram(CljcEnv *env, const char *src, bool truthy_exit) {
 
 /* Like run_subprogram, but an integer final value becomes the exit status
  * (-main returning an int, bb-style). Shared rule with bundled binaries. */
-static int run_subprogram_int_exit(CljcEnv *env, const char *src) {
+static int run_subprogram_int_exit(CloveEnv *env, const char *src) {
     if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
     const char *p = src;
-    Cljc *volatile last = NIL;
+    Clove *volatile last = NIL;
     while (*p) {
         skip_ws(&p);
         if (!*p) break;
-        Cljc *form = read_form(&p);
+        Clove *form = read_form(&p);
         if (!form) break;
         last = eval(env, form);
     }
-    return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
+    return (last != NIL && last->tag == CLOVE_INT) ? (int)last->as.i : 0;
 }
 
-/* `cljc lint`: reader-level syntax check, Elm-style errors with carets. */
-static int lint_file(CljcEnv *env, const char *path) {
+/* `clove lint`: reader-level syntax check, Elm-style errors with carets. */
+static int lint_file(CloveEnv *env, const char *path) {
     (void)env;
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "lint: cannot open %s\n", path); return 1; }
@@ -16765,7 +16772,7 @@ static int lint_file(CljcEnv *env, const char *path) {
     return 0;
 }
 
-static int run_script(CljcEnv *env, const char *path) {
+static int run_script(CloveEnv *env, const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
     err_src_name = path;
@@ -16774,7 +16781,7 @@ static int run_script(CljcEnv *env, const char *path) {
     return rc;
 }
 
-/* `cljc watch <file> [args]` — run the script, rerun when its mtime changes.
+/* `clove watch <file> [args]` — run the script, rerun when its mtime changes.
  * Each run is a fresh child process (clean slate: no stale defs, no leaked
  * state), so this is exec-based rather than in-process. The 200ms poll is
  * portable everywhere stat is. A run in progress is not interrupted — the
@@ -16844,21 +16851,21 @@ static int run_watch(int argc, char **argv) {
     }
 }
 
-/* `cljc doctor` — print the resolved environment so "why isn't my require
+/* `clove doctor` — print the resolved environment so "why isn't my require
  * finding anything" is a ten-second question, not a debugging session. */
-static int run_doctor(CljcEnv *env) {
+static int run_doctor(CloveEnv *env) {
     char exe[4096];
-    printf("cljc %s\n", CLJC_VERSION);
+    printf("clove %s\n", CLOVE_VERSION);
     printf("executable:     %s\n", exe_path(exe, sizeof exe) ? exe : "(unknown)");
-    printf("built sharedir: %s\n", CLJC_SHAREDIR);
+    printf("built sharedir: %s\n", CLOVE_SHAREDIR);
     printf("load path:\n");
     bool docs = false, vend = false;
     char hit_docs[640] = "", hit_vend[640] = "";
     Binding *b = root_find(env_root(env), intern("*load-path*", 11), NULL, false);
-    if (b && b->value != NIL && b->value->tag == CLJC_VECTOR) {
+    if (b && b->value != NIL && b->value->tag == CLOVE_VECTOR) {
         for (size_t i = 0; i < vec_len(b->value); i++) {
-            Cljc *d = vec_nth(b->value, i);
-            if (d == NIL || d->tag != CLJC_STRING) continue;
+            Clove *d = vec_nth(b->value, i);
+            if (d == NIL || d->tag != CLOVE_STRING) continue;
             struct stat st;
             bool ok = stat(d->as.str, &st) == 0 && S_ISDIR(st.st_mode);
             printf("  %-8s %s\n", ok ? "ok" : "missing", d->as.str);
@@ -16890,15 +16897,15 @@ int main(int argc, char **argv) {
         if (want > rl.rlim_cur) { rl.rlim_cur = want; setrlimit(RLIMIT_STACK, &rl); }
     }
 #endif
-    if (getenv("CLJC_UNBUFFERED")) {
+    if (getenv("CLOVE_UNBUFFERED")) {
         /* Diagnostic mode: redirected stdout is fully buffered, so a crash
          * loses the tail and stderr interleaves out of order — unbuffered
          * output makes "last line printed" pinpoint the dying form. */
         setvbuf(stdout, NULL, _IONBF, 0);
         setvbuf(stderr, NULL, _IONBF, 0);
     }
-    cljc_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
-    CljcEnv *env = cljc_new_env();
+    clove_set_stack_base(&argc);  /* top-of-stack anchor for conservative GC */
+    CloveEnv *env = clove_new_env();
     const char *cmd = argc > 1 ? argv[1] : NULL;
 
     if (!cmd) {
@@ -16907,14 +16914,14 @@ int main(int argc, char **argv) {
         return run_repl(env);
     }
 
-    /* Exact subcommand names win; `cljc run <file>` is the escape hatch
+    /* Exact subcommand names win; `clove run <file>` is the escape hatch
      * for a script file that happens to be named like one. */
     if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
         usage(stdout);
         return 0;
     }
     if (!strcmp(cmd, "version") || !strcmp(cmd, "--version")) {
-        printf("cljc %s\n", CLJC_VERSION);
+        printf("clove %s\n", CLOVE_VERSION);
         return 0;
     }
     if (!strcmp(cmd, "doctor") || !strcmp(cmd, "--doctor")) return run_doctor(env);
@@ -16926,40 +16933,40 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "nrepl") || !strcmp(cmd, "--nrepl"))
         return nrepl_server(env, argc > 2 ? atoi(argv[2]) : 7888);
     if (!strcmp(cmd, "run")) {
-        if (argc < 3) { fputs("usage: cljc run <file.clj> [args]\n", stderr); return 1; }
+        if (argc < 3) { fputs("usage: clove run <file.clj> [args]\n", stderr); return 1; }
         set_args(env, argc, argv, 3);
         return run_script(env, argv[2]);
     }
     if (!strcmp(cmd, "-m") || !strcmp(cmd, "--main")) {
-        /* cljc -m <ns> [args] — require the namespace, then call its -main
+        /* clove -m <ns> [args] — require the namespace, then call its -main
          * with the remaining args (as strings), like `bb -m` / `clojure -m`. */
-        if (argc < 3) { fputs("usage: cljc -m <namespace> [args]\n", stderr); return 1; }
+        if (argc < 3) { fputs("usage: clove -m <namespace> [args]\n", stderr); return 1; }
         const char *ns = argv[2];
         set_args(env, argc, argv, 3);   /* args after the ns land in *args* */
         char prog[1024];
         snprintf(prog, sizeof prog,
                  "(require '[%s])"
-                 "(let [m (or (cljc/resolve-maybe \"%s/-main\")"
-                 "            (cljc/resolve-maybe \"-main\"))]"
+                 "(let [m (or (clove/resolve-maybe \"%s/-main\")"
+                 "            (clove/resolve-maybe \"-main\"))]"
                  "  (if m (apply m *args*)"
                  "    (throw (ex-info \"no -main found in %s\" {}))))",
                  ns, ns, ns);
         return run_subprogram_int_exit(env, prog);
     }
     if (!strcmp(cmd, "eval") || !strcmp(cmd, "-e")) {
-        if (argc < 3) { fputs("usage: cljc eval <expr...>\n", stderr); return 1; }
+        if (argc < 3) { fputs("usage: clove eval <expr...>\n", stderr); return 1; }
         set_args(env, argc, argv, 3);
         if (setjmp(err_jmp) != 0) { print_error(); return 1; }
-        Cljc *volatile last = NIL;
+        Clove *volatile last = NIL;
         for (int i = 2; i < argc; i++) {
             const char *p = argv[i];
-            /* `cljc -e A -e B` (the clojure/bb spelling): a repeated flag
+            /* `clove -e A -e B` (the clojure/bb spelling): a repeated flag
              * separates expressions, it is not itself one */
             if (!strcmp(p, "-e") && i + 1 < argc) continue;
             while (*p) {
                 skip_ws(&p);
                 if (!*p) break;
-                Cljc *form = read_form(&p);
+                Clove *form = read_form(&p);
                 if (!form) break;
                 last = eval(env, form);
             }
@@ -16972,12 +16979,12 @@ int main(int argc, char **argv) {
         return run_subprogram(env, "(load-file \"clerk.clj\") (clerk/main)", false);
     }
     if (!strcmp(cmd, "vendor")) {
-        /* cljc vendor [source] — thin CLI over cljc/vendor-main!: with no
+        /* clove vendor [source] — thin CLI over clove/vendor-main!: with no
          * argument (or a deps.edn path) it resolves ./deps.edn's :deps
          * transitively; a coord/URL fetches that one library. Also callable
          * from the REPL as (vendor! "user/repo"). */
         set_args(env, argc, argv, 2);
-        return run_subprogram(env, "(cljc/vendor-main!)", true);
+        return run_subprogram(env, "(clove/vendor-main!)", true);
     }
     if (!strcmp(cmd, "test")) {
         set_args(env, argc, argv, 2);
@@ -16986,9 +16993,9 @@ int main(int argc, char **argv) {
          * than an error. Explicit arguments always win. */
         return run_subprogram(env,
             "(load-file \"test.clj\")"
-            "(let [fs (if (seq *args*) (vec *args*) (cljc/find-test-files))]"
+            "(let [fs (if (seq *args*) (vec *args*) (clove/find-test-files))]"
             "  (if (empty? fs)"
-            "    (do (println \"cljc test: no *_test.clj or *_test.cljc files found under .\")"
+            "    (do (println \"clove test: no *_test.clj or *_test.cljc files found under .\")"
             "        false)"
             "    (do (when-not (seq *args*)"
             "          (println (str \"testing \" (count fs) \" file(s): \" (str/join \" \" fs))))"
@@ -16996,7 +17003,7 @@ int main(int argc, char **argv) {
             "        (run-tests))))", true);
     }
     if (!strcmp(cmd, "lint")) {
-        if (argc < 3) { fputs("usage: cljc lint <files...>\n", stderr); return 1; }
+        if (argc < 3) { fputs("usage: clove lint <files...>\n", stderr); return 1; }
         int bad = 0;
         for (int i = 2; i < argc; i++) bad += lint_file(env, argv[i]);
         if (!bad) printf("%d file%s, no reader errors\n", argc - 2, argc == 3 ? "" : "s");
@@ -17004,8 +17011,8 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(cmd, "fmt")) {
         /* thin wrapper over cljfmt (https://github.com/weavejester/cljfmt):
-         *   cljc fmt <files>        -> cljfmt fix <files>   (format in place)
-         *   cljc fmt check <files>  -> cljfmt check <files>  (verb passes through)
+         *   clove fmt <files>        -> cljfmt fix <files>   (format in place)
+         *   clove fmt check <files>  -> cljfmt check <files>  (verb passes through)
          * exec replaces this process, so cljfmt's streams and exit code are ours. */
         int base = 2;
         const char *verb = "fix";
@@ -17013,7 +17020,7 @@ int main(int argc, char **argv) {
             verb = argv[2]; base = 3;
         }
         int n = argc - base;
-        if (n > 4090) { fputs("cljc fmt: too many arguments\n", stderr); return 1; }
+        if (n > 4090) { fputs("clove fmt: too many arguments\n", stderr); return 1; }
         char *av[4096];
         int k = 0;
         av[k++] = (char *)"cljfmt";
@@ -17022,8 +17029,8 @@ int main(int argc, char **argv) {
         av[k] = NULL;
         execvp("cljfmt", av);
         fprintf(stderr,
-            "cljc fmt: cljfmt not found on PATH.\n"
-            "  cljc fmt wraps cljfmt; install the native binary from\n"
+            "clove fmt: cljfmt not found on PATH.\n"
+            "  clove fmt wraps cljfmt; install the native binary from\n"
             "  https://github.com/weavejester/cljfmt (or `brew install cljfmt`).\n");
         return 127;
     }
@@ -17036,26 +17043,26 @@ int main(int argc, char **argv) {
          * the READ — its bare defns get home-ns "judge", so the runner's
          * internal bare references resolve to judge/… . */
         const char *prog = "(require '[judge]) (apply judge/-main *args*)";
-        Cljc *last = NIL;
+        Clove *last = NIL;
         while (*prog) {
             skip_ws(&prog);
             if (!*prog) break;
-            Cljc *f2 = read_form(&prog);
+            Clove *f2 = read_form(&prog);
             if (!f2) break;
             last = eval(env, f2);
         }
-        return (last != NIL && last->tag == CLJC_INT) ? (int)last->as.i : 0;
+        return (last != NIL && last->tag == CLOVE_INT) ? (int)last->as.i : 0;
     }
     if (!strcmp(cmd, "bundle")) {
         /* Just require "some args" here — bundle.clj owns the real arg
          * grammar (flags like --static/--cc=/-m), so a strict positional
          * count in C would reject every flag it documents. */
-        if (argc < 3) { fputs("usage: cljc bundle [-m <ns>] [flags] [script.clj] <output>\n", stderr); return 1; }
+        if (argc < 3) { fputs("usage: clove bundle [-m <ns>] [flags] [script.clj] <output>\n", stderr); return 1; }
         set_args(env, argc, argv, 2);
         return run_subprogram(env, "(load-file \"bundle.clj\")", false);
     }
     if (cmd[0] == '-') {            /* unknown flag: complain, show help */
-        fprintf(stderr, "cljc: unknown option %s\n\n", cmd);
+        fprintf(stderr, "clove: unknown option %s\n\n", cmd);
         usage(stderr);
         return 1;
     }

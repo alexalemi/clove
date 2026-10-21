@@ -1,4 +1,4 @@
-;; primes.clj — a tour of cljc's lazy, possibly-infinite sequences.
+;; primes.clj — a tour of clove's lazy, possibly-infinite sequences.
 ;;
 ;; Showcases: lazy-seq, infinite (range)/(iterate), take/take-while, and the
 ;; fact that you can define an unbounded stream and only pay for what you pull.

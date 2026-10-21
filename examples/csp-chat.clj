@@ -6,7 +6,7 @@
 ;; park on socket readiness), one pair of go blocks per client (a reader and a
 ;; writer), and `mult`/`tap` to broadcast one stream to all of them.
 ;;
-;; Run:    cljc examples/csp-chat.clj           (port 8077, all interfaces)
+;; Run:    clove examples/csp-chat.clj           (port 8077, all interfaces)
 ;; Connect (in other terminals):
 ;;         nc localhost 8077        (or:  telnet localhost 8077)
 ;; Type in one; watch it appear in the others.

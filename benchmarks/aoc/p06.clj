@@ -1,4 +1,4 @@
-;; AoC 2017 day 6 — portable across cljc / babashka / clojure.
+;; AoC 2017 day 6 — portable across clove / babashka / clojure.
 ;; Vectors as hash keys: stresses collection hashing + set/map lookups.
 (def data (mapv parse-long (re-seq #"\d+" (slurp "input/06.txt"))))
 

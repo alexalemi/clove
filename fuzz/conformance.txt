@@ -2,7 +2,7 @@
 ;; JVM Clojure exactly. One expression per line; lines starting with ";" and
 ;; blank lines are skipped by the runners. Every expression is deterministic
 ;; and order-stable: unordered collections are printed via sorted views only.
-;; Documented cljc divergences (astral strings, wrapping int64 arithmetic,
+;; Documented clove divergences (astral strings, wrapping int64 arithmetic,
 ;; typed catch, small-N literal demotion, hash values) are deliberately absent.
 ;; numbers: arithmetic, division, quot/rem/mod
 (+ 1 2)

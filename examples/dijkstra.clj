@@ -15,7 +15,7 @@
    :f {:a 14 :c 2 :e 9}})
 
 ;; Returns {:dist {node cost}, :prev {node predecessor}}. We avoid a real
-;; priority queue (cljc has none built in) by scanning the unvisited set for
+;; priority queue (clove has none built in) by scanning the unvisited set for
 ;; the current minimum each round — fine for small graphs and clearer to read.
 (defn dijkstra [graph source]
   (loop [dist    {source 0}

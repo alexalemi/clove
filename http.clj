@@ -1,4 +1,4 @@
-;; http.clj — a small async HTTP/1.1 server + client for cljc, on the csp
+;; http.clj — a small async HTTP/1.1 server + client for clove, on the csp
 ;; coroutine event loop. Everything is non-blocking: the server handles many
 ;; connections concurrently on one thread, and the client returns a channel so
 ;; it composes inside go blocks (N concurrent requests via pipeline-async).
@@ -39,13 +39,13 @@
      :query   (parse-query (when qmark (subs target (inc qmark))))
      :headers (parse-headers hdrs)}))
 
-;; Content-Length is a BYTE count; count/subs on cljc strings are codepoint
-;; based, so framing must go through cljc/str-nbytes*. Trim a body that ran
+;; Content-Length is a BYTE count; count/subs on clove strings are codepoint
+;; based, so framing must go through clove/str-nbytes*. Trim a body that ran
 ;; past clen (pipelined bytes) by dropping tail codepoints until it fits.
 (defn- trim-to-bytes [s clen]
   (loop [e (count s)]
     (let [t (subs s 0 e)]
-      (if (<= (cljc/str-nbytes* t) clen) t (recur (dec e))))))
+      (if (<= (clove/str-nbytes* t) clen) t (recur (dec e))))))
 
 ;; Read one full request off a connection (headers, then Content-Length bytes of
 ;; body). Returns the request map, or nil if the client hung up first.
@@ -56,7 +56,7 @@
         (let [req  (parse-request-head (subs buf 0 idx))
               clen (parse-long (or ((:headers req) "content-length") "0"))]
           (loop [body (subs buf (+ idx 4))]
-            (if (>= (cljc/str-nbytes* body) clen)
+            (if (>= (clove/str-nbytes* body) clen)
               (assoc req :body (trim-to-bytes body clen))
               (let [more (csp/recv! conn)]
                 (if (nil? more) (assoc req :body body) (recur (str body more)))))))
@@ -80,7 +80,7 @@
         has-ct? (some (fn [k] (= "content-type" (str/lower-case k))) (keys headers))]
     (str "HTTP/1.1 " status " " (or (status-text status) "OK") "\r\n"
          (when-not has-ct? "Content-Type: text/html; charset=utf-8\r\n")
-         "Content-Length: " (cljc/str-nbytes* body) "\r\n"
+         "Content-Length: " (clove/str-nbytes* body) "\r\n"
          (str/join "" (for [[k v] headers] (str k ": " v "\r\n")))
          "Connection: close\r\n\r\n"
          body)))
@@ -168,7 +168,7 @@
           req (str (str/upper-case (name (or method :get))) " " path " HTTP/1.1\r\n"
                    "Host: " host "\r\n"
                    "Connection: close\r\n"
-                   (when body (str "Content-Length: " (cljc/str-nbytes* body) "\r\n"))
+                   (when body (str "Content-Length: " (clove/str-nbytes* body) "\r\n"))
                    (str/join "" (for [[k v] headers] (str k ": " v "\r\n")))
                    "\r\n" (or body ""))]
       (csp/send! fd req)

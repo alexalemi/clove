@@ -1,5 +1,5 @@
 ;; hello-bundle.clj — a tiny standalone demo to send to friends.
-;; Build:  cljc bundle.clj examples/hello-bundle.clj hello
+;; Build:  clove bundle.clj examples/hello-bundle.clj hello
 ;; Run:    ./hello            (or)   ./hello Ada Grace
 
 (def who
@@ -15,7 +15,7 @@
 (def primes (filter prime? (range 2 50)))
 
 (println "  ___  ___  ___")
-(println " / __|| |  |_ _|  cljc standalone binary")
+(println " / __|| |  |_ _|  clove standalone binary")
 (println "| (__ | |__ | |   no runtime, no deps — just this file")
 (println " \\___||____|___|")
 (println)

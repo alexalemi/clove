@@ -1,5 +1,5 @@
 ;; csp-sieve.clj — the concurrent prime sieve, the classic CSP demo (Newsqueak
-;; / Go's "prime sieve"), running on cljc's coroutine-backed core.async.
+;; / Go's "prime sieve"), running on clove's coroutine-backed core.async.
 ;;
 ;; Each prime spawns its own goroutine that filters out its multiples. Numbers
 ;; flow through a growing chain of filter coroutines; whatever pops out the far
@@ -9,8 +9,8 @@
 ;; channels, `go`, `<!`/`>!`, and `<!!`. Hundreds of coroutines, cooperatively
 ;; scheduled on one thread.
 ;;
-;; Run:  cljc examples/csp-sieve.clj          (from the repo root)
-;;       cljc examples/csp-sieve.clj 40
+;; Run:  clove examples/csp-sieve.clj          (from the repo root)
+;;       clove examples/csp-sieve.clj 40
 
 ;; csp.clj lives in the repo root; make it findable from examples/ too.
 (def *load-path* (into [".." "."] *load-path*))

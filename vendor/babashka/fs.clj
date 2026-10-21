@@ -1,8 +1,8 @@
 (ns babashka.fs
-  "babashka.fs API over cljc's fs.clj battery (filesystem via libc FFI).")
-(cljc/in-ns* nil)
+  "babashka.fs API over clove's fs.clj battery (filesystem via libc FFI).")
+(clove/in-ns* nil)
 (load-file "fs.clj")
-(cljc/in-ns* "babashka.fs")
+(clove/in-ns* "babashka.fs")
 (def exists?      fs/exists?)
 (def directory?   fs/directory?)
 (def regular-file? fs/regular-file?)

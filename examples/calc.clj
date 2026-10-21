@@ -9,8 +9,8 @@
 ;;   term   = factor (('*' | '/') factor)*
 ;;   factor = number | '(' expr ')' | '-' factor
 ;;
-;; Run:  cljc examples/calc.clj "2 + 3 * (4 - 1)"
-;;       cljc examples/calc.clj            ; runs a built-in demo set
+;; Run:  clove examples/calc.clj "2 + 3 * (4 - 1)"
+;;       clove examples/calc.clj            ; runs a built-in demo set
 
 (defn tokenize [s]
   (re-seq #"\d+\.?\d*|[-+*/()]" s))

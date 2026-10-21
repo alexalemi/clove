@@ -1,5 +1,5 @@
-;; AoC 2017 day 5 — portable across cljc / babashka / clojure.
-(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on cljc
+;; AoC 2017 day 5 — portable across clove / babashka / clojure.
+(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on clove
 ;; Persistent-vector stress: parts do ~350k / ~25M assoc+nth steps.
 (def tape (mapv parse-long (str/split-lines (slurp "input/05.txt"))))
 

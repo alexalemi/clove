@@ -1,5 +1,5 @@
 (ns clojure.core.async
-  "A single-threaded, coroutine-backed implementation of core.async for cljc.
+  "A single-threaded, coroutine-backed implementation of core.async for clove.
    A `go` block is a stackful coroutine that YIELDS when it parks on a channel;
    the scheduler resumes it when the rendezvous completes. No real threads —
    blocking ops (<!! / >!! / alts!!) drive the event loop until ready."
@@ -164,7 +164,7 @@
 ;; ── timeout ────────────────────────────────────────────────────────────
 (defn timeout [ms]
   (let [c (chan)]
-    (fiber/timer! (+ (cljc/now-ms*) ms) (fn [] (close! c)))
+    (fiber/timer! (+ (clove/now-ms*) ms) (fn [] (close! c)))
     c))
 
 ;; ── alts! : first ready op wins (a shared one-shot flag) ──────────────────

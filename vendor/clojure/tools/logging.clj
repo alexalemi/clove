@@ -1,5 +1,5 @@
 (ns clojure.tools.logging
-  "A minimal console logger (cljc has no slf4j/log4j): logs to *err*.")
+  "A minimal console logger (clove has no slf4j/log4j): logs to *err*.")
 
 (def ^:dynamic *level* :debug)
 (def ^:private order {:trace 0 :debug 1 :info 2 :warn 3 :error 4 :fatal 5})

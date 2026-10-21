@@ -1,5 +1,5 @@
 (ns clojure.java.io
-  "A pragmatic subset over cljc's slurp/spit. `file` yields a path string;
+  "A pragmatic subset over clove's slurp/spit. `file` yields a path string;
    reader/writer/streams are the path (slurp/spit accept paths)."
   (:require [clojure.string :as str]))
 (defn file [& parts] (str/join "/" (map str parts)))
@@ -10,14 +10,14 @@
    StringBuilder); plain strings stay path strings for slurp compatibility."
   [x]
   (if (and (map? x) (contains? #{:java.io.Reader :LineReader :StringBuilder}
-                               (:cljc/type x)))
+                               (:clove/type x)))
     (java.io.BufferedReader. x)
     (str x)))
 (defn writer
   "A StringWriter/StringBuilder passes through (its .write/.append/.toString
    accumulate); anything else is a path string for spit."
   [x]
-  (if (and (map? x) (= :StringBuilder (:cljc/type x))) x (str x)))
+  (if (and (map? x) (= :StringBuilder (:clove/type x))) x (str x)))
 (defn input-stream [x] (str x))
 (defn output-stream [x] (str x))
 (defn resource [_] nil)

@@ -6,13 +6,13 @@
 ;; first load compiles once and later loads just dlopen.
 
 (declare getpid getppid getenv setenv unsetenv system
-         mkdir rmdir unlink rename chdir access cljc_libc_cwd
+         mkdir rmdir unlink rename chdir access clove_libc_cwd
          sleep usleep)
 
 ;; getcwd wants a caller-owned buffer, and the buffer-free GNU alternative
 ;; (get_current_dir_name) doesn't exist on macOS — a tiny shim owns the buffer.
-(spit (str (cljc/user-tmp-dir*) "/cljc_libc_shim.h")
-      "#include <unistd.h>\nstatic inline char *cljc_libc_cwd(void){ static char b[4096]; return getcwd(b, sizeof b); }\n")
+(spit (str (clove/user-tmp-dir*) "/clove_libc_shim.h")
+      "#include <unistd.h>\nstatic inline char *clove_libc_cwd(void){ static char b[4096]; return getcwd(b, sizeof b); }\n")
 
 (ffi/define
   [;; process & environment
@@ -29,12 +29,12 @@
    [:int rename [:string :string]]
    [:int chdir [:string]]
    [:int access [:string :int]]
-   [:string cljc_libc_cwd []]
+   [:string clove_libc_cwd []]
    ;; sleep — NOTE: no `time` binding: it would shadow the core time macro
    [:int sleep [:int]]
    [:int usleep [:int]]]
-  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h" "cljc_libc_shim.h"]
-   :libs (str "-I" (cljc/user-tmp-dir*))})
+  {:headers ["unistd.h" "stdlib.h" "sys/stat.h" "stdio.h" "clove_libc_shim.h"]
+   :libs (str "-I" (clove/user-tmp-dir*))})
 
 ;; ── friendly wrappers ──
 
@@ -44,8 +44,8 @@
 (def X_OK 1)
 
 (defn file-exists? [path] (zero? (access path F_OK)))
-(defn cwd [] (cljc_libc_cwd))
-(defn now-epoch [] (cljc/epoch*))
+(defn cwd [] (clove_libc_cwd))
+(defn now-epoch [] (clove/epoch*))
 (defn mkdir-p
   "Create path AND any missing parents (like mkdir -p); 0 when path exists after."
   [path]

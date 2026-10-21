@@ -1,5 +1,5 @@
-;; AoC 2017 day 1 — portable across cljc / babashka / clojure.
-(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on cljc
+;; AoC 2017 day 1 — portable across clove / babashka / clojure.
+(try (require (quote [clojure.string :as str])) (catch Exception e nil)) ; no-op on clove
 (def data (str/trim (slurp "input/01.txt")))
 (def ds (mapv (fn [c] (parse-long (str c))) (seq data)))
 

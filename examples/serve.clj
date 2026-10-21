@@ -1,51 +1,51 @@
-;; serve.clj — a self-contained gallery of the cljc examples, served over HTTP.
+;; serve.clj — a self-contained gallery of the clove examples, served over HTTP.
 ;;
-;; This server is itself a cljc program: it uses the built-in tcp/* primitives
-;; (the same ones clerk.clj uses) and shells out to ./cljc to run each example
+;; This server is itself a clove program: it uses the built-in tcp/* primitives
+;; (the same ones clerk.clj uses) and shells out to ./clove to run each example
 ;; and capture its real output. At startup it runs every example once, builds
 ;; one static HTML page (code + output, syntax-highlighted client-side by
 ;; highlight.js), then serves it.
 ;;
-;; Run:  cljc examples/serve.clj          ; http://127.0.0.1:8088
-;;       cljc examples/serve.clj 9000     ; custom port
+;; Run:  clove examples/serve.clj          ; http://127.0.0.1:8088
+;;       clove examples/serve.clj 9000     ; custom port
 ;;
-;; Run it from the repo root so ./cljc and examples/ resolve.
+;; Run it from the repo root so ./clove and examples/ resolve.
 
 ;; ── the gallery: filename, title, feature tag, and how to run it ──
 ;; A few examples take args or read stdin; we pin a representative invocation
 ;; and redirect </dev/null so nothing blocks on input.
 (def gallery
   [{:file "mandelbrot.clj"  :title "Mandelbrot Set"      :tag "doubles · loop/recur"
-    :run "./cljc examples/mandelbrot.clj </dev/null"}
+    :run "./clove examples/mandelbrot.clj </dev/null"}
    {:file "life.clj"        :title "Game of Life"        :tag "persistent sets · simulation"
-    :run "./cljc examples/life.clj </dev/null"}
+    :run "./clove examples/life.clj </dev/null"}
    {:file "primes.clj"      :title "Lazy Sequences"      :tag "lazy-seq · infinite streams"
-    :run "./cljc examples/primes.clj </dev/null"}
+    :run "./clove examples/primes.clj </dev/null"}
    {:file "nqueens.clj"     :title "N-Queens"            :tag "backtracking · mapcat"
-    :run "./cljc examples/nqueens.clj 6 </dev/null"}
+    :run "./clove examples/nqueens.clj 6 </dev/null"}
    {:file "sudoku.clj"      :title "Sudoku Solver"       :tag "backtracking · clojure.set"
-    :run "./cljc examples/sudoku.clj </dev/null"}
+    :run "./clove examples/sudoku.clj </dev/null"}
    {:file "calc.clj"        :title "Expression Parser"   :tag "recursive descent · regex"
-    :run "./cljc examples/calc.clj </dev/null"}
+    :run "./clove examples/calc.clj </dev/null"}
    {:file "brainfuck.clj"   :title "Brainfuck Interpreter" :tag "mutable arrays · hosting a language"
-    :run "./cljc examples/brainfuck.clj </dev/null"}
+    :run "./clove examples/brainfuck.clj </dev/null"}
    {:file "macros.clj"      :title "Macros & DSLs"       :tag "defmacro · quasiquote · gensym"
-    :run "./cljc examples/macros.clj </dev/null"}
+    :run "./clove examples/macros.clj </dev/null"}
    {:file "shapes.clj"      :title "Polymorphism"        :tag "protocols · multimethods · records"
-    :run "./cljc examples/shapes.clj </dev/null"}
+    :run "./clove examples/shapes.clj </dev/null"}
    {:file "dijkstra.clj"    :title "Shortest Paths"      :tag "maps as graphs · loop/recur"
-    :run "./cljc examples/dijkstra.clj </dev/null"}
+    :run "./clove examples/dijkstra.clj </dev/null"}
    {:file "wordfreq.clj"    :title "Word Frequency"      :tag "regex · frequencies · CLI"
-    :run "./cljc examples/wordfreq.clj README.md 10 </dev/null"}
+    :run "./clove examples/wordfreq.clj README.md 10 </dev/null"}
    {:file "bank.clj"        :title "Atoms & Exceptions"  :tag "atom · swap! · ex-info/try"
-    :run "./cljc examples/bank.clj </dev/null"}
+    :run "./clove examples/bank.clj </dev/null"}
    {:file "ffi-demo.clj"    :title "C FFI"               :tag "ffi/define · native calls"
-    :run "./cljc examples/ffi-demo.clj </dev/null"}
+    :run "./clove examples/ffi-demo.clj </dev/null"}
    {:file "sqlite.clj"      :title "SQLite via FFI"      :tag "libsqlite3 · shim header · prepare/step"
-    :run "./cljc examples/sqlite.clj </dev/null"}
+    :run "./clove examples/sqlite.clj </dev/null"}
    {:file "fractal-svg.clj" :title "Fractal Tree (SVG)"  :tag "recursion · trig · file output"
-    :run "./cljc examples/fractal-svg.clj /tmp/cljc-gallery-tree.svg 11 </dev/null"
-    :svg "/tmp/cljc-gallery-tree.svg"}])
+    :run "./clove examples/fractal-svg.clj /tmp/clove-gallery-tree.svg 11 </dev/null"
+    :svg "/tmp/clove-gallery-tree.svg"}])
 
 ;; ── HTML helpers ──
 (defn esc [s]
@@ -118,16 +118,16 @@ footer{text-align:center;color:var(--dim);font-size:13px;padding:30px}
 (defn page []
   (str "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-       "<title>cljc examples</title>"
+       "<title>clove examples</title>"
        "<link rel='stylesheet' href='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/tokyo-night-dark.min.css'>"
        "<script src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js'></script>"
        "<script src='https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/clojure.min.js'></script>"
        "<script>addEventListener('DOMContentLoaded',()=>hljs.highlightAll())</script>"
        "<style>" css "</style></head><body>"
-       "<header><h1>cljc · example gallery</h1>"
+       "<header><h1>clove · example gallery</h1>"
        "<p>A small Clojure in a single C file. Every program below was run by "
-       "<code>cljc</code> to produce the output shown — this page was assembled and is served "
-       "by <code>cljc</code> too.</p></header>"
+       "<code>clove</code> to produce the output shown — this page was assembled and is served "
+       "by <code>clove</code> too.</p></header>"
        (nav)
        "<main>"
        (str/join "" (map card gallery))

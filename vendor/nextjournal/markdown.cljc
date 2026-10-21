@@ -1,6 +1,6 @@
 (ns nextjournal.markdown
-  "A pure-Clojure CommonMark-subset parser for cljc (the upstream :clj impl wraps
-   the Java commonmark lib, which cljc has no access to). Produces the same AST
+  "A pure-Clojure CommonMark-subset parser for clove (the upstream :clj impl wraps
+   the Java commonmark lib, which clove has no access to). Produces the same AST
    nextjournal.markdown.transform/->hiccup consumes."
   (:require [clojure.string :as str]
             [nextjournal.markdown.transform :as transform]))

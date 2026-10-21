@@ -1,5 +1,5 @@
 ; AoC 2017 day 5 — s7 Scheme port of p05.clj (same input, same algorithm)
-; NOTE: idiomatic Scheme uses a mutable vector (vector-set!); the cljc
+; NOTE: idiomatic Scheme uses a mutable vector (vector-set!); the clove
 ; original uses a *persistent* vector (assoc) by design as a stress test.
 (define (slurp path)
   (call-with-input-file path

@@ -1,4 +1,4 @@
-# Nightly differential fuzz: random expressions through cljc and babashka,
+# Nightly differential fuzz: random expressions through clove and babashka,
 # diffed (fuzz/fuzz.sh). The conformance corpus in CI is FIXED -- it only
 # guards against regressions. This is the job that finds new divergences.
 #
