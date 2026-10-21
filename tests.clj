@@ -3490,9 +3490,10 @@
   (assert= [{"type" "text" "text" "hi"} {"type" "tool_use" "id" "t" "name" "propose_form" "input" {"code" "(inc 1)"}}]
            (vec (vals (:blocks st)))))
 ;; clove/sh-lines*: one call per output line, exit status back; a throw closes the pipe
-(let [ls (atom [])]
-  (assert= 3 (clove/sh-lines* "printf 'a\\nb\\n'; exit 3" #(swap! ls conj %)))
-  (assert= ["a" "b"] @ls))
+(when clove-test-unix?   ; POSIX sh syntax; Windows popen runs cmd.exe
+  (let [ls (atom [])]
+    (assert= 3 (clove/sh-lines* "printf 'a\\nb\\n'; exit 3" #(swap! ls conj %)))
+    (assert= ["a" "b"] @ls)))
 (assert= "stop" (try (clove/sh-lines* "yes" (fn [_] (throw (ex-info "stop" {})))) (catch Exception e (ex-message e))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
