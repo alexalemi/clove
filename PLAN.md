@@ -25,7 +25,7 @@ Renamed cljc → clove (2026-10-20): binary, source file, env vars, share dir,
 `clove/` helpers and the C API all moved; `:cljc` stays a reader-conditional
 alias and `~/.cljc_history` is migrated on first REPL start. HISTORY.md and
 released CHANGELOG entries keep the old name. The GitHub repo is now
-alexalemi/clove; the local checkout dir is still ~/projects/cljc.
+alexalemi/clove, and the checkout lives at ~/projects/clove.
 
 Also (2026-10-20): `? question` in the REPL asks Claude
 (`claude.clj` battery; C side keeps a 32 KB session transcript in
