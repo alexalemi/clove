@@ -12001,6 +12001,7 @@ static Clove *prim_sh(CloveEnv *env, Clove **argv, int nargs) {
 #ifndef CLOVE_NO_MAIN   /* defined with the REPL */
 static Clove *prim_repl_edit(CloveEnv *env, Clove **argv, int nargs);
 static Clove *prim_repl_log(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_edit_mode(CloveEnv *env, Clove **argv, int nargs);
 #endif
 
 /* (clove/sh-lines* "cmd" f) → exit status. Like sh, but calls (f line) for
@@ -13950,6 +13951,7 @@ CloveEnv *clove_new_env(void) {
 #ifndef CLOVE_NO_MAIN
     clove_define_native(e, "clove/repl-edit*", prim_repl_edit);
     clove_define_native(e, "clove/repl-log*", prim_repl_log);
+    clove_define_native(e, "clove/edit-mode", prim_edit_mode);
 #endif
     clove_define_native(e, "clove/read-key*", prim_read_key);
     clove_define_native(e, "clove/term-size*", prim_term_size);
@@ -15811,47 +15813,139 @@ static int run_stream(CloveEnv *env, FILE *f, const char *name) {
 #include <termios.h>
 #endif
 
-#define RL_MAX 8192
+#define RL_MAX 65536
 #define HIST_MAX 512
 static char *rl_hist[HIST_MAX];
 static int rl_hist_n;
 
-static void hist_load(void) {
+/* History file: one entry per line. Multi-line forms are escaped in the v2
+ * format (first line "#clove-history-v2": newline → \n, backslash → \\);
+ * an older plain file is read as-is and rewritten as v2. */
+#define HIST_V2 "#clove-history-v2"
+static bool hist_path(char *path, size_t n) {
     const char *home = getenv("HOME");
-    if (!home) return;
-    char path[512];
-    snprintf(path, sizeof path, "%s/.clove_history", home);
-    FILE *f = fopen(path, "r");
-    if (!f) {   /* carry over the history from before the cljc → clove rename */
-        char old[512];
-        snprintf(old, sizeof old, "%s/.cljc_history", home);
-        if (rename(old, path) == 0) f = fopen(path, "r");
-    }
-    if (!f) return;
-    char line[RL_MAX];
-    while (fgets(line, sizeof line, f) && rl_hist_n < HIST_MAX) {
-        size_t n = strlen(line);
-        while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-        if (n) rl_hist[rl_hist_n++] = strdup(line);
-    }
-    fclose(f);
+    if (!home) return false;
+    snprintf(path, n, "%s/.clove_history", home);
+    return true;
 }
-
-static void hist_add(const char *line) {
-    if (!*line) return;
-    if (rl_hist_n && !strcmp(rl_hist[rl_hist_n-1], line)) return;
+static void hist_write_entry(FILE *f, const char *s) {
+    for (; *s; s++) {
+        if (*s == '\n') fputs("\\n", f);
+        else if (*s == '\\') fputs("\\\\", f);
+        else if (*s != '\r') fputc(*s, f);
+    }
+    fputc('\n', f);
+}
+static void hist_push(char *s) {
     if (rl_hist_n == HIST_MAX) {
         free(rl_hist[0]);
         memmove(rl_hist, rl_hist + 1, sizeof(char *) * (HIST_MAX - 1));
         rl_hist_n--;
     }
-    rl_hist[rl_hist_n++] = strdup(line);
-    const char *home = getenv("HOME");
-    if (!home) return;
-    char path[512];
-    snprintf(path, sizeof path, "%s/.clove_history", home);
+    rl_hist[rl_hist_n++] = s;
+}
+
+static void hist_load(void) {
+    char path[1024];
+    if (!hist_path(path, sizeof path)) return;
+    FILE *f = fopen(path, "r");
+    if (!f) {   /* carry over the history from before the cljc → clove rename */
+        char old[1024];
+        snprintf(old, sizeof old, "%s/.cljc_history", getenv("HOME"));
+        if (rename(old, path) == 0) f = fopen(path, "r");
+    }
+    if (!f) return;
+    SBuf line = {0};
+    bool v2 = false, first = true;
+    int c;
+    for (;;) {
+        line.len = 0;
+        while ((c = fgetc(f)) != EOF && c != '\n') sb_putc(&line, (char)c);
+        if (c == EOF && line.len == 0) break;
+        sb_putc(&line, 0);
+        size_t n = strlen(line.data);
+        while (n && line.data[n-1] == '\r') line.data[--n] = 0;
+        if (first) { first = false; if (!strcmp(line.data, HIST_V2)) { v2 = true; continue; } }
+        if (!n) continue;
+        char *e = malloc(n + 1);
+        if (!e) break;
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (v2 && line.data[i] == '\\' && i + 1 < n) {
+                i++;
+                e[k++] = line.data[i] == 'n' ? '\n' : line.data[i];
+            } else e[k++] = line.data[i];
+        }
+        e[k] = 0;
+        hist_push(e);
+    }
+    free(line.data);
+    fclose(f);
+    if (!v2 && rl_hist_n) {   /* upgrade the file in place */
+        FILE *w = fopen(path, "w");
+        if (w) {
+            fputs(HIST_V2 "\n", w);
+            for (int i = 0; i < rl_hist_n; i++) hist_write_entry(w, rl_hist[i]);
+            fclose(w);
+        }
+    }
+}
+
+static void hist_add(const char *line) {
+    if (!*line) return;
+    if (rl_hist_n && !strcmp(rl_hist[rl_hist_n-1], line)) return;
+    hist_push(strdup(line));
+    char path[1024];
+    if (!hist_path(path, sizeof path)) return;
     FILE *f = fopen(path, "a");
-    if (f) { fprintf(f, "%s\n", line); fclose(f); }
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fputs(HIST_V2 "\n", f);
+    hist_write_entry(f, line);
+    fclose(f);
+}
+
+/* ───── Line editor ─────────────────────────────────────────────────────
+ * A multi-line editor for the REPL: Enter submits a complete form and
+ * otherwise opens an indented new line; Alt-Enter / Ctrl-J always add a
+ * line. Brackets and quotes auto-pair, pastes arrive verbatim (bracketed
+ * paste), the arglists of the call around the cursor show dimly after the
+ * text, and history holds whole multi-line forms. Emacs-style keys by
+ * default; vi mode (insert + normal, operators, text objects, counts, undo,
+ * dot-repeat) when ~/.inputrc says `set editing-mode vi`, CLOVE_EDIT_MODE=vi
+ * is set, or (clove/edit-mode! :vi) runs. The frame is redrawn whole on
+ * every key: the buffer's rows are computed from the terminal width, so
+ * wrapped and multi-line input both stay put. */
+
+/* Key codes above the byte range for decoded escape sequences. */
+enum { K_ESC = 0x1b, K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_HOME, K_END, K_DEL,
+       K_PGUP, K_PGDN, K_CLEFT, K_CRIGHT, K_ALT_ENTER, K_ALT_B, K_ALT_F, K_ALT_D,
+       K_ALT_BS, K_PASTE, K_NONE };
+
+/* Scan state of a buffer prefix: inside a string, a comment, and the stack of
+ * open brackets with their columns (for indentation and arglist hints). A
+ * backslash outside a string starts a char literal (\( is not a paren). */
+typedef struct { bool in_str, in_com; int depth; long open_at[64]; } EdScan;
+static void ed_scan(const char *s, size_t n, EdScan *sc) {
+    memset(sc, 0, sizeof *sc);
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (sc->in_com) { if (c == '\n') sc->in_com = false; continue; }
+        if (sc->in_str) {
+            if (c == '\\' && i + 1 < n) i++;
+            else if (c == '"') sc->in_str = false;
+            continue;
+        }
+        if (c == '\\') { if (i + 1 < n) i++; continue; }
+        if (c == '"') sc->in_str = true;
+        else if (c == ';') sc->in_com = true;
+        else if (c == '(' || c == '[' || c == '{') {
+            if (sc->depth < 64) sc->open_at[sc->depth] = (long)i;
+            sc->depth++;
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (sc->depth > 0) sc->depth--;
+        }
+    }
 }
 
 /* Index of the bracket matching `target`; -1 = none, -2 = orphan closer.
@@ -15875,6 +15969,7 @@ static long rl_match(const char *buf, long target, bool *mismatch) {
             else if (c == '"') in_str = false;
             continue;
         }
+        if (c == '\\') { if (buf[i+1]) i++; continue; }   /* char literal */
         if (c == '"') in_str = true;
         else if (c == ';') in_com = true;
         else if (strchr("([{", c)) { if (sp < 256) stack[sp++] = i; }
@@ -15891,32 +15986,48 @@ static long rl_match(const char *buf, long target, bool *mismatch) {
     return -1;
 }
 
+/* A newline inside highlighted output: reset, move to the next row, draw
+ * the continuation prompt, and resume the color the text was in. */
+static void ed_hl_nl(SBuf *out, const char *cont, const char *color) {
+    sb_puts(out, "\x1b[0m\r\n");
+    sb_puts(out, cont);
+    if (color) sb_puts(out, color);
+}
+
 /* Render the buffer with syntax highlighting into out; the bracket pair
  * (hl_a, hl_b) renders in reverse video — red when hl_bad (mismatched
- * types or an orphan closer). */
+ * types or an orphan closer). Newlines start a row with `cont`. */
 static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b,
-                         bool hl_bad) {
+                         bool hl_bad, const char *cont) {
     const char *p = buf;
     while (*p) {
         long off = (long)(p - buf);
+        if (*p == '\n') { ed_hl_nl(out, cont, NULL); p++; continue; }
         if ((off == hl_a || off == hl_b) && strchr("()[]{}", *p)) {
             sb_puts(out, hl_bad ? "\x1b[7;31;1m" : "\x1b[7;1m");
             sb_putc(out, *p++);
             sb_puts(out, "\x1b[0m");
             continue;
         }
-        if (*p == ';') {                                /* comment */
+        if (*p == ';') {                                /* comment, to end of line */
             sb_puts(out, "\x1b[2m");
-            while (*p) sb_putc(out, *p++);
+            while (*p && *p != '\n') sb_putc(out, *p++);
             sb_puts(out, "\x1b[0m");
         } else if (*p == '"') {                          /* string */
             sb_puts(out, "\x1b[32m");
             sb_putc(out, *p++);
             while (*p && *p != '"') {
-                if (*p == '\\' && p[1]) { sb_putc(out, *p++); }
+                if (*p == '\n') { ed_hl_nl(out, cont, "\x1b[32m"); p++; continue; }
+                if (*p == '\\' && p[1] && p[1] != '\n') { sb_putc(out, *p++); }
                 sb_putc(out, *p++);
             }
             if (*p) sb_putc(out, *p++);
+            sb_puts(out, "\x1b[0m");
+        } else if (*p == '\\' && p[1] && p[1] != '\n') { /* char literal */
+            sb_puts(out, "\x1b[32m");
+            sb_putc(out, *p++);
+            sb_putc(out, *p++);
+            while (isalnum((unsigned char)*p)) sb_putc(out, *p++);   /* \newline, A */
             sb_puts(out, "\x1b[0m");
         } else if (*p == ':' && is_sym_char((unsigned char)p[1])) {  /* keyword */
             sb_puts(out, "\x1b[36m");
@@ -15932,85 +16043,12 @@ static void rl_highlight(const char *buf, SBuf *out, long hl_a, long hl_b,
             sb_puts(out, "\x1b[2m");
             sb_putc(out, *p++);
             sb_puts(out, "\x1b[0m");
+        } else if (is_sym_char((unsigned char)*p)) {     /* a whole symbol at once */
+            while (is_sym_char((unsigned char)*p)) sb_putc(out, *p++);
         } else sb_putc(out, *p++);
     }
 }
 
-static void rl_refresh_opt(const char *prompt, const char *buf, size_t pos,
-                           bool show_match) {
-    /* bracket match: closer just typed/behind cursor, or opener at cursor */
-    long hl_a = -1, hl_b = -1;
-    if (show_match && pos > 0 && strchr(")]}", buf[pos - 1])) hl_a = (long)pos - 1;
-    else if (!show_match) { /* accepted line: no lingering highlight */ }
-    else if (show_match && strchr("([{", buf[pos] ? buf[pos] : ' ')) hl_a = (long)pos;
-    bool hl_bad = false;
-    if (hl_a >= 0) {
-        hl_b = rl_match(buf, hl_a, &hl_bad);
-        if (hl_b == -2) { hl_b = -1; hl_bad = true; }  /* orphan: red alone */
-        else if (hl_b < 0) hl_a = -1;
-    }
-    SBuf out = {0};
-    sb_puts(&out, "\r\x1b[K");
-    sb_puts(&out, prompt);
-    rl_highlight(buf, &out, hl_a, hl_b, hl_bad);
-    /* cursor: return to col 0, advance past prompt + pos */
-    char mv[32];
-    snprintf(mv, sizeof mv, "\r\x1b[%zuC", strlen(prompt) + pos);
-    sb_puts(&out, mv);
-    fwrite(out.data, 1, out.len, stdout);
-    fflush(stdout);
-    free(out.data);
-}
-
-static void rl_refresh(const char *prompt, const char *buf, size_t pos) {
-    rl_refresh_opt(prompt, buf, pos, true);
-}
-
-/* Tab completion: the symbol fragment before the cursor, against root
- * bindings + special forms. Inserts the unique completion or lists. */
-static const char *rl_specials[] = {"defn", "defmacro", "let", "loop", "recur",
-    "lazy-seq", "binding", "when", "cond", "quote", NULL};
-
-static void rl_complete(char *buf, size_t *len, size_t *pos, const char *prompt) {
-    size_t start = *pos;
-    while (start > 0 && is_sym_char((unsigned char)buf[start-1])) start--;
-    size_t fraglen = *pos - start;
-    if (!fraglen) return;
-    const char *matches[64];
-    int nm = 0;
-    for (Binding *b = gc_root_envs[0]->bindings; b && nm < 64; b = b->next) {
-        if (strstr(b->name, "**") || !strncmp(b->name, "clove/", 6)) continue;
-        if (!strncmp(b->name, buf + start, fraglen)) matches[nm++] = b->name;
-    }
-    for (int i = 0; rl_specials[i] && nm < 64; i++)
-        if (!strncmp(rl_specials[i], buf + start, fraglen)) matches[nm++] = rl_specials[i];
-    if (nm == 0) return;
-    /* longest common prefix of all matches */
-    size_t common = strlen(matches[0]);
-    for (int i = 1; i < nm; i++) {
-        size_t j = 0;
-        while (j < common && matches[i][j] == matches[0][j]) j++;
-        common = j;
-    }
-    if (common > fraglen) {       /* extend the fragment */
-        size_t add = common - fraglen;
-        if (*len + add < RL_MAX - 1) {
-            memmove(buf + *pos + add, buf + *pos, *len - *pos + 1);
-            memcpy(buf + *pos, matches[0] + fraglen, add);
-            *len += add;
-            *pos += add;
-        }
-    } else if (nm > 1) {          /* show candidates */
-        printf("\r\n");
-        for (int i = 0; i < nm && i < 24; i++)
-            printf("%s%s", i ? "  " : "", matches[i]);
-        if (nm > 24) printf("  ...(%d total)", nm);
-        printf("\r\n");
-    }
-    rl_refresh(prompt, buf, *pos);
-}
-
-/* Read one edited line; returns false on EOF (ctrl-d on empty). */
 /* Raw-mode enter/exit, one implementation per platform. On Windows the
  * console is switched to VT input (arrow keys arrive as ESC [ sequences,
  * exactly what the shared editing loop parses) + VT output (the ANSI
@@ -16037,19 +16075,960 @@ static void rl_raw_exit(RlTermState *st) {
     SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), st->in0);
     SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), st->out0);
 }
+static int ed_getbyte(void) {
+    unsigned char c; DWORD n = 0;
+    if (!ReadFile(GetStdHandle(STD_INPUT_HANDLE), &c, 1, &n, NULL) || n != 1) return -1;
+    return c;
+}
+/* a keypress waiting within ms? (key-up/focus/mouse events don't count) */
+static bool ed_pending(int ms) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD t0 = GetTickCount();
+    for (;;) {
+        INPUT_RECORD r[16]; DWORD n = 0;
+        if (PeekConsoleInputW(h, r, 16, &n) && n) {
+            for (DWORD i = 0; i < n; i++)
+                if (r[i].EventType == KEY_EVENT && r[i].Event.KeyEvent.bKeyDown) return true;
+            ReadConsoleInputW(h, r, n, &n);             /* drop the non-key events */
+        }
+        if (GetTickCount() - t0 >= (DWORD)ms) return false;
+        Sleep(1);
+    }
+}
 #else
 typedef struct { struct termios orig; } RlTermState;
 static bool rl_raw_enter(RlTermState *st) {
     if (tcgetattr(0, &st->orig) == -1) return false;   /* not a tty */
     struct termios raw = st->orig;
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG);
+    raw.c_iflag &= (tcflag_t)~(ICRNL | IXON);          /* Enter is \r, Ctrl-J is \n */
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | ISIG | IEXTEN);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     tcsetattr(0, TCSAFLUSH, &raw);
     return true;
 }
 static void rl_raw_exit(RlTermState *st) { tcsetattr(0, TCSAFLUSH, &st->orig); }
+static int ed_getbyte(void) { return raw_getc(); }
+static bool ed_pending(int ms) { return raw_pending(ms); }
 #endif
+
+/* ── edit mode: emacs or vi ── */
+static bool ed_ieq(const char *a, const char *b) {
+    while (*a && tolower((unsigned char)*a) == tolower((unsigned char)*b)) a++, b++;
+    return !*a && !*b;
+}
+static int ed_mode_cfg = -1;            /* -1 unknown, 0 emacs, 1 vi */
+static bool ed_vi_mode(void) {
+    if (ed_mode_cfg >= 0) return ed_mode_cfg == 1;
+    const char *e = getenv("CLOVE_EDIT_MODE");
+    if (e && *e) return (ed_mode_cfg = (!strcmp(e, "vi") || !strcmp(e, "vim"))) == 1;
+    ed_mode_cfg = 0;
+    /* readline users already said it once: honor `set editing-mode vi` */
+    char path[1024];
+    const char *ir = getenv("INPUTRC"), *home = getenv("HOME");
+    if (ir && *ir) snprintf(path, sizeof path, "%s", ir);
+    else if (home) snprintf(path, sizeof path, "%s/.inputrc", home);
+    else return false;
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char a[64], b[64], c[64];
+        if (line[0] == '#') continue;
+        if (sscanf(line, "%63s %63s %63s", a, b, c) == 3 && !strcmp(a, "set") &&
+            ed_ieq(b, "editing-mode"))
+            ed_mode_cfg = ed_ieq(c, "vi") ? 1 : 0;
+    }
+    fclose(f);
+    return ed_mode_cfg == 1;
+}
+
+/* ── the editor state ── */
+#define ED_UNDO_MAX 64
+typedef struct { char *text; size_t pos; } EdSnap;
+typedef struct {
+    char *buf; size_t len, cap, pos;
+    const char *prompt;
+    int pw;                       /* prompt display width */
+    int prev_crow;                /* cursor row (from the frame top) last drawn */
+    bool vi, normal;              /* vi mode / in its normal (command) state */
+    bool typing;                  /* in a run of typed chars (one undo group) */
+    EdSnap undo[ED_UNDO_MAX]; int nundo;
+    EdSnap redo[ED_UNDO_MAX]; int nredo;
+    int hidx;                     /* history cursor (rl_hist_n = the live line) */
+    char *saved;                  /* the live line while browsing history */
+    int pending_count;
+} Ed;
+
+static char *ed_yank;             /* kill/yank register, shared across lines */
+static bool ed_yank_lines;        /* yanked whole lines (vi linewise) */
+
+/* Key replay queue (vi `.`) and recording of the last change. */
+static int ed_q[512]; static int ed_qh, ed_qt;
+static int ed_rec[512]; static int ed_nrec; static bool ed_recording;
+static int ed_last[512]; static int ed_nlast;
+
+static int ed_vis_width(const char *s) {   /* columns, ignoring ANSI escapes */
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == 0x1b && p[1] == '[') {
+            p += 2;
+            while (*p && !(*p >= 0x40 && *p <= 0x7e)) p++;
+            if (!*p) break;
+            continue;
+        }
+        if ((*p & 0xC0) != 0x80) w++;
+    }
+    return w;
+}
+
+static int ed_rawkey(bool vi) {
+    int c = ed_getbyte();
+    if (c != 0x1b) return c;
+    if (!ed_pending(vi ? 25 : 40)) return K_ESC;
+    int c1 = ed_getbyte();
+    if (c1 == '[' || c1 == 'O') {
+        char seq[16]; int n = 0;
+        for (;;) {
+            int d = ed_getbyte();
+            if (d < 0) return K_NONE;
+            if (n < 15) seq[n++] = (char)d;
+            if (c1 == 'O' || (d >= 0x40 && d <= 0x7e)) break;
+        }
+        seq[n] = 0;
+        if (!strcmp(seq, "A")) return K_UP;
+        if (!strcmp(seq, "B")) return K_DOWN;
+        if (!strcmp(seq, "C")) return K_RIGHT;
+        if (!strcmp(seq, "D")) return K_LEFT;
+        if (!strcmp(seq, "H") || !strcmp(seq, "1~") || !strcmp(seq, "7~")) return K_HOME;
+        if (!strcmp(seq, "F") || !strcmp(seq, "4~") || !strcmp(seq, "8~")) return K_END;
+        if (!strcmp(seq, "3~")) return K_DEL;
+        if (!strcmp(seq, "5~")) return K_PGUP;
+        if (!strcmp(seq, "6~")) return K_PGDN;
+        if (!strcmp(seq, "1;5D") || !strcmp(seq, "1;3D")) return K_CLEFT;
+        if (!strcmp(seq, "1;5C") || !strcmp(seq, "1;3C")) return K_CRIGHT;
+        if (!strcmp(seq, "200~")) return K_PASTE;
+        return K_NONE;
+    }
+    if (c1 == '\r' || c1 == '\n') return K_ALT_ENTER;
+    if (!vi) {
+        if (c1 == 'b') return K_ALT_B;
+        if (c1 == 'f') return K_ALT_F;
+        if (c1 == 'd') return K_ALT_D;
+        if (c1 == 127 || c1 == 8) return K_ALT_BS;
+        return K_NONE;
+    }
+    /* vi: Esc typed quickly before a command key is still Esc + that key */
+    if (ed_qt < (int)(sizeof ed_q / sizeof *ed_q)) ed_q[ed_qt++] = c1;
+    return K_ESC;
+}
+
+static int ed_key(Ed *e) {
+    int k;
+    if (ed_qh < ed_qt) {
+        k = ed_q[ed_qh++];
+        if (ed_qh == ed_qt) ed_qh = ed_qt = 0;
+    } else {
+        k = ed_rawkey(e->vi);
+    }
+    if (ed_recording && ed_nrec < (int)(sizeof ed_rec / sizeof *ed_rec)) ed_rec[ed_nrec++] = k;
+    return k;
+}
+
+/* ── buffer primitives ── */
+static void ed_snapshot_to(EdSnap *stack, int *n, Ed *e) {
+    if (*n == ED_UNDO_MAX) { free(stack[0].text); memmove(stack, stack + 1, sizeof *stack * (ED_UNDO_MAX - 1)); (*n)--; }
+    stack[*n].text = strdup(e->buf);
+    stack[*n].pos = e->pos;
+    (*n)++;
+}
+static void ed_save_undo(Ed *e) {   /* before a change: one undo step */
+    ed_snapshot_to(e->undo, &e->nundo, e);
+    while (e->nredo) free(e->redo[--e->nredo].text);
+}
+static void ed_restore(Ed *e, EdSnap *s) {
+    size_t n = strlen(s->text);
+    if (n >= e->cap) n = e->cap - 1;
+    memcpy(e->buf, s->text, n); e->buf[n] = 0;
+    e->len = n; e->pos = s->pos > n ? n : s->pos;
+    free(s->text);
+}
+static void ed_undo(Ed *e) {
+    if (!e->nundo) return;
+    ed_snapshot_to(e->redo, &e->nredo, e);
+    ed_restore(e, &e->undo[--e->nundo]);
+}
+static void ed_redo(Ed *e) {
+    if (!e->nredo) return;
+    ed_snapshot_to(e->undo, &e->nundo, e);
+    ed_restore(e, &e->redo[--e->nredo]);
+}
+
+static bool ed_insert_n(Ed *e, const char *s, size_t n) {
+    if (e->len + n >= e->cap) { fputs("\a", stdout); return false; }   /* full: bell, not a silent cut */
+    memmove(e->buf + e->pos + n, e->buf + e->pos, e->len - e->pos + 1);
+    memcpy(e->buf + e->pos, s, n);
+    e->len += n; e->pos += n;
+    return true;
+}
+static void ed_delete_range(Ed *e, size_t a, size_t b) {   /* [a, b) */
+    if (a > b) { size_t t = a; a = b; b = t; }
+    if (b > e->len) b = e->len;
+    if (a >= b) return;
+    memmove(e->buf + a, e->buf + b, e->len - b + 1);
+    e->len -= b - a;
+    if (e->pos > b) e->pos -= b - a;
+    else if (e->pos > a) e->pos = a;
+}
+static void ed_set_yank(const char *s, size_t n, bool lines) {
+    free(ed_yank);
+    ed_yank = malloc(n + 1);
+    if (!ed_yank) return;
+    memcpy(ed_yank, s, n); ed_yank[n] = 0;
+    ed_yank_lines = lines;
+}
+static void ed_set_text(Ed *e, const char *s) {
+    size_t n = strlen(s);
+    if (n >= e->cap) n = e->cap - 1;
+    memcpy(e->buf, s, n); e->buf[n] = 0;
+    e->len = e->pos = n;
+}
+
+/* UTF-8 aware cursor steps */
+static size_t ed_next(Ed *e, size_t i) {
+    if (i >= e->len) return e->len;
+    i++;
+    while (i < e->len && ((unsigned char)e->buf[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+static size_t ed_prev(Ed *e, size_t i) {
+    if (i == 0) return 0;
+    i--;
+    while (i > 0 && ((unsigned char)e->buf[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+static size_t ed_bol(Ed *e, size_t i) { while (i > 0 && e->buf[i-1] != '\n') i--; return i; }
+static size_t ed_eol(Ed *e, size_t i) { while (i < e->len && e->buf[i] != '\n') i++; return i; }
+static int ed_col(Ed *e, size_t i) {          /* codepoints from line start */
+    int c = 0;
+    for (size_t j = ed_bol(e, i); j < i; j++) if (((unsigned char)e->buf[j] & 0xC0) != 0x80) c++;
+    return c;
+}
+static size_t ed_at_col(Ed *e, size_t bol, int col) {   /* index of col on that line, clamped */
+    size_t i = bol, eol = ed_eol(e, bol);
+    while (col > 0 && i < eol) { i = ed_next(e, i); col--; }
+    return i;
+}
+
+/* ── arglist hint: the call around the cursor ── */
+typedef struct { const char *name; char *hint; } EdHint;
+static EdHint ed_hints[64]; static int ed_nhints, ed_hint_rr;
+
+/* arglists of a symbol as one line ("[f coll] [f val coll]"), or NULL;
+ * looked up through the doc machinery under its own error frame (so a broken
+ * docs file or an odd symbol can't longjmp out of the editor), then cached */
+static const char *ed_arglists(CloveEnv *env, const char *sym, size_t n) {
+    const char *name = intern(sym, n);
+    for (int i = 0; i < ed_nhints; i++) if (ed_hints[i].name == name) return ed_hints[i].hint;
+    char *hint = NULL;
+    Clove *volatile info = NIL;
+    ErrFrame fr;
+    fr.prev = err_top; fr.vsp_save = vsp; fr.esp_save = eval_sp;
+    fr.vm_tsp_save = vm_tsp; fr.ns_save = cur_reader_ns; fr.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL; fr.rd_line_save = rd_line;
+    fr.rd_start_save = rd_line_start; fr.rd_file_save = rd_file_cell;
+    err_top = &fr;
+    if (setjmp(fr.jb) == 0) {
+        Binding *ed = root_find(env_root(env), intern("clove/ensure-docs!", 18), NULL, false);
+        if (ed && ed->value != NIL) apply(env_root(env), ed->value, NULL, 0);
+        Clove *a1[1] = { mk_sym(name) };
+        info = prim_doc_info(env_root(env), a1, 1);
+        err_top = fr.prev;
+    } else {
+        err_top = fr.prev;
+        vsp = fr.vsp_save; eval_sp = fr.esp_save; vm_tsp = fr.vm_tsp_save; cur_reader_ns = fr.ns_save; if (g_ns_binding && fr.nsvar_save) g_ns_binding->value = fr.nsvar_save;
+        rd_line = fr.rd_line_save; rd_line_start = fr.rd_start_save;
+        rd_file_cell = fr.rd_file_save;
+        info = NIL;
+    }
+    Clove *v;
+    if (info != NIL && info->tag == CLOVE_MAP &&
+        map_find(info, mk_kw(intern("arglists", 8)), &v) && v != NIL &&
+        (v->tag == CLOVE_LIST || v->tag == CLOVE_VECTOR)) {
+        SBuf sb = {0};
+        print_to(&sb, v, true);
+        if (sb.data && sb.len >= 2 && (sb.data[0] == '(' || sb.data[0] == '[')) {
+            sb.data[sb.len - 1] = 0;                      /* strip the outer ( ) */
+            hint = strdup(sb.data + 1);
+        }
+        free(sb.data);
+    }
+    int slot;
+    if (ed_nhints < 64) slot = ed_nhints++;
+    else { slot = ed_hint_rr++ % 64; free(ed_hints[slot].hint); }
+    ed_hints[slot].name = name;
+    ed_hints[slot].hint = hint;
+    return hint;
+}
+
+static CloveEnv *ed_env;   /* the REPL env, for hint lookups (NULL: no hints) */
+
+static const char *ed_hint(Ed *e) {
+    if (!ed_env) return NULL;
+    EdScan sc;
+    ed_scan(e->buf, e->pos, &sc);
+    if (sc.in_str || sc.in_com || sc.depth == 0 || sc.depth > 64) return NULL;
+    long o = sc.open_at[sc.depth - 1];
+    if (e->buf[o] != '(') return NULL;
+    size_t a = (size_t)o + 1, b = a;
+    while (b < e->len && is_sym_char((unsigned char)e->buf[b])) b++;
+    if (b == a || e->pos < b) return NULL;             /* still typing the head */
+    if (isdigit((unsigned char)e->buf[a]) || e->buf[a] == ':') return NULL;
+    return ed_arglists(ed_env, e->buf + a, b - a);
+}
+
+/* ── drawing ── */
+static void ed_cont_prompt(Ed *e, SBuf *out) {
+    sb_puts(out, "\x1b[2m");
+    for (int i = 0; i < e->pw - 5; i++) sb_putc(out, ' ');
+    sb_puts(out, e->pw >= 5 ? "...> " : "");
+    sb_puts(out, "\x1b[0m");
+}
+
+/* Redraw the whole frame. final: no hint/highlight, cursor parked at the
+ * end of the text, then a newline (the line was accepted). */
+static void ed_render(Ed *e, bool final) {
+    int cols = term_width();
+    SBuf out = {0};
+    if (e->prev_crow > 0) sb_printf(&out, "\x1b[%dA", e->prev_crow);
+    sb_puts(&out, "\r\x1b[J");
+    sb_puts(&out, e->prompt);
+    SBuf cont = {0};
+    ed_cont_prompt(e, &cont);
+    long hl_a = -1, hl_b = -1;
+    bool hl_bad = false;
+    if (!final) {
+        size_t pos = e->pos;
+        if (pos > 0 && strchr(")]}", e->buf[pos - 1]) && e->buf[pos - 1]) hl_a = (long)pos - 1;
+        else if (pos < e->len && strchr("([{", e->buf[pos])) hl_a = (long)pos;
+        if (e->normal && pos < e->len && strchr(")]}", e->buf[pos])) hl_a = (long)pos;
+        if (hl_a >= 0) {
+            hl_b = rl_match(e->buf, hl_a, &hl_bad);
+            if (hl_b == -2) { hl_b = -1; hl_bad = true; }
+            else if (hl_b < 0) hl_a = -1;
+        }
+    }
+    rl_highlight(e->buf, &out, hl_a, hl_b, hl_bad, cont.data ? cont.data : "");
+    free(cont.data);
+    /* geometry: rows per logical line, the cursor's (row, col) */
+    size_t cpos = final ? e->len : e->pos;
+    int total = 0, crow = 0, ccol = 0, lastw = 0;
+    size_t i = 0;
+    for (;;) {
+        size_t eol = ed_eol(e, i);
+        int w = e->pw;
+        for (size_t j = i; j < eol; j++) if (((unsigned char)e->buf[j] & 0xC0) != 0x80) w++;
+        int rows = (w - 1) / cols + 1;
+        if (cpos >= i && cpos <= eol) {
+            int c = e->pw + ed_col(e, cpos);
+            if (c > 0 && c % cols == 0 && c == w) {     /* cursor just past a full row */
+                if (eol == e->len) { crow = total + c / cols; ccol = 0; }
+                else { crow = total + (c - 1) / cols; ccol = cols - 1; }
+            } else { crow = total + c / cols; ccol = c % cols; }
+        }
+        total += rows;
+        if (eol >= e->len) { lastw = w; break; }
+        i = eol + 1;
+    }
+    int end_row = total - 1;
+    const char *hint = (!final) ? ed_hint(e) : NULL;
+    if (hint) {
+        int used = lastw % cols;
+        int avail = cols - used - 3;
+        if (used != 0 && avail > 4) {
+            int hw = (int)strlen(hint);
+            sb_puts(&out, "\x1b[2m  ");
+            if (hw <= avail) sb_puts(&out, hint);
+            else { SBuf t = {0}; sb_puts(&t, hint); t.data[avail - 1] = 0; sb_puts(&out, t.data); sb_puts(&out, "…"); free(t.data); }
+            sb_puts(&out, "\x1b[0m");
+        }
+    }
+    if (crow > end_row) { sb_puts(&out, "\r\n"); end_row++; }   /* make the row the cursor needs */
+    sb_puts(&out, "\r");
+    if (end_row - crow > 0) sb_printf(&out, "\x1b[%dA", end_row - crow);
+    if (ccol > 0) sb_printf(&out, "\x1b[%dC", ccol);
+    if (final) sb_puts(&out, "\r\n");
+    fwrite(out.data, 1, out.len, stdout);
+    fflush(stdout);
+    free(out.data);
+    e->prev_crow = final ? 0 : crow;
+}
+
+/* Something was printed below the frame (completion list): start a fresh
+ * frame under it. */
+static void ed_below(Ed *e) {
+    e->pos = e->len;
+    ed_render(e, true);
+}
+
+/* ── tab completion ── */
+static const char *rl_specials[] = {"defn", "defmacro", "let", "loop", "recur",
+    "lazy-seq", "binding", "when", "cond", "quote", NULL};
+
+static void ed_complete(Ed *e) {
+    size_t start = e->pos;
+    while (start > 0 && is_sym_char((unsigned char)e->buf[start-1])) start--;
+    size_t fraglen = e->pos - start;
+    if (!fraglen) { ed_insert_n(e, "  ", 2); return; }   /* nothing to complete: indent */
+    const char *matches[64];
+    int nm = 0;
+    for (Binding *b = gc_root_envs[0]->bindings; b && nm < 64; b = b->next) {
+        if (strstr(b->name, "**") || !strncmp(b->name, "clove/", 6)) continue;
+        if (!strncmp(b->name, e->buf + start, fraglen)) matches[nm++] = b->name;
+    }
+    for (int i = 0; rl_specials[i] && nm < 64; i++)
+        if (!strncmp(rl_specials[i], e->buf + start, fraglen)) matches[nm++] = rl_specials[i];
+    if (nm == 0) return;
+    size_t common = strlen(matches[0]);
+    for (int i = 1; i < nm; i++) {
+        size_t j = 0;
+        while (j < common && matches[i][j] == matches[0][j]) j++;
+        common = j;
+    }
+    if (common > fraglen) {
+        ed_insert_n(e, matches[0] + fraglen, common - fraglen);
+    } else if (nm > 1) {
+        size_t keep = e->pos;
+        ed_below(e);
+        for (int i = 0; i < nm && i < 24; i++)
+            printf("%s%s", i ? "  " : "", matches[i]);
+        if (nm > 24) printf("  ...(%d total)", nm);
+        printf("\r\n");
+        e->pos = keep;
+    }
+}
+
+/* ── history ── */
+static void ed_history(Ed *e, int dir) {
+    int n = e->hidx + dir;
+    if (n < 0 || n > rl_hist_n) return;
+    if (e->hidx == rl_hist_n) { free(e->saved); e->saved = strdup(e->buf); }
+    e->hidx = n;
+    ed_set_text(e, n == rl_hist_n ? (e->saved ? e->saved : "") : rl_hist[n]);
+    if (e->vi && e->normal) {      /* vi lands on the first line, like readline */
+        e->pos = 0;
+    }
+}
+
+/* ↑/↓ move between the lines of a multi-line form; past the first/last
+ * line they walk history */
+static void ed_vertical(Ed *e, int dir) {
+    size_t bol = ed_bol(e, e->pos);
+    int col = ed_col(e, e->pos);
+    if (dir < 0) {
+        if (bol == 0) { ed_history(e, -1); return; }
+        size_t pbol = ed_bol(e, bol - 1);
+        e->pos = ed_at_col(e, pbol, col);
+    } else {
+        size_t eol = ed_eol(e, e->pos);
+        if (eol >= e->len) { ed_history(e, +1); return; }
+        e->pos = ed_at_col(e, eol + 1, col);
+    }
+}
+
+/* ── words ── */
+static bool ed_wordc(int c) {   /* vim's lisp 'iskeyword': symbols stay whole */
+    return isalnum(c) || c == '_' || (c >= 0x80) || (c && strchr("!$%&*+-/:<=>?'.#", c));
+}
+static int ed_class(int c, bool big) {
+    if (c == 0 || isspace(c)) return 0;
+    if (big) return 1;
+    return ed_wordc(c) ? 1 : 2;
+}
+#define EDC(i) ((unsigned char)e->buf[i])
+static size_t ed_word_fwd(Ed *e, size_t i, bool big) {   /* w */
+    int c0 = ed_class(EDC(i), big);
+    while (i < e->len && ed_class(EDC(i), big) == c0 && c0) i++;
+    while (i < e->len && isspace(EDC(i))) i++;
+    return i;
+}
+static size_t ed_word_end(Ed *e, size_t i, bool big) {   /* e */
+    if (i < e->len) i++;
+    while (i < e->len && isspace(EDC(i))) i++;
+    int c0 = ed_class(EDC(i), big);
+    while (i + 1 < e->len && ed_class(EDC(i + 1), big) == c0) i++;
+    return i;
+}
+static size_t ed_word_back(Ed *e, size_t i, bool big) {  /* b */
+    while (i > 0 && isspace(EDC(i - 1))) i--;
+    if (i == 0) return 0;
+    int c0 = ed_class(EDC(i - 1), big);
+    while (i > 0 && ed_class(EDC(i - 1), big) == c0) i--;
+    return i;
+}
+
+/* ── auto-pairing ── */
+static bool ed_in_code(Ed *e) {   /* cursor outside strings and comments */
+    EdScan sc; ed_scan(e->buf, e->pos, &sc);
+    return !sc.in_str && !sc.in_com;
+}
+static bool ed_pair_ok_after(Ed *e) {   /* pair only before space, a closer, or the end */
+    if (e->pos >= e->len) return true;
+    char n = e->buf[e->pos];
+    return isspace((unsigned char)n) || strchr(")]}", n);
+}
+static void ed_type(Ed *e, int c, bool autopair) {
+    char ch = (char)c;
+    if (autopair && e->pos > 0 && e->buf[e->pos - 1] == '\\' && ed_in_code(e)) autopair = false;
+    if (autopair && strchr(")]}", ch) && e->pos < e->len && e->buf[e->pos] == ch && ed_in_code(e)) {
+        e->pos++;                                    /* type over the auto-inserted closer */
+        return;
+    }
+    if (autopair && ch == '"') {
+        EdScan sc; ed_scan(e->buf, e->pos, &sc);
+        if (sc.in_str && e->pos < e->len && e->buf[e->pos] == '"') { e->pos++; return; }
+        if (!sc.in_str && !sc.in_com && ed_pair_ok_after(e)) {
+            if (ed_insert_n(e, "\"\"", 2)) e->pos--;
+            return;
+        }
+    }
+    if (autopair && strchr("([{", ch) && ed_in_code(e) && ed_pair_ok_after(e)) {
+        char pair[2] = { ch, ch == '(' ? ')' : ch == '[' ? ']' : '}' };
+        if (ed_insert_n(e, pair, 2)) e->pos--;
+        return;
+    }
+    ed_insert_n(e, &ch, 1);
+}
+static void ed_backspace(Ed *e) {
+    if (e->pos == 0) return;
+    size_t p = ed_prev(e, e->pos);
+    char a = e->buf[p], b = e->pos < e->len ? e->buf[e->pos] : 0;
+    if (((a == '(' && b == ')') || (a == '[' && b == ']') || (a == '{' && b == '}') ||
+         (a == '"' && b == '"')) && (p == 0 || e->buf[p - 1] != '\\')) {
+        ed_delete_range(e, p, e->pos + 1);          /* an empty pair goes together */
+        return;
+    }
+    ed_delete_range(e, p, e->pos);
+}
+
+/* newline + indentation for the open brackets before the cursor: two
+ * spaces past a `(`, one past a `[` or `{` (Tonsky-style) */
+static void ed_newline(Ed *e) {
+    EdScan sc; ed_scan(e->buf, e->pos, &sc);
+    int ind = 0;
+    if (sc.depth > 0 && sc.depth <= 64 && !sc.in_str) {
+        long o = sc.open_at[sc.depth - 1];
+        ind = ed_col(e, (size_t)o) + (e->buf[o] == '(' ? 2 : 1);
+    }
+    char sp[128];
+    if (ind > 120) ind = 120;
+    sp[0] = '\n';
+    memset(sp + 1, ' ', (size_t)ind);
+    ed_insert_n(e, sp, (size_t)ind + 1);
+}
+
+static bool balanced(const char *s);
+static bool is_ask_line(const char *s);
+static bool ed_complete_input(const char *s) {   /* does Enter submit? */
+    return s[0] == '!' || is_ask_line(s) || balanced(s);
+}
+
+/* Bracketed paste: insert the bytes as-is (no pairing, no submit on \n). */
+static void ed_paste(Ed *e) {
+    static const char endseq[] = "\x1b[201~";
+    char tail[6]; int m = 0;
+    SBuf p = {0};
+    for (;;) {
+        int c = ed_getbyte();
+        if (c < 0) break;
+        if (c == endseq[m]) { tail[m++] = (char)c; if (m == 6) break; continue; }
+        for (int i = 0; i < m; i++) sb_putc(&p, tail[i]);
+        m = 0;
+        if (c == endseq[0]) { tail[m++] = (char)c; continue; }
+        sb_putc(&p, c == '\r' ? '\n' : (char)c);
+    }
+    if (p.len) { ed_save_undo(e); ed_insert_n(e, p.data, p.len); }
+    free(p.data);
+}
+
+/* Ctrl-R incremental reverse search through history. Returns 1 to accept
+ * and run, 0 to keep editing (the buffer holds the match). */
+static int ed_search(Ed *e) {
+    char q[128] = ""; size_t qn = 0;
+    int start = rl_hist_n - 1;
+    const char *saved_prompt = e->prompt; int saved_pw = e->pw;
+    char sp[192];
+    for (;;) {
+        int match = -1;
+        for (int i = start; i >= 0; i--)
+            if (strstr(rl_hist[i], q)) { match = i; break; }
+        snprintf(sp, sizeof sp, "(reverse-i-search)`%s': ", q);
+        e->prompt = sp; e->pw = ed_vis_width(sp);
+        if (match >= 0) ed_set_text(e, rl_hist[match]);
+        else if (qn) ed_set_text(e, "");
+        ed_render(e, false);
+        int k = ed_key(e);
+        if (k == 18) { if (match > 0) start = match - 1; }
+        else if (k == 127 || k == 8) { if (qn) q[--qn] = 0; start = rl_hist_n - 1; }
+        else if (k >= 32 && k < 127 && qn < sizeof q - 1) { q[qn++] = (char)k; q[qn] = 0; start = rl_hist_n - 1; }
+        else {
+            e->prompt = saved_prompt; e->pw = saved_pw;
+            if (k == 7 || k == 3) { ed_set_text(e, ""); return 0; }   /* ^G/^C: abort */
+            if (k == '\r') return 1;
+            if (match >= 0) e->hidx = match;
+            return 0;
+        }
+    }
+}
+
+/* ── vi normal mode ── */
+static void ed_clamp_normal(Ed *e) {   /* normal mode sits ON a char, not past the line */
+    size_t eol = ed_eol(e, e->pos);
+    if (e->pos >= eol && e->pos > ed_bol(e, e->pos)) e->pos = ed_prev(e, eol);
+}
+
+/* text object [a, b) for i/a + kind; false if none around the cursor */
+static bool ed_textobj(Ed *e, bool around, int kind, size_t *a, size_t *b) {
+    if (kind == 'w' || kind == 'W') {
+        bool big = kind == 'W';
+        size_t s = e->pos, t = e->pos;
+        if (e->pos >= e->len) return false;
+        int c0 = ed_class(EDC(e->pos), big);
+        while (s > 0 && ed_class(EDC(s - 1), big) == c0 && EDC(s - 1) != '\n') s--;
+        while (t < e->len && ed_class(EDC(t), big) == c0 && EDC(t) != '\n') t++;
+        if (around) {
+            size_t t2 = t;
+            while (t2 < e->len && (EDC(t2) == ' ' || EDC(t2) == '\t')) t2++;
+            if (t2 > t) t = t2;
+            else while (s > 0 && (EDC(s - 1) == ' ' || EDC(s - 1) == '\t')) s--;
+        }
+        *a = s; *b = t;
+        return true;
+    }
+    if (kind == '"') {
+        EdScan sc; ed_scan(e->buf, e->pos, &sc);
+        size_t open;
+        if (sc.in_str) {
+            open = e->pos;
+            while (open > 0) { open--; if (e->buf[open] == '"' && (open == 0 || e->buf[open-1] != '\\')) break; }
+        } else if (e->pos < e->len && e->buf[e->pos] == '"') open = e->pos;
+        else return false;
+        size_t close = open + 1;
+        while (close < e->len && !(e->buf[close] == '"' && e->buf[close-1] != '\\')) close++;
+        if (close >= e->len) return false;
+        *a = around ? open : open + 1; *b = around ? close + 1 : close;
+        return true;
+    }
+    char open = kind == 'b' || kind == '(' || kind == ')' ? '(' :
+                kind == '[' || kind == ']' ? '[' :
+                kind == 'B' || kind == '{' || kind == '}' ? '{' : 0;
+    if (!open) return false;
+    /* innermost enclosing `open` bracket containing the cursor */
+    EdScan sc;
+    size_t upto = e->pos < e->len && e->buf[e->pos] == open ? e->pos + 1 : e->pos;
+    ed_scan(e->buf, upto, &sc);
+    for (int d = sc.depth - 1; d >= 0 && d < 64; d--) {
+        long o = sc.open_at[d];
+        if (e->buf[o] != open) continue;
+        bool bad;
+        long c = rl_match(e->buf, o, &bad);
+        if (c < 0) return false;
+        *a = around ? (size_t)o : (size_t)o + 1;
+        *b = around ? (size_t)c + 1 : (size_t)c;
+        return true;
+    }
+    return false;
+}
+
+/* a motion from the cursor: target index, inclusive (e/f/t/$/%), linewise (j/k/G) */
+static bool ed_motion(Ed *e, int k, int count, size_t *to, bool *incl, bool *lines) {
+    size_t p = e->pos;
+    *incl = false; *lines = false;
+    for (int n = 0; n < count; n++) {
+        switch (k) {
+        case 'h': case K_LEFT: case 127: case 8:
+            if (p > ed_bol(e, p)) p = ed_prev(e, p);
+            break;
+        case 'l': case K_RIGHT: case ' ':
+            if (p < ed_eol(e, p)) p = ed_next(e, p);
+            break;
+        case 'w': case 'W': p = ed_word_fwd(e, p, k == 'W'); break;
+        case 'b': case 'B': p = ed_word_back(e, p, k == 'B'); break;
+        case 'e': case 'E': p = ed_word_end(e, p, k == 'E'); *incl = true; break;
+        case '0': case K_HOME: p = ed_bol(e, p); break;
+        case '^': p = ed_bol(e, p); while (p < e->len && (EDC(p) == ' ' || EDC(p) == '\t')) p++; break;
+        case '$': case K_END: p = ed_eol(e, p); if (p > ed_bol(e, p)) p = ed_prev(e, p); *incl = true; break;
+        case 'j': case K_DOWN: { size_t eol = ed_eol(e, p); if (eol >= e->len) return n > 0; p = ed_at_col(e, eol + 1, ed_col(e, p)); *lines = true; break; }
+        case 'k': case K_UP: { size_t bol = ed_bol(e, p); if (bol == 0) return n > 0; p = ed_at_col(e, ed_bol(e, bol - 1), ed_col(e, p)); *lines = true; break; }
+        case 'G': p = ed_bol(e, e->len); *lines = true; break;
+        case '%': {
+            size_t s = p;
+            while (s < ed_eol(e, p) && !strchr("()[]{}", e->buf[s])) s++;
+            if (s >= e->len || !strchr("()[]{}", e->buf[s])) return false;
+            bool bad; long m = rl_match(e->buf, (long)s, &bad);
+            if (m < 0) return false;
+            p = (size_t)m; *incl = true; break;
+        }
+        case 'f': case 'F': case 't': case 'T': case ';': case ',': {
+            static int lastf, lastc;
+            int fk = k, fc;
+            if (k == ';' || k == ',') {
+                if (!lastf) return false;
+                fk = lastf; fc = lastc;
+                if (k == ',') fk = fk == 'f' ? 'F' : fk == 'F' ? 'f' : fk == 't' ? 'T' : 't';
+            } else {
+                if (n == 0) { fc = ed_key(e); lastf = k; lastc = fc; } else fc = lastc;
+            }
+            size_t s = p;
+            bool fwd = fk == 'f' || fk == 't';
+            if (fwd) {
+                size_t eol = ed_eol(e, p);
+                s = p + 1 + ((fk == 't' && (k == ';' || k == ',' || n > 0)) ? 1 : 0);
+                while (s < eol && EDC(s) != fc) s++;
+                if (s >= eol) return false;
+                p = fk == 't' ? s - 1 : s;
+            } else {
+                size_t bol = ed_bol(e, p);
+                if (p == bol) return false;
+                s = p - 1;
+                if (fk == 'T' && (k == ';' || k == ',' || n > 0) && s > bol) s--;
+                while (s > bol && EDC(s) != fc) s--;
+                if (EDC(s) != fc) return false;
+                p = fk == 'T' ? s + 1 : s;
+            }
+            *incl = fwd;
+            break;
+        }
+        default: return false;
+        }
+    }
+    *to = p;
+    return true;
+}
+
+static void ed_to_insert(Ed *e) { e->normal = false; e->typing = false; printf("\x1b[6 q"); }
+static void ed_to_normal(Ed *e) {
+    e->normal = true;
+    if (e->pos > ed_bol(e, e->pos)) e->pos = ed_prev(e, e->pos);   /* vim steps back on Esc */
+    ed_clamp_normal(e);
+    printf("\x1b[2 q");
+}
+
+/* range [a, b) of whole lines covering positions a..b (inclusive of b's line) */
+static void ed_line_range(Ed *e, size_t a, size_t b, size_t *ra, size_t *rb) {
+    if (a > b) { size_t t = a; a = b; b = t; }
+    *ra = ed_bol(e, a);
+    size_t eol = ed_eol(e, b);
+    *rb = eol < e->len ? eol + 1 : eol;
+    if (eol >= e->len && *ra > 0) *ra = *ra - 1;   /* last line: take the newline before it */
+}
+
+/* Operator d/c/y over [a, b). Returns true when it leaves normal mode. */
+static bool ed_apply_op(Ed *e, int op, size_t a, size_t b, bool lines) {
+    if (a > b) { size_t t = a; a = b; b = t; }
+    if (lines) {
+        size_t ra, rb; ed_line_range(e, a, b, &ra, &rb);
+        /* yank as complete lines (without the joining newline position quirks) */
+        size_t ya = ed_bol(e, a), yb = ed_eol(e, b);
+        if (a > b) { ya = ed_bol(e, b); yb = ed_eol(e, a); }
+        ed_set_yank(e->buf + ya, yb - ya, true);
+        if (op == 'y') { e->pos = ya; return false; }
+        ed_save_undo(e);
+        if (op == 'c') {
+            ed_delete_range(e, ya, yb);
+            e->pos = ya;
+            ed_to_insert(e);
+            return true;
+        }
+        ed_delete_range(e, ra, rb);
+        e->pos = ra < e->len ? ra : ed_bol(e, e->len);
+        if (e->pos < e->len && e->buf[e->pos] == '\n' && ra > 0) e->pos = ed_bol(e, ra);
+        return false;
+    }
+    ed_set_yank(e->buf + a, b - a, false);
+    if (op == 'y') { e->pos = a; return false; }
+    ed_save_undo(e);
+    ed_delete_range(e, a, b);
+    e->pos = a;
+    if (op == 'c') { ed_to_insert(e); return true; }
+    return false;
+}
+
+static void ed_put(Ed *e, bool after, int count) {
+    if (!ed_yank) return;
+    ed_save_undo(e);
+    for (int n = 0; n < count; n++) {
+        if (ed_yank_lines) {
+            if (after) {
+                e->pos = ed_eol(e, e->pos);
+                ed_insert_n(e, "\n", 1);
+                size_t at = e->pos;
+                ed_insert_n(e, ed_yank, strlen(ed_yank));
+                e->pos = at;
+            } else {
+                e->pos = ed_bol(e, e->pos);
+                size_t at = e->pos;
+                ed_insert_n(e, ed_yank, strlen(ed_yank));
+                ed_insert_n(e, "\n", 1);
+                e->pos = at;
+            }
+        } else {
+            if (after && e->pos < e->len && e->buf[e->pos] != '\n') e->pos = ed_next(e, e->pos);
+            ed_insert_n(e, ed_yank, strlen(ed_yank));
+            if (e->pos > 0) e->pos = ed_prev(e, e->pos);
+        }
+    }
+}
+
+/* One normal-mode command. Returns 1 accept line, -1 EOF, 0 continue. */
+static int ed_normal_cmd(Ed *e, int k) {
+    int count = 0;
+    while ((k >= '1' && k <= '9') || (count && k == '0')) { count = count * 10 + (k - '0'); k = ed_key(e); }
+    int cnt = count ? count : 1;
+    size_t to; bool incl, lines;
+    switch (k) {
+    case 'i': ed_save_undo(e); ed_to_insert(e); return 0;
+    case 'a': ed_save_undo(e); if (e->pos < ed_eol(e, e->pos)) e->pos = ed_next(e, e->pos); ed_to_insert(e); return 0;
+    case 'I': ed_save_undo(e); e->pos = ed_bol(e, e->pos); while (e->pos < e->len && (EDC(e->pos) == ' ')) e->pos++; ed_to_insert(e); return 0;
+    case 'A': ed_save_undo(e); e->pos = ed_eol(e, e->pos); ed_to_insert(e); return 0;
+    case 'o': ed_save_undo(e); e->pos = ed_eol(e, e->pos); ed_newline(e); ed_to_insert(e); return 0;
+    case 'O': {
+        ed_save_undo(e);
+        size_t bol = ed_bol(e, e->pos);
+        int ind = 0; for (size_t j = bol; j < e->len && e->buf[j] == ' '; j++) ind++;
+        e->pos = bol;
+        char sp[128]; if (ind > 120) ind = 120; memset(sp, ' ', (size_t)ind); sp[ind] = '\n';
+        ed_insert_n(e, sp, (size_t)ind + 1);
+        e->pos = bol + (size_t)ind;
+        ed_to_insert(e);
+        return 0;
+    }
+    case 'x': case K_DEL: {
+        size_t eol = ed_eol(e, e->pos), b = e->pos;
+        for (int n = 0; n < cnt && b < eol; n++) b = ed_next(e, b);
+        if (b > e->pos) { ed_set_yank(e->buf + e->pos, b - e->pos, false); ed_save_undo(e); ed_delete_range(e, e->pos, b); }
+        ed_clamp_normal(e); return 0;
+    }
+    case 'X': {
+        size_t bol = ed_bol(e, e->pos), a = e->pos;
+        for (int n = 0; n < cnt && a > bol; n++) a = ed_prev(e, a);
+        if (a < e->pos) { ed_set_yank(e->buf + a, e->pos - a, false); ed_save_undo(e); ed_delete_range(e, a, e->pos); }
+        return 0;
+    }
+    case 's': { size_t b = e->pos; for (int n = 0; n < cnt && b < ed_eol(e, e->pos); n++) b = ed_next(e, b); ed_apply_op(e, 'c', e->pos, b, false); return 0; }
+    case 'S': ed_apply_op(e, 'c', e->pos, e->pos, true); return 0;
+    case 'D': { size_t eol = ed_eol(e, e->pos); ed_apply_op(e, 'd', e->pos, eol, false); ed_clamp_normal(e); return 0; }
+    case 'C': ed_apply_op(e, 'c', e->pos, ed_eol(e, e->pos), false); return 0;
+    case 'Y': ed_apply_op(e, 'y', e->pos, e->pos, true); return 0;
+    case 'p': ed_put(e, true, cnt); return 0;
+    case 'P': ed_put(e, false, cnt); return 0;
+    case 'u': for (int n = 0; n < cnt; n++) ed_undo(e); ed_clamp_normal(e); return 0;
+    case 18: for (int n = 0; n < cnt; n++) ed_redo(e); ed_clamp_normal(e); return 0;   /* ^R */
+    case 'r': {
+        int c = ed_key(e);
+        if (c < 32 || c > 126) return 0;
+        size_t eol = ed_eol(e, e->pos);
+        if (e->pos + (size_t)cnt > eol) return 0;
+        ed_save_undo(e);
+        for (int n = 0; n < cnt; n++) e->buf[e->pos + (size_t)n] = (char)c;
+        e->pos += (size_t)cnt - 1;
+        return 0;
+    }
+    case '~': {
+        ed_save_undo(e);
+        for (int n = 0; n < cnt && e->pos < ed_eol(e, e->pos); n++) {
+            char c = e->buf[e->pos];
+            e->buf[e->pos] = isupper((unsigned char)c) ? (char)tolower((unsigned char)c) : (char)toupper((unsigned char)c);
+            e->pos = ed_next(e, e->pos);
+        }
+        ed_clamp_normal(e); return 0;
+    }
+    case 'J': {
+        ed_save_undo(e);
+        for (int n = 0; n < (cnt > 1 ? cnt - 1 : 1); n++) {
+            size_t eol = ed_eol(e, e->pos);
+            if (eol >= e->len) break;
+            size_t nb = eol + 1;
+            while (nb < e->len && e->buf[nb] == ' ') nb++;
+            ed_delete_range(e, eol, nb);
+            e->pos = eol;
+            if (eol > 0 && e->buf[eol - 1] != ' ' && e->pos < e->len && !strchr(")]}", e->buf[e->pos]))
+                ed_insert_n(e, " ", 1), e->pos = eol;
+        }
+        return 0;
+    }
+    case 'g': {
+        int k2 = ed_key(e);
+        if (k2 == 'g') e->pos = 0;
+        return 0;
+    }
+    case 'v': return 0;                       /* visual mode: not supported */
+    case '.': {
+        int n = ed_nlast;
+        if (!n) return 0;
+        for (int i = 0; i < n && ed_qt < 512; i++) ed_q[ed_qt++] = ed_last[i];
+        return 0;
+    }
+    case 'd': case 'c': case 'y': {
+        int op = k;
+        int k2 = ed_key(e), count2 = 0;
+        while ((k2 >= '1' && k2 <= '9') || (count2 && k2 == '0')) { count2 = count2 * 10 + (k2 - '0'); k2 = ed_key(e); }
+        int c2 = cnt * (count2 ? count2 : 1);
+        if (k2 == op) {                           /* dd cc yy: whole lines */
+            size_t b = e->pos;
+            for (int n = 1; n < c2; n++) { size_t eol = ed_eol(e, b); if (eol >= e->len) break; b = eol + 1; }
+            ed_apply_op(e, op, e->pos, b, true);
+            if (op != 'c') ed_clamp_normal(e);
+            return 0;
+        }
+        if (k2 == 'i' || k2 == 'a') {            /* text objects */
+            int kind = ed_key(e);
+            size_t a, b;
+            if (ed_textobj(e, k2 == 'a', kind, &a, &b)) ed_apply_op(e, op, a, b, false);
+            if (op != 'c' || e->normal) ed_clamp_normal(e);
+            return 0;
+        }
+        if (op == 'c' && (k2 == 'w' || k2 == 'W')) { /* cw acts like ce (vim) */
+            if (e->pos < e->len && !isspace(EDC(e->pos))) {
+                size_t p = e->pos;
+                for (int n = 0; n < c2; n++) p = ed_word_end(e, n ? p : (p > 0 ? p - 1 : p), k2 == 'W');
+                /* ed_word_end from the char before keeps a 1-char word */
+                size_t b = p < e->len ? ed_next(e, p) : p;
+                ed_apply_op(e, 'c', e->pos, b, false);
+                return 0;
+            }
+        }
+        if (k2 == 'g') { int k3 = ed_key(e); if (k3 != 'g') return 0; ed_apply_op(e, op, 0, e->pos, true); return 0; }
+        if (!ed_motion(e, k2, c2, &to, &incl, &lines)) return 0;
+        size_t a = e->pos, b = to;
+        if (b < a) { size_t t = a; a = b; b = t; incl = incl && to != e->pos; }
+        if (incl && b < e->len) b = ed_next(e, b);
+        /* dw on the last word of a line stops at the line end (vim) */
+        if ((k2 == 'w' || k2 == 'W') && !lines) { size_t eol = ed_eol(e, a); if (b > eol) b = eol; }
+        ed_apply_op(e, op, a, b, lines);
+        if (op != 'c' || e->normal) ed_clamp_normal(e);
+        return 0;
+    }
+    case 'j': case 'k': case K_UP: case K_DOWN: {
+        bool up = k == 'k' || k == K_UP;
+        for (int n = 0; n < cnt; n++) {
+            size_t bol = ed_bol(e, e->pos), eol = ed_eol(e, e->pos);
+            if (up && bol == 0) { ed_history(e, -1); break; }
+            if (!up && eol >= e->len) { ed_history(e, +1); break; }
+            ed_vertical(e, up ? -1 : 1);
+        }
+        ed_clamp_normal(e);
+        return 0;
+    }
+    default:
+        if (ed_motion(e, k, cnt, &to, &incl, &lines)) { e->pos = to; ed_clamp_normal(e); }
+        return 0;
+    }
+}
+
+/* Is k a normal-mode key that starts a change (recorded for `.`)? */
+static bool ed_is_change(int k) {
+    return k && k < 256 && strchr("dcxXsSrDCpPoOiaIAJ~", k);
+}
 
 /* Edit one line; `init` (may be NULL) is preloaded with the cursor at its
  * end, so a proposed line can be accepted with Enter or edited first. */
@@ -16063,125 +17042,135 @@ static bool rl_edit_init(const char *prompt, char *buf, size_t bufcap, const cha
         buf[strcspn(buf, "\n")] = 0;
         return true;
     }
-    size_t len = 0, pos = 0;
-    int hidx = rl_hist_n;
-    char saved[RL_MAX] = "";
-    buf[0] = 0;
-    if (init) {
-        snprintf(buf, bufcap, "%s", init);
-        len = pos = strlen(buf);
-    }
-    rl_refresh(prompt, buf, pos);
-    for (;;) {
-        int c = getchar();
-        if (c == EOF || (c == 4 && len == 0)) {           /* ctrl-d */
-            rl_raw_exit(&st);
-            printf("\r\n");
-            return false;
-        }
-        if (c == '\r' || c == '\n') {
-            rl_refresh_opt(prompt, buf, len, false);  /* clear match highlight */
-            rl_raw_exit(&st);
-            printf("\r\n");
-            return true;
-        }
-        if (c == 3) { len = pos = 0; buf[0] = 0; }        /* ctrl-c: clear */
-        else if (c == 127 || c == 8) {                    /* backspace */
-            if (pos > 0) {
-                memmove(buf + pos - 1, buf + pos, len - pos + 1);
-                pos--; len--;
-            }
-        } else if (c == 1) pos = 0;                       /* ctrl-a */
-        else if (c == 5) pos = len;                       /* ctrl-e */
-        else if (c == 11) { buf[pos] = 0; len = pos; }    /* ctrl-k */
-        else if (c == 21) {                               /* ctrl-u */
-            memmove(buf, buf + pos, len - pos + 1);
-            len -= pos; pos = 0;
-        } else if (c == 23) {                             /* ctrl-w */
-            size_t s = pos;
-            while (s > 0 && buf[s-1] == ' ') s--;
-            while (s > 0 && buf[s-1] != ' ') s--;
-            memmove(buf + s, buf + pos, len - pos + 1);
-            len -= pos - s; pos = s;
-        } else if (c == 12) { printf("\x1b[2J\x1b[H"); }  /* ctrl-l */
-        else if (c == 18) {                               /* ctrl-r: reverse-i-search */
-            char q[128] = "";
-            size_t qn = 0;
-            int start = rl_hist_n - 1;
-            for (;;) {
-                int match = -1;
-                for (int i = start; i >= 0; i--)
-                    if (strstr(rl_hist[i], q)) { match = i; break; }
-                char sp[192];
-                snprintf(sp, sizeof sp, "(reverse-i-search)`%s': ", q);
-                if (match >= 0) snprintf(buf, bufcap, "%s", rl_hist[match]);
-                else if (qn) buf[0] = 0;
-                len = pos = strlen(buf);
-                rl_refresh(sp, buf, pos);
-                int k = getchar();
-                if (k == 18) {                            /* again: next older match */
-                    if (match > 0) start = match - 1;
-                } else if (k == 127 || k == 8) {          /* backspace: shrink query */
-                    if (qn) q[--qn] = 0;
-                    start = rl_hist_n - 1;
-                } else if (k >= 32 && k < 127 && qn < sizeof q - 1) {
-                    q[qn++] = (char)k; q[qn] = 0;
-                    start = rl_hist_n - 1;
-                } else if (k == 7 || k == 3) {            /* ctrl-g/ctrl-c: abort */
-                    buf[0] = 0; len = pos = 0;
-                    break;
-                } else if (k == '\r' || k == '\n') {      /* accept + run */
-                    rl_refresh_opt(prompt, buf, len, false);
-                    rl_raw_exit(&st);
-                    printf("\r\n");
-                    return true;
-                } else {                                  /* any other key: edit the match */
-                    if (k == 27) { getchar(); getchar(); }  /* swallow the arrow tail */
-                    if (match >= 0) hidx = match;
-                    break;
-                }
-            }
-            rl_refresh(prompt, buf, pos);
-            continue;
-        }
-        else if (c == '\t') {
-            rl_complete(buf, &len, &pos, prompt);
-            continue;
-        } else if (c == 27) {                             /* escape sequences */
-            int c1 = getchar(), c2 = getchar();
-            if (c1 == '[') {
-                if (c2 == 'D' && pos > 0) pos--;          /* left */
-                else if (c2 == 'C' && pos < len) pos++;   /* right */
-                else if (c2 == 'H') pos = 0;
-                else if (c2 == 'F') pos = len;
-                else if (c2 == 'A') {                     /* up: history */
-                    if (hidx > 0) {
-                        if (hidx == rl_hist_n) snprintf(saved, sizeof saved, "%s", buf);
-                        hidx--;
-                        snprintf(buf, bufcap, "%s", rl_hist[hidx]);
-                        len = pos = strlen(buf);
-                    }
-                } else if (c2 == 'B') {                   /* down */
-                    if (hidx < rl_hist_n) {
-                        hidx++;
-                        snprintf(buf, bufcap, "%s",
-                                 hidx == rl_hist_n ? saved : rl_hist[hidx]);
-                        len = pos = strlen(buf);
-                    }
-                } else if (c2 == '3') { (void)getchar();  /* delete key */
-                    if (pos < len) {
-                        memmove(buf + pos, buf + pos + 1, len - pos);
-                        len--;
+    Ed ed = {0}, *e = &ed;
+    e->buf = buf; e->cap = bufcap; buf[0] = 0;
+    e->prompt = prompt; e->pw = ed_vis_width(prompt);
+    e->vi = ed_vi_mode();
+    e->hidx = rl_hist_n;
+    if (init) ed_set_text(e, init);
+    ed_qh = ed_qt = 0;
+    printf("\x1b[?2004h");                           /* bracketed paste on */
+    if (e->vi) printf("\x1b[6 q");                   /* insert mode: bar cursor */
+    ed_render(e, false);
+    int result = 0;                                  /* 1 accept, -1 EOF */
+    while (!result) {
+        int k = ed_key(e);
+        if (k < 0) { result = -1; break; }
+        if (k == K_NONE) continue;
+        if (k == K_PASTE) { ed_paste(e); ed_render(e, false); continue; }
+        if (e->vi && e->normal) {
+            if (k == '\r' || k == '\n') {
+                if (ed_complete_input(e->buf)) { result = 1; break; }
+                e->pos = ed_eol(e, e->pos); ed_save_undo(e); ed_newline(e); ed_to_insert(e);
+            } else if (k == 4 && e->len == 0) { result = -1; break; }
+            else if (k == 3) { ed_save_undo(e); ed_set_text(e, ""); ed_to_insert(e); }
+            else if (k == 12) printf("\x1b[2J\x1b[H"), e->prev_crow = 0;
+            else if (k == K_ESC) { /* nothing pending */ }
+            else {
+                bool change = ed_is_change(k) || (k >= '1' && k <= '9');
+                if (change) { ed_recording = true; ed_nrec = 0; ed_rec[ed_nrec++] = k; }
+                int r = ed_normal_cmd(e, k);
+                if (change && e->normal) {               /* finished inside normal mode */
+                    ed_recording = false;
+                    if (ed_nrec > 0 && ed_is_change(ed_rec[0] >= '1' && ed_rec[0] <= '9' ? ed_rec[ed_nrec - 1] : ed_rec[0])) {
+                        memcpy(ed_last, ed_rec, sizeof(int) * (size_t)ed_nrec); ed_nlast = ed_nrec;
                     }
                 }
+                if (r) { result = r; break; }
             }
-        } else if (c >= 32 && c < 127 && len < bufcap - 1) {
-            memmove(buf + pos + 1, buf + pos, len - pos + 1);
-            buf[pos] = (char)c;
-            pos++; len++;
+            ed_render(e, false);
+            continue;
         }
-        rl_refresh(prompt, buf, pos);
+        /* insert mode (vi) or emacs */
+        if (k == K_ESC) {
+            if (e->vi) {
+                ed_to_normal(e);
+                if (ed_recording) {                      /* a change that went through insert */
+                    ed_recording = false;
+                    memcpy(ed_last, ed_rec, sizeof(int) * (size_t)ed_nrec); ed_nlast = ed_nrec;
+                }
+            }
+            ed_render(e, false);
+            continue;
+        }
+        bool was_typing = e->typing;
+        e->typing = false;
+        switch (k) {
+        case '\r':
+            if (ed_complete_input(e->buf)) { result = 1; break; }
+            ed_save_undo(e); ed_newline(e); break;
+        case '\n': case K_ALT_ENTER: ed_save_undo(e); ed_newline(e); break;
+        case 4:                                          /* ^D */
+            if (e->len == 0) { result = -1; break; }
+            if (e->pos < e->len) { ed_save_undo(e); ed_delete_range(e, e->pos, ed_next(e, e->pos)); }
+            break;
+        case 3: ed_save_undo(e); ed_set_text(e, ""); break;          /* ^C: clear */
+        case 127: case 8: if (!was_typing) ed_save_undo(e); ed_backspace(e); e->typing = true; break;
+        case K_DEL: if (e->pos < e->len) { ed_save_undo(e); ed_delete_range(e, e->pos, ed_next(e, e->pos)); } break;
+        case 1: case K_HOME: e->pos = ed_bol(e, e->pos); break;         /* ^A */
+        case 5: case K_END: e->pos = ed_eol(e, e->pos); break;          /* ^E */
+        case 2: case K_LEFT: e->pos = ed_prev(e, e->pos); break;        /* ^B */
+        case 6: case K_RIGHT: e->pos = ed_next(e, e->pos); break;       /* ^F */
+        case 11: {                                                      /* ^K */
+            size_t eol = ed_eol(e, e->pos);
+            if (eol == e->pos && eol < e->len) eol++;                   /* at line end: join */
+            ed_set_yank(e->buf + e->pos, eol - e->pos, false);
+            ed_save_undo(e); ed_delete_range(e, e->pos, eol); break;
+        }
+        case 21: {                                                      /* ^U */
+            size_t bol = ed_bol(e, e->pos);
+            ed_set_yank(e->buf + bol, e->pos - bol, false);
+            ed_save_undo(e); ed_delete_range(e, bol, e->pos); break;
+        }
+        case 23: case K_ALT_BS: {                                        /* ^W */
+            size_t a = ed_word_back(e, e->pos, k == 23);
+            ed_set_yank(e->buf + a, e->pos - a, false);
+            ed_save_undo(e); ed_delete_range(e, a, e->pos); break;
+        }
+        case K_ALT_D: {
+            size_t b = e->pos;
+            while (b < e->len && !ed_wordc(EDC(b))) b++;
+            while (b < e->len && ed_wordc(EDC(b))) b++;
+            ed_set_yank(e->buf + e->pos, b - e->pos, false);
+            ed_save_undo(e); ed_delete_range(e, e->pos, b); break;
+        }
+        case 25: if (ed_yank) { ed_save_undo(e); ed_insert_n(e, ed_yank, strlen(ed_yank)); } break;   /* ^Y */
+        case 31: ed_undo(e); break;                                     /* ^_ */
+        case K_ALT_B: case K_CLEFT: e->pos = ed_word_back(e, e->pos, false); break;
+        case K_ALT_F: case K_CRIGHT: {
+            size_t b = e->pos;
+            while (b < e->len && !ed_wordc(EDC(b))) b++;
+            while (b < e->len && ed_wordc(EDC(b))) b++;
+            e->pos = b; break;
+        }
+        case 12: printf("\x1b[2J\x1b[H"); e->prev_crow = 0; break;     /* ^L */
+        case 16: case K_UP: ed_vertical(e, -1); break;                  /* ^P */
+        case 14: case K_DOWN: ed_vertical(e, +1); break;                /* ^N */
+        case K_PGUP: ed_history(e, -(e->hidx)); break;
+        case K_PGDN: ed_history(e, rl_hist_n - e->hidx); break;
+        case 18: if (ed_search(e)) result = 1; break;                   /* ^R */
+        case '\t': ed_save_undo(e); ed_complete(e); break;
+        default:
+            if ((k >= 32 && k < 127) || (k >= 0x80 && k < 0x100)) {
+                if (!was_typing) ed_save_undo(e);
+                ed_type(e, k, k < 0x80);
+                e->typing = true;
+            }
+        }
+        if (result) break;
+        ed_render(e, false);
     }
+    if (result == 1) ed_render(e, true);
+    else { e->pos = e->len; ed_render(e, true); }
+    printf("\x1b[?2004l");
+    if (e->vi) printf("\x1b[0 q");                   /* the terminal's own cursor again */
+    fflush(stdout);
+    rl_raw_exit(&st);
+    ed_recording = false;
+    while (e->nundo) free(e->undo[--e->nundo].text);
+    while (e->nredo) free(e->redo[--e->nredo].text);
+    free(e->saved);
+    return result == 1;
 }
 
 static bool rl_edit(const char *prompt, char *buf, size_t bufcap) {
@@ -16198,6 +17187,7 @@ static bool balanced(const char *s) {
             else if (*c == '"') in_str = false;
             continue;
         }
+        if (*c == '\\') { if (c[1]) c++; continue; }   /* char literal: \( */
         if (*c == '"') in_str = true;
         else if (*c == ';') in_com = true;
         else if (strchr("([{", *c)) depth++;
@@ -16219,6 +17209,7 @@ static int open_depth(const char *s) {
             else if (*c == '"') in_str = false;
             continue;
         }
+        if (*c == '\\') { if (c[1]) c++; continue; }   /* char literal: \( */
         if (*c == '"') in_str = true;
         else if (*c == ';') in_com = true;
         else if (strchr("([{", *c)) depth++;
@@ -16275,7 +17266,7 @@ static Clove *prim_repl_edit(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs != 2) clove_error("clove/repl-edit*: expected prompt and initial text");
     const char *prompt = as_str(argv[0], "clove/repl-edit*");
     const char *init = argv[1] == NIL ? NULL : as_str(argv[1], "clove/repl-edit*");
-    char line[RL_MAX];
+    static char line[RL_MAX];
     fflush(stdout);
     if (!rl_edit_init(prompt, line, sizeof line, init)) return NIL;
     const char *t = line;
@@ -16283,6 +17274,21 @@ static Clove *prim_repl_edit(CloveEnv *env, Clove **argv, int nargs) {
     if (!*t) return NIL;
     hist_add(line);
     return mk_str(line, strlen(line));
+}
+
+/* (clove/edit-mode) → :vi or :emacs, the REPL's key bindings;
+ * (clove/edit-mode :vi) switches from the next prompt on. */
+static Clove *prim_edit_mode(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env;
+    if (nargs > 1) clove_error("clove/edit-mode: expected :vi, :emacs, or nothing");
+    if (nargs == 1) {
+        const char *m = argv[0]->tag == CLOVE_KEYWORD ? argv[0]->as.kw :
+                        argv[0]->tag == CLOVE_STRING ? argv[0]->as.str : "";
+        if (!strcmp(m, "vi") || !strcmp(m, "vim")) ed_mode_cfg = 1;
+        else if (!strcmp(m, "emacs")) ed_mode_cfg = 0;
+        else clove_error("clove/edit-mode: expected :vi or :emacs");
+    }
+    return mk_kw(ed_vi_mode() ? intern("vi", 2) : intern("emacs", 5));
 }
 
 /* (clove/repl-log* s) → nil; append s to the transcript `? ` sends along. */
@@ -16316,6 +17322,7 @@ static bool is_ask_line(const char *s) { return s[0] == '?' && (s[1] == ' ' || s
 
 static int run_repl(CloveEnv *env) {
     clove_interactive = true;
+    ed_env = env;
     hist_load();
 #ifdef _WIN32
     SetConsoleCtrlHandler(clove_ctrl_handler, 1);
@@ -16328,8 +17335,9 @@ static int run_repl(CloveEnv *env) {
 #endif
     printf("clove %s — tab completes, (doc x) (source x) (dir ns) (dbg x), ↑/^R history, *1 *2 *3 / (*results* n) hold results, !cmd shells out, ? question asks Claude\n",
            CLOVE_VERSION);
-    char form[RL_MAX * 4];
-    char line[RL_MAX];
+    /* static, not stack: the conservative GC scans the whole C stack */
+    static char form[RL_MAX * 4];
+    static char line[RL_MAX];
     int out_n = 1;
     char prompt[48];
     for (;;) {

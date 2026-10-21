@@ -56,6 +56,10 @@ conformance: clove
 # expressions, BMP strings, string invariants. `make fuzz SEED=7 N=5000`
 # reproduces a run; the nightly workflow (.github/workflows/fuzz.yml) runs it
 # with fresh seeds.
+# the REPL line editor through a real pty (skips without python3 + pexpect)
+test-pty: clove
+	@python3 tests/pty_repl.py ./clove
+
 fuzz: clove
 	@fuzz/fuzz.sh "$(SEED)" "$(N)"
 
@@ -84,4 +88,4 @@ lint:
 	clj-kondo --lint json.clj libc.clj test.clj examples 2>/dev/null || true
 	@echo "(name files .cljc if they use #?(:clove ...) reader conditionals)"
 
-.PHONY: run test test-full conformance fuzz clean example lint install uninstall
+.PHONY: run test test-full test-pty conformance fuzz clean example lint install uninstall
