@@ -3653,5 +3653,9 @@
 ;; = between a finite and an infinite seq walks lazily and stops (was a hang)
 (assert= [false false false true] [(= [0 1 2] (range)) (= (range 3) (range)) (= (range) '(0 1)) (= (range 3) [0 1 2])])
 
+;; (long ratio) out of range is IllegalArgumentException with the quotient, as RT.longCast
+(assert= "Value out of range for long: 32281802128991715324"
+         (try (long (* -7/2 -9223372036854775807)) (catch ArithmeticException e :ae) (catch IllegalArgumentException e (ex-message e))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

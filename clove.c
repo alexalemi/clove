@@ -9599,7 +9599,14 @@ static Clove *prim_int(CloveEnv *env, Clove **argv, int nargs) {
     }
     if (v != NIL && (v->tag == CLOVE_BIGDEC || v->tag == CLOVE_RATIO)) {   /* (long 2.7M) => 2 */
         Clove *q; big_divmod(rat_num(v), rat_den(v), &q, NULL);
-        if (q->tag != CLOVE_INT) clove_error("int: value out of range: %s", val_desc(v));
+        if (q->tag != CLOVE_INT) {   /* RT.longCast(Ratio): the truncated quotient's range check */
+            char *ds = big_to_decimal(q);
+            static SBuf vr;
+            vr.len = 0;
+            sb_puts(&vr, ds);
+            free(ds);
+            clove_error_cls("IllegalArgumentException", "Value out of range for long: %s", vr.data);
+        }
         return q;
     }
     if (v != NIL && v->tag == CLOVE_STRING && v->as.str[0])

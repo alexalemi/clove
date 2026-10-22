@@ -134,6 +134,9 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- **`(long ratio)` out of range** throws `IllegalArgumentException` "Value out
+  of range for long: <quotient>", as Clojure does, instead of an untyped error
+  that any `catch` clause took (found by the nightly fuzzer).
 - **`=` between a finite and an infinite seq** returns false instead of
   hanging: `(= [0 1 2] (range))`.
 - **Long names, messages and format output are no longer cut off.** Fixed

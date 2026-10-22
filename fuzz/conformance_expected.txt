@@ -496,3 +496,4 @@ true
 ["Value out of range for long: 1.0E19" 0 -2 9223372036854775807]
 ["Can't pop empty vector" :ise nil [1]]
 [false false false true]
+["Value out of range for long: 32281802128991715324" -3]

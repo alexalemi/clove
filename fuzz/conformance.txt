@@ -520,3 +520,4 @@
 [(try (long 1e19) (catch IllegalArgumentException e (ex-message e))) (long ##NaN) (long -2.7) (long 9.223372036854775807E18)]
 [(try (pop []) (catch IndexOutOfBoundsException e :wrong) (catch IllegalStateException e (ex-message e))) (try (pop (list)) (catch IllegalStateException e :ise)) (pop nil) (pop [1 2])]
 [(= [0 1 2] (range)) (= (range 3) (range)) (= (range) (quote (0 1))) (= (range 3) [0 1 2])]
+[(try (long (* -7/2 -9223372036854775807)) (catch ArithmeticException e :ae) (catch IllegalArgumentException e (ex-message e))) (long -7/2)]
