@@ -50,6 +50,23 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
   `N`/`M` suffix like `pr` does (`1.5M`, not `1.5`); `str` of a bare number
   still drops it. And `str` of a collection prints its contents readably:
   `(str ["a" 1.5M])` is `"[\"a\" 1.5M]"`, where it was `"[a 1.5]"`.
+- **BigInt is a type, not a size.** `1N` is a BigInt (it read as the long
+  `1`), and BigInt arithmetic stays BigInt whatever the magnitude, as
+  Clojure's contagion does: `(+ 1N 1)` is `2N`, and
+  `(reduce * 1N (range 1 30))` returns
+  `8841761993739701954543616000000N` where it threw "long overflow". A
+  whole result of ratio arithmetic is a BigInt too (`(+ 1/2 1/2)` is `1N`),
+  while long division stays long (`(/ 4 2)` is `2`). `bigint` and
+  `rationalize` of a double return BigInts; `(bigint 1e30)` is exact. Longs
+  and BigInts are still one category: `(= 1 1N)`, equal hashes, the same
+  map/set key, and a small BigInt works as an index (`(nth v 1N)`). Visible
+  change: `pr-str` of these results now carries the `N`, and `int?` is false
+  for them (`integer?` is true). `biginteger` returns the same type, so it
+  prints `3N` where the JVM's `BigInteger` prints `3`.
+- **Comparator results are read by sign.** A `sort`/`sort-by` comparator
+  returning a BigInt, or a long beyond 32 bits (`(fn [a b] (- a b))` over
+  large values), used to be truncated to a C `int`, which could flip or zero
+  the ordering.
 
 ### Added
 - **A multi-line REPL editor, with vi mode.** Enter runs a complete form and

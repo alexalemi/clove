@@ -3,7 +3,7 @@
 ;; blank lines are skipped by the runners. Every expression is deterministic
 ;; and order-stable: unordered collections are printed via sorted views only.
 ;; Documented clove divergences (astral strings, wrapping int64 arithmetic,
-;; typed catch, small-N literal demotion, hash values) are deliberately absent.
+;; typed catch, hash values) are deliberately absent.
 ;; numbers: arithmetic, division, quot/rem/mod
 (+ 1 2)
 (- 10 3 2)
@@ -89,6 +89,19 @@
 (identity ##Inf)
 (- ##Inf)
 (reduce * (range 1 21))
+;; BigInt is sticky: N literals and BigInt arithmetic stay BigInt at any size,
+;; whole ratio results are BigInts, and Long/BigInt are one = / hash category
+1N
+[0N -1N (- 1N) (+ 1N 1) (* 1N 1N) (inc 1N) (dec 1N) (- 5N 5) (* 0 1N) (+ 1N)]
+(reduce * 1N (range 1 30))
+[(+ 1/2 1/2) (* 2/3 3) (- 1/2 1/2) (/ 4N 2) (/ 4 2) (/ 1N 2) (/ 1N) (/ 1/2)]
+[(quot 7N 2) (rem 7N 2) (mod -7N 2) (quot 6 3N) (rem 7 2N)]
+[(bigint 5) (bigint 2.7) (bigint 2.7M) (bigint 1e30) (bigint "12") (rationalize 2.0) (rationalize 1e20)]
+[(abs -3N) (max 3N 2) (max 1N 2) (- (+' 9223372036854775807 1) 1)]
+[(= 1 1N) (== 1 1N) (= (hash 1) (hash 1N)) (get {1 :a} 1N) (get {1N :a} 1) (contains? #{1N} 1) (int? 1N) (integer? 1N)]
+[(nth [10 20] 1N) ([10 20] 1N) (get [10 20] 1N) (assoc [1 2] 1N :x) (long 5N) (double 5N) (str 5N) (str [1N])]
+[(sort [3N 1 2N]) (sort (fn [a b] (- a b)) [3N 1N 2N]) (hash-set 1 1N) (frequencies [1 1N]) (zero? 0N) (even? 2N)]
+[(+ 1N 1.5) (+ 1N 1M) (unchecked-add 1N 1) (read-string "3N")]
 ;; range promotion semantics
 (range 5)
 (range 2 8 2)

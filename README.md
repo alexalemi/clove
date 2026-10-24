@@ -3,7 +3,7 @@
 A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
 embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
 beyond: persistent collections, macros, destructuring, protocols, ratios,
-namespaces, coroutines, regex — in ~12,500 lines of C99 with no dependencies.
+namespaces, coroutines, regex — in one ~18,000-line C99 file with no dependencies.
 
 ```clojure
 (defn top-words [text n]
@@ -31,7 +31,7 @@ built-in namespaces. See [Running real libraries](#running-real-libraries).
 make            # builds ./clove (cc, -lm -ldl, nothing else)
 ./clove          # REPL: editing, history, tab-completion, highlighting, *1 *2 *3
 ./clove file.clj # run a script
-make test       # 1000+ assertions + conformance corpus (~20s)
+make test       # 2000+ assertions + conformance corpus (~20s)
 make test-full  # adds the CLOVE_GC_STRESS=1 pass (~8x slower; CI/pre-release)
 
 ./install.sh                      # install to ~/.local (no sudo)
@@ -172,7 +172,7 @@ same `tests.clj` runs everywhere.
 
 | Area | Coverage |
 |---|---|
-| **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **bignums** (`123…890N` literals and the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
+| **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **BigInts** with Clojure's contagion (`1N` literals, `(+ 1N 1)` ⇒ `2N`, the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
 | **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
@@ -454,10 +454,9 @@ embeddability matter; use bb/JVM where throughput does.
   no match rethrows. The remaining interpreter errors are *untyped* and take
   any clause except `ExceptionInfo`, `AssertionError` and `Error`, so
   `(catch SomeSpecificException e …)` around one still works
-- In-range BigInts are longs: `1N` reads as `1`, and bigint arithmetic whose
-  result fits a long returns a long. So `(reduce * 1N (range 1 30))` throws
-  "long overflow" where Clojure's BigInt contagion keeps going — use `*'`/
-  `+'`/`-'`, which promote
+- There is no separate `java.math.BigInteger`: `biginteger` returns a BigInt
+  (same arithmetic as the JVM's, but it prints `3N` where Java prints `3`),
+  and `numerator`/`denominator` of a ratio return longs when they fit
 - Float division by zero is `##Inf`/`##NaN` whatever the operand types, as in
   compiled Clojure with primitive doubles; boxed JVM math (and babashka) throws
 - Hash maps/sets iterate in hash order, not insertion order (use sorted

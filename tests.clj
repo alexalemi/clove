@@ -3331,6 +3331,31 @@
 (assert= 18446744073709551616N (*' 4611686018427387904 4))
 (assert= 9223372036854775808N (inc' 9223372036854775807))
 (assert= 109223372036854775807N (+ 9223372036854775807 100000000000000000000N))  ; a bigint operand: exact path
+;; BigInt is sticky (clojure.lang.BigInt contagion): pr-str, since = can't see it
+(assert= "[1N 0N -1N 2N 2N 0N 0N]" (pr-str [1N 0N (- 1N) (+ 1N 1) (inc 1N) (dec 1N) (* 0 1N)]))
+(assert= "8841761993739701954543616000000N" (pr-str (reduce * 1N (range 1 30))))
+(assert= "9223372036854775807N" (pr-str (- (+' 9223372036854775807 1) 1)))  ; no demotion
+(assert= "[1N 2N 2 1N 2N 1/2]" (pr-str [(+ 1/2 1/2) (/ 4N 2) (/ 4 2) (/ 1N) (/ 1/2) (/ 1N 2)]))
+(assert= true (ratio? (/ 1N 3)))                                ; (/ 1N) above is not 1/1
+(assert= "[3N 1N 1N 2N]" (pr-str [(quot 7N 2) (rem 7N 2) (mod -7N 2) (quot 6 3N)]))
+(assert= "[5N 2N 2N 2N 1000000000000000000000000000000N]"
+         (pr-str [(bigint 5) (bigint 2.7) (bigint 2.7M) (rationalize 2.0) (bigint 1e30)]))
+(assert= "3N" (pr-str (read-string "3N")))
+(assert= "5" (str 5N))
+;; ...but Long and BigInt are one category for =, hash, and integer positions
+(assert= true (= 1 1N))
+(assert= (hash 1) (hash 1N))
+(assert= (hash -9223372036854775808) (hash (+ -9223372036854775808 0N)))   ; Long/MIN_VALUE edge
+(assert= :a (get {1 :a} 1N))
+(assert= 1 (count (hash-set 1 1N)))
+(assert= [false true] [(int? 1N) (integer? 1N)])
+(assert= [20 20 20 [1 :x]] [(nth [10 20] 1N) ([10 20] 1N) (get [10 20] 1N) (assoc [1 2] 1N :x)])
+(assert= "5" (pr-str (long 5N)))
+(assert= [true true] [(zero? 0N) (even? 2N)])
+(assert= [1N 2N 3N] (sort (fn [a b] (- a b)) [3N 1N 2N]))  ; BigInt comparator results
+(assert= [1 2 3] (sort (fn [a b] (- a b)) [3 1 2]))
+(assert= [-5000000000 1 5000000000]                      ; comparator results past 32 bits
+         (sort (fn [a b] (- a b)) [5000000000 1 -5000000000]))
 (assert= 9.223372036854776E18 (+ 9223372036854775807 1.0))
 (assert= 0 (unchecked-multiply 4611686018427387904 4))
 (assert= -9223372036854775808 (unchecked-add 9223372036854775807 1))

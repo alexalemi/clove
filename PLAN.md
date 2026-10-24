@@ -11,7 +11,7 @@ are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
 ## Status (as of 2026-10-21, unreleased on top of v0.5.1)
 
-~17,000 lines, zero warnings, ~1920 assertions in `tests.clj` + ~500-expression
+~18,000 lines, zero warnings, ~2040 assertions in `tests.clj` + ~510-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan at
@@ -20,6 +20,15 @@ mingw64) — suite runs normal + GC-stress on every push; a nightly job runs the
 differential fuzzer against babashka (`make fuzz`); tagged releases publish
 portable binaries. Suite verdict is the exit status + the "tests complete: N
 passed, 0 failed" line, never a grep for "error".
+
+BigInt contagion (2026-10-21): CLOVE_BIGINT is now the BigInt *type* at any
+magnitude (1N, BigInt arithmetic, whole ratio results, `bigint`), not "an
+int too big for int64". The `big_*` helpers still return the compact form
+(ratio/BigDecimal internals and `+'` overflow want that); user-visible BigInt
+results go through `to_bigint`. Integer positions read values through
+`int_value` (INT or an in-range BIGINT), `clove_eq`/`clove_hash` equate 1 and
+1N, and `make_ratio`/`mk_bigdec` demote their parts. Diffed against bb
+(conformance lines + `fuzz.sh` no longer strips the `N`); minijax unchanged.
 
 Fixed-buffer audit (2026-10-21): every `char buf[N]` that could cut a value
 users see now grows (err_msg is heap-grown via err_msg_vset, `intern_qual`
@@ -86,13 +95,12 @@ Things the history log leaves unresolved, roughly by value:
   registry misses. Fix is to qualify inside library loads, held back until a
   prelude/battery audit confirms nothing relies on clove's bare-symbol
   (non-hygienic) templates. Details: HISTORY.md, specter/meander entries.
-- **BigInt contagion.** In-range BigInts are longs (`1N` reads as `1`; a
-  bigint result that fits demotes), so `(reduce * 1N (range 1 30))` now
-  throws "long overflow" — loud, where it used to wrap silently, but Clojure
-  keeps going in BigInt. The real fix is a non-demoting BIGINT, which touches
-  every `->tag == CLOVE_INT` integer check (`as_int` is the main choke point),
-  `=`/`hash` across the two representations, and `int?` vs `integer?`.
-  `fuzz.sh` strips the `N` suffix before diffing so this stays quiet there.
+- **BigInt leftovers.** No separate BigInteger type (`biginteger` prints
+  `3N`); a ratio's `numerator`/`denominator` are longs when they fit (JVM:
+  BigInteger). Natives that take an integer through `int_value`/`as_int`
+  accept a small BigInt where the JVM is stricter (`bit-and`, `format "%d"`).
+  A new `tag == CLOVE_INT` check meaning "is an integer" should use
+  `int_value` instead, or 1N is silently rejected.
 - **Untyped interpreter errors.** Only the error sites with an obvious JVM
   class go through `clove_error_cls` (arithmetic, index bounds, number
   parsing, nil/non-number arguments, stack overflow). Everything else is
@@ -106,8 +114,7 @@ Things the history log leaves unresolved, roughly by value:
   the JVM itself, so there is no single right answer — left as is.
 - **BigDecimal leftovers**: `(BigDecimal. 0.1)` uses the double's shortest
   repr (Java's `valueOf`) rather than the exact binary expansion; only
-  HALF_UP rounding; no `*math-context*`; `(bigint 2.7M)` demotes to a long
-  like every in-range integer.
+  HALF_UP rounding; no `*math-context*`.
 - **Libraries needing a JVM reimplementation**: `clojure.data.xml` (StAX),
   `cognitect.transit` (see README "Not yet").
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
@@ -135,8 +142,7 @@ Things the history log leaves unresolved, roughly by value:
 
 ## Known divergences from Clojure (deliberate)
 - `catch` is typed only as far as exception classes are recorded; hash
-  maps/sets iterate in hash order; in-range BigInts are longs (see README's
-  list — it supersedes this one)
+  maps/sets iterate in hash order (see README's list — it supersedes this one)
 - Namespaces: flat global + per-ns aliases behind a symbol-based namespace
   layer; top-level `user` defs are bare, hence visible from other
   namespaces; no remove-ns/ns-unmap (root Bindings are append-only)

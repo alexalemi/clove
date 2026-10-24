@@ -30,9 +30,6 @@ differential() {
   if [ $rc -ne 0 ]; then
     echo "$1: clove exited $rc (crash or uncaught error):"; tail -15 "$tmp/$1.cljc.err"; fail=1
   fi
-  # A BigInt that fits a long prints without its N in clove (in-range bigints
-  # demote to longs -- a documented divergence), so "-1N" vs "-1" is not news.
-  sed -i -E 's/([0-9])N/\1/g' "$tmp/$1.cljc" "$tmp/$1.bb"
   grep -v '^;' "$2" | grep -v '^[[:space:]]*$' > "$tmp/$1.exprs"
   local found
   found=$(paste -d '\n' "$tmp/$1.exprs" "$tmp/$1.cljc" "$tmp/$1.bb" | awk '

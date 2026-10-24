@@ -198,9 +198,12 @@ typedef enum {
     CLOVE_EMPTY,     /* the empty list () — a distinct singleton: truthy, seq?/list?
                      * true, (= () nil) false, but seq/to_seq of it is NIL so the
                      * seq machinery and cons-traversal still terminate cleanly */
-    CLOVE_BIGINT,    /* arbitrary-precision integer: sign + base-2^32 magnitude.
-                     * Only exists when a value exceeds int64 — results that fit
-                     * demote back to CLOVE_INT, so the common case never allocates */
+    CLOVE_BIGINT,    /* clojure.lang.BigInt: sign + base-2^32 magnitude, at ANY
+                     * magnitude. CLOVE_INT is a Long, CLOVE_BIGINT a BigInt; the
+                     * tag is the value's type, not a function of its size. A
+                     * BigInt is sticky -- 1N stays 1N and (+ 1N 1) is 2N -- while
+                     * Long arithmetic only reaches one through +' -' *' overflow.
+                     * = and hash treat an in-range BigInt as its long value. */
     CLOVE_RATIO,     /* exact rational num/den (each INT or BIGINT), den>0, gcd-
                      * reduced, den!=1 (den==1 demotes to the integer) */
     CLOVE_BIGDEC,    /* java.math.BigDecimal: unscaled (INT or BIGINT) x 10^-scale.
@@ -285,8 +288,8 @@ struct Clove {
                  bool fc_ready; uint8_t fc_n; Clove *fc_arity; } fn;
         CloveNativeFn native;
         struct { Clove *value; } atom;
-        /* CLOVE_BIGINT: sign in {-1,+1}; mag is n little-endian base-2^32 limbs,
-         * mag[n-1] != 0 (never stored as zero — zero demotes to CLOVE_INT). */
+        /* CLOVE_BIGINT: mag is n little-endian base-2^32 limbs, mag[n-1] != 0;
+         * sign in {-1,+1}, or sign 0 with n 0 for 0N (mag still allocated). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
         struct { Clove *num; Clove *den; } ratio;   /* CLOVE_RATIO */
         struct { Clove *u; int64_t s; } bigdec;     /* CLOVE_BIGDEC: u * 10^-s */
@@ -347,6 +350,8 @@ static Clove *iarr_get(Clove *a, int64_t i);
 static Clove *prim_get(CloveEnv *env, Clove **argv, int nargs);
 static void iarr_set(Clove *a, int64_t i, Clove *v, const char *what);
 static Clove *big_from_decimal(const char *s);
+static Clove *to_bigint(Clove *v);
+static bool int_value(Clove *v, int64_t *out);
 static char *big_to_decimal(Clove *v);
 static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R);
 static bool big_is_zero(Clove *A);
@@ -1668,7 +1673,9 @@ static uint32_t clove_hash(Clove *v) {
         case CLOVE_NIL:  return 0x9e3779b9u;
         case CLOVE_BOOL: return v->as.b ? 1231u : 1237u;
         case CLOVE_INT:  return mix64((uint64_t)v->as.i);
-        case CLOVE_BIGINT: { uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
+        case CLOVE_BIGINT: { int64_t i;   /* (= 1 1N), so they must hash alike */
+            if (int_value(v, &i)) return mix64((uint64_t)i);
+            uint64_t h = v->as.big.sign < 0 ? 2166136261u : 0;
             for (uint32_t i = 0; i < v->as.big.n; i++) h = h * 31 + v->as.big.mag[i];
             return mix64(h); }
         case CLOVE_RATIO: return mix64(clove_hash(v->as.ratio.num) * 31 + clove_hash(v->as.ratio.den));
@@ -2479,15 +2486,41 @@ static Clove *peel_meta_sym_priv(Clove *v, bool *priv) {
 }
 static Clove *peel_meta_sym(Clove *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
+/* An exact integer as int64: a Long, or a BigInt whose value fits. BigInts
+ * are sticky (1N stays a BigInt), so every integer position -- indices,
+ * counts, vector keys, comparator results -- must accept the small ones the
+ * way the JVM's Util.isInteger + intValue do. False for anything else. */
+static bool int_value(Clove *v, int64_t *out) {
+    if (v == NULL || v == NIL) return false;
+    if (v->tag == CLOVE_INT) { *out = v->as.i; return true; }
+    if (v->tag != CLOVE_BIGINT || v->as.big.n > 2) return false;
+    uint64_t u = v->as.big.n == 0 ? 0 : v->as.big.mag[0] |
+                 (v->as.big.n == 2 ? (uint64_t)v->as.big.mag[1] << 32 : 0);
+    if (v->as.big.sign >= 0) {
+        if (u > (uint64_t)INT64_MAX) return false;
+        *out = (int64_t)u; return true;
+    }
+    if (u > (uint64_t)INT64_MAX + 1) return false;
+    *out = u == (uint64_t)INT64_MAX + 1 ? INT64_MIN : -(int64_t)u;
+    return true;
+}
+/* An in-range BigInt as the equivalent Long; anything else unchanged. For
+ * representations that store integer parts (ratio num/den, a decimal's
+ * unscaled value), where the BigInt/Long distinction carries no meaning. */
+static Clove *int_demote(Clove *v) {
+    int64_t i;
+    return v->tag == CLOVE_BIGINT && int_value(v, &i) ? mk_int(i) : v;
+}
+
 static int64_t as_int(Clove *v, const char *what) {
     if (v != NULL) {
-        if (v->tag == CLOVE_INT) return v->as.i;
+        int64_t i;
+        if (int_value(v, &i)) return i;
         /* Clojure coerces at integer positions (RT.intCast): (nth v 1.9) is
          * index 1, (subs s 1/2) index 0 -- truncation toward zero, which is
          * what a C cast already does. Numeric code that computes an index in
          * floating point (chebfun, array shapes) relies on this. A BIGINT
-         * here is by construction out of int64 range (in-range values demote
-         * to CLOVE_INT), so it falls through to the error below. */
+         * that gets past int_value is out of int64 range: the error below. */
         if (v->tag == CLOVE_DOUBLE || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC) {
             double d = as_num(v);
             if (!(d >= -9.2233720368547758e18 && d <= 9.2233720368547758e18))
@@ -2608,7 +2641,8 @@ static Clove *read_atom(const char **p) {
     if (is_num) {
         /* Plain decimal integer (optional sign, digits, optional trailing N):
          * may exceed int64 -> bigint. Detected first, before the 64-char buf cap,
-         * so arbitrarily long literals parse. big_from_decimal demotes if it fits. */
+         * so arbitrarily long literals parse. An N suffix is a BigInt at any
+         * size (1N); without one, a value that fits is a Long. */
         {
             const char *q = start; size_t m = n;
             if (m && (*q == '+' || *q == '-')) { q++; m--; }
@@ -2620,7 +2654,7 @@ static Clove *read_atom(const char **p) {
                 char *tmp = xmalloc(n + 1); memcpy(tmp, start, n); tmp[n] = '\0';
                 Clove *r = big_from_decimal(tmp);   /* stops at the trailing N */
                 free(tmp);
-                return r;
+                return hasN ? to_bigint(r) : r;
             }
         }
         /* BigDecimal literal: 1.5M, 1M, 1E+3M -- the decimal text before M */
@@ -3316,9 +3350,11 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
             bool found = false;
             if (value != NIL) {
                 if (value->tag == CLOVE_MAP) found = map_find(value, key, &v);
-                else if (value->tag == CLOVE_VECTOR && key != NIL && key->tag == CLOVE_INT &&
-                         key->as.i >= 0 && (size_t)key->as.i < vec_len(value)) {
-                    v = vec_nth(value, (size_t)key->as.i); found = true;
+                else if (value->tag == CLOVE_VECTOR) {
+                    int64_t i;
+                    if (int_value(key, &i) && i >= 0 && (size_t)i < vec_len(value)) {
+                        v = vec_nth(value, (size_t)i); found = true;
+                    }
                 } else if (value->tag == CLOVE_SORTED && value->as.sorted.is_map)
                     found = sorted_get(scope, value, key, &v);
             }
@@ -4638,16 +4674,17 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
         return a1;
     }
     if (fn->tag == CLOVE_IARRAY) {
-        if (a0 == NIL || a0->tag != CLOVE_INT || a0->as.i < 0 ||
-            a0->as.i >= (int64_t)fn->as.iarr.n)
+        int64_t i;
+        if (!int_value(a0, &i) || i < 0 || i >= (int64_t)fn->as.iarr.n)
             clove_error("int-array lookup: bad index");
-        return iarr_get(fn, a0->as.i);
+        return iarr_get(fn, i);
     }
     if (fn->tag == CLOVE_VECTOR || fn->tag == CLOVE_TVEC) {  /* transients too */
-        if (a0->tag != CLOVE_INT) clove_error("vector lookup needs an integer index");
-        if (a0->as.i < 0 || (size_t)a0->as.i >= vec_len(fn))
-            clove_error_cls("IndexOutOfBoundsException", "index %lld out of bounds for length %zu", (long long)a0->as.i, vec_len(fn));
-        return vec_nth(fn, (size_t)a0->as.i);
+        int64_t i;
+        if (!int_value(a0, &i)) clove_error("vector lookup needs an integer index");
+        if (i < 0 || (size_t)i >= vec_len(fn))
+            clove_error_cls("IndexOutOfBoundsException", "index %lld out of bounds for length %zu", (long long)i, vec_len(fn));
+        return vec_nth(fn, (size_t)i);
     }
     /* Symbols as functions: ('k m) and ('k m default), like keywords. */
     if (fn->tag == CLOVE_SYMBOL) {
@@ -6480,11 +6517,15 @@ static void print_error(void) {
  *   - exact (non-float) division always takes the ratio path, so
  *     (/ 1 3) is the Ratio 1/3, like real Clojure */
 /* ───── Arbitrary-precision integers ─────────────────────────────────────
- * Sign-magnitude, base-2^32 little-endian limbs. Only created when a value
- * exceeds int64; big_norm demotes back to CLOVE_INT whenever the result fits,
- * so CLOVE_INT vs CLOVE_BIGINT is purely a function of magnitude. Local Clove*
- * are GC roots (conservative C-stack scan), so no manual rooting is needed;
- * malloc'd limb arrays are owned by their cell and freed in the GC sweep. */
+ * Sign-magnitude, base-2^32 little-endian limbs. The big_* helpers below are
+ * exact integer arithmetic over INT and BIGINT operands alike, and their
+ * results are the compact form: big_norm demotes to CLOVE_INT whenever the
+ * value fits. That is what ratio/BigDecimal internals and +' -' *' overflow
+ * want. User-visible BigInt results (a BigInt operand, a whole ratio result,
+ * 1N, bigint) go through to_bigint, which keeps the BigInt type at any size.
+ * Local Clove* are GC roots (conservative C-stack scan), so no manual rooting
+ * is needed; malloc'd limb arrays are owned by their cell and freed in the GC
+ * sweep. */
 static uint32_t *umalloc(uint32_t n) { return xmalloc(sizeof(uint32_t) * (n ? n : 1)); }
 
 typedef struct { int sign; uint32_t n; const uint32_t *mag; } BigView;
@@ -6516,6 +6557,18 @@ static Clove *big_norm(int sign, uint32_t *mag, uint32_t n) {
     Clove *v = alloc(CLOVE_BIGINT);
     v->as.big.sign = sign < 0 ? -1 : 1; v->as.big.n = n; v->as.big.mag = mag;
     return v;
+}
+
+/* An exact integer (INT or BIGINT) as a BigInt cell, whatever its magnitude:
+ * the sticky result type of BigInt arithmetic, (bigint x), and 1N. */
+static Clove *to_bigint(Clove *v) {
+    if (v->tag == CLOVE_BIGINT) return v;
+    uint32_t s[2]; BigView bv; big_view(v, &bv, s);
+    uint32_t *m = umalloc(bv.n);
+    m[0] = 0; memcpy(m, bv.mag, bv.n * 4);
+    Clove *b = alloc(CLOVE_BIGINT);
+    b->as.big.sign = bv.sign; b->as.big.n = bv.n; b->as.big.mag = m;
+    return b;
 }
 
 static int umag_cmp(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb) {
@@ -6601,7 +6654,9 @@ static Clove *big_abs(Clove *A) {
     uint32_t *m = umalloc(A->as.big.n); memcpy(m, A->as.big.mag, A->as.big.n * 4);
     return big_norm(1, m, A->as.big.n);
 }
-static bool big_is_zero(Clove *A) { return A->tag == CLOVE_INT && A->as.i == 0; }
+static bool big_is_zero(Clove *A) {
+    return A->tag == CLOVE_INT ? A->as.i == 0 : A->as.big.sign == 0;
+}
 static Clove *big_gcd(Clove *A, Clove *B) {
     Clove *a = big_abs(A), *b = big_abs(B);
     while (!big_is_zero(b)) { Clove *r; big_divmod(a, b, NULL, &r); a = b; b = r; }
@@ -6620,6 +6675,7 @@ static uint32_t udiv_small_inplace(uint32_t *d, uint32_t n, uint32_t div) {
 /* Decimal text (with sign). Caller frees. */
 static char *big_to_decimal(Clove *v) {
     if (v->tag == CLOVE_INT) { char *b = xmalloc(24); snprintf(b, 24, "%lld", (long long)v->as.i); return b; }
+    if (v->as.big.sign == 0) { char *b = xmalloc(2); b[0] = '0'; b[1] = 0; return b; }   /* 0N */
     uint32_t n = v->as.big.n, tn = n; uint32_t *t = umalloc(n); memcpy(t, v->as.big.mag, n * 4);
     /* each chunk holds 9 decimal digits (~29.9 bits) vs 32 bits per limb */
     uint32_t *chunks = xmalloc(sizeof(uint32_t) * ((size_t)n * 32 / 29 + 2)); size_t nc = 0;
@@ -6659,6 +6715,7 @@ static Clove *rat_den(Clove *v) {
 /* Build a reduced rational from num/den (each INT or BIGINT): force den>0,
  * divide out the gcd, and demote to an integer when den becomes 1. */
 static Clove *make_ratio(Clove *num, Clove *den) {
+    num = int_demote(num); den = int_demote(den);   /* parts are plain integers */
     if (big_is_zero(den)) clove_error_cls("ArithmeticException", "Divide by zero");
     if (big_cmp(den, mk_int(0)) < 0) { num = big_addsub(mk_int(0), num, 1); den = big_addsub(mk_int(0), den, 1); }
     if (big_is_zero(num)) return mk_int(0);
@@ -6708,6 +6765,7 @@ static double ratio_to_double(Clove *v) {
  * preferred scale (dividend.scale - divisor.scale) that represents it, or an
  * ArithmeticException when the expansion does not terminate (1M/3M). */
 static Clove *mk_bigdec(Clove *u, int64_t s) {
+    u = int_demote(u);                     /* (bigdec 1N): no BigInt-ness inside */
     Clove *d = alloc(CLOVE_BIGDEC);
     d->as.bigdec.u = u; d->as.bigdec.s = s;
     return d;
@@ -6906,12 +6964,31 @@ static Clove *big_binop(ArithOp op, Clove *a, Clove *b) {
  *   AR_CHECK   throw ArithmeticException "long overflow" -- Clojure's + - *
  *   AR_PROMOTE spill into a bigint                        -- +' -' *'
  *   AR_WRAP    two's-complement wraparound                -- unchecked-add etc.
- * A bigint operand always takes the exact path regardless of mode. */
+ * A bigint operand always takes the exact path regardless of mode, and its
+ * result stays a BigInt at any magnitude (Clojure's BigInt contagion). */
 typedef enum { AR_WRAP, AR_CHECK, AR_PROMOTE } ArithMode;
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn, cold))
 #endif
 static void long_overflow(void) { clove_error_cls("ArithmeticException", "long overflow"); }
+
+/* a/b OP c/d OP ... over exact operands (nargs >= 2), as a reduced rational:
+ * an integer when the denominator cancels, in compact (demoted) form. */
+static Clove *ratio_fold(ArithOp op, Clove **argv, int nargs) {
+    Clove *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
+    for (int ai_ = 1; ai_ < nargs; ai_++) {
+        Clove *n2 = rat_num(argv[ai_]), *d2 = rat_den(argv[ai_]);
+        switch (op) {
+            case OP_ADD: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 0); rd = big_mul(rd, d2); break;
+            case OP_SUB: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 1); rd = big_mul(rd, d2); break;
+            case OP_MUL: rn = big_mul(rn, n2); rd = big_mul(rd, d2); break;
+            case OP_DIV: rn = big_mul(rn, d2); rd = big_mul(rd, n2); break;
+        }
+        Clove *g = big_gcd(rn, rd);    /* reduce each step to bound intermediates */
+        if (!(g->tag == CLOVE_INT && g->as.i == 1)) { Clove *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
+    }
+    return make_ratio(rn, rd);
+}
 
 static Clove *arith(ArithOp op, Clove **argv, int nargs, ArithMode mode) {
     size_t n = (size_t)nargs;
@@ -6983,33 +7060,27 @@ static Clove *arith(ArithOp op, Clove **argv, int nargs, ArithMode mode) {
 big_path: {
         Clove *acc = argv[0];
         if (n == 1) {
-            if (op == OP_SUB) return big_addsub(mk_int(0), acc, 1);
-            return acc;           /* OP_DIV never gets here (ratio path) */
+            if (op == OP_SUB) return to_bigint(big_addsub(mk_int(0), acc, 1));
+            return to_bigint(acc);   /* OP_DIV never gets here (ratio path) */
         }
         for (int ai_ = 1; ai_ < nargs; ai_++)
             acc = big_binop(op, acc, argv[ai_]);
-        return acc;
+        return to_bigint(acc);
     }
 
 ratio_path: {
-        Clove *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
+        /* A whole result is a BigInt when a ratio or BigInt went in --
+         * (+ 1/2 1/2) is 1N, (/ 4N 2) is 2N -- but Long division stays Long:
+         * (/ 4 2) is 2. Clojure's RatioOps/BigIntOps versus LongOps. */
+        Clove *r;
         if (n == 1) {
-            if (op == OP_DIV) return make_ratio(rd, rn);                 /* reciprocal */
-            if (op == OP_SUB) return make_ratio(big_addsub(mk_int(0), rn, 1), rd);
-            return argv[0];
-        }
-        for (int ai_ = 1; ai_ < nargs; ai_++) {
-            Clove *n2 = rat_num(argv[ai_]), *d2 = rat_den(argv[ai_]);
-            switch (op) {                                               /* a/b OP c/d */
-                case OP_ADD: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 0); rd = big_mul(rd, d2); break;
-                case OP_SUB: rn = big_addsub(big_mul(rn, d2), big_mul(n2, rd), 1); rd = big_mul(rd, d2); break;
-                case OP_MUL: rn = big_mul(rn, n2); rd = big_mul(rd, d2); break;
-                case OP_DIV: rn = big_mul(rn, d2); rd = big_mul(rd, n2); break;
-            }
-            Clove *g = big_gcd(rn, rd);    /* reduce each step to bound intermediates */
-            if (!(g->tag == CLOVE_INT && g->as.i == 1)) { Clove *a, *b; big_divmod(rn, g, &a, NULL); big_divmod(rd, g, &b, NULL); rn = a; rd = b; }
-        }
-        return make_ratio(rn, rd);
+            Clove *rn = rat_num(argv[0]), *rd = rat_den(argv[0]);
+            if (op == OP_DIV) r = make_ratio(rd, rn);                    /* reciprocal */
+            else if (op == OP_SUB) r = make_ratio(big_addsub(mk_int(0), rn, 1), rd);
+            else r = argv[0];
+        } else r = ratio_fold(op, argv, nargs);
+        if (r->tag == CLOVE_INT && (is_ratio || is_big)) r = to_bigint(r);
+        return r;
     }
 
 dec_path: {
@@ -7149,8 +7220,11 @@ static bool clove_eq(Clove *a, Clove *b) {
         /* Clojure's = is category-sensitive across the numeric tower: an exact
          * integer never equals a floating-point value (only == crosses that),
          * so (= -1 -1.0) is false. This matters for set/map literals like
-         * #{-1 -1.0}, which are two distinct elements. Integer<->bigint DO
-         * compare (bignums demote to int when they fit, so same tag here). */
+         * #{-1 -1.0}, which are two distinct elements. Long and BigInt are
+         * one category, though: (= 1 1N), and clove_hash agrees. */
+        if ((a->tag == CLOVE_INT && b->tag == CLOVE_BIGINT) ||
+            (a->tag == CLOVE_BIGINT && b->tag == CLOVE_INT))
+            return big_cmp(a, b) == 0;
         return false;
     }
     switch (a->tag) {
@@ -7647,7 +7721,7 @@ static Clove *prim_mod(CloveEnv *env, Clove **argv, int nargs) {
         Clove *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
         if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
             r = big_addsub(r, argv[1], 0);
-        return r;
+        return to_bigint(r);
     }
     int64_t a = as_int(argv[0], "mod");
     int64_t b = as_int(argv[1], "mod");
@@ -7703,10 +7777,11 @@ static void iarr_set(Clove *a, int64_t i, Clove *v, const char *what) {
  * types -- they differ only in what a slot holds. */
 static Clove *array_ctor(Clove **argv, int nargs, bool dbl, const char *name) {
     Clove *a0 = argv[0];
-    if (a0 != NIL && a0->tag == CLOVE_INT) {
-        if (a0->as.i < 0 || a0->as.i > (int64_t)UINT32_MAX)
-            clove_error("%s: bad size %lld", name, (long long)a0->as.i);
-        Clove *arr = mk_iarray_of((uint32_t)a0->as.i, dbl);
+    int64_t size;
+    if (int_value(a0, &size)) {
+        if (size < 0 || size > (int64_t)UINT32_MAX)
+            clove_error("%s: bad size %lld", name, (long long)size);
+        Clove *arr = mk_iarray_of((uint32_t)size, dbl);
         if (nargs > 1)
             for (uint32_t i = 0; i < arr->as.iarr.n; i++) iarr_set(arr, i, argv[1], name);
         return arr;
@@ -7786,17 +7861,17 @@ static Clove *prim_get(CloveEnv *env, Clove **argv, int nargs) {
     } else if (coll != NIL && coll->tag == CLOVE_SORTED) {
         Clove *out;
         if (sorted_get(env, coll, k, &out)) return out;
-    } else if (coll != NIL && coll->tag == CLOVE_IARRAY && k->tag == CLOVE_INT) {
-        if (k->as.i >= 0 && k->as.i < (int64_t)coll->as.iarr.n)
-            return iarr_get(coll, k->as.i);
-    } else if (coll != NIL && (coll->tag == CLOVE_VECTOR || coll->tag == CLOVE_TVEC)
-               && k->tag == CLOVE_INT) {
-        if (k->as.i >= 0 && (size_t)k->as.i < vec_len(coll))
-            return vec_nth(coll, (size_t)k->as.i);
-    } else if (coll != NIL && coll->tag == CLOVE_STRING && k->tag == CLOVE_INT) {
-        size_t len = str_cp_count(coll);     /* (get s i) => char */
-        if (k->as.i >= 0 && (size_t)k->as.i < len)
-            return mk_char(str_cp_at(coll, (size_t)k->as.i));
+    } else if (coll != NIL) {
+        int64_t i;   /* integer keys of indexed colls: a Long or a small BigInt */
+        if (!int_value(k, &i) || i < 0) return dflt;
+        if (coll->tag == CLOVE_IARRAY) {
+            if (i < (int64_t)coll->as.iarr.n) return iarr_get(coll, i);
+        } else if (coll->tag == CLOVE_VECTOR || coll->tag == CLOVE_TVEC) {
+            if ((size_t)i < vec_len(coll)) return vec_nth(coll, (size_t)i);
+        } else if (coll->tag == CLOVE_STRING) {
+            if ((size_t)i < str_cp_count(coll))   /* (get s i) => char */
+                return mk_char(str_cp_at(coll, (size_t)i));
+        }
     }
     return dflt;
 }
@@ -7820,11 +7895,12 @@ static Clove *prim_assoc(CloveEnv *env, Clove **argv, int nargs) {
             r = sorted_put(env, r, k, v);
         }
         else if (r->tag == CLOVE_VECTOR) {
-            if (k->tag != CLOVE_INT)
+            int64_t idx;
+            if (!int_value(k, &idx))
                 clove_error("assoc: vector index must be an integer, got %s", val_desc(k));
-            if (k->as.i < 0)
-                clove_error_cls("IndexOutOfBoundsException", "assoc: index %lld out of bounds for length %zu", (long long)k->as.i, vec_len(r));
-            r = vec_assoc_idx(r, (size_t)k->as.i, v);  /* assoc at len appends */
+            if (idx < 0)
+                clove_error_cls("IndexOutOfBoundsException", "assoc: index %lld out of bounds for length %zu", (long long)idx, vec_len(r));
+            r = vec_assoc_idx(r, (size_t)idx, v);  /* assoc at len appends */
         } else clove_error("assoc: %s is not associative", val_desc(r));
     }
     return r;
@@ -7910,7 +7986,8 @@ static Clove *prim_contains_p(CloveEnv *env, Clove **argv, int nargs) {
     if (coll->tag == CLOVE_SET) return mk_bool(set_contains(coll, k, NULL));
     if (coll->tag == CLOVE_SORTED) return mk_bool(sorted_contains(env, coll, k));
     if (coll->tag == CLOVE_VECTOR)  /* contains? checks INDEX presence on vectors */
-        return mk_bool(k->tag == CLOVE_INT && k->as.i >= 0 && (size_t)k->as.i < vec_len(coll));
+    {   int64_t i;
+        return mk_bool(int_value(k, &i) && i >= 0 && (size_t)i < vec_len(coll)); }
     clove_error("contains?: %s is not associative", val_desc(coll));
     return NIL;
 }
@@ -7944,7 +8021,7 @@ static Clove *prim_rem(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "rem");
     if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_rem(argv[0], argv[1]);
     if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *r; big_divmod(argv[0], argv[1], NULL, &r); return r;
+        Clove *r; big_divmod(argv[0], argv[1], NULL, &r); return to_bigint(r);
     }
     int64_t a = as_int(argv[0], "rem");
     int64_t b = as_int(argv[1], "rem");
@@ -9590,6 +9667,8 @@ static Clove *prim_int(CloveEnv *env, Clove **argv, int nargs) {
         return mk_int((int64_t)d);
     }
     if (v != NIL && v->tag == CLOVE_BIGINT) {
+        int64_t i;
+        if (int_value(v, &i)) return mk_int(i);           /* (long 5N) => 5 */
         char *ds = big_to_decimal(v);
         static SBuf vr;
         vr.len = 0;
@@ -10075,6 +10154,7 @@ static int sorted_cmp_call(CloveEnv *env, Clove *coll, Clove *a, Clove *b) {
     Clove *r = apply(env, cmp, args, 2);
     if (r == NIL) return 0;
     if (r->tag == CLOVE_INT)    return r->as.i < 0 ? -1 : r->as.i > 0 ? 1 : 0;
+    if (r->tag == CLOVE_BIGINT) return r->as.big.sign;   /* (fn [a b] (- a b)) over BigInts */
     if (r->tag == CLOVE_DOUBLE) return r->as.d < 0 ? -1 : r->as.d > 0 ? 1 : 0;
     if (is_truthy(r)) return -1;     /* boolean comparator: true => a before b */
     Clove *args2[2] = { b, a };
@@ -10286,7 +10366,8 @@ static int sort_adapter(const void *pa, const void *pb) {
     Clove *two[2] = {a, b};
     Clove *r = apply(env, fn, two, 2);
     g_sort_env = env; g_sort_fn = fn;    /* restore after a possible nested sort */
-    if (r != NIL && r->tag == CLOVE_INT) return (int)r->as.i;
+    if (r != NIL && r->tag == CLOVE_INT) return r->as.i < 0 ? -1 : r->as.i > 0 ? 1 : 0;
+    if (r != NIL && r->tag == CLOVE_BIGINT) return r->as.big.sign;
     /* Boolean comparator: (f a b) true => a first; tie-break with (f b a). */
     if (is_truthy(r)) return -1;
     Clove *two2[2] = {b, a};
@@ -10413,7 +10494,7 @@ static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 2, "quot");
     if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_quot(argv[0], argv[1]);
     if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *q; big_divmod(argv[0], argv[1], &q, NULL); return q;
+        Clove *q; big_divmod(argv[0], argv[1], &q, NULL); return to_bigint(q);
     }
     int64_t a = as_int(argv[0], "quot");
     int64_t b = as_int(argv[1], "quot");
@@ -12083,10 +12164,10 @@ static void *fa_nil(void) { return NIL; }
  * JIT-compiled ^long function handed 2.5 must not quietly compute on 2 --
  * its interpreted twin would return a double. Reject instead. */
 static long long fa_as_int(void *v) {
-    Clove *c = (Clove *)v;
-    if (c == NULL || c->tag != CLOVE_INT)
+    Clove *c = (Clove *)v; int64_t i;
+    if (!int_value(c, &i))
         clove_error("ffi: expected an integer, got %s", val_desc(c));
-    return (long long)c->as.i;
+    return (long long)i;
 }
 static double fa_as_double(void *v) { return as_num((Clove *)v); }
 static const char *fa_as_str(void *v) { return as_str((Clove *)v, "ffi"); }
@@ -12919,21 +13000,26 @@ static const char *PRELUDE =
     "(defn reader-conditional? [_] false) (defn tagged-literal? [_] false)\n"
     "(defn undefined? [x] (nil? x)) (defn keyword-identical? [a b] (= a b))\n"
     "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
-    /* numeric coercions (clove ints are int64, no bignum/ratio) */
+    /* numeric coercions: int/long give a Long (int64; there is no 32-bit int) */
     "(defn byte [x] (int x)) (defn short [x] (int x)) (defn long [x] (int x))\n"
     "(defn num [x] x) (defn bigdec [x] (clove/->bd x))\n"
-    /* idempotent: (bigint x) on a value that is already a bigint must not
-       round-trip through int, which caps at int64 */
-    "(defn bigint [x] (cond (string? x) (read-string (str x \"N\"))\n"
-    "                       (bigint? x) x\n"
-    "                       (decimal? x) (let [r (clove/bd->ratio x)]\n"
-    "                                      (if (ratio? r) (quot (numerator r) (denominator r)) r))\n"
-    "                       :else (int x)))\n"
+    /* A BigInt at any size: (+ 0N n) keeps an integer's value and makes it
+       a BigInt (contagion). Doubles go through bigdec, i.e. Java's
+       BigDecimal.valueOf, so (bigint 1e30) is exact like the JVM's.
+       biginteger is the same type here: java.math.BigInteger has no
+       separate representation, so it prints with the N suffix. */
+    "(defn bigint [x] (cond (bigint? x) x\n"
+    "                       (string? x) (read-string (str x \"N\"))\n"
+    "                       (int? x) (+ 0N x)\n"
+    "                       (double? x) (bigint (bigdec x))\n"
+    "                       (decimal? x) (bigint (clove/bd->ratio x))\n"
+    "                       (ratio? x) (+ 0N (quot (numerator x) (denominator x)))\n"
+    "                       :else (+ 0N (int x))))\n"
     "(defn biginteger [x] (bigint x))\n"
     /* rationalize: exact ratio from a double's shortest decimal repr (str x
      * matches Java's Double.toString, so this tracks JVM semantics:
-     * (rationalize 0.1) => 1/10). Integral results demote to int64 where the
-     * JVM keeps BigInt — the documented bigness divergence. */
+     * (rationalize 0.1) => 1/10). The digits are a BigInt, so a whole result
+     * is one too: (rationalize 2.0) => 2N, as on the JVM. */
     "(defn rationalize [x]\n"
     "  (if (decimal? x) (clove/bd->ratio x)\n"
     "  (if (double? x)\n"
@@ -12944,7 +13030,7 @@ static const char *PRELUDE =
     "          mant (if neg (subs mant 1) mant)\n"
     "          [ip fp] (str/split mant \".\")\n"
     "          fp (or fp \"\")\n"
-    "          n (parse-long (str ip fp))\n"
+    "          n (bigint (str ip fp))\n"
     "          n (if neg (- n) n)\n"
     "          k (- (count fp) e)]\n"
     "      (if (pos? k)\n"
