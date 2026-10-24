@@ -23,6 +23,23 @@ jobs:
       - name: Test (normal + GC stress)
         run: make test-full
 
+  # The multi-line/vi line editor only runs through a real pty. pexpect comes
+  # from apt (pip is externally managed on ubuntu-latest); CLOVE_REQUIRE_PTY
+  # turns a missing pexpect into a failure instead of a silent skip.
+  linux-pty:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pexpect
+        run: sudo apt-get update && sudo apt-get install -y python3-pexpect
+      - name: Build
+        run: make
+      - name: REPL line editor through a pty
+        env:
+          CLOVE_REQUIRE_PTY: "1"
+        run: make test-pty
+
   linux-asan:
     runs-on: ubuntu-latest
     timeout-minutes: 30

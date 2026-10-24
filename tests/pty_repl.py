@@ -3,12 +3,16 @@
 
 Each case types keys into a fresh `clove` REPL and expects a result that
 only comes out if the editor assembled the right form. Skips (exit 0) when
-pexpect is missing. Usage: tests/pty_repl.py [path/to/clove]"""
+pexpect is missing, unless CLOVE_REQUIRE_PTY is set (CI), which makes that a
+failure. Usage: tests/pty_repl.py [path/to/clove]"""
 import os, sys, tempfile, time
 
 try:
     import pexpect
 except ImportError:
+    if os.environ.get("CLOVE_REQUIRE_PTY"):
+        print("pty tests FAILED: pexpect is required (CLOVE_REQUIRE_PTY is set)")
+        sys.exit(1)
     print("pty tests skipped: no pexpect")
     sys.exit(0)
 
