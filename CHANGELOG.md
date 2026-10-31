@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0 — 2026-10-31
 
 ### Renamed: cljc is now clove
 The old name collided with the `.cljc` file extension. The binary is `clove`,
@@ -151,6 +151,20 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- **`#inst` and `#uuid` literals read.** The reader had no tagged literals,
+  so `#inst "2020-01-01"` was an unknown symbol. They now read as values,
+  in code and in `read-string`/`clojure.edn/read-string` data alike: `#inst`
+  is a `java.util.Date` (`inst?`, `inst-ms`), `#uuid` a UUID (`uuid?`), and
+  both print back as their literals. `random-uuid` and
+  `java.util.UUID/fromString` return UUIDs rather than strings (use `str` for
+  the text), and `parse-uuid` is new. Any other tag raises "No reader function
+  for tag …", except inside the skipped branches of `#?`, where it is ignored
+  as in Clojure (so `#?(:cljs #js {} :clj …)` reads).
+- **`proxy` builds a working object.** It was an inert atom; it is now a
+  `reify` of the given methods, each with proxy's implicit `this`, so
+  `(str (proxy [Object] [] (toString [] "hi")))` is `"hi"`. Constructor args
+  are ignored (there is no superclass to construct). `ThreadLocal` proxies
+  keep their atom behavior.
 - **`shuffle` shuffles.** It was a stub that returned `(vec coll)` unchanged;
   it is now a Fisher–Yates shuffle. The `rand` seed also mixes sub-second
   time with the pid, so processes started in the same second no longer get

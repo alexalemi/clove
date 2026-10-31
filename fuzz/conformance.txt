@@ -541,3 +541,6 @@
 [(tagged-literal? (tagged-literal (quote foo) 1)) (tagged-literal? {:tag 1}) (:tag (tagged-literal (quote foo) 1)) (reader-conditional? (reader-conditional (quote (:clj 1)) true)) (reader-conditional? 1)]
 [(map unchecked-byte [200 127 128 -129 255 256]) (map unchecked-short [70000 32768 -32769]) (unchecked-char 65) (unchecked-char 65601)]
 [(test (with-meta (fn []) {:test (fn [] nil)})) (test (fn []))]
+[(pr-str #inst "2020-01-01") (inst-ms #inst "2020-01-01") (inst-ms #inst "1969-12-31T23:59:59.999Z") (pr-str #inst "2024-02-29T23:59:59.123456789-05:30") (inst? #inst "2020") (= #inst "2020" #inst "2020-01-01T00:00:00Z")]
+[(pr-str #uuid "00000000-0000-0000-0000-00000000000A") (str #uuid "00000000-0000-0000-0000-00000000000A") (uuid? #uuid "00000000-0000-0000-0000-000000000001") (uuid? (random-uuid)) (parse-uuid "x") (= #uuid "00000000-0000-0000-0000-00000000000A" #uuid "00000000-0000-0000-0000-00000000000a")]
+[(read-string "[#?(:cljs #js {:a 1} :clj 2)]") (inst-ms (first (read-string "[#inst \"2000-03-01T00:00:00Z\"]")))]

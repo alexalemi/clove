@@ -157,7 +157,7 @@ static void clove_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLOVE_VERSION "0.5.1"
+#define CLOVE_VERSION "0.7.0"
 #ifndef CLOVE_SHAREDIR
 #define CLOVE_SHAREDIR "/usr/local/share/clove"
 #endif
@@ -2684,6 +2684,131 @@ static bool is_sym_char(int c) {
     return !strchr("()[]{}\";`,~@", c);  /* ' is legal INSIDE symbols (coll') */
 }
 
+/* ── tagged literals: #inst, #uuid ──
+ * The reader builds the VALUE, as Clojure's default data readers do, so
+ * read-string / edn data and source code agree. Values are typed maps:
+ * #inst -> {:clove/type :Date :ms <epoch-ms>} (java.util.Date, as on the JVM)
+ * #uuid -> {:clove/type :UUID :s "<lowercase canonical string>"} */
+
+/* Days since 1970-01-01 for a proleptic-Gregorian civil date (H. Hinnant). */
+static int64_t days_from_civil(int64_t y, int m, int d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+static void civil_from_days(int64_t z, int64_t *y, int *m, int *d) {
+    z += 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = yoe + era * 400 + (*m <= 2);
+}
+
+static bool inst_digits(const char **q, int n, int *out) {
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        if (!isdigit((unsigned char)(*q)[i])) return false;
+        v = v * 10 + ((*q)[i] - '0');
+    }
+    *q += n; *out = v;
+    return true;
+}
+
+/* RFC 3339 as Clojure's #inst reader takes it: yyyy[-MM[-dd[THH[:mm[:ss
+ * [.fff…]]]]]][Z|±HH:mm], every part after the year optional. */
+static bool parse_inst(const char *s, int64_t *ms_out) {
+    const char *q = s;
+    int y, mo = 1, d = 1, h = 0, mi = 0, se = 0, oh = 0, om = 0, sign = 0;
+    int64_t frac = 0;
+    if (!inst_digits(&q, 4, &y)) return false;
+    if (*q == '-') { q++; if (!inst_digits(&q, 2, &mo)) return false;
+     if (*q == '-') { q++; if (!inst_digits(&q, 2, &d)) return false;
+      if (*q == 'T') { q++; if (!inst_digits(&q, 2, &h)) return false;
+       if (*q == ':') { q++; if (!inst_digits(&q, 2, &mi)) return false;
+        if (*q == ':') { q++; if (!inst_digits(&q, 2, &se)) return false;
+         if (*q == '.') {
+             q++;
+             int nd = 0;
+             while (isdigit((unsigned char)*q)) {
+                 if (nd < 3) frac = frac * 10 + (*q - '0');
+                 nd++; q++;
+             }
+             if (nd == 0) return false;
+             for (; nd < 3; nd++) frac *= 10;
+         } } } } } }
+    if (*q == 'Z' || *q == 'z') q++;
+    else if (*q == '+' || *q == '-') {
+        sign = *q == '-' ? -1 : 1; q++;
+        if (!inst_digits(&q, 2, &oh)) return false;
+        if (*q == ':') q++;
+        if (!inst_digits(&q, 2, &om)) return false;
+    }
+    if (*q) return false;
+    static const int mdays[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > (mo == 2 && !leap ? 28 : mdays[mo - 1]) ||
+        h > 23 || mi > 59 || se > (mi == 59 ? 60 : 59) || oh > 23 || om > 59)
+        return false;
+    int64_t secs = ((days_from_civil(y, mo, d) * 24 + h) * 60 + mi) * 60 + se;
+    secs -= (int64_t)sign * (oh * 3600 + om * 60);
+    *ms_out = secs * 1000 + frac;
+    return true;
+}
+
+/* java.util.UUID.fromString's canonical shape: 8-4-4-4-12 hex digits. */
+static bool uuid_canon(const char *s, char out[37]) {
+    if (strlen(s) != 36) return false;
+    for (int i = 0; i < 36; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (c != '-') return false; }
+        else if (!isxdigit(c)) return false;
+        out[i] = (char)tolower(c);
+    }
+    out[36] = 0;
+    return true;
+}
+
+static Clove *mk_typed2(const char *type, const char *k, Clove *v) {
+    Clove *m = map_assoc(mk_map(), mk_kw(intern("clove/type", 10)),
+                         mk_kw(intern(type, strlen(type))));
+    return map_assoc(m, mk_kw(intern(k, strlen(k))), v);
+}
+
+/* Inside a #? form every branch is read, but Clojure suppresses tag lookup in
+ * the branches it skips: #?(:clj x :cljs #js {}) must not fail on #js. While
+ * this is nonzero an unknown (or malformed) tag reads as a quoted
+ * tagged-literal value instead of raising. Reset at each top-level read. */
+static int rd_suppress_tags;
+
+static Clove *read_tagged(Clove *tag, Clove *form) {
+    const char *t = tag->as.sym;
+    bool is_str = form != NULL && form != NIL && form->tag == CLOVE_STRING;
+    if (strcmp(t, "inst") == 0 && is_str) {
+        int64_t ms;
+        if (parse_inst(form->as.str, &ms)) return mk_typed2("Date", "ms", mk_int(ms));
+        if (!rd_suppress_tags) rd_error("Unrecognized date/time syntax: %s", form->as.str);
+    } else if (strcmp(t, "uuid") == 0 && is_str) {
+        char buf[37];
+        if (uuid_canon(form->as.str, buf)) return mk_typed2("UUID", "s", mk_str(buf, 36));
+        if (!rd_suppress_tags) rd_error("Invalid UUID string: %s", form->as.str);
+    } else if (!rd_suppress_tags) {
+        if (strcmp(t, "inst") == 0 || strcmp(t, "uuid") == 0)
+            rd_error("#%s expects a string", t);
+        rd_error("No reader function for tag %s", t);
+    }
+    Clove *tl = map_assoc(mk_typed2("TaggedLiteral", "tag", tag),
+                          mk_kw(intern("form", 4)), form);
+    return mk_cons(mk_sym(intern("quote", 5)), mk_cons(tl, NIL));
+}
+
 static Clove *read_atom(const char **p) {
     const char *start = *p;
     while (is_sym_char((unsigned char)**p)) (*p)++;
@@ -3044,7 +3169,9 @@ static Clove *read_form(const char **p) {
         if (splicing) (*p)++;
         skip_ws(p);
         if (**p != '(') clove_error("#? expects a list");
+        rd_suppress_tags++;
         Clove *clauses = read_list(p, ')');
+        rd_suppress_tags--;
         static const char *KW_CLOVE, *KW_CLJC_OLD, *KW_CLJ, *KW_DEFAULT, *KW_BB;
         if (!KW_CLOVE) { KW_CLOVE = intern("clove", 5); KW_CLJ = intern("clj", 3);
                         KW_CLJC_OLD = intern("cljc", 4);   /* the pre-rename feature name */
@@ -3247,6 +3374,14 @@ static Clove *read_form(const char **p) {
         if (**p == '@') { (*p)++; tag = "clojure.core/unquote-splicing"; taglen = 29; }
         Clove *form = read_form(p);
         return mk_cons(mk_sym(intern(tag, taglen)), mk_cons(form, NIL));
+    }
+    if (c == '#' && isalpha((unsigned char)(*p)[1])) {   /* #tag form */
+        (*p)++;
+        Clove *tag = read_atom(p);
+        if (tag == NULL || tag == NIL || tag->tag != CLOVE_SYMBOL)
+            rd_error("reader tag must be a symbol");
+        Clove *form = read_form(p);
+        return read_tagged(tag, form);
     }
     if (c == '@') {
         (*p)++;
@@ -6120,6 +6255,30 @@ static void print_to(SBuf *sb, Clove *v, bool readably) {
                     sb_puts(sb, vv->as.atom.value->as.str);
                 break;
             }
+            /* #uuid "…" and #inst "…" print as their reader literals (pr AND
+             * print, as on the JVM); str gives the bare string (str_to). */
+            if (ty == mk_kw(intern("UUID", 4))) {
+                Clove *sv;
+                if (map_find(v, mk_kw(intern("s", 1)), &sv) && sv != NIL && sv->tag == CLOVE_STRING) {
+                    sb_puts(sb, "#uuid \""); sb_puts(sb, sv->as.str); sb_putc(sb, '"');
+                    break;
+                }
+            }
+            if (ty == mk_kw(intern("Date", 4))) {
+                Clove *mv;
+                if (map_find(v, mk_kw(intern("ms", 2)), &mv) && mv != NIL && mv->tag == CLOVE_INT) {
+                    int64_t ms = mv->as.i, days = ms / 86400000, rem = ms % 86400000;
+                    if (rem < 0) { rem += 86400000; days--; }
+                    int64_t y; int m, d;
+                    civil_from_days(days, &y, &m, &d);
+                    char buf[64];
+                    snprintf(buf, sizeof buf, "#inst \"%04lld-%02d-%02dT%02d:%02d:%02d.%03d-00:00\"",
+                             (long long)y, m, d, (int)(rem / 3600000), (int)(rem / 60000 % 60),
+                             (int)(rem / 1000 % 60), (int)(rem % 1000));
+                    sb_puts(sb, buf);
+                    break;
+                }
+            }
             /* (str x) on a deftype with a toString method renders via toString
              * (hiccup's RawString); pr-str / print keep the structural map form.
              * `out != v` guards a toString that returns its own instance. */
@@ -6260,8 +6419,19 @@ static void str_to(SBuf *sb, Clove *v) {
         case CLOVE_SET: case CLOVE_SORTED:
             print_to(sb, v, true); break;
         case CLOVE_MAP: {
-            Clove *ty;
-            print_to(sb, v, !map_find(v, mk_kw(intern("clove/type", 10)), &ty));
+            Clove *ty, *sv;
+            bool typed = map_find(v, mk_kw(intern("clove/type", 10)), &ty);
+            if (typed && ty == mk_kw(intern("UUID", 4)) &&
+                map_find(v, mk_kw(intern("s", 1)), &sv) && sv != NIL && sv->tag == CLOVE_STRING) {
+                sb_puts(sb, sv->as.str);       /* UUID.toString */
+                break;
+            }
+            if (typed && ty == mk_kw(intern("Date", 4))) {
+                Clove *out;                     /* Date: its registered toString */
+                if (dispatch_deftype_method(gc_root_envs[0], v, "toString", NULL, 0, &out) &&
+                    out != v) { str_to(sb, out); break; }
+            }
+            print_to(sb, v, !typed);
             break;
         }
         default: print_to(sb, v, false); break;
@@ -9566,6 +9736,7 @@ static Clove *prim_eval_forms(CloveEnv *env, Clove **argv, int nargs) {
     Clove *save_file = rd_file_cell;
     rd_line = 1;
     rd_line_start = src;
+    rd_suppress_tags = 0;
     rd_file_cell = (nargs > 1 && argv[1] != NIL && argv[1]->tag == CLOVE_STRING)
         ? argv[1] : NULL;
     /* Top-level forms evaluate in the ROOT env, not the caller's lexical
@@ -11934,6 +12105,7 @@ static Clove *prim_read_string(CloveEnv *env, Clove **argv, int nargs) {
     rd_line = 1;
     rd_line_start = p;
     rd_file_cell = NULL;
+    rd_suppress_tags = 0;
     Clove *form = read_form(&p);
     rd_line = save_line;
     rd_line_start = save_start;
@@ -13101,7 +13273,8 @@ static const char *PRELUDE =
     "(defn ratio? [x] (= (type x) :ratio))\n"
     "(defn rational? [x] (or (integer? x) (ratio? x) (decimal? x)))\n"
     "(defn volatile? [x] (= :atom (type x)))\n"   /* realized?: Tier 3.5 */
-    "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
+    "(defn inst? [x] (boolean (and (map? x) (#{:Date :Instant} (:clove/type x)))))\n"
+    "(defn uri? [_] false) (defn uuid? [x] (and (map? x) (= :UUID (:clove/type x))))\n"
     "(defn object? [x] (some? x))\n"
     /* the JVM Compiler's special forms (so `let`/`fn`/`loop` are false: macros) */
     "(def clove/special-forms '#{if do def let* fn* loop* recur quote var throw try catch finally\n"
@@ -13208,7 +13381,10 @@ static const char *PRELUDE =
     "(defn compare-and-set! [a old new] (if (identical? (deref a) old) (do (reset! a new) true) false))\n"
     "(defn random-uuid []\n"
     "  (let [h (fn [n] (apply str (map (fn [_] (nth \"0123456789abcdef\" (rand-int 16))) (range n))))]\n"
-    "    (str (h 8) \"-\" (h 4) \"-4\" (h 3) \"-\" (nth \"89ab\" (rand-int 4)) (h 3) \"-\" (h 12))))\n"
+    "    {:clove/type :UUID :s (str (h 8) \"-\" (h 4) \"-4\" (h 3) \"-\" (nth \"89ab\" (rand-int 4)) (h 3) \"-\" (h 12))}))\n"
+    /* parse-uuid: nil for a malformed string, as Clojure 1.11 */
+    "(defn parse-uuid [s] (when (re-matches #\"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\" s)\n"
+    "  {:clove/type :UUID :s (str/lower-case s)}))\n"
     "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
     "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
 
@@ -13223,7 +13399,7 @@ static const char *PRELUDE =
     "(defn bean [_] {}) (defn demunge [x] (str x)) (defn seque ([coll] coll) ([_ coll] coll))\n"
     "(defn update-proxy [& _] nil) (defn proxy-mappings [_] {}) (defn proxy-call-with-super [f _ _] (f))\n"
     "(defn reader-conditional [form splicing?] {:clove/type :ReaderConditional :form form :splicing? splicing?})\n"
-    "(defn inst-ms [_] 0) (defn to-array-2d [coll] (mapv vec coll))\n"
+    "(defn inst-ms [x] (if (inst? x) (:ms x) (throw (IllegalArgumentException. (str \"inst-ms: not an inst: \" (pr-str x)))))) (defn to-array-2d [coll] (mapv vec coll))\n"
     "(defn halt-when\n"
     "  ([pred] (halt-when pred nil))\n"
     "  ([pred retf]\n"
@@ -13445,12 +13621,23 @@ static const char *PRELUDE =
     "(def *source-path* \"NO_SOURCE_FILE\") (def *use-context-classloader* true)\n"
     /* proxy: no JVM classes to subclass — stub to nil so (def x (proxy ..))
        loads (the object is unused unless its host methods are called). */
-    /* proxy: clove has no host classes; model the instance as an atom. If the
-       proxy defines an (initialValue [] BODY) method (the ThreadLocal idiom),
-       seed the atom with BODY so .get returns it. .get/.set act on the atom. */
-    "(defmacro proxy [_supers _ctor & methods]\n"
-    "  (let [iv (some (fn [m] (when (= 'initialValue (first m)) m)) methods)]\n"
-    "    (if iv `(atom ~(first (drop 2 iv))) `(atom nil))))\n"
+    /* proxy: clove has no host classes to subclass, so a proxy is a reify of
+       its methods, each given the implicit `this` that proxy binds. Methods are
+       (name [params] body..) or multi-arity (name ([ps] ..) ([ps] ..)); ctor
+       args are dropped (there is no superclass constructor to run).
+       A ThreadLocal proxy keeps the old model, an atom seeded from its
+       (initialValue [] BODY), so .get/.set act on the atom. */
+    "(defmacro proxy [supers _ctor & methods]\n"
+    "  (if (some '#{ThreadLocal java.lang.ThreadLocal} supers)\n"
+    "    (let [iv (some (fn [m] (when (= 'initialValue (first m)) m)) methods)]\n"
+    "      (if iv `(atom ~(first (drop 2 iv))) `(atom nil)))\n"
+    "    (let [arity (fn [nm ps body] (list* nm (vec (cons 'this ps)) body))]\n"
+    "      `(reify ~@supers\n"
+    "         ~@(mapcat (fn [[nm & more]]\n"
+    "                     (if (vector? (first more))\n"
+    "                       [(arity nm (first more) (rest more))]\n"
+    "                       (map (fn [[ps & body]] (arity nm ps body)) more)))\n"
+    "                   methods)))))\n"
     "(defn .get\n"
     "  ([x] (if (= :atom (type x)) (deref x) x))\n"   /* IDeref/future .get */
     "  ([m k] (get (if (= :atom (type m)) (deref m) m) k))\n"   /* incl. HashMap */
@@ -14927,7 +15114,8 @@ CloveEnv *clove_new_env(void) {
         "(defn java.time.ZoneId/systemDefault [] {:clove/type :ZoneId})\n"
         "(def java.util.UUID :UUID)\n"
         "(defn java.util.UUID/randomUUID [] (random-uuid))\n"
-        "(defn java.util.UUID/fromString [s] s)\n"
+        "(defn java.util.UUID/fromString [s] (or (parse-uuid s) (throw (IllegalArgumentException. (str \"Invalid UUID string: \" s)))))\n"
+        "(clove/reg-method! 'toString :UUID (fn [this] (:s this)))\n"
         "(defn UUID/randomUUID [] (random-uuid))\n"
         /* java.util.Random: the JVM's exact 48-bit LCG (seed scramble,
            multiplier 0x5DEECE66D, addend 0xB), so a seeded stream matches

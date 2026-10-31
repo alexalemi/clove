@@ -473,6 +473,13 @@ embeddability matter; use bb/JVM where throughput does.
 - Metadata works (`with-meta`/`meta`/`^{}`) and propagates through collection
   ops (`conj`/`assoc`/`into`, incl. transient roundtrips)
 - `#?(:clove …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported
+- Tagged literals: `#inst` and `#uuid` only. `*data-readers*` and
+  `data_readers.clj` are not consulted, so any other tag is a read error. An
+  inst is a `java.util.Date` (`(str d)` gives ISO-8601, not `Date.toString`),
+  and host objects like it, UUIDs, and `proxy`/`reify` instances are typed
+  maps underneath, so `map?` is true of them
+- Vars don't carry `def`-time metadata yet (`(meta #'x)` has only `:name`,
+  `:doc`, `:arglists`), so `(test #'x)` finds no `:test` and returns `:no-test`
 
 The live plan (open threads, GC invariants) is in [PLAN.md](PLAN.md); the full
 milestone log is in [HISTORY.md](HISTORY.md).

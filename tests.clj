@@ -3088,8 +3088,32 @@
          (.format java.time.format.DateTimeFormatter/ISO_INSTANT
                   (java.time.Instant/ofEpochMilli 1751500000000)))
 (assert= true (some? (re-matches #"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
-                                 (random-uuid))))                ; real v4, not the zeros stub
+                                 (str (random-uuid)))))          ; real v4, not the zeros stub
 (assert= false (= (random-uuid) (random-uuid)))
+;; #inst / #uuid tagged literals read as values (were unreadable)
+(assert= 1577836800000 (inst-ms #inst "2020-01-01"))
+(assert= -1 (inst-ms #inst "1969-12-31T23:59:59.999Z"))
+(assert= "#inst \"2020-01-01T09:20:30.500-00:00\"" (pr-str #inst "2020-01-01T10:20:30.5+01:00"))
+(assert= true (= #inst "2020" #inst "2020-01-01T00:00:00Z"))
+(assert= [true true false] [(inst? #inst "2020") (inst? (java.util.Date. 5)) (inst? "2020")])
+(assert= "#uuid \"00000000-0000-0000-0000-00000000000a\"" (pr-str #uuid "00000000-0000-0000-0000-00000000000A"))
+(assert= "00000000-0000-0000-0000-00000000000a" (str #uuid "00000000-0000-0000-0000-00000000000A"))
+(assert= [true true false] [(uuid? (random-uuid)) (uuid? #uuid "00000000-0000-0000-0000-000000000001") (uuid? "x")])
+(assert= [nil #uuid "00000000-0000-0000-0000-000000000001"]
+         [(parse-uuid "x") (parse-uuid "00000000-0000-0000-0000-000000000001")])
+(assert= 1577836800000 (inst-ms (:t (read-string "{:t #inst \"2020-01-01\"}"))))   ; data, not code
+(assert= [2] (read-string "[#?(:cljs #js {:a 1} :clj 2)]"))   ; skipped branch: unknown tag tolerated
+;; proxy builds a working object (was an inert atom): methods get the implicit `this`
+(assert= ["hi" "hello hi" "hello bob" 42 7]
+         (let [x (proxy [Object] [] (toString [] "hi")
+                   (greet ([] (str "hello " this)) ([n] (str "hello " n))))
+               d (proxy [clojure.lang.IDeref] [] (deref [] 42))
+               tl (proxy [ThreadLocal] [] (initialValue [] 7))]
+           [(str x) (.greet x) (.greet x "bob") @d (.get tl)]))
+(assert= true (boolean (re-find #"No reader function for tag foo"
+                                (try (read-string "#foo 1") (catch Exception e (ex-message e))))))
+(assert= true (boolean (re-find #"Unrecognized date/time"
+                                (try (read-string "#inst \"2020-13-01\"") (catch Exception e (ex-message e))))))
 (assert= 12345678901234567890123456N (bigint "12345678901234567890123456"))  ; parses strings
 (assert= 42 (Long/valueOf "42"))
 (assert= "2a" (Integer/toHexString 42))

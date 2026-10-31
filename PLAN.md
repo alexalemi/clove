@@ -9,7 +9,7 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-10-21, unreleased on top of v0.5.1)
+## Status (as of 2026-10-31, v0.7.0)
 
 ~18,000 lines, zero warnings, ~2040 assertions in `tests.clj` + ~510-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
@@ -109,6 +109,15 @@ Things the history log leaves unresolved, roughly by value:
   wrong-arity (ArityException) and "not a function" (ClassCastException) are
   the likely next ones. `type` of an exception is still its representation
   (`:map`/`:string`); only `class` and `instance?` see the recorded class.
+- **Var metadata.** `def`/`defn` drop name metadata (`^{:test f}`, `^:foo`),
+  and `alter-meta!` on a var is a no-op; `(meta #'x)` is synthesized from the
+  doc registry (`:name`/`:doc`/`:arglists`). So `test` on a var finds no
+  `:test`, and clojure.test-style `:test` metadata doesn't round-trip.
+- **Remaining inert stubs** (found 2026-10-31 by a differential sweep against
+  bb): `munge`/`namespace-munge` don't mangle, `bytes?`/`chunked-seq?` are
+  always false, `supers` is `#{}`, `bean` is `{}`. A global `.method` host shim
+  (e.g. `.write`) takes precedence over a `reify`/`proxy` method of the same
+  name. Data readers: only `#inst`/`#uuid`, with no `*data-readers*` lookup.
 - **Float division by an exact zero** is `##Inf` (as compiled Clojure with
   primitive doubles); boxed JVM math and babashka throw. Typing-dependent on
   the JVM itself, so there is no single right answer — left as is.
