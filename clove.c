@@ -287,7 +287,7 @@ struct Clove {
         struct { Clove *arities; CloveEnv *env; bool is_macro;
                  bool fc_ready; uint8_t fc_n; Clove *fc_arity; } fn;
         CloveNativeFn native;
-        struct { Clove *value; } atom;
+        struct { Clove *value; Clove *watches; } atom;  /* watches: {key fn} or NIL */
         /* CLOVE_BIGINT: mag is n little-endian base-2^32 limbs, mag[n-1] != 0;
          * sign in {-1,+1}, or sign 0 with n 0 for 0N (mag still allocated). */
         struct { int sign; uint32_t n; uint32_t *mag; } big;
@@ -1374,6 +1374,7 @@ static void gc_drain(void) {
                 break;
             case CLOVE_ATOM:
                 mark_push(v->as.atom.value);
+                mark_push(v->as.atom.watches);
                 break;
             case CLOVE_LAZY:
                 mark_push(v->as.lazy.thunk);
@@ -2341,6 +2342,61 @@ static Clove *prim_conj_bang(CloveEnv *env, Clove **argv, int nargs) {
     t->as.vec.tail[0] = x;                      /* reuse the tail buffer */
     t->as.vec.taillen = 1;
     t->as.vec.count = cnt + 1;
+    return t;
+}
+
+/* Remove the trie's last leaf (the one holding index cnt-2), copying only
+ * nodes this transient doesn't own yet. NULL when the subtree empties.
+ * Clojure's TransientVector.popTail; level counts down to 5 (the level whose
+ * kids are leaves). */
+static Clove *tvec_poptail(int level, Clove *node, uint32_t cnt, uint32_t id) {
+    size_t sub = ((size_t)(cnt - 2) >> level) & 31;
+    Clove *p;
+    if (level > 5) {
+        Clove *child = tvec_poptail(level - 5, node->as.hnode.kids[sub], cnt, id);
+        if (child == NULL && sub == 0) return NULL;
+        p = tvec_ensure_owned(node, id);
+        p->as.hnode.kids[sub] = child;
+        return p;
+    }
+    if (sub == 0) return NULL;
+    p = tvec_ensure_owned(node, id);
+    p->as.hnode.kids[sub] = NULL;
+    return p;
+}
+
+static Clove *prim_pop_bang(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)nargs;
+    Clove *t = as_tvec(argv[0], "pop!");
+    uint32_t cnt = t->as.vec.count;
+    if (cnt == 0) clove_error_cls("IllegalStateException", "Can't pop empty vector");
+    if (cnt == 1 || t->as.vec.taillen > 1) {     /* in-place: shrink the tail */
+        t->as.vec.tail[--t->as.vec.taillen] = NULL;
+        t->as.vec.count = cnt - 1;
+        if (cnt == 1) { t->as.vec.root = NULL; t->as.vec.shift = 0; }
+        return t;
+    }
+    /* the tail empties: the trie's last leaf becomes the new (full) tail */
+    Clove *leaf = t->as.vec.root;
+    for (int level = t->as.vec.shift; level > 0; level -= 5)
+        leaf = leaf->as.hnode.kids[((size_t)(cnt - 2) >> level) & 31];
+    memcpy(t->as.vec.tail, leaf->as.hnode.kids, sizeof(Clove *) * 32);
+    t->as.vec.taillen = 32;
+    Clove *root = NULL;
+    uint8_t shift = t->as.vec.shift;
+    if (shift > 0) {
+        root = tvec_poptail(shift, t->as.vec.root, cnt, t->as.vec.edit_id);
+        /* collapse a root left with one child, down to a bare leaf (shift 0),
+         * which is the shape conj! builds for a vector of 33..64 elements */
+        while (root != NULL && shift > 0 && root->as.hnode.kids[1] == NULL) {
+            root = root->as.hnode.kids[0];
+            shift = (uint8_t)(shift - 5);
+        }
+    }
+    if (root == NULL) shift = 0;
+    t->as.vec.root = root;
+    t->as.vec.shift = shift;
+    t->as.vec.count = cnt - 1;
     return t;
 }
 
@@ -9967,6 +10023,34 @@ static Clove *prim_atom(CloveEnv *env, Clove **argv, int nargs) {
     need_nargs(nargs, 1, "atom");
     Clove *a = alloc(CLOVE_ATOM);
     a->as.atom.value = argv[0];
+    a->as.atom.watches = NIL;
+    return a;
+}
+
+/* Call each watch as (f key atom old new), after the value has changed, as
+ * Clojure's ARef.notifyWatches does. The map is snapshotted first, so a watch
+ * that adds or removes watches affects the next change, not this one. */
+static void atom_notify(CloveEnv *env, Clove *a, Clove *old, Clove *nv) {
+    Clove *w = a->as.atom.watches;
+    if (w == NIL) return;
+    for (Clove *e = map_entry_list(w); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+        Clove *args[4] = { e->as.cons.head->as.cons.head, a, old, nv };
+        apply(env, e->as.cons.head->as.cons.tail, args, 4);
+    }
+}
+
+/* (clove/atom-watches a) -> the {key fn} watch map; (clove/atom-watches! a m)
+ * replaces it. add-watch / remove-watch (prelude) are built on these. */
+static Clove *prim_atom_watches(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)nargs;
+    return as_atom(argv[0], "add-watch")->as.atom.watches;
+}
+static Clove *prim_atom_set_watches(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)nargs;
+    Clove *a = as_atom(argv[0], "add-watch");
+    Clove *m = argv[1];
+    if (m != NIL && m->tag != CLOVE_MAP) clove_error("add-watch: watch table must be a hash map");
+    a->as.atom.watches = (m == NIL || m->as.map.count == 0) ? NIL : m;
     return a;
 }
 
@@ -10032,8 +10116,9 @@ static Clove *prim_reset(CloveEnv *env, Clove **argv, int nargs) {
         }
     }
     Clove *a = as_atom(argv[0], "reset!");
-    Clove *v = argv[1];
+    Clove *v = argv[1], *old = a->as.atom.value;
     a->as.atom.value = v;
+    atom_notify(env, a, old, v);
     return v;
 }
 
@@ -10058,9 +10143,11 @@ static Clove *prim_swap(CloveEnv *env, Clove **argv, int nargs) {
     size_t base = vsp;
     vpush(a->as.atom.value);
     for (int i = 2; i < nargs; i++) vpush(argv[i]);
+    Clove *old = a->as.atom.value;
     Clove *nv = apply(env, f, &vstack[base], (int)(vsp - base));
     vsp = base;
     a->as.atom.value = nv;
+    atom_notify(env, a, old, nv);
     return nv;
 }
 
@@ -10986,6 +11073,26 @@ static Clove *prim_getpid(CloveEnv *env, Clove **argv, int nargs) {
 #else
     return mk_int((int64_t)getpid());
 #endif
+}
+
+/* Seed for rand(): wall-clock micros mixed with the pid, so processes started
+ * in the same second (a shell loop, parallel jobs) get different streams.
+ * Seconds alone made `(shuffle ...)` / `(rand)` repeat across such runs. */
+static unsigned rng_seed(void) {
+    uint64_t t, pid;
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    t = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
+    pid = (uint64_t)GetCurrentProcessId();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    t = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    pid = (uint64_t)getpid();
+#endif
+    uint64_t h = (t ^ (pid << 32) ^ pid) * 0x9E3779B97F4A7C15u;  /* spread bits */
+    return (unsigned)(h ^ (h >> 32));
 }
 
 /* (clove/getuid) -> the real user id; 0 on Windows, which has no uid. Used to
@@ -12995,9 +13102,14 @@ static const char *PRELUDE =
     "(defn rational? [x] (or (integer? x) (ratio? x) (decimal? x)))\n"
     "(defn volatile? [x] (= :atom (type x)))\n"   /* realized?: Tier 3.5 */
     "(defn inst? [_] false) (defn uri? [_] false) (defn uuid? [_] false)\n"
-    "(defn object? [x] (some? x)) (defn special-symbol? [_] false)\n"
+    "(defn object? [x] (some? x))\n"
+    /* the JVM Compiler's special forms (so `let`/`fn`/`loop` are false: macros) */
+    "(def clove/special-forms '#{if do def let* fn* loop* recur quote var throw try catch finally\n"
+    "  new set! . & case* letfn* deftype* reify* monitor-enter monitor-exit clojure.core/import*})\n"
+    "(defn special-symbol? [s] (contains? clove/special-forms s))\n"
     "(defn bytes? [_] false) (defn array? [_] false) (defn chunked-seq? [_] false)\n"
-    "(defn reader-conditional? [_] false) (defn tagged-literal? [_] false)\n"
+    "(defn reader-conditional? [x] (and (map? x) (= :ReaderConditional (:clove/type x))))\n"
+    "(defn tagged-literal? [x] (and (map? x) (= :TaggedLiteral (:clove/type x))))\n"
     "(defn undefined? [x] (nil? x)) (defn keyword-identical? [a b] (= a b))\n"
     "(defn neg-int? [x] (and (int? x) (neg? x))) (defn pos-int? [x] (and (int? x) (pos? x)))\n"
     /* numeric coercions: int/long give a Long (int64; there is no 32-bit int) */
@@ -13048,8 +13160,11 @@ static const char *PRELUDE =
     "(def unchecked-multiply-int unchecked-multiply)\n"
     "(def unchecked-dec-int unchecked-dec) (def unchecked-inc-int unchecked-inc) (def unchecked-negate-int unchecked-negate)\n"
     "(def unchecked-divide-int quot) (def unchecked-remainder-int rem)\n"
-    "(def unchecked-int int) (def unchecked-long int) (def unchecked-byte int)\n"
-    "(def unchecked-short int) (def unchecked-char int)\n"
+    "(def unchecked-int int) (def unchecked-long int)\n"
+    /* narrowing casts wrap to two's complement, as Java's (byte)/(short)/(char) */
+    "(defn unchecked-byte [x] (let [b (bit-and (long x) 0xFF)] (if (< b 128) b (- b 256))))\n"
+    "(defn unchecked-short [x] (let [b (bit-and (long x) 0xFFFF)] (if (< b 32768) b (- b 65536))))\n"
+    "(defn unchecked-char [x] (char (bit-and (if (char? x) (int x) (long x)) 0xFFFF)))\n"
     "(def unchecked-float float) (def unchecked-double double)\n"
     /* array coercions are identity; the *-array CONSTRUCTORS are defined later,
        after clove's real (transient-backed, mutable) int-array exists */
@@ -13058,7 +13173,14 @@ static const char *PRELUDE =
     /* misc */
     "(defn bounded-count [n coll] (loop [i 0 s (seq coll)] (if (and s (< i n)) (recur (inc i) (next s)) i)))\n"
     "(defn comparator [f] (fn [a b] (cond (f a b) -1 (f b a) 1 :else 0)))\n"
-    "(defn shuffle [coll] (vec coll))\n"
+    /* Fisher-Yates over a transient: swap slot i with a uniform j in [0, i] */
+    "(defn shuffle [coll]\n"
+    "  (let [v (vec coll)]\n"
+    "    (loop [t (transient v) i (dec (count v))]\n"
+    "      (if (pos? i)\n"
+    "        (let [j (rand-int (inc i)) x (nth t i)]\n"
+    "          (recur (assoc! (assoc! t i (nth t j)) j x) (dec i)))\n"
+    "        (persistent! t)))))\n"
     "(defn replace\n"
     "  ([smap] (map (fn [x] (if (contains? smap x) (get smap x) x))))\n"
     "  ([smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
@@ -13082,14 +13204,14 @@ static const char *PRELUDE =
     "(defn re-groups [m] (:groups (deref m)))\n"
     "(defn prefers [_] {})\n"
     "(defn ex-cause [e] (when (map? e) (:cause e)))\n"
-    "(defn tagged-literal [tag form] {:tag tag :form form})\n"
-    "(defn compare-and-set! [a old new] (if (= (deref a) old) (do (reset! a new) true) false))\n"
+    "(defn tagged-literal [tag form] {:clove/type :TaggedLiteral :tag tag :form form})\n"
+    "(defn compare-and-set! [a old new] (if (identical? (deref a) old) (do (reset! a new) true) false))\n"
     "(defn random-uuid []\n"
     "  (let [h (fn [n] (apply str (map (fn [_] (nth \"0123456789abcdef\" (rand-int 16))) (range n))))]\n"
     "    (str (h 8) \"-\" (h 4) \"-4\" (h 3) \"-\" (nth \"89ab\" (rand-int 4)) (h 3) \"-\" (h 12))))\n"
     "(defn hash-ordered-coll [c] (hash (vec c))) (defn hash-unordered-coll [c] (hash (set c)))\n"
     "(defn hash-combine [a b] (bit-xor (hash a) (hash b)))\n"
-    "(defn pop! [coll] coll)\n"
+
     "(defn random-sample\n"
     "  ([prob] (filter (fn [_] (< (rand) prob))))\n"
     "  ([prob coll] (filter (fn [_] (< (rand) prob)) coll)))\n"
@@ -13100,7 +13222,7 @@ static const char *PRELUDE =
     /* misc remaining */
     "(defn bean [_] {}) (defn demunge [x] (str x)) (defn seque ([coll] coll) ([_ coll] coll))\n"
     "(defn update-proxy [& _] nil) (defn proxy-mappings [_] {}) (defn proxy-call-with-super [f _ _] (f))\n"
-    "(defn reader-conditional [form splicing?] {:form form :splicing? splicing?})\n"
+    "(defn reader-conditional [form splicing?] {:clove/type :ReaderConditional :form form :splicing? splicing?})\n"
     "(defn inst-ms [_] 0) (defn to-array-2d [coll] (mapv vec coll))\n"
     "(defn halt-when\n"
     "  ([pred] (halt-when pred nil))\n"
@@ -13116,7 +13238,7 @@ static const char *PRELUDE =
 
     "(defn prn-str [& xs] (str (apply pr-str xs) \"\\n\"))\n"
 
-    "(defn test [_] :ok)\n"
+    "(defn test [v] (if-let [f (:test (meta v))] (do (f) :ok) :no-test))\n"
     "(def char-name-string {}) (def char-escape-string {})\n"
     "(defn seq-to-map-for-destructuring [s] (if (map? s) s (apply hash-map s)))\n"
     "(defmacro when-some [bindings & body]\n"
@@ -13766,7 +13888,7 @@ static const char *PRELUDE =
 CloveEnv *clove_new_env(void) {
     if (!NIL) {
         gc_stress = getenv("CLOVE_GC_STRESS") != NULL;
-        srand((unsigned)time(NULL));
+        srand(rng_seed());
         vstack = xmalloc(sizeof(Clove *) * VSTACK_CAP);
         for (int64_t i = SMALLINT_MIN; i <= SMALLINT_MAX; i++) {
             smallints[i - SMALLINT_MIN].tag = CLOVE_INT;
@@ -14002,6 +14124,8 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "ex-message", prim_ex_message);
     clove_define_native(e, "ex-data",    prim_ex_data);
     clove_define_native(e, "atom",    prim_atom);
+    clove_define_native(e, "clove/atom-watches",  prim_atom_watches);
+    clove_define_native(e, "clove/atom-watches!", prim_atom_set_watches);
     clove_define_native(e, "deref",   prim_deref);
     clove_define_native(e, "reset!",  prim_reset);
     clove_define_native(e, "swap!",   prim_swap);
@@ -14018,6 +14142,7 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "persistent!", prim_persistent_bang);
     clove_define_native(e, "conj!",       prim_conj_bang);
     clove_define_native(e, "assoc!",      prim_assoc_bang);
+    clove_define_native(e, "pop!",        prim_pop_bang);
     clove_define_native(e, "dissoc!",     prim_dissoc);  /* shim: persistent */
     clove_define_native(e, "disj!",       prim_disj);    /* shim: persistent */
     clove_define_native(e, "name",    prim_name);
@@ -15498,12 +15623,14 @@ CloveEnv *clove_new_env(void) {
         "(defn clove/fire-watches! [r old new]\n"
         "  (doseq [kv (:watches (deref (:state r)))] ((second kv) (first kv) r old new)))\n"
         "(defn add-watch [r k f]\n"           /* shadows the PRELUDE no-op */
-        "  (when (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
-        "    (swap! (:state r) update :watches assoc k f))\n"
+        "  (cond (= :atom (type r)) (clove/atom-watches! r (assoc (or (clove/atom-watches r) {}) k f))\n"
+        "        (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
+        "        (swap! (:state r) update :watches assoc k f))\n"
         "  r)\n"
         "(defn remove-watch [r k]\n"
-        "  (when (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
-        "    (swap! (:state r) update :watches dissoc k))\n"
+        "  (cond (= :atom (type r)) (clove/atom-watches! r (dissoc (clove/atom-watches r) k))\n"
+        "        (and (map? r) (#{:CloveAgent :CloveRef} (:clove/type r)))\n"
+        "        (swap! (:state r) update :watches dissoc k))\n"
         "  r)\n"
         /* ── agents ── */
         "(deftype CloveAgent [state]\n"

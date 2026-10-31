@@ -151,6 +151,29 @@ reader-conditional feature is `:clove`; `:cljc` is still accepted, so existing
 - `Math/signum` (NaN and both zeros pass through, as in Java).
 
 ### Fixed
+- **`shuffle` shuffles.** It was a stub that returned `(vec coll)` unchanged;
+  it is now a Fisher–Yates shuffle. The `rand` seed also mixes sub-second
+  time with the pid, so processes started in the same second no longer get
+  the same `rand`/`shuffle` stream.
+- **`add-watch` / `remove-watch` work on atoms.** They were no-ops on atoms
+  (agents and refs already worked); a watch is now called as
+  `(f key atom old new)` after every `swap!`, `reset!`, `swap-vals!`,
+  `reset-vals!` and successful `compare-and-set!`.
+- **`pop!` pops.** On a transient vector it returned its argument unchanged;
+  it now removes the last element in place, and throws
+  `IllegalStateException` "Can't pop empty vector" on an empty one.
+- **`compare-and-set!` compares by identity**, as Clojure does, rather than
+  with `=`: `(compare-and-set! (atom [1]) [1] 2)` is `false`.
+- **`special-symbol?`** is true for the JVM's special forms (`if`, `let*`,
+  `fn*`, `.`, …); it was always false.
+- **`tagged-literal?` and `reader-conditional?`** recognize the values that
+  `tagged-literal` and `reader-conditional` build; they were always false.
+- **`unchecked-byte`, `unchecked-short` and `unchecked-char` wrap** like Java's
+  narrowing casts (`(unchecked-byte 200)` is `-56`, `(unchecked-char 65)` is
+  `\A`); they were aliases of `int`.
+- **`test`** calls the `:test` function in the metadata and returns `:ok`, or
+  `:no-test` when there is none; it always returned `:ok` without running
+  anything.
 - **`(long ratio)` out of range** throws `IllegalArgumentException` "Value out
   of range for long: <quotient>", as Clojure does, instead of an untyped error
   that any `catch` clause took (found by the nightly fuzzer).

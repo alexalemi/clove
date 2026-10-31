@@ -566,6 +566,40 @@
 (assert= true (and (<= 0 (rand)) (< (rand) 1)))
 (assert= true (every? (fn [_] (<= 0 (rand-int 10) 9)) (range 50)))
 (assert= true (contains? #{1 2 3} (rand-nth [1 2 3])))
+;; shuffle is a permutation, and actually reorders (was a (vec coll) stub)
+(assert= (range 50) (sort (shuffle (range 50))))
+(assert= true (vector? (shuffle '(1 2 3))))
+(assert= [] (shuffle []))
+(assert= true (< 1 (count (set (repeatedly 20 #(shuffle (range 10)))))))
+;; add-watch on an atom fires (f key atom old new) on every change (was a no-op)
+(assert= [[:k 0 1] [:k 1 10] [:k 10 15] [:k 15 3]]
+         (let [a (atom 0) l (atom [])]
+           (add-watch a :k (fn [k r o n] (when (identical? r a) (swap! l conj [k o n]))))
+           (swap! a inc) (reset! a 10) (swap-vals! a + 5) (compare-and-set! a 15 3)
+           (remove-watch a :k) (swap! a inc) @l))
+(assert= 2 (let [a (atom 0) n (atom 0)]   ; two keys, both fire; re-adding a key replaces it
+             (add-watch a :x (fn [& _] (swap! n inc))) (add-watch a :y (fn [& _] (swap! n inc)))
+             (add-watch a :x (fn [& _] nil)) (swap! a inc) (+ @n (if (= 1 @a) 1 0))))
+;; pop! on a transient vector removes the last element (was identity)
+(assert= [1 2] (persistent! (pop! (transient [1 2 3]))))
+(assert= (vec (range 31)) (persistent! (reduce (fn [t _] (pop! t)) (transient (vec (range 100))) (range 69))))
+(assert= (vec (range 1023)) (persistent! (pop! (pop! (transient (vec (range 1025)))))))
+(assert= [(vec (range 200)) (vec (range 100))]   ; pop! down, conj! back up; source untouched
+         (let [v (vec (range 100)) t (reduce (fn [t _] (pop! t)) (transient v) (range 70))]
+           [(persistent! (reduce conj! t (range 30 200))) v]))
+(assert= "Can't pop empty vector" (try (pop! (transient [])) (catch IllegalStateException e (ex-message e))))
+;; compare-and-set! compares by identity, as on the JVM (was =)
+(assert= [false true] [(compare-and-set! (atom [1]) [1] 2) (let [v [1]] (compare-and-set! (atom v) v 2))])
+;; special-symbol? knows the JVM special forms; macros like let are not special
+(assert= [true false true true false] (mapv special-symbol? '[if let let* . foo]))
+(assert= [true false true false]
+         [(tagged-literal? (tagged-literal 'foo 1)) (tagged-literal? {:tag 'foo :form 1})
+          (reader-conditional? (reader-conditional '(:clj 1) false)) (reader-conditional? nil)])
+;; narrowing unchecked casts wrap like Java's (byte)/(short)/(char)
+(assert= "[-56 -128 4464 -32768 \\A]"
+         (pr-str [(unchecked-byte 200) (unchecked-byte 128) (unchecked-short 70000) (unchecked-short 32768) (unchecked-char 65601)]))
+;; test runs :test metadata and reports :no-test when there is none
+(assert= [:ok 1 :no-test] (let [n (atom 0)] [(test (with-meta (fn []) {:test #(swap! n inc)})) @n (test (fn []))]))
 (assert= 3 (count (max-key count [1] [1 2 3] [1 2])))
 (assert= [1] (min-key count [1] [1 2 3] [1 2]))
 
