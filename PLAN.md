@@ -9,7 +9,7 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-11-01, v0.8.0)
+## Status (as of 2026-11-01, v0.8.1)
 
 ~18,000 lines, zero warnings, ~2200 assertions in `tests.clj` + ~540-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean

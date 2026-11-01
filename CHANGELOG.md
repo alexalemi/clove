@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.1 — 2026-11-01
+
+### Fixed
+- Windows: `.mkdirs` and `clojure.java.io/make-parents` created nothing when
+  the path started with a drive letter (`D:\...`). v0.8.0 shipped no
+  binaries because of it; this is the release of that work.
+
 ## v0.8.0 — 2026-11-01
 
 ### Changed

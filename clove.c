@@ -159,7 +159,7 @@ static void clove_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLOVE_VERSION "0.8.0"
+#define CLOVE_VERSION "0.8.1"
 #ifndef CLOVE_SHAREDIR
 #define CLOVE_SHAREDIR "/usr/local/share/clove"
 #endif
