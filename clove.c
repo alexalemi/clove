@@ -11626,14 +11626,17 @@ static Clove *prim_file_op(CloveEnv *env, Clove **argv, int nargs) {
             sep = sep || buf[i] == '\\';
 #endif
             if (sep) {
+                /* a prefix that can't be made may still exist or be a drive
+                 * ("D:" fails stat on Windows): only the final dir decides */
                 char c = buf[i]; buf[i] = '\0';
                 struct stat s2;
-                if (stat(buf, &s2) != 0 && mkdir1(buf) != 0) { free(buf); return FALSE; }
+                if (stat(buf, &s2) != 0) (void)mkdir1(buf);
                 buf[i] = c;
             }
         }
         free(buf);
-        return TRUE;
+        struct stat s3;
+        return mk_bool(stat(path, &s3) == 0 && S_ISDIR(s3.st_mode));
     }
     if (!strcmp(op, "list")) {
         if (!have || !S_ISDIR(st.st_mode)) return NIL;
