@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.8.0 — 2026-11-01
+
+### Changed
+- **Maps keep insertion order at every size.** Small maps (up to 8 entries)
+  are now array maps, as on the JVM: they print and iterate in insertion
+  order, where they used to come out reversed. Larger maps keep insertion
+  order too: the hash trie points into an ordered entry vector, so `keys`,
+  `seq` and printing follow insertion order (the JVM switches to hash order
+  past 8). Replacing a value keeps its key's slot. Lookups and iteration cost
+  the same as before; churn-heavy `dissoc` on large maps is about 2x slower.
+  Records print their fields in declaration order.
+
+### Fixed (silently wrong before)
+- `spit` with `:append true` appended; it used to overwrite the file.
+- `atom` honours `:validator` and `:meta`; `set-validator!` and
+  `get-validator` exist. An invalid state throws IllegalStateException
+  "Invalid reference state".
+- `clojure.java.shell/sh` exists and runs an argv, with `:in`, `:env`,
+  `:dir`, a separate `:err`, `with-sh-dir` and `with-sh-env`. Core `sh` with
+  several arguments used to drop all but the first.
+- `*command-line-args*` holds the script's arguments; it was always nil.
+- `with-in-str` feeds `read-line` and `read`; they returned nil.
+- `*in*` (and `System/in`) is stdin: `(slurp *in*)` reads it (it tried to
+  open the file ""), `(line-seq (io/reader *in*))` streams it, and `read`
+  on a pipe keeps the rest of the line for the next `read`/`read-line`
+  (it used to drop it).
+- `(.getName file)` is the last path segment, not the whole path. File is now
+  a value (`java.io.File.`, `io/file`) with `.exists`, `.getParent`,
+  `.listFiles`, `.mkdirs`, `.delete`, `.length`, `File/createTempFile`,
+  `file-seq`, and `str` gives its path.
+- `.getBytes` returns a UTF-8 byte array, not characters.
+- `make-array` of `Long/TYPE`, `Double/TYPE` and the other primitive types
+  fills with zeros, not nil.
+- `str` of a regex is its source (it included the `#"…"` wrapper).
+- `str` of an exception is `"java.lang.Exception: msg"`, and `pr-str`
+  prints `#error {…}`. Both used to print a raw map. `.printStackTrace`
+  prints the exception and its causes to `*err*` (it printed nothing).
+- `macroexpand-1` expands `when`, `cond`, `and`, `or` and the other natively
+  implemented macros, as the JVM shows them.
+- `map->R` gives a record's absent fields nil, so `(= (map->R {:a 1})
+  (->R 1 nil))` holds and `contains?` sees every field.
+- `cl-format` `~r` spells numbers (`"four"`, `"twenty-first"`, `"MCMXCIV"`);
+  it printed digits.
+
+### Added
+- clojure.core: `printf`, `newline`, `read` (also from a PushbackReader),
+  `read+string`, `load-string`, `load-reader`, `parse-boolean`, `infinite?`,
+  `NaN?`, `bound?`, `memfn`, `with-local-vars`/`var-get`/`var-set`,
+  `tap>`/`add-tap`/`remove-tap`, `partitionv`, `partitionv-all`,
+  `splitv-at`, `iteration`, `amap`, `areduce`, `Throwable->map`,
+  `with-precision` (BigDecimal division and arithmetic round to the
+  precision), `char-array`, `into-array` with a type, and `:doc` metadata on
+  core vars.
+- `Math/floorDiv`, `Math/floorMod` and the `*Exact` fns. `(Math/PI)` and
+  other static fields work in call position.
+- Regex flags `(?i)`, `(?m)` and `(?u)`; `re-matcher`, `re-groups`, and
+  Matcher `.find`/`.start`/`.end`.
+- `format`: the `,` grouping flag (`%,d`, `%,.2f`), `%b`, `%c`, `%S`, `%h`,
+  `%n`, and `%2$s` argument indexes.
+- String methods: `.split`, `.isEmpty`, `.isBlank`, `.equalsIgnoreCase`,
+  `.repeat`, `.lastIndexOf`, `.strip`, `.matches`, `.replaceAll`,
+  `.toCharArray`, `String/join`, `String/format`, and others. Character:
+  `isLetter`, `isUpperCase`, `isLowerCase`, `toUpperCase`, `toLowerCase`,
+  `getNumericValue`, and friends.
+- `java.util` collections (`ArrayList`, `LinkedList`, `ArrayDeque`,
+  `HashMap`, `LinkedHashMap`, `TreeMap`, `HashSet`, `TreeSet`, …) work with
+  `seq`, `count`, `into`, `get`, `=` and printing.
+- `java.time.LocalDate` (parse, of, now, plus/minus, day-of-week, epoch
+  days) and `ChronoUnit/DAYS .between`.
+- `slurp` of a Reader; `clojure.java.io/copy`, `make-parents` and
+  `delete-file` on Files.
+- `clojure.pprint/print-table`, and `cl-format` with `~a ~s ~d ~b ~o ~x ~r
+  ~f ~e ~$ ~c ~p ~t ~* ~% ~& ~{~} ~^ ~[~] ~(~)`.
+
+### Fixed
+- **Vars keep their metadata.** `def` used to drop the metadata on its name;
+  it is now stored with the var and merged into `(meta #'x)`, evaluated as
+  Clojure evaluates it (`^{:test (fn [] ..)}` stores a fn; a `^String` hint
+  stays the symbol). `defn`'s attr-map lands there too, a redef without
+  metadata resets it, and `alter-meta!`/`reset-meta!` work on vars. So
+  `(test #'x)` runs a var's `:test`.
+- **An instance's own method beats a host shim of the same name.** clove
+  defines some JVM methods globally (`.write`, `.get`, …), and those used to
+  shadow a `reify`/`proxy`/`deftype` method of that name: `(.write w s)` on
+  a reified Writer called the shim. The instance now wins, as an override
+  would on the JVM. Only names some type actually implements pay for the
+  check, so other `.method` calls run at full speed.
+- **`byte-array` makes byte arrays**: values wrap to -128..127 as Java's
+  `byteValue` does, `bytes?` is true of them (it was always false), and they
+  print as `#<byte-array n>`.
+- **`munge`, `namespace-munge` and `demunge` mangle** with Clojure's
+  character map (`(munge "a-b?")` is `"a_b_QMARK_"`); they returned their
+  argument unchanged. `clojure.main/demunge` is an alias.
+- **`supers`** returns a type's ancestors from the interfaces its
+  `deftype`/`defrecord` declared, or nil (it was always `#{}`); **`bean`**
+  returns `:class` plus a typed instance's fields (it was always `{}`).
+
 ## v0.7.0 — 2026-10-31
 
 ### Renamed: cljc is now clove

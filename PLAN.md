@@ -9,9 +9,9 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-10-31, v0.7.0)
+## Status (as of 2026-11-01, v0.8.0)
 
-~18,000 lines, zero warnings, ~2040 assertions in `tests.clj` + ~510-expression
+~18,000 lines, zero warnings, ~2200 assertions in `tests.clj` + ~540-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan at
@@ -29,6 +29,20 @@ results go through `to_bigint`. Integer positions read values through
 `int_value` (INT or an in-range BIGINT), `clove_eq`/`clove_hash` equate 1 and
 1N, and `make_ratio`/`mk_bigdec` demote their parts. Diffed against bb
 (conformance lines + `fuzz.sh` no longer strips the `N`); minijax unchanged.
+
+Everyday sweep (2026-11-01): a 559-expression corpus of everyday idioms
+diffed against bb turned up silently wrong results (`spit :append`, atom
+`:validator`, multi-arg `sh`, `*command-line-args*`, reversed small-map order,
+`with-in-str`+`read-line`, `.getBytes`, `make-array` zeros, exception `str`)
+and ~60 missing names. Fixed in one pass: most of the gap-fill is Clojure in
+the last prelude chunk (`/* ── everyday gap-fill`), with C support for
+ordered maps (`map_assoc`/`map_compact`: small = array map, big = HAMT →
+entry in an `order` vector with tombstones), atom validators, `clove/proc*`
+(fork/execvp; popen fallback on Windows), `clove/file-op*`, regex flags
+(`RXF_*` in `rx_dotall`), `format` flags, and `*math-context*`
+(`bd_mc_precision`). Not covered: other java.time types, cl-format `~<~>`.
+Pre-existing, unrelated: minijax notebook-test has 8 failures (`:=` define
+cells), identical on v0.7.0.
 
 Fixed-buffer audit (2026-10-21): every `char buf[N]` that could cut a value
 users see now grows (err_msg is heap-grown via err_msg_vset, `intern_qual`
@@ -109,21 +123,20 @@ Things the history log leaves unresolved, roughly by value:
   wrong-arity (ArityException) and "not a function" (ClassCastException) are
   the likely next ones. `type` of an exception is still its representation
   (`:map`/`:string`); only `class` and `instance?` see the recorded class.
-- **Var metadata.** `def`/`defn` drop name metadata (`^{:test f}`, `^:foo`),
-  and `alter-meta!` on a var is a no-op; `(meta #'x)` is synthesized from the
-  doc registry (`:name`/`:doc`/`:arglists`). So `test` on a var finds no
-  `:test`, and clojure.test-style `:test` metadata doesn't round-trip.
-- **Remaining inert stubs** (found 2026-10-31 by a differential sweep against
-  bb): `munge`/`namespace-munge` don't mangle, `bytes?`/`chunked-seq?` are
-  always false, `supers` is `#{}`, `bean` is `{}`. A global `.method` host shim
-  (e.g. `.write`) takes precedence over a `reify`/`proxy` method of the same
-  name. Data readers: only `#inst`/`#uuid`, with no `*data-readers*` lookup.
+- **Data readers**: only `#inst`/`#uuid`; `*data-readers*` and
+  `data_readers.clj` are not consulted, so other tags are read errors (inside
+  a skipped `#?` branch they are tolerated).
+- **Method override timing**: an instance method beats a global `.method`
+  shim only for names in `method_notes`, filled when a deftype/reify/proxy
+  form is macroexpanded or registered. Code the VM compiled before then
+  still calls the shim directly.
 - **Float division by an exact zero** is `##Inf` (as compiled Clojure with
   primitive doubles); boxed JVM math and babashka throw. Typing-dependent on
   the JVM itself, so there is no single right answer — left as is.
 - **BigDecimal leftovers**: `(BigDecimal. 0.1)` uses the double's shortest
   repr (Java's `valueOf`) rather than the exact binary expansion; only
-  HALF_UP rounding; no `*math-context*`.
+  HALF_UP rounding (`with-precision` with another `:rounding` mode throws
+  rather than rounding differently).
 - **Libraries needing a JVM reimplementation**: `clojure.data.xml` (StAX),
   `cognitect.transit` (see README "Not yet").
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
@@ -151,7 +164,8 @@ Things the history log leaves unresolved, roughly by value:
 
 ## Known divergences from Clojure (deliberate)
 - `catch` is typed only as far as exception classes are recorded; hash
-  maps/sets iterate in hash order (see README's list — it supersedes this one)
+  sets iterate in hash order, maps in insertion order at every size (see
+  README's list — it supersedes this one)
 - Namespaces: flat global + per-ns aliases behind a symbol-based namespace
   layer; top-level `user` defs are bare, hence visible from other
   namespaces; no remove-ns/ns-unmap (root Bindings are append-only)

@@ -1,8 +1,8 @@
 ;; wordfreq.clj — a word-frequency CLI, the "hello world" of text processing.
 ;;
 ;; Showcases: regex tokenizing, frequencies, sort-by, *args* for CLI input,
-;; and reading either a file or stdin (clove has no *in*, so we drain stdin
-;; with a read-line loop — a useful idiom for pipe-friendly scripts).
+;; and reading either a file or stdin (drained with a read-line loop, which
+;; works the same on the JVM: `(slurp *in*)` is the other idiom).
 ;;
 ;; Run:  clove examples/wordfreq.clj README.md
 ;;       cat README.md | clove examples/wordfreq.clj

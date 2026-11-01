@@ -3103,6 +3103,29 @@
          [(parse-uuid "x") (parse-uuid "00000000-0000-0000-0000-000000000001")])
 (assert= 1577836800000 (inst-ms (:t (read-string "{:t #inst \"2020-01-01\"}"))))   ; data, not code
 (assert= [2] (read-string "[#?(:cljs #js {:a 1} :clj 2)]"))   ; skipped branch: unknown tag tolerated
+;; var metadata: def keeps name metadata (evaluated), defn its attr-map; redef resets
+(def ^{:foo 2 :test (fn [] nil)} t-vm-y 2)
+(assert= [2 true :ok] [(:foo (meta #'t-vm-y)) (fn? (:test (meta #'t-vm-y))) (test #'t-vm-y)])
+(def t-vm-y 3)
+(assert= false (contains? (meta #'t-vm-y) :foo))
+(defn ^:bar t-vm-z "doc" {:baz 3} [] 1)
+(assert= {:bar true :baz 3 :doc "doc"} (select-keys (meta #'t-vm-z) [:bar :baz :doc]))
+(def ^String t-vm-s "x")
+(assert= 'String (:tag (meta #'t-vm-s)))                 ; type hints stay symbols
+(alter-meta! #'t-vm-s assoc :k 1)
+(assert= 1 (:k (meta #'t-vm-s)))
+(reset-meta! #'t-vm-s {:only 1})
+(assert= [1 false] [(:only (meta #'t-vm-s)) (contains? (meta #'t-vm-s) :k)])
+;; an instance's own method beats a global .method host shim (.write is one)
+(defn t-write [w] (.write w "x"))
+(assert= ["w:x" "w:x"] (let [w (reify java.io.Writer (write [this s] (str "w:" s)))] [(.write w "x") (t-write w)]))
+;; munge / namespace-munge / demunge, bytes?, supers, bean
+(assert= ["a_b_QMARK__BANG_.c" 'a_b "a_b.c_d" "a-b?!"]
+         [(munge "a-b?!.c") (munge 'a-b) (namespace-munge "a-b.c-d") (demunge "a_b_QMARK__BANG_")])
+(assert= [true false "[-56 127 -1]"] [(bytes? (byte-array 1)) (bytes? (int-array 1)) (pr-str (vec (byte-array [200 -129 255])))])
+(deftype TSupers [a b] java.io.Closeable)
+(assert= [#{:java.io.Closeable} nil] [(supers TSupers) (supers :t-no-such-type)])
+(assert= {:class :TSupers :a 1 :b 2} (bean (->TSupers 1 2)))
 ;; proxy builds a working object (was an inert atom): methods get the implicit `this`
 (assert= ["hi" "hello hi" "hello bob" 42 7]
          (let [x (proxy [Object] [] (toString [] "hi")
@@ -3739,6 +3762,226 @@
 ;; (long ratio) out of range is IllegalArgumentException with the quotient, as RT.longCast
 (assert= "Value out of range for long: 32281802128991715324"
          (try (long (* -7/2 -9223372036854775807)) (catch ArithmeticException e :ae) (catch IllegalArgumentException e (ex-message e))))
+
+;; ── everyday sweep (2026-11-01): silent-wrong results and missing core fns ──
+;; maps keep insertion order at every size (small maps: array form, like the JVM)
+(assert= "{:a 1, :b 2, :c 3}" (pr-str {:a 1 :b 2 :c 3}))
+(assert= [:z :y :x :w :v :u :t :s :r :q] (keys (reduce (fn [m k] (assoc m k 1)) {} [:z :y :x :w :v :u :t :s :r :q])))
+(assert= "{:a 1, :c 3}" (pr-str (dissoc {:a 1 :b 2 :c 3} :b)))
+(assert= "{:a 9, :b 2}" (pr-str (assoc {:a 1 :b 2} :a 9)))                  ; replacing keeps the slot
+(assert= [0 1 2 18 19] (keys (reduce dissoc (into {} (map vector (range 20) (range 20))) (range 3 18))))
+(assert= [3 4 0] (keys (-> (into {} (map vector (range 12) (range 12))) (#(apply dissoc % (range 12))) (assoc 3 3 4 4 0 0))))
+(let [big (into {} (map vector (range 100) (range 100)))
+      churned (reduce (fn [m i] (assoc (dissoc m i) i i)) big (range 0 100 2))]   ; tombstones + compaction
+  (assert= (concat (range 1 100 2) (range 0 100 2)) (keys churned))
+  (assert= 100 (count churned))
+  (assert= true (= big churned))
+  (assert= (hash big) (hash churned)))
+(assert= {\h 1 \e 1 \l 2 \o 1} (frequencies "hello"))
+(assert= "{\\h 1, \\e 1, \\l 2, \\o 1}" (pr-str (frequencies "hello")))
+;; spit :append appends (it overwrote)
+(let [f (str (System/getProperty "java.io.tmpdir") "/clove-spit-" (rand-int 1000000) ".txt")]
+  (spit f "a") (spit f "b" :append true) (spit f "c" :append true)
+  (assert= "abc" (slurp f))
+  (spit f "x" :append false)
+  (assert= "x" (slurp f))
+  (assert= true (.delete (java.io.File. f))))
+;; atom :validator / :meta and set-validator! (were ignored / missing)
+(let [a (atom 1 :validator pos? :meta {:k 1})]
+  (assert= {:k 1} (meta a))
+  (assert= [:ise "Invalid reference state" 1] (try (reset! a -1) (catch IllegalStateException e [:ise (ex-message e) @a])))
+  (assert= 1 (try (swap! a - 5) (catch IllegalStateException e @a)))
+  (assert= 2 (swap! a inc)))
+(let [a (atom 2)]
+  (set-validator! a even?)
+  (assert= even? (get-validator a))
+  (assert= 2 (try (reset! a 3) (catch IllegalStateException e @a)))
+  (assert= :ise (try (set-validator! (atom 1) even?) (catch IllegalStateException e :ise))))
+;; clojure.java.shell/sh: an argv, :in :env :dir, and separate :err
+(when clove-test-unix?
+  (require '[clojure.java.shell :as shell])
+  (assert= "hi there\n" (:out (shell/sh "echo" "hi" "there")))
+  (assert= "hi there\n" (:out (sh "echo" "hi" "there")))                  ; multi-arg core sh too
+  (assert= "piped" (:out (shell/sh "cat" :in "piped")))
+  (assert= "/\n" (:out (shell/sh "pwd" :dir "/")))
+  (assert= "v\n" (:out (shell/sh "sh" "-c" "echo $X" :env {"X" "v" "PATH" (System/getenv "PATH")})))
+  (assert= ["" "e\n" 3] ((juxt :out :err :exit) (shell/sh "sh" "-c" "echo e >&2; exit 3")))
+  (assert= "/\n" (shell/with-sh-dir "/" (:out (shell/sh "pwd"))))
+  (assert= :ioe (try (shell/sh "no-such-program-xyz") (catch java.io.IOException e :ioe)))
+  (assert= "ok\n" (:out (sh "echo ok"))))                                 ; one string: still a shell line
+;; with-in-str feeds read-line / read
+(assert= ["a" "b" nil] (with-in-str "a\nb\n" [(read-line) (read-line) (read-line)]))
+(assert= ['(+ 1 2) :k] (with-in-str "(+ 1 2) :k" [(read) (read)]))
+(assert= [1 :eof] (let [r (java.io.PushbackReader. (java.io.StringReader. "1"))] [(read r false :eof) (read r false :eof)]))
+(assert= [[1 2] "[1 2]"] (with-in-str "[1 2] 3" (read+string)))
+;; java.io.File is a value: name/parent/exists/mkdirs/listFiles, io/file, file-seq
+(assert= ["b.txt" "/a" "/a/b.txt"] (let [f (java.io.File. "/a/b.txt")] [(.getName f) (.getParent f) (str f)]))
+(assert= "a/b/c.txt" (str (clojure.java.io/file "a" "b" "c.txt")))
+(assert= "y.clj" (.getName (clojure.java.io/file "x/y.clj")))
+(assert= false (.exists (java.io.File. "/nonexistent-clove-xyz")))
+(let [root (str (System/getProperty "java.io.tmpdir") "/clove-ft-" (rand-int 1000000))
+      f (clojure.java.io/file root "mp" "a" "b.txt")]
+  (clojure.java.io/make-parents f)
+  (spit f "hello")
+  (assert= [true 5 "hello"] [(.isFile f) (.length f) (slurp f)])
+  (assert= ["a"] (map #(.getName %) (.listFiles (java.io.File. root "mp"))))
+  (assert= 1 (count (filter #(.isFile %) (file-seq (clojure.java.io/file root)))))
+  (assert= :ioe (try (clojure.java.io/delete-file (str root "/nope")) (catch java.io.IOException e :ioe)))
+  (assert= true (clojure.java.io/delete-file (str root "/nope") true))
+  (assert= [true true true true] (mapv #(.delete (clojure.java.io/file %)) [f (str root "/mp/a") (str root "/mp") root])))
+(let [t (java.io.File/createTempFile "abc" ".txt")]
+  (assert= [true true] [(.exists t) (str/ends-with? (str t) ".txt")])
+  (.delete t))
+(assert= "#object[java.io.File" (subs (pr-str (java.io.File. "x")) 0 20))
+;; .getBytes is a byte array of UTF-8; String. decodes it
+(assert= [104 -61 -87] (vec (.getBytes "hé")))
+(assert= [true "hé"] [(bytes? (.getBytes "a")) (String. (.getBytes "hé"))])
+(assert= "5d41402abc4b2a76b9719d911017c592"                                ; the md5 idiom still works
+         (format "%032x" (BigInteger. 1 (.digest (MessageDigest/getInstance "MD5") (.getBytes "hello")))))
+;; primitive arrays fill with their zero value
+(assert= [[0 0 0] [0.0 0.0] [nil nil]] [(vec (make-array Long/TYPE 3)) (vec (make-array Double/TYPE 2)) (vec (make-array Object 2))])
+(assert= [[0 0 0] [0 0 0]] (mapv vec (make-array Long/TYPE 2 3)))
+(assert= [[\a \b] ["a" "b"] [:a "b"]] [(vec (char-array "ab")) (vec (into-array String ["a" "b"])) (vec (to-array [:a "b"]))])
+;; str of a regex is its source; exceptions print like the JVM
+(assert= ["a+b" "x.y"] [(str #"a+b") (str (re-pattern "x.y"))])
+(assert= "clojure.lang.ExceptionInfo: m {:a 1}" (str (ex-info "m" {:a 1})))
+(assert= ["java.lang.Exception: x" "java.lang.RuntimeException"] [(str (Exception. "x")) (str (RuntimeException.))])
+(assert= "java.lang.ArithmeticException: Divide by zero" (try (/ 1 0) (catch Exception e (str e))))
+(assert= "Divide by zero" (try (/ 1 0) (catch Exception e (ex-message e))))
+(assert= true (str/starts-with? (pr-str (ex-info "m" {:a 1})) "#error {\n :cause \"m\"\n :data {:a 1}"))
+(assert= nil (ex-message (Exception.)))
+(assert= "java.lang.Exception: boom" (first (str/split-lines (with-out-str (binding [*err* *out*] (.printStackTrace (Exception. "boom")))))))
+(assert= {:cause "inner" :data {:d 1} :n 2}
+         (let [m (Throwable->map (ex-info "outer" {} (ex-info "inner" {:d 1})))] {:cause (:cause m) :data (:data m) :n (count (:via m))}))
+;; macroexpand-1 shows the JVM expansion of the forms clove implements natively
+(assert= '(if a (do b c)) (macroexpand-1 '(when a b c)))
+(assert= '(if a b (clojure.core/cond c d)) (macroexpand-1 '(cond a b c d)))
+(assert= '(if a nil (do b)) (macroexpand '(when-not a b)))
+(assert= [3 3] [(eval (macroexpand-1 '(and 1 2 3))) (eval (macroexpand-1 '(or nil false 3)))])
+;; read / read-line on a real stdin pipe share a pushback buffer (read used to drop the rest of the line)
+(when clove-test-unix?
+  (assert= "[(+ 1 2) \" :k\" \"next\" :eof]\n"
+           (:out (sh (str (clove/exe-dir*) "/clove") "-e" "(prn [(read) (read-line) (read-line) (read *in* false :eof)])" :in "(+ 1 2) :k\nnext\n")))
+  (assert= "(+ 1 2) :k [3] :eof\n"
+           (:out (sh (str (clove/exe-dir*) "/clove") "-e" "(prn (read) (read) (read) (read *in* false :eof))" :in "(+ 1\n 2) :k [3]")))
+  ;; *in* is stdin: (slurp *in*) and line-seq over a reader of it (slurp *in* used to open "")
+  (assert= "[\"abc\" \"(1 2)\\nlast\"]\n"
+           (:out (sh (str (clove/exe-dir*) "/clove") "-e" "(prn [(read-line) (slurp *in*)])" :in "abc\n(1 2)\nlast")))
+  (assert= "[\"x\" \"y\"] 0\n"                                         ; the first line-seq drains stdin
+           (:out (sh (str (clove/exe-dir*) "/clove") "-e"
+                     "(prn (vec (line-seq (java.io.BufferedReader. *in*))) (count (line-seq (java.io.BufferedReader. (java.io.InputStreamReader. System/in)))))"
+                     :in "x\ny\n"))))
+;; *command-line-args*: the script args (a seq), nil when none
+(when clove-test-unix?
+  (let [exe (str (clove/exe-dir*) "/clove")
+        f (str (System/getProperty "java.io.tmpdir") "/clove-cla-" (rand-int 1000000) ".clj")]
+    (spit f "(prn *command-line-args*)")
+    (assert= "(\"a\" \"b\")\nnil\n" (str (:out (sh exe f "a" "b")) (:out (sh exe f))))
+    (.delete (java.io.File. f))))
+;; missing clojure.core fns
+(assert= "a-5" (with-out-str (printf "%s-%d" "a" 5)))
+(assert= "1\n2" (with-out-str (print 1) (newline) (print 2)))
+(assert= [true false nil] [(parse-boolean "true") (parse-boolean "false") (parse-boolean "yes")])
+(assert= [true true false true false] [(infinite? ##Inf) (infinite? ##-Inf) (infinite? 1.0) (NaN? ##NaN) (NaN? 1.0)])
+(assert= 42 (load-string "(def ls-x 40) (+ ls-x 2)"))
+(assert= true (bound? #'inc))
+(assert= 12 (with-local-vars [x 1 y 2] (var-set x 10) (+ (var-get x) (var-get y))))
+(assert= ["A" "B"] (map (memfn toUpperCase) ["a" "b"]))
+(assert= "el" ((memfn substring start end) "hello" 1 3))
+(let [seen (atom []) f #(swap! seen conj %)]
+  (add-tap f) (tap> 1) (tap> 2) (remove-tap f) (tap> 3)
+  (assert= [1 2] @seen))
+(assert= ['([0 1 2] [3 4 5]) '([0 1 2] [3 4 5] [6 7]) [[0 1] '(2 3 4)]] [(partitionv 3 (range 8)) (partitionv-all 3 (range 8)) (splitv-at 2 (range 5))])
+(assert= true (vector? (first (partitionv 2 [1 2 3 4]))))
+(assert= [0 1 4 9 16] (vec (iteration (fn [k] (when (< k 5) {:v (* k k) :k (inc k)})) :initk 0 :vf :v :kf :k)))
+(assert= [[1] [2] [3]] (vec (iteration (fn [p] {:items [p] :next (when (< p 3) (inc p))}) :initk 1 :vf :items :kf :next)))
+(let [a (long-array [1 2 3])]
+  (assert= [10 20 30] (vec (amap a i r (* 10 (aget a i)))))
+  (assert= 6 (areduce a i s 0 (+ s (aget a i)))))
+(assert= ["3.1429M" "3.6M" "0.3333333333M" "0.667M" "0.25M"]
+         (map pr-str [(with-precision 5 (/ 22M 7)) (with-precision 2 (+ 1.234M 2.345M)) (with-precision 10 (/ 1M 3))
+                      (with-precision 3 :rounding HALF_UP (/ 2M 3)) (with-precision 3 (/ 1M 4))]))
+(assert= :ae (try (/ 1M 3) (catch ArithmeticException e :ae)))            ; no precision: still exact
+(assert= [-4 3 1 -1] [(Math/floorDiv -7 2) (Math/floorDiv 7 2) (Math/floorMod -7 2) (Math/floorMod 7 -2)])
+(defn clove-test-pi2 [] (* 2 (Math/PI)))                                  ; compiled body too
+(assert= [3.141592653589793 9223372036854775807 6.283185307179586] [(Math/PI) (Long/MAX_VALUE) (clove-test-pi2)])
+;; regex (?i) and (?m) flags (were "unsupported flag")
+(assert= ["HELLO" ["A" "b" "C"] "ABC" ["a1" "2c"]]
+         [(re-find #"(?i)hello" "Say HELLO") (re-seq #"(?i)[a-c]" "xAbCd") (re-matches #"(?i)abc" "ABC") (str/split "a1B2c" #"(?i)b")])
+(assert= [["one" "three"] "two" nil "b"] [(re-seq #"(?m)^\w+" "one two\nthree four") (re-find #"(?m)two$" "one two\nthree")
+                                         (re-matches #"(?m)a$" "a\n") (re-find #"(?i)[^a]" "Ab")])
+(assert= "Jello" (str/replace "Hello" #"(?i)h" "J"))
+;; re-matcher: a stateful matcher for re-find / re-groups
+(let [m (re-matcher #"(\d+)" "a12b345")]
+  (assert= [["12" "12"] ["12" "12"] ["345" "345"] nil] [(re-find m) (re-groups m) (re-find m) (re-find m)]))
+(assert= ["1" "2"] (let [m (re-matcher #"\d" "x1y2")] (loop [acc []] (if-let [x (re-find m)] (recur (conj acc x)) acc))))
+;; format: %,d %,f %b %c %n %S and %2$s argument indexes
+(assert= ["1,234,567" "-1,234" "9,876,543.22" "false" "true" "z" "b a" "\n" "ABC" "true  |" "    -1,234|"]
+         [(format "%,d" 1234567) (format "%,d" -1234) (format "%,.2f" 9876543.219) (format "%b" nil) (format "%b" 0)
+          (format "%c" \z) (format "%2$s %1$s" "a" "b") (format "%n") (format "%S" "abc") (format "%-6b|" true) (format "%,10d|" -1234)])
+;; String / Character interop
+(assert= [["a" "b" "" "c"] ["a" "b" "c"] ["a" "b,c"] [""]]
+         [(vec (.split "a,b,,c,," ",")) (vec (.split "a1b2c3" "\\d")) (vec (.split "a,b,c" "," 2)) (vec (.split "" ","))])
+(assert= [true false true "ababab" "a-b-c" 3 -1] [(.isEmpty "") (.isEmpty "a") (.equalsIgnoreCase "AbC" "aBc") (.repeat "ab" 3)
+                                                 (String/join "-" ["a" "b" "c"]) (.lastIndexOf "hello" "l") (.indexOf "hello" "z")])
+(assert= [true false true false true \A \q 7 10]
+         [(Character/isLetter \a) (Character/isLetter \1) (Character/isUpperCase \A) (Character/isUpperCase \a) (Character/isLowerCase \a)
+          (Character/toUpperCase \a) (Character/toLowerCase \Q) (Character/getNumericValue \7) (Character/getNumericValue \a)])
+(require (quote clojure.java.io))
+(assert= ["abc" "x\ny"] [(slurp (java.io.StringReader. "abc")) (slurp (clojure.java.io/reader (java.io.StringReader. "x\ny")))])
+;; java.util collections seq, count, compare and print by their contents
+(let [l (java.util.ArrayList.)]
+  (.add l 1) (.add l 2)
+  (assert= ['(1 2) [1 2] 2 2 2 "[1 2]"] [(seq l) (into [] l) (count l) (.size l) (.get l 1) (pr-str l)]))
+(assert= ['(1 2 3) 3 6] (let [l (java.util.ArrayList. [3 1 2])] [(sort l) (first l) (reduce + l)]))
+(assert= true (= (java.util.ArrayList. [1 2]) [1 2]))
+(let [m (java.util.HashMap.)]
+  (assert= nil (.put m :a 1))
+  (assert= 1 (.put m :a 5))                                                ; returns the old value
+  (.put m :b 2)
+  (assert= [5 2 2 true {:a 5 :b 2} 9] [(get m :a) (.get m :b) (count m) (.containsKey m :a) (into {} m) (.getOrDefault m :z 9)]))
+(assert= [2 true #{1 2}] (let [s (java.util.HashSet. [1 2 2])] [(count s) (.contains s 2) (into #{} s)]))
+(assert= [2 2 1 3 0] (let [d (java.util.ArrayDeque.)] (.push d 1) (.push d 2) (.offer d 3) [(.peek d) (.pop d) (.poll d) (.pollLast d) (.size d)]))
+(assert= [3 [1 2]] [(.peek [1 2 3]) (.pop [1 2 3])])                       ; persistent stacks keep .peek/.pop
+;; java.time.LocalDate
+(assert= ["2024-01-15" 2024 3 5 "2024-04-04" "2024-02-29" "2024-02-29" "2025-02-28" "TUESDAY"]
+         (let [d (java.time.LocalDate/parse "2024-03-05")]
+           [(str (java.time.LocalDate/of 2024 1 15)) (.getYear d) (.getMonthValue d) (.getDayOfMonth d) (str (.plusDays d 30))
+            (str (.minusDays (java.time.LocalDate/parse "2024-03-01") 1)) (str (.plusMonths (java.time.LocalDate/parse "2024-01-31") 1))
+            (str (.plusYears (java.time.LocalDate/parse "2024-02-29") 1)) (str (.getDayOfWeek d))]))
+(assert= [true 28 61 10957 "2022-01-08" true 60]
+         [(.isLeapYear (java.time.LocalDate/of 2024 1 1)) (.lengthOfMonth (java.time.LocalDate/of 2023 2 1))
+          (.getDayOfYear (java.time.LocalDate/of 2024 3 1)) (.toEpochDay (java.time.LocalDate/of 2000 1 1))
+          (str (java.time.LocalDate/ofEpochDay 19000)) (= (java.time.LocalDate/of 2024 1 1) (java.time.LocalDate/parse "2024-01-01"))
+          (.between java.time.temporal.ChronoUnit/DAYS (java.time.LocalDate/of 2024 1 1) (java.time.LocalDate/of 2024 3 1))])
+(assert= true (boolean (re-matches #"\d{4}-\d{2}-\d{2}" (str (java.time.LocalDate/now)))))
+;; clojure.pprint/print-table and cl-format
+(assert= "\n| :a | :b |\n|----+----|\n|  1 |  2 |\n| 33 |  4 |\n" (with-out-str (clojure.pprint/print-table [{:a 1 :b 2} {:a 33 :b 4}])))
+(assert= ["3 items" "1 item" "5 items" "1, 2, 3" "   42|00007|1,234,567" "\"s\" and s" "yes" "one" "ab        |        cd|" "3.14" "101 10 ff" ":a=1 :b=2 " "Hello\nWorld"]
+         [(clojure.pprint/cl-format nil "~a items" 3) (clojure.pprint/cl-format nil "~d item~:p" 1) (clojure.pprint/cl-format nil "~d item~:p" 5)
+          (clojure.pprint/cl-format nil "~{~a~^, ~}" [1 2 3]) (clojure.pprint/cl-format nil "~5d|~5,'0d|~:d" 42 7 1234567)
+          (clojure.pprint/cl-format nil "~s and ~a" "s" "s") (clojure.pprint/cl-format nil "~:[no~;yes~]" true)
+          (clojure.pprint/cl-format nil "~[zero~;one~;two~]" 1) (clojure.pprint/cl-format nil "~10a|~10@a|" "ab" "cd")
+          (clojure.pprint/cl-format nil "~,2f" 3.14159) (clojure.pprint/cl-format nil "~b ~o ~x" 5 8 255)
+          (clojure.pprint/cl-format nil "~:{~a=~a ~}" [[:a 1] [:b 2]]) (clojure.pprint/cl-format nil "Hello~%World")])
+;; cl-format ~r spells numbers (it printed digits), ~e/~f/~$ match the JVM's layout, plus ~( ~) ~t ~* ~:c
+(assert= ["one thousand, two hundred thirty-four" "twenty-second" "MCMXCIV" "minus seven" "101"]
+         (map #(clojure.pprint/cl-format nil %1 %2) ["~r" "~:r" "~@r" "~r" "~2r"] [1234 22 1994 -7 5]))
+(assert= ["1.2345678E+4" "1.000E+1" "-1.234E-3" "1000000000000000000000.0" "0.00001" "-1234.50" "0001.50" "+2.00"]
+         (map #(clojure.pprint/cl-format nil %1 %2) ["~e" "~,3e" "~e" "~f" "~f" "~$" "~,4$" "~@$"] [12345.678 9.9996 -0.001234 1e21 1e-5 -1234.5 1.5 2]))
+(assert= ["Space" "\\a" "Big-World Foo" "Hello world" "HELLO" "ab   |" "3" "1 2 1"]
+         [(clojure.pprint/cl-format nil "~:c" \space) (clojure.pprint/cl-format nil "~@c" \a) (clojure.pprint/cl-format nil "~:(~a~)" "big-world foo")
+          (clojure.pprint/cl-format nil "~@(~a~)" "hello WORLD") (clojure.pprint/cl-format nil "~:@(~a~)" "hello") (clojure.pprint/cl-format nil "ab~5,4t|")
+          (clojure.pprint/cl-format nil "~2*~a" 1 2 3) (clojure.pprint/cl-format nil "~a ~a ~2:*~a" 1 2)])
+(assert= :iae (try (clojure.pprint/cl-format nil "~<~a~>" 1) (catch IllegalArgumentException e :iae)))   ; unsupported: loud
+;; map->R gives absent fields nil (they were missing, so = against ->R failed)
+(defrecord CloveMR [a b])
+(assert= [nil true true 1] (let [r (map->CloveMR {:a 5 :z 1})] [(:b r) (contains? r :b) (= (map->CloveMR {:a 5}) (->CloveMR 5 nil)) (:z r)]))
+;; core vars carry :doc; seque is a seq; System/getProperty knows the common keys; time prints with prn
+(assert= true (string? (:doc (meta #'map))))
+(assert= '(1 2 3) (seque [1 2 3]))
+(assert= [true "dflt"] [(string? (System/getProperty "user.dir")) (System/getProperty "nope.prop" "dflt")])
+(assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

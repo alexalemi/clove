@@ -174,19 +174,20 @@ same `tests.clj` runs everywhere.
 |---|---|
 | **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **BigInts** with Clojure's contagion (`1N` literals, `(+ 1N 1)` ⇒ `2N`, the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
-| **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
+| **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT, **insertion-ordered at every size**), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
 | **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in clove itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
 | **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
 | **Errors** | `throw` any value, `try`/`catch`/`finally` with **typed `catch`** (first clause the exception is-a; `class`/`instance?` agree), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
-| **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit`, string readers/writers |
-| **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
+| **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit` (`:append`), string readers/writers, `*in*` is stdin (`slurp`, `line-seq`, `read`), `with-in-str`, `printf` |
+| **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, flags `(?i)`/`(?m)`/`(?s)`, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-matcher`/`re-groups` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **PEGs** | `peg.clj` battery: [Janet's](https://janet-lang.org/docs/peg.html) parsing-expression grammars as plain data — `(peg/match '(* (<- :w+) "=" (number :d+)) "k=7")` ⇒ `["k" 7]`; grammars as maps with `:main`, ordered choice, `any`/`some`/`between`, `if`/`if-not`/`look` (arbitrary lookahead *and* lookbehind), `to`/`thru`, `sub`/`split`, captures with tags (`<-` `group` `replace` `cmt` `accumulate` `number` `backmatch` `->` `unref` …), `find`/`find-all`/`replace`/`replace-all`; codepoint-indexed; verified case-for-case against the Janet binary |
 | **Transducers** | `map`/`filter`/`take`/`mapcat`/… as transducers, `transduce`, `eduction`, `into` with an xform — compose over infinite seqs with `reduced` early-exit |
 | **Concurrency** | stackful **coroutines** (`coro/new`/`resume`/`yield`) under a shared cooperative **fiber scheduler** (Janet `ev/`-style: ready queue, timer wheel, `poll(2)` fd parking). Real **`future`/`promise`** with blocking `deref` (parks in a fiber, drives the loop on main, `(deref x ms tval)` timeouts, failed futures rethrow at deref), fiber-aware `Thread/sleep`, a genuine `clojure.core.async` (`go`/`<!`/`>!`/`alts!`, channels, timeouts), **agents** (`send`/`await`/error modes/`restart-agent`, serial actions on a drain fiber), and **STM refs** (`dosync`/`alter`/`commute`/`ensure` with real conflict-detect-and-retry across fiber yields; in-tx `send`s held until commit; watches on agents/refs) — all on one thread, one scheduler |
-| **Library** | hundreds of core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops, `format`, `sort`/`compare`, `read-string`/`eval`, `Math/*` |
+| **Library** | hundreds of core fns: seq ops (`map filter reduce group-by frequencies partition …`), string ops, `format`, `sort`/`compare`, `read-string`/`eval`, `Math/*`, `with-precision` |
+| **Host interop** | the JVM classes scripts reach for first, modeled in clove: `java.io.File` + `clojure.java.io`, `clojure.java.shell/sh` (argv, `:in`/`:env`/`:dir`), String/Character methods, `java.util` collections (`ArrayList`, `HashMap`, `ArrayDeque`, …), `java.time.LocalDate`, `clojure.pprint/print-table` and `cl-format` |
 | **Memory** | mark-and-sweep GC over pooled cells, conservative C-stack scanning (interpreter C code needs no root registration), structural sharing throughout, adaptive collection floor for high-churn workloads |
 | **Execution** | tree-walking evaluator with a **bytecode VM** for hot functions, plus proper tail calls (general TCO, beyond Clojure) and `trampoline` |
 | **Modes** | REPL, script file, piped stdin, embedded C library, **nREPL server** |
@@ -459,8 +460,11 @@ embeddability matter; use bb/JVM where throughput does.
   and `numerator`/`denominator` of a ratio return longs when they fit
 - Float division by zero is `##Inf`/`##NaN` whatever the operand types, as in
   compiled Clojure with primitive doubles; boxed JVM math (and babashka) throws
-- Hash maps/sets iterate in hash order, not insertion order (use sorted
-  collections for ordered traversal)
+- Hash maps iterate in **insertion order at every size**. The JVM agrees up
+  to 8 entries (an array map) and then switches to hash order; clove keeps
+  insertion order past that. A replaced key keeps its slot, and a dissoc'd and
+  re-added key moves to the end. Sets still iterate in hash order. Code that
+  needs an order should still say so (`sorted-map`, `array-map`)
 - Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not
 - `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
   `nil`, as in Clojure
@@ -478,8 +482,30 @@ embeddability matter; use bb/JVM where throughput does.
   inst is a `java.util.Date` (`(str d)` gives ISO-8601, not `Date.toString`),
   and host objects like it, UUIDs, and `proxy`/`reify` instances are typed
   maps underneath, so `map?` is true of them
-- Vars don't carry `def`-time metadata yet (`(meta #'x)` has only `:name`,
-  `:doc`, `:arglists`), so `(test #'x)` finds no `:test` and returns `:no-test`
+- `chunked-seq?` is always false: clove's seqs are unchunked. `supers` reports
+  the interfaces a `deftype`/`defrecord` declared (as keywords), not a JVM
+  class hierarchy, and `bean` returns `:class` plus a typed instance's fields
+- A host shim like `.write` yields to a `reify`/`proxy`/`deftype` method of the
+  same name only once some type implementing that name has been defined. A
+  function compiled before that point keeps calling the shim
+- Host classes clove models are typed maps with the common methods, not the
+  whole class: `java.io.File` (`.getName`, `.exists`, `.listFiles`, …),
+  `java.time.LocalDate` (parse/of/now, plus/minus days, months and years,
+  day-of-week, epoch days, `ChronoUnit/DAYS .between`; no other java.time
+  types), and `java.util` collections (`ArrayList`, `HashMap`, `ArrayDeque`,
+  …), which are atoms underneath, so `seq`/`count`/`into`/`=` see their
+  contents
+- `clojure.pprint/cl-format` covers the common directives (`~a ~s ~d ~b ~o ~x
+  ~r ~f ~e ~$ ~c ~% ~& ~~ ~p ~t ~* ~{~} ~^ ~[~;~] ~(~)` and their `:`/`@`
+  forms, with column/pad parameters), not all of Common Lisp `format`.
+  Unsupported directives (`~<~>` justification, `~?`, `~i`, `~_`, `~/`)
+  throw `IllegalArgumentException`
+- `tap>` calls the taps synchronously on the caller's thread (the JVM queues
+  them for a background thread). `.printStackTrace` prints the exception and
+  its causes, but there are no stack frames to print
+- Regex `(?i)` folds ASCII case only, and so does `(?iu)`
+- `format` accepts flags after the width (`%10,d`), where Java throws
+  `UnknownFormatConversionException`
 
 The live plan (open threads, GC invariants) is in [PLAN.md](PLAN.md); the full
 milestone log is in [HISTORY.md](HISTORY.md).
