@@ -336,6 +336,7 @@
   ["defonce" "Macro. defs the value only if the symbol has no root binding yet." "((defonce name expr))"]
   ["declare" "Macro. Forward-declares names so later defs can be referenced before definition." "((declare & names))"]
   ["binding" "Macro. Temporarily rebinds dynamic (root) vars for the extent of the body, restoring on exit." "((binding [var-val-pairs*] exprs*))"]
+  ["with-redefs" "Macro. Temporarily rebinds the root values of vars for the extent of the body, restoring them afterwards, even on a throw. Visible to all code, unlike binding." "((with-redefs [var-val-pairs*] exprs*))"]
   ["letfn" "Macro. Binds locally-scoped, mutually recursive fns for the body." "((letfn [(name [params*] exprs*)+] exprs*))"]
   ["case" "Macro. Constant-time dispatch on compile-time literal test values; last arg is the default, throws when absent and unmatched." "((case e & test-result-pairs default?))"]
   ["condp" "Macro. (condp pred expr ...) — first clause where (pred test-val expr) is truthy." "((condp pred expr & clauses))"]

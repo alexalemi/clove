@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.9.0 — 2026-11-02
+
+### Changed
+- Notebooks and standalone pages use the clove brand: palette from the new
+  logo (`brand/`), rounded headings, automatic dark mode, and a small "made
+  with clove" footer. Code no longer renders font ligatures (`->>` stays
+  three characters).
+
+### Fixed
+- Startup is back to about 8 ms, from 10 (it regressed in 0.8.0 as the core
+  library grew). Global definitions and lookups went through a linked list
+  of every global, about 2,000 of them; they now use a hash index. Symbol
+  interning keeps each name's hash and length, so a lookup no longer calls
+  `strlen` on every name in the bucket.
+- Programs started from clove (`sh`, `clojure.java.shell/sh`, `process`)
+  inherited the 1 GB stack limit clove sets for itself, and threaded ones
+  could fail to start a thread (headless Chrome did). They now get the limit
+  clove started with.
+- `(doc with-redefs)` has a docstring.
+- Notebook markdown: a list item that wraps onto the next line stays one
+  item (it used to break into a stray paragraph). Added fenced code blocks
+  (Clojure fences are highlighted) and `>` block quotes.
+
+### Added
+- A documentation site, built from notebooks in `doc/` with
+  `./clove doc/build.clj`: tutorial, guides, a generated reference, a
+  cheat sheet (with a printable PDF) and an in-browser playground. Code on
+  every page can be edited and re-run in the browser.
+- Notebook markdown renders `| tables |`.
+- One-line install: `curl -fsSL
+  https://raw.githubusercontent.com/alexalemi/clove/main/install.sh | sh`
+  downloads the newest tagged source, builds it, and installs to `~/.local`.
+  `--version` (a tag or `main`), `--prefix`, and `--test` adjust it; run from
+  a checkout, `install.sh` still builds that checkout and runs the suite.
+- Notebooks: percent cells. A `;; %%` line in a notebook switches it to
+  grouped cells: a code cell runs everything up to the next `;; %%`, prose
+  block, or directive, and shows only its last form's value (end a cell
+  with `nil` to show nothing). Notebooks without a `;; %%` line still make
+  every top-level form its own cell.
+- `clove notebook nb.clj -o nb.html -S` writes a standalone page that embeds
+  clove compiled to WebAssembly: the page re-runs its cells on load, and any
+  cell can be edited and re-run in the browser. Needs emscripten (`emcc`, or
+  `CLOVE_EMCC`) once; the build is cached. `--wasm-url <url>` references a
+  hosted interpreter instead of inlining its ~1.3 MB, and
+  `clove notebook --wasm out.js` writes that file. Notebook flags may now come
+  in any order.
+
 ## v0.8.1 — 2026-11-01
 
 ### Fixed

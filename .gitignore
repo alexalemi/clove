@@ -7,4 +7,6 @@ build.log
 target/
 benchmarks/aoc/target/
 .clj-kondo/.cache/
+brand/*.html
 .claude/scheduled_tasks.lock
+_site/

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="32" height="32">
+  <title>clove</title>
+  <circle cx="100" cy="100" r="74" fill="#989c6c"/>
+  <circle cx="100" cy="100" r="86" fill="none" stroke="#364c3b" stroke-width="18"/>
+  <path d="M93 14 C91 30 86 42 74 52 C50 68 26 92 26 122 C26 150 48 172 74 176 L126 176 C152 172 174 150 174 122 C174 92 150 68 126 52 C114 42 109 30 107 14 C102 9 98 9 93 14 Z" fill="#ece5cf" stroke="#47422f" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M80 84 C90 82 95 89 99 99 L120 152 M103 110 L80 152" fill="none" stroke="#364c3b" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

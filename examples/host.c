@@ -18,15 +18,16 @@
 static int total_score = 0;
 
 /* (add-score! n) — adds n to the C-side total, returns the new total. */
-static Clove *native_add_score(CloveEnv *env, Clove *args) {
+static Clove *native_add_score(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    total_score += (int)as_int(args->as.cons.head, "add-score!");
+    if (nargs != 1) clove_error("add-score! takes one argument");
+    total_score += (int)as_int(argv[0], "add-score!");
     return mk_int(total_score);
 }
 
 /* (host-info) — returns a clove map built from C. */
-static Clove *native_host_info(CloveEnv *env, Clove *args) {
-    (void)env; (void)args;
+static Clove *native_host_info(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
     Clove *m = mk_map();
     m = map_assoc(m, mk_kw(intern("pid", 3)), mk_int((int64_t)getpid()));
     m = map_assoc(m, mk_kw(intern("lang", 4)), mk_str("C", 1));

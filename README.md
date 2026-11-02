@@ -3,7 +3,7 @@
 A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
 embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
 beyond: persistent collections, macros, destructuring, protocols, ratios,
-namespaces, coroutines, regex — in one ~18,000-line C99 file with no dependencies.
+namespaces, coroutines, regex — in one ~20,000-line C99 file with no dependencies.
 
 ```clojure
 (defn top-words [text n]
@@ -25,7 +25,27 @@ It's grown well past a scripting toy: real libraries run on it unmodified —
 [instaparse](https://github.com/Engelberg/instaparse), and ~30 of babashka's
 built-in namespaces. See [Running real libraries](#running-real-libraries).
 
+clove is a hobby project: we love Clojure and wanted one that is easy to
+embed, extend and customize. It is vibe coded, written mostly by an AI
+assistant and checked against JVM Clojure, and it isn't meant for critical
+work. [How clove is made](doc/how-clove-is-made.clj) explains, including
+Clojure's own policy on generated code.
+
+Documentation, a tutorial, a cheat sheet and an in-browser playground live at
+**[alexalemi.github.io/clove](https://alexalemi.github.io/clove/)** (sources
+in [`doc/`](doc/)).
+
 ## Quick start
+
+Install with one line (needs `cc` and `make`; builds the latest tagged
+source in a few seconds and installs to `~/.local`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/alexalemi/clove/main/install.sh | sh
+# options: sh -s -- --version v0.9.0 --prefix /usr/local --test
+```
+
+From a checkout:
 
 ```sh
 make            # builds ./clove (cc, -lm -ldl, nothing else)
@@ -95,6 +115,8 @@ the actual fix: `try (require 'clojure.set) first`. Stack overflows say
 **Workflow subcommands.**
 
 ```sh
+clove -e '(+ 1 2)'        # evaluate and print (alias: clove eval)
+clove -m my.app           # require a namespace and call its -main
 clove new my-app          # scaffold: clove.edn, src/, test/
 clove tasks               # list clove.edn's :tasks
 clove run test            # run one (deps first; args go to the task)
@@ -103,10 +125,14 @@ clove vendor weavejester/medley                  # or a full git URL:
 clove vendor https://github.com/clojure/data.json
 clove vendor              # resolve ./deps.edn's :deps, transitively
 clove doctor              # why isn't my require finding anything?
+clove test                # run every *_test.clj under . (exit 1 on failure)
+clove judge -a file.clj   # inline snapshot tests: fill in (test expr) results
+clove fmt [check] files   # format with cljfmt, if installed
+clove version
 ```
 
-`clove vendor` resolves `group/artifact` against Clojars first (latest release
-jar, extracted with `unzip`/`bsdtar`), falling back to a GitHub shallow clone;
+`clove vendor` resolves `group/artifact` against Clojars, then Maven Central
+(latest release jar, extracted with `unzip`/`bsdtar`), then a GitHub shallow clone;
 sources land in `./vendor/` (already on the load path), then it *tries each
 namespace* and reports which load cleanly. With no argument (or a deps.edn
 path) it reads `deps.edn` instead and resolves the whole `:deps` map,
@@ -156,13 +182,14 @@ the reader sees a discarded form and reaches the code.
 
 ## Platforms
 
-CI builds and runs the full suite (normal + GC-stress) on every push:
+CI builds and runs the suite on every push, and repeats it with
+`CLOVE_GC_STRESS=1` on Linux (under ASan/UBSan), macOS arm64 and Windows:
 
 | Platform | Status |
 |---|---|
-| Linux | full — the reference platform (plus an ASan/UBSan job) |
-| macOS arm64 + x86_64 | full, including coroutines/csp (ucontext) |
-| Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets, full line-editing REPL (Windows 10+ VT console; plain-line fallback); **no** coroutines/`csp`/`core.async`/nREPL |
+| Linux | full — the reference platform (plus ASan/UBSan jobs) |
+| macOS arm64 + x86_64 | full, including coroutines/csp (ucontext); x86_64 runs under Rosetta |
+| Windows (mingw-w64) | core language, collections, lazy seqs, regex, sockets, full line-editing REPL (Windows 10+ VT console; plain-line fallback); **no** coroutines/`csp`/`core.async`/nREPL, FFI, JIT or `sh` |
 
 The test suite probes capabilities at startup (`clove-test-unix?`,
 `clove-test-coro?` in `tests.clj`) and self-skips what a platform lacks, so the
@@ -175,7 +202,7 @@ same `tests.clj` runs everywhere.
 | **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **BigInts** with Clojure's contagion (`1N` literals, `(+ 1N 1)` ⇒ `2N`, the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
 | **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT, **insertion-ordered at every size**), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
-| **Special forms** | `quote if do def defn defmacro let fn loop recur and or when cond try/catch/finally quasiquote var` |
+| **Special forms & core macros** | special forms `quote if do def let fn loop recur try/catch/finally throw var`, plus `defn defmacro and or when cond` and syntax-quote |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in clove itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
 | **Namespaces & vars** | per-namespace `:as`/`:refer` aliases, first-class **vars** (`#'x`, `var?`, `resolve`, `alter-var-root`, `with-redefs`), a real `user` namespace at the top level, `*ns*`/`in-ns`/`find-ns`/`all-ns`/`ns-publics`/`ns-interns`/`ns-aliases`/`ns-resolve`, **`^:private` enforced** across namespaces (`#'a/x` var access stays open, like Clojure) |
@@ -200,7 +227,7 @@ same `tests.clj` runs everywhere.
 ```
 
 Speaks bencode nREPL (`clone` `describe` `eval` `load-file` `close`
-`interrupt` `ls-sessions`), so Conjure, CIDER, and Calva can connect:
+`interrupt` `ls-sessions` `completions` `lookup` `info`), so Conjure, CIDER, and Calva can connect:
 evaluation results come back as `value`, `println` output as `out`
 messages, errors as `err`. Definitions persist across evals. One client
 at a time, loopback only.
@@ -226,10 +253,10 @@ set).
 (load-file "jit.clj")
 (jit/defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 (jit/compile! 'fib)    ; generate C → cc → dlopen → swap the binding, live
-(fib 32)               ; 1.24 s interpreted → 6 ms native (faster than bb/JVM)
+(fib 32)               ; ~0.7 s interpreted → 5 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~250 lines of clove) compiles a numeric subset — `if`, `let`,
+`jit.clj` (~300 lines of clove) compiles a numeric subset — `if`, `let`,
 `loop`/`recur`, self-recursion, arithmetic/comparisons, `Math/sqrt`, casts —
 to unboxed C through the same generate→`cc`→`dlopen`→rebind pipeline as the
 FFI. Types default to `long long`; JVM-style `^long`/`^double` hints on
@@ -245,8 +272,8 @@ arithmetic like C promotion:
 
 Compiled modules are content-cached, so warm compiles are a `dlopen`.
 Outside the subset, `jit/compile!` errors cleanly and the interpreted
-version stays. fib(32): **6 ms** vs babashka's 540 ms and JVM Clojure's
-630 ms — it's real machine code.
+version stays. fib(32): **5 ms** vs babashka's 520 ms and JVM Clojure's
+610 ms — it's real machine code.
 
 ## FFI: call C from Clojure
 
@@ -266,7 +293,7 @@ shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
 ## Standalone binaries
 
 ```sh
-./clove bundle.clj myscript.clj mybinary       # one ~300 KB executable, no deps
+./clove bundle.clj myscript.clj mybinary       # one ~500 KB executable, no deps
 ./clove bundle.clj --static myscript.clj out   # static: no glibc dep, best to share
 ./clove bundle.clj --windows myscript.clj out.exe   # cross-compile a Windows .exe
 ```
@@ -290,8 +317,8 @@ machine. Flags steer the compiler:
 
 `--cc=`, `--libs=`, and `--cflags=` (plus the `CLOVE_CC` env var) expose the
 compiler directly for any other cross toolchain, e.g. `zig cc`. On Windows the
-interactive REPL drops to plain line input and the nREPL server is unavailable —
-script execution and bundles are unaffected.
+nREPL server, coroutines, FFI and JIT are unavailable — script execution and
+bundles are otherwise unaffected.
 
 **Shared libraries.** `--library` builds the inverse embedding direction: your
 script as a `.so`/`.dylib`/`.dll` with a C ABI, callable from C, C++, Rust,
@@ -308,6 +335,33 @@ the interpreter survives and keeps state), and `clove_lib_last_error()`.
 Returned strings stay valid until the next call; the usual embedding rules
 apply (one interpreter per process, single-threaded). See
 `examples/libhost.c`.
+
+## Notebooks
+
+```sh
+clove notebook nb.clj                 # live server on :7878, re-renders on save
+clove notebook nb.clj -o nb.html      # static page with the outputs baked in
+clove notebook nb.clj -o nb.html -S   # standalone: the interpreter rides along
+```
+
+A notebook is a plain `.clj` file. Top-level `;;` comments render as markdown,
+and each top-level form is a code cell showing its value (tables for seqs of
+maps). Directives such as `;; @clerk:hide-code` and `;; @clerk:hide-result`
+apply to the next cell. Add a `;; %%` line anywhere and the file switches to
+percent cells, as in jupytext: a cell runs everything up to the next `;; %%`,
+prose block, or directive, and shows only its last value (end it with `nil` to
+show nothing).
+
+`-S` makes the page standalone: clove compiled to WebAssembly is embedded, the
+page re-runs its cells in the browser on load, and every cell can be edited and
+re-run there (click the code, shift+enter). It needs emscripten's `emcc` (or
+`CLOVE_EMCC`) the first time; the build is cached per clove version. The
+interpreter adds about 1.3 MB to the page. To share one copy instead, write it
+with `clove notebook --wasm clove-wasm.js`, host it, and build pages with
+`-S --wasm-url <url>` (a page is then ~50 KB plus your notebook). In the
+browser there are no coroutines (core.async, `future`, agents), no `sh`, FFI,
+sockets or local files, and recursion stops at about 1000 frames with a
+catchable StackOverflowError.
 
 ## Running real libraries
 
@@ -331,7 +385,7 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | `nextjournal.markdown` | markdown → hiccup (pure-Clojure CommonMark subset) |
 | `clj-yaml.core` | YAML ↔ Clojure data (pure-Clojure subset; block/flow, `\|`/`>` scalars) |
 | `babashka.fs` `babashka.process` `babashka.cli` `bencode.core` | scripting batteries |
-| medley, camel-snake-kebab, edamame | |
+| `clojure.math.combinatorics`, medley, camel-snake-kebab | |
 
 **Runs with the library's own source on `CLOVE_PATH`** (clone it, point clove at
 `src`) — these exercise deftype, multimethods, multi-file graphs, the lot:
@@ -373,9 +427,9 @@ reference private puzzle inputs, so they live outside this repo.)
   values differ.
 - **Tasks**: `clove.edn` holds `:paths` and `:tasks`, as in `bb.edn`:
   `{:tasks {test "clove test", ci {:depends [lint test] :task (println "ok")}}}`.
-- **Dependencies**: `clove vendor <git-url|github-user/repo>` copies a
+- **Dependencies**: `clove vendor <group/artifact|git-url>` copies a
   pure-Clojure library's sources into `./vendor/` and reports which of its
-  namespaces load.
+  namespaces load; with no argument it resolves `./deps.edn` transitively.
 - **Editor/LSP**: `./clove --nrepl` for eval (Conjure/CIDER/Calva); clojure-lsp's
   static features work on clove files via the same clj-kondo analysis.
 
@@ -389,10 +443,10 @@ constructors in scope, which is what you need to exchange data:
 #define CLOVE_NO_MAIN
 #include "clove.c"
 
-static Clove *native_add(CloveEnv *env, Clove *args) {
-    int64_t a = as_int(args->as.cons.head, "host-add");
-    int64_t b = as_int(args->as.cons.tail->as.cons.head, "host-add");
-    return mk_int(a + b);
+static Clove *native_add(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env;
+    if (nargs != 2) clove_error("host-add takes two arguments");
+    return mk_int(as_int(argv[0], "host-add") + as_int(argv[1], "host-add"));
 }
 
 int main(int argc, char **argv) {
@@ -420,25 +474,25 @@ Benchmarks in `benchmarks/` run unmodified on clove, [babashka](https://babashka
 and JVM Clojure, producing identical output (mean wall time, hyperfine, one machine —
 treat as orders of magnitude):
 
-| benchmark | clove | babashka 1.12 | Clojure / JDK 21 |
+| benchmark | clove | babashka | Clojure / JDK |
 |---|---|---|---|
-| startup (hello world) | **2 ms** | 10 ms | 440 ms |
-| fib(27), interpreted recursion | 88 ms | **56 ms** | 563 ms |
-| 5M-iteration loop/recur | 439 ms | **239 ms** | 563 ms |
-| seq pipeline (1M: filter→map→reduce) | 332 ms | **58 ms** | 488 ms |
-| build+read 100k-entry map | 231 ms | **107 ms** | 699 ms |
-| build 1M-element vector | 223 ms | **107 ms** | 542 ms |
-| sort 200k | **126 ms** | 185 ms | 641 ms |
-| regex word-frequency | **23 ms** | 23 ms | 632 ms |
-| fib(32), ~1 s of compute | 1.00 s | **0.54 s** | 0.63 s |
+| startup (hello world) | 8 ms | **7 ms** | 441 ms |
+| fib(27), interpreted recursion | 93 ms | **58 ms** | 593 ms |
+| 5M-iteration loop/recur | 1029 ms | **240 ms** | 603 ms |
+| seq pipeline (1M: filter→map→reduce) | 259 ms | **58 ms** | 506 ms |
+| build+read 100k-entry map | 283 ms | **108 ms** | 657 ms |
+| build 1M-element vector | 246 ms | **111 ms** | 566 ms |
+| sort 200k | **138 ms** | 176 ms | 699 ms |
+| regex word-frequency | 36 ms | **24 ms** | 627 ms |
+| fib(32), ~1 s of compute | 626 ms | **523 ms** | 605 ms |
 
-Honest reading: babashka wins most compute because its `clojure.core` is
-AOT-compiled native code — SCI only interprets your glue, while clove interprets
-*everything*. That clove stays within ~1.5–4× of bb (and beats it on sort and
-startup) is the trade we wanted. JVM Clojure pays ~440 ms of startup, which
-dominates at script scale; for long-running compute the JIT inverts everything.
-Use clove where its 2 ms startup, ~325 KB binary, zero dependencies, and
-embeddability matter; use bb/JVM where throughput does.
+Measured 2026-11-02 (clove 0.9.0, babashka v1.12.217, `benchmarks/run.sh`). babashka
+wins most compute because its `clojure.core` is AOT-compiled native code —
+SCI only interprets your glue, while clove interprets *everything*. clove is
+within ~1.2–4.5× of bb and beats it on sort. JVM Clojure pays ~440 ms of
+startup, which dominates at script scale; for long-running compute the JIT
+inverts everything. Use clove where a ~580 KB binary with no dependencies and
+embeddability matter; use bb or the JVM where throughput does.
 
 ## Deliberate divergences from Clojure
 
@@ -465,7 +519,9 @@ embeddability matter; use bb/JVM where throughput does.
   insertion order past that. A replaced key keeps its slot, and a dissoc'd and
   re-added key moves to the end. Sets still iterate in hash order. Code that
   needs an order should still say so (`sorted-map`, `array-map`)
-- Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not
+- Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not.
+  Syntax quote leaves symbols unqualified: `` `map `` reads as `map`, where
+  the JVM gives `clojure.core/map`
 - `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
   `nil`, as in Clojure
 - Namespaces are a flat global with per-namespace aliases (not separate var
@@ -482,7 +538,8 @@ embeddability matter; use bb/JVM where throughput does.
   inst is a `java.util.Date` (`(str d)` gives ISO-8601, not `Date.toString`),
   and host objects like it, UUIDs, and `proxy`/`reify` instances are typed
   maps underneath, so `map?` is true of them
-- `chunked-seq?` is always false: clove's seqs are unchunked. `supers` reports
+- `chunked-seq?` is always false, although lazy seqs over ranges and
+  vectors do realize 32 items at a time, as on the JVM. `supers` reports
   the interfaces a `deftype`/`defrecord` declared (as keywords), not a JVM
   class hierarchy, and `bean` returns `:class` plus a typed instance's fields
 - A host shim like `.write` yields to a `reify`/`proxy`/`deftype` method of the
@@ -491,8 +548,9 @@ embeddability matter; use bb/JVM where throughput does.
 - Host classes clove models are typed maps with the common methods, not the
   whole class: `java.io.File` (`.getName`, `.exists`, `.listFiles`, …),
   `java.time.LocalDate` (parse/of/now, plus/minus days, months and years,
-  day-of-week, epoch days, `ChronoUnit/DAYS .between`; no other java.time
-  types), and `java.util` collections (`ArrayList`, `HashMap`, `ArrayDeque`,
+  day-of-week, epoch days, `ChronoUnit/DAYS .between`), `Instant` (epoch
+  milliseconds, ISO-8601 via `DateTimeFormatter/ISO_INSTANT`; no other
+  java.time types), and `java.util` collections (`ArrayList`, `HashMap`, `ArrayDeque`,
   …), which are atoms underneath, so `seq`/`count`/`into`/`=` see their
   contents
 - `clojure.pprint/cl-format` covers the common directives (`~a ~s ~d ~b ~o ~x
@@ -519,8 +577,9 @@ make fuzz                      # differential fuzz vs babashka (needs bb + pytho
 # sanitizers (flags required by conservative stack scanning, as with Boehm GC):
 # -O1 on purpose: at -O0 stale stack slots root values and hide missing GC roots
 # built AS ./clove: the suite's subprocess tests re-invoke "<exe-dir>/clove"
-cc -g -O1 -fsanitize=address,undefined -o clove clove.c -lm -ldl
+cc -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o clove clove.c -lm -ldl
 ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 ./clove tests.clj
+ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 CLOVE_GC_STRESS=1 ./clove tests.clj
 make -B clove                   # back to the normal build
 ```
 

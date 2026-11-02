@@ -75,6 +75,10 @@
 #include <errno.h>
 #include <limits.h>   /* INT_MAX — clamping the length delta in str_compare */
 #include <setjmp.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>        /* scan_registers + exports (clove notebook -S) */
+#include <emscripten/stack.h>
+#endif
 #include <math.h>
 #include <time.h>
 #include <unistd.h>      /* isatty, close — REPL detection, tcp primitives */
@@ -132,8 +136,10 @@ static int clove_wsa_init(void) {   /* idempotent winsock startup */
 #include <fcntl.h>        /* O_NONBLOCK on the child stdin pipe */
 #include <sys/resource.h>  /* setrlimit — main() raises the stack ceiling */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
+#ifndef __EMSCRIPTEN__      /* no ucontext in wasm: notebooks run without coroutines */
 #include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
 #define CLOVE_HAVE_CORO 1
+#endif
 #define sock_close close
 #define clove_wsa_init() 0
 #ifdef __APPLE__
@@ -159,7 +165,7 @@ static void clove_no_sigpipe(int fd) {
 #endif
 }
 
-#define CLOVE_VERSION "0.8.1"
+#define CLOVE_VERSION "0.9.0"
 #ifndef CLOVE_SHAREDIR
 #define CLOVE_SHAREDIR "/usr/local/share/clove"
 #endif
@@ -815,6 +821,13 @@ static void clove_throw_value(Clove *v) {
 static const char *main_stack_floor;       /* lowest safe SP on the main stack */
 
 static void stack_floor_init(const char *base) {
+#ifdef __EMSCRIPTEN__
+    /* The shadow stack's exact bounds. The engine's own call stack is a
+     * separate limit the guard can't see (see "clove notebook -S" in PLAN). */
+    (void)base;
+    main_stack_floor = (const char *)(emscripten_stack_get_end() + STACK_SAFETY_MARGIN);
+    return;
+#endif
 #ifdef _WIN32
     /* The PE default stack reserve is 2 MiB — far under the 8 MiB fallback
      * guess, which made the guard useless (SEGV before it tripped). Windows
@@ -1077,8 +1090,13 @@ static size_t list_len(Clove *l) {
 /* Tiny chained hash table. Pointers returned here are stable for the
  * lifetime of the interpreter, so symbol equality is pointer equality. */
 
-#define INTERN_BUCKETS 1024
-typedef struct InternNode { const char *str; struct InternNode *next; } InternNode;
+#define INTERN_BUCKETS 8192   /* ~10k names after startup; power of two */
+typedef struct InternNode {
+    const char *str;
+    struct InternNode *next;
+    uint32_t hash;
+    uint32_t len;
+} InternNode;
 static InternNode *intern_table[INTERN_BUCKETS];
 
 static uint32_t fnv1a(const char *s, size_t n) {
@@ -1088,15 +1106,17 @@ static uint32_t fnv1a(const char *s, size_t n) {
 }
 
 static const char *intern(const char *s, size_t n) {
-    uint32_t h = fnv1a(s, n) % INTERN_BUCKETS;
-    for (InternNode *node = intern_table[h]; node; node = node->next) {
-        if (strlen(node->str) == n && memcmp(node->str, s, n) == 0) return node->str;
-    }
+    uint32_t full = fnv1a(s, n), h = full & (INTERN_BUCKETS - 1);
+    for (InternNode *node = intern_table[h]; node; node = node->next)
+        if (node->hash == full && node->len == n && memcmp(node->str, s, n) == 0)
+            return node->str;
     char *copy = xmalloc(n + 1);
     memcpy(copy, s, n);
     copy[n] = '\0';
     InternNode *node = xmalloc(sizeof *node);
     node->str = copy;
+    node->hash = full;
+    node->len = (uint32_t)n;
     node->next = intern_table[h];
     intern_table[h] = node;
     return copy;
@@ -1115,7 +1135,12 @@ static CloveEnv *env_new(CloveEnv *parent) {
 
 /* Find a local in ONE env frame: overflow chain first (newer than any
  * slot — sequential let rebinds shadow), then slots newest-first. */
+static Binding *root_binding(CloveEnv *root, const char *name);
 static inline Clove **env_local_find(CloveEnv *e, const char *name) {
+    if (!e->parent) {
+        Binding *b = root_binding(e, name);
+        return b ? &b->value : NULL;
+    }
     for (Binding *b = e->bindings; b; b = b->next)
         if (b->name == name) return &b->value;
     for (int i = (int)e->nslots - 1; i >= 0; i--)
@@ -1149,6 +1174,60 @@ static Binding *binding_alloc(void) {
     return b;
 }
 
+/* The first root env's Bindings are also indexed by name, so a def or a
+ * global lookup doesn't walk a 2,000-entry chain. Names are interned, so the
+ * key is the pointer. The chain stays the source of truth for enumeration
+ * and GC; the index always holds the newest Binding for a name, the one a
+ * chain walk would find first. Other roots (embedders can make up to 8) fall
+ * back to the walk. */
+static CloveEnv *ridx_env;
+static const char **ridx_key;
+static Binding **ridx_val;
+static size_t ridx_cap, ridx_n;
+
+static inline size_t ridx_slot(const char *name, size_t cap) {
+    uint64_t x = (uint64_t)(uintptr_t)name;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t)x & (cap - 1);
+}
+
+static void ridx_put(const char *name, Binding *b) {
+    if (2 * (ridx_n + 1) > ridx_cap) {
+        size_t ncap = ridx_cap ? ridx_cap * 2 : 4096;
+        const char **nk = calloc(ncap, sizeof *nk);
+        Binding **nv = calloc(ncap, sizeof *nv);
+        if (!nk || !nv) { fputs("out of memory\n", stderr); exit(1); }
+        for (size_t i = 0; i < ridx_cap; i++) {
+            if (!ridx_key[i]) continue;
+            size_t j = ridx_slot(ridx_key[i], ncap);
+            while (nk[j]) j = (j + 1) & (ncap - 1);
+            nk[j] = ridx_key[i]; nv[j] = ridx_val[i];
+        }
+        free(ridx_key); free(ridx_val);
+        ridx_key = nk; ridx_val = nv; ridx_cap = ncap;
+    }
+    size_t j = ridx_slot(name, ridx_cap);
+    while (ridx_key[j] && ridx_key[j] != name) j = (j + 1) & (ridx_cap - 1);
+    if (!ridx_key[j]) { ridx_key[j] = name; ridx_n++; }
+    ridx_val[j] = b;
+}
+
+/* The newest root Binding named `name` (an interned pointer), or NULL. */
+static Binding *root_binding(CloveEnv *root, const char *name) {
+    if (root == ridx_env) {
+        if (!ridx_cap) return NULL;
+        size_t j = ridx_slot(name, ridx_cap);
+        while (ridx_key[j]) {
+            if (ridx_key[j] == name) return ridx_val[j];
+            j = (j + 1) & (ridx_cap - 1);
+        }
+        return NULL;
+    }
+    for (Binding *b = root->bindings; b; b = b->next)
+        if (b->name == name) return b;
+    return NULL;
+}
+
 static void env_define(CloveEnv *env, const char *name, Clove *value) {
     if (env->parent && env->nslots < ENV_SLOTS) {  /* root: Bindings only */
         env->sname[env->nslots] = name;
@@ -1159,6 +1238,7 @@ static void env_define(CloveEnv *env, const char *name, Clove *value) {
     Binding *b = binding_alloc();
     b->name = name; b->value = value; b->next = env->bindings;
     env->bindings = b;
+    if (env == ridx_env) ridx_put(name, b);
 }
 
 /* def/defmacro/native install: mutate an existing root binding in place
@@ -1183,8 +1263,8 @@ static const char *env_define_root(CloveEnv *root, const char *name, Clove *valu
         (!strchr(name, '/') || !strcmp(name, "/"))) {
         name = intern_qual(cur_reader_ns, name);
     }
-    for (Binding *b = root->bindings; b; b = b->next)
-        if (b->name == name) { b->value = value; return name; }
+    Binding *b = root_binding(root, name);
+    if (b) { b->value = value; return name; }
     env_define(root, name, value);
     return name;
 }
@@ -1524,6 +1604,13 @@ static void gc_collect(void) {
     /* Flush callee-saved registers onto the stack so the scan sees them. */
     jmp_buf regs;
     setjmp(regs);
+#ifdef __EMSCRIPTEN__
+    /* wasm locals live outside linear memory, invisible to the stack scan
+     * below (which only sees the shadow stack). Under ASYNCIFY this unwinds
+     * every frame into a heap buffer, scans it, and rewinds; the rewind
+     * resumes from the event loop, so a GC makes the caller's eval async. */
+    emscripten_scan_registers(gc_scan_range);
+#endif
 
     gc_mark(NIL); gc_mark(TRUE); gc_mark(FALSE); gc_mark(EMPTY); gc_mark(EMPTY_VEC);
     gc_mark(cur_exc);  /* exception value may be in flight between throw and catch */
@@ -3839,25 +3926,24 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                           bool public_only) {
     if (home_ns) {
         const char *qual = intern_qual(home_ns, name);
-        for (Binding *b = root->bindings; b; b = b->next)
-            if (b->name == qual) return b;
+        { Binding *b = root_binding(root, qual); if (b) return b; }
         /* refer alias: <home-ns>/name -> <source-ns>/name (shared global) */
         for (int i = 0; i < n_refers; i++)
             if (refer_from[i] == qual)
-                for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == refer_to[i]) return b;
+                { Binding *b = root_binding(root, refer_to[i]); if (b) return b; }
     }
-    for (Binding *b = root->bindings; b; b = b->next)
-        if (b->name == name) {
+    {
+        Binding *b = root_binding(root, name);
+        if (b) {
             if (public_only && n_private_defs && private_denied(name, home_ns))
                 clove_error("var: %s is not public", name);
             return b;
         }
+    }
     /* refer alias on an already-qualified name */
     for (int i = 0; i < n_refers; i++)
         if (refer_from[i] == name)
-            for (Binding *b = root->bindings; b; b = b->next)
-                if (b->name == refer_to[i]) return b;
+            { Binding *b = root_binding(root, refer_to[i]); if (b) return b; }
     /* clojure.core / cljs.core / clojure.lang qualified names resolve to the
      * bare global (clove's core lives in the flat global namespace). Lets code
      * (and macroexpansions) that fully-qualify core refer to clove's builtins. */
@@ -3869,8 +3955,7 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                 (plen == 9  && !memcmp(name, "cljs.core", 9)) ||
                 (plen == 12 && !memcmp(name, "clojure.lang", 12))) {
                 const char *bare = intern(slash + 1, strlen(slash + 1));
-                for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == bare) return b;
+                { Binding *b = root_binding(root, bare); if (b) return b; }
             }
         }
     }
@@ -3884,15 +3969,14 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
             if (full) {
                 const char *qual = intern_qual(full, slash + 1);
                 const char *bare = intern(slash + 1, strlen(slash + 1));
-                for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == qual) {
-                        if (public_only && n_private_defs &&
-                            private_denied(qual, home_ns))
-                            clove_error("var: %s is not public", qual);
-                        return b;
-                    }
-                for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == bare) return b;
+                Binding *qb = root_binding(root, qual);
+                if (qb) {
+                    if (public_only && n_private_defs &&
+                        private_denied(qual, home_ns))
+                        clove_error("var: %s is not public", qual);
+                    return qb;
+                }
+                { Binding *b = root_binding(root, bare); if (b) return b; }
             }
         }
     }
@@ -3905,8 +3989,7 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                 size_t pre = (size_t)(p - name);
                 {
                     const char *q = intern_qual_n(name, pre, p + 1, strlen(p + 1));
-                    for (Binding *b = root->bindings; b; b = b->next)
-                        if (b->name == q) return b;
+                    { Binding *b = root_binding(root, q); if (b) return b; }
                 }
                 break;
             }
@@ -3922,8 +4005,7 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
                 if (*p == '.') lastdot = p;
             if (lastdot) {
                 const char *shortn = intern(lastdot + 1, strlen(lastdot + 1));
-                for (Binding *b = root->bindings; b; b = b->next)
-                    if (b->name == shortn) return b;
+                { Binding *b = root_binding(root, shortn); if (b) return b; }
             }
         }
     }
@@ -3936,8 +4018,7 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
         const char *dot = strrchr(name, '.');
         if (dot && dot[1] >= 'A' && dot[1] <= 'Z' && !strchr(name, '/')) {
             env_define(root, name, mk_kw(name));
-            for (Binding *b = root->bindings; b; b = b->next)
-                if (b->name == name) return b;
+            { Binding *b = root_binding(root, name); if (b) return b; }
         }
     }
     return NULL;
@@ -5387,8 +5468,7 @@ static Clove *qq_expand(CloveEnv *env, Clove *form) {
     if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns &&
         !strchr(form->as.symc.name, '/')) {
         const char *qual = intern_qual(form->as.symc.home_ns, form->as.symc.name);
-        for (Binding *b = env_root(env)->bindings; b; b = b->next)
-            if (b->name == qual) return mk_sym(qual);
+        if (root_binding(env_root(env), qual)) return mk_sym(qual);
     }
     /* Atoms are template literals. */
     return form;
@@ -5923,21 +6003,18 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                              * under foo/, and binding must find it there */
                             if (symc->as.symc.home_ns && !strchr(nm, '/')) {
                                 const char *qual = intern_qual(symc->as.symc.home_ns, nm);
-                                for (Binding *x = root->bindings; x; x = x->next)
-                                    if (x->name == qual) { b = x; break; }
+                                b = root_binding(root, qual);
                                 /* binding a referred var rebinds the shared
                                  * source global, so other ns's reads see it */
                                 if (!b)
                                     for (int ri = 0; ri < n_refers; ri++)
                                         if (refer_from[ri] == qual) {
-                                            for (Binding *x = root->bindings; x; x = x->next)
-                                                if (x->name == refer_to[ri]) { b = x; break; }
+                                            b = root_binding(root, refer_to[ri]);
                                             if (b) break;
                                         }
                             }
                             if (!b)
-                                for (Binding *x = root->bindings; x; x = x->next)
-                                    if (x->name == nm) { b = x; break; }
+                                b = root_binding(root, nm);
                             /* aliased dynamic var like cfg/-star-v-star-: resolve
                              * the alias to its full ns, else the bare var name */
                             if (!b) {
@@ -5948,13 +6025,11 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                                     const char *full = alias_lookup(pre, symc->as.symc.home_ns);
                                     if (full) {
                                         const char *q = intern_qual(full, base);
-                                        for (Binding *x = root->bindings; x; x = x->next)
-                                            if (x->name == q) { b = x; break; }
+                                        b = root_binding(root, q);
                                     }
                                     if (!b) {
                                         const char *bb = intern(base, strlen(base));
-                                        for (Binding *x = root->bindings; x; x = x->next)
-                                            if (x->name == bb) { b = x; break; }
+                                        b = root_binding(root, bb);
                                     }
                                 }
                             }
@@ -11704,6 +11779,38 @@ static Clove *prim_file_op(CloveEnv *env, Clove **argv, int nargs) {
 extern char **environ;
 #endif
 
+/* main() raises the soft stack limit to 1 GB for deep recursion, and child
+ * processes would inherit it. glibc sizes each new thread's stack from that
+ * limit, so a threaded program started from clove (Chrome, for one) asked
+ * for 1 GB per thread and failed in pthread_create. Children get the limit
+ * clove started with: fork children reset it before exec, and commands run
+ * through popen get a ulimit prefix. 0 when main didn't raise it. */
+#ifndef _WIN32
+static unsigned long long clove_orig_stack_limit;
+#endif
+
+static void clove_child_limits(void) {
+#ifndef _WIN32
+    struct rlimit rl;
+    if (clove_orig_stack_limit && getrlimit(RLIMIT_STACK, &rl) == 0) {
+        rl.rlim_cur = (rlim_t)clove_orig_stack_limit;
+        setrlimit(RLIMIT_STACK, &rl);
+    }
+#endif
+}
+
+static void sb_child_limits(SBuf *b) {
+#ifndef _WIN32
+    if (clove_orig_stack_limit) {
+        char t[64];
+        snprintf(t, sizeof t, "ulimit -S -s %llu 2>/dev/null; ", clove_orig_stack_limit / 1024);
+        sb_puts(b, t);
+    }
+#else
+    (void)b;
+#endif
+}
+
 /* (clove/proc* argv in env dir) → {:exit n :out s :err s}: run a program
  * with an argument vector (no shell), as clojure.java.shell/sh does. in is a
  * string fed to stdin (or nil); env a map that REPLACES the environment (or
@@ -11796,6 +11903,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
         close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); close(perr[0]); close(perr[1]);
         if (cdir && chdir(cdir) != 0) { fprintf(stderr, "sh: cannot cd to %s\n", cdir); _exit(127); }
         if (cenv) environ = cenv;
+        clove_child_limits();
         execvp(cargv[0], cargv);
         fprintf(stderr, "Cannot run program \"%s\": %s\n", cargv[0], strerror(errno));
         _exit(127);
@@ -13364,6 +13472,7 @@ static Clove *prim_sh(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *cmd = as_str(argv[0], "sh");
     SBuf full = {0};
+    sb_child_limits(&full);
     sb_puts(&full, cmd);
     sb_puts(&full, " 2>&1");
     FILE *p = popen(full.data, "r");
@@ -13403,6 +13512,7 @@ static Clove *prim_sh_lines(CloveEnv *env, Clove **argv, int nargs) {
     char *cmd = as_str(argv[0], "clove/sh-lines*");
     Clove *f = argv[1];
     SBuf full = {0};
+    sb_child_limits(&full);
     sb_puts(&full, cmd);
     sb_puts(&full, " 2>&1");
     FILE *volatile p = popen(full.data, "r");
@@ -15151,6 +15261,7 @@ CloveEnv *clove_new_env(void) {
         EMPTY_VEC = vec_cell(NULL, 0, 0, NULL, 0, NULL);
     }
     CloveEnv *e = env_new(NULL);
+    if (!ridx_env) ridx_env = e;
     /* Register as a GC root immediately — everything defined below
      * (natives, prelude) is kept alive through this env. */
     if (gc_n_root_envs >= (int)(sizeof gc_root_envs / sizeof *gc_root_envs))
@@ -18000,6 +18111,39 @@ Clove *clove_eval_string(CloveEnv *env, const char *src) {
 
 void clove_print(Clove *v) { print(v); }
 
+#ifdef __EMSCRIPTEN__
+/* ── WebAssembly exports (standalone notebooks: clove notebook -S) ──
+ * One interpreter per page. The page calls clove_wasm_eval through
+ * ccall(..., {async: true}): a GC suspends to the event loop mid-eval
+ * (emscripten_scan_registers), so callers must await each call and never
+ * start another while one is pending. Returns a string result verbatim and
+ * anything else pr-str'd; NULL on an error (see clove_wasm_last_error).
+ * Returned strings are owned here and valid until the next call. */
+static CloveEnv *clove_wasm_env;
+static char *clove_wasm_out, *clove_wasm_err;
+
+EMSCRIPTEN_KEEPALIVE const char *clove_wasm_last_error(void) { return clove_wasm_err; }
+
+EMSCRIPTEN_KEEPALIVE const char *clove_wasm_eval(const char *src) {
+    char anchor;
+    clove_set_stack_base(&anchor);
+    if (!clove_wasm_env) clove_wasm_env = clove_new_env();
+    Clove *v = clove_eval_string(clove_wasm_env, src);
+    if (clove_eval_errored) {
+        SBuf sb = {0}; sb_grow(&sb, 1); sb.data[0] = '\0';
+        if (cur_exc && cur_exc != NIL) print_to(&sb, cur_exc, true);
+        else for (const char *p = err_msg; *p; p++) sb_putc(&sb, *p);
+        free(clove_wasm_err); clove_wasm_err = sb.data;
+        return NULL;
+    }
+    SBuf sb = {0}; sb_grow(&sb, 1); sb.data[0] = '\0';
+    if (v->tag == CLOVE_STRING) { for (const char *p = v->as.str; *p; p++) sb_putc(&sb, *p); }
+    else print_to(&sb, v, true);
+    free(clove_wasm_out); clove_wasm_out = sb.data;
+    return clove_wasm_out;
+}
+#endif
+
 /* ───── REPL ─────────────────────────────────────────────────────────── */
 
 #ifndef CLOVE_NO_MAIN
@@ -20037,18 +20181,23 @@ static void usage(FILE *f) {
         "  notebook <file|dir> [port] live literate notebook (default 7878);\n"
         "                             dir: any .clj saved in the tree is shown\n"
         "  notebook <file> -o <html>  static notebook build\n"
-        "  test [files...]            run deftests, exit 1 on failure; no args:\n"
+        "    -S [--wasm-url URL]      standalone: embed clove as wasm, cells re-run\n"
+        "                             in the browser (needs emcc once)\n"
+        "  notebook --wasm <out.js>   write the wasm interpreter, for --wasm-url\n"        "  test [files...]            run deftests, exit 1 on failure; no args:\n"
         "                             glob *_test.clj(c) under .\n"
         "  judge [-a|-i] <files...>   inline snapshot tests: fill in/verify\n"
         "                             (test expr) results; -a apply, -i review\n"
-        "  lint [files...]            reader syntax check, full error rendering\n"
+        "  lint <files...>            reader syntax check, full error rendering\n"
         "  fmt [check] <files...>     format with cljfmt (fix in place; check only)\n"
         "  bundle <file> <out>        script + runtime → one native binary;\n"
         "                             calls -main (argv) if the script defines one\n"
         "  bundle -m <ns> <out>       bundle a namespace, entrypoint its -main\n"
+        "    --static --windows       static Linux binary / cross-compile a .exe\n"
+        "    --library                a shared library with a C API instead\n"
+        "    --cc= --cflags= --libs=  pass a compiler and flags through\n"
         "  watch <file> [args]        run the script, rerun whenever it changes\n"
-        "  vendor [src|deps.edn]    copy a library's .clj sources into ./vendor;\n"
-        "                           no arg: resolve ./deps.edn's :deps transitively\n"
+        "  vendor [src|deps.edn]      copy a library's .clj sources into ./vendor;\n"
+        "                             no arg: resolve ./deps.edn's :deps transitively\n"
         "  doctor                     print resolved load path + batteries\n"
         "  version                    print version\n"
         "  help                       this text\n",
@@ -20247,7 +20396,11 @@ int main(int argc, char **argv) {
     if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
         rlim_t want = 1024ul * 1024 * 1024;   /* 1 GB */
         if (rl.rlim_max != RLIM_INFINITY && want > rl.rlim_max) want = rl.rlim_max;
-        if (want > rl.rlim_cur) { rl.rlim_cur = want; setrlimit(RLIMIT_STACK, &rl); }
+        if (want > rl.rlim_cur) {
+            rlim_t orig = rl.rlim_cur;
+            rl.rlim_cur = want;
+            if (setrlimit(RLIMIT_STACK, &rl) == 0) clove_orig_stack_limit = (unsigned long long)orig;
+        }
     }
 #endif
     if (getenv("CLOVE_UNBUFFERED")) {
@@ -20394,6 +20547,7 @@ int main(int argc, char **argv) {
         av[k++] = (char *)verb;
         for (int i = base; i < argc; i++) av[k++] = argv[i];
         av[k] = NULL;
+        clove_child_limits();
         execvp("cljfmt", av);
         fprintf(stderr,
             "clove fmt: cljfmt not found on PATH.\n"

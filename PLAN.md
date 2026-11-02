@@ -9,7 +9,7 @@ complete milestone log (roadmap items 1–50-odd, the July/August arc
 summaries) is in [HISTORY.md](HISTORY.md); user-facing changes per release
 are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
-## Status (as of 2026-11-01, v0.8.1)
+## Status (as of 2026-11-02, v0.9.0)
 
 ~18,000 lines, zero warnings, ~2200 assertions in `tests.clj` + ~540-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
@@ -103,6 +103,24 @@ type.
 
 Things the history log leaves unresolved, roughly by value:
 
+- **Docs site** (`doc/`, built by `./clove doc/build.clj` into `_site/`).
+  Drafted 2026-11-02, awaiting review. Still to do: a GitHub Actions deploy
+  to Pages (needs emsdk for the wasm and Chrome for the cheat sheet PDF),
+  self-hosted fonts, search beyond the reference filter. `doc/cheatsheet.edn`
+  is checked by tests.clj; the build lists documented names it leaves out.
+- **Startup**: ~8 ms (`benchmarks/01-startup.clj`, 2026-11-02; bb 7 ms,
+  v0.7.0 8 ms). The 0.8.0 regression to ~10 ms was linear root-binding
+  lookups and a 1,024-bucket intern table; both fixed. What's left is
+  reading and evaluating the prelude: ~87k cells (~4.9 MB, ~1,200 page
+  faults) and ~1,300 top-level forms. Measure with hyperfine and put a
+  warm-up run first: the first command in a hyperfine run reads ~4 ms slow.
+  Prefaulting cell blocks with MAP_POPULATE saved only ~0.2 ms.
+- **`clojure.data.priority-map`**: `conj`/`into` on one bypass its deftype
+  `cons` (they treat it as a plain map), and it prints its internals.
+  `assoc`/`peek`/`pop` work.
+- **Small REPL rough edges** seen while writing docs: `printn` suggests
+  `print` rather than `println`; `defn` returns the fn rather than the var
+  (`#'user/f` on the JVM).
 - **meander `m/rewrite`** — blocked on syntax-quote: JVM qualifies an
   unresolvable bare symbol to the current ns (`with` →
   `meander.syntax.epsilon/with`); clove leaves it bare, so meander's parser
@@ -139,6 +157,23 @@ Things the history log leaves unresolved, roughly by value:
   rather than rounding differently).
 - **Libraries needing a JVM reimplementation**: `clojure.data.xml` (StAX),
   `cognitect.transit` (see README "Not yet").
+- **Standalone notebooks in wasm** (`clove notebook -S`, clerk.clj). clove
+  compiles under emscripten with `-DCLOVE_NO_MAIN`; the `__EMSCRIPTEN__`
+  guards in clove.c drop coroutines (no ucontext), take the stack floor from
+  `emscripten_stack_get_end`, and export `clove_wasm_eval`. The GC needs
+  ASYNCIFY: wasm locals are invisible to the conservative scan, so
+  `gc_collect` calls `emscripten_scan_registers`, which unwinds the stack into
+  a heap buffer and resumes from `setTimeout`. Every GC therefore makes an eval
+  asynchronous, and the page queues its calls. The 1.5 MB shadow stack is
+  sized so clove's guard trips (~1000 frames) before a browser's ~1 MB engine
+  stack, whose overflow kills the instance (the page then asks for a reload).
+  Open: port coroutines to emscripten fibers (also ASYNCIFY-based); try
+  Binaryen `--spill-pointers` with a current emsdk instead of ASYNCIFY
+  (synchronous, likely faster, and would lift the depth cap). Tested only
+  against Debian's emcc 3.1.6, in node and Chrome.
+- **Intern table never grows**: `intern` has a fixed 1024 buckets and does a
+  `strlen` per node, so creating 300k distinct keywords takes ~20 s
+  (quadratic). Resize on load factor and store the length.
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
   item 36 and the July perf-campaign summary.
 

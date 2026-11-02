@@ -1,0 +1,61 @@
+/* clove brand palette. Colors sampled from the logo (brand/logo.svg).
+ *
+ * This file is the canonical copy. clerk.clj (notebooks, standalone pages)
+ * inlines the same custom properties; tests.clj checks they stay identical.
+ *
+ * Text roles meet WCAG AA (4.5:1) on both --paper and --surface, in both
+ * schemes. --fern and --moss are too light for text: fills and rules only. */
+
+:root {
+  /* logo colors */
+  --forest:   #364c3b;  /* ring: brand dark, headings accent, links */
+  --fern:     #7b855e;  /* ring highlight */
+  --moss:     #989c6c;  /* inner disc */
+  --bulb:     #e8e1ca;  /* garlic */
+  --tan:      #c7b697;  /* garlic shadow */
+  --soil:     #625f49;  /* bulb base */
+
+  /* roles, light */
+  --paper:    #f6f7f1;  /* page */
+  --surface:  #ecebdf;  /* code, cards */
+  --ink:      #47422f;  /* body text, wordmark */
+  --ink-soft: #6b6650;  /* secondary text */
+  --rule:     #d6d3c2;  /* borders */
+  --link:     #364c3b;
+  --accent:   #989c6c;  /* value bars, underlines, focus */
+  --err:      #9c3b2e;
+  --err-bg:   #f4e4dc;
+
+  /* syntax */
+  --hl-com:   #6f6b55;
+  --hl-str:   #80552f;
+  --hl-kwd:   #2f6650;
+  --hl-lit:   #5f6e2c;
+  --hl-pun:   #6e6953;
+  --hl-spe:   #364c3b;
+
+  /* type */
+  --font-head: Comfortaa, 'Varela Round', Nunito, ui-rounded, system-ui, sans-serif;
+  --font-body: 'Source Serif 4', 'Source Serif Pro', Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Inconsolata, ui-monospace, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:    #1a201b;
+    --surface:  #232b24;
+    --ink:      #e6e2d3;
+    --ink-soft: #b3ae99;
+    --rule:     #3a443a;
+    --link:     #b4c98f;
+    --accent:   #7b855e;
+    --err:      #f0a090;
+    --err-bg:   #3a2622;
+    --hl-com:   #9a9681;
+    --hl-str:   #dcbc8c;
+    --hl-kwd:   #8ec7a6;
+    --hl-lit:   #c3d08c;
+    --hl-pun:   #a29f8a;
+    --hl-spe:   #b9d08f;
+  }
+}

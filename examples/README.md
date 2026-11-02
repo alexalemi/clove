@@ -38,25 +38,22 @@ primitives and shells out to `clove` to run each example.
 | `sqlite.clj` | A real SQLite database | binding libsqlite3 via a shim header; prepare/step/column |
 | `raylib-bounce.clj` | Interactive bouncing balls | the raylib GUI binding — `:float`/struct-by-value FFI (needs raylib + a display) |
 | `fractal-svg.clj` | A recursive fractal tree | recursion, trig, writing a real `.svg` file with `spit` |
+| `csp-sieve.clj` | The concurrent prime sieve | core.async: one `go` block per prime, chained channels |
+| `csp-chat.clj` | A broadcast chat server | sockets on the fiber event loop, `mult`/`tap` fan-out |
+| `csp-http-server.clj` | A concurrent HTTP server | one `go` block per connection, no threads |
+| `http-app.clj` | A small routed web app | `http.clj`'s router, path params, a shared atom |
 
-Plus two that aren't scripts:
+Plus three that aren't scripts:
 
 | File | What it is |
 |---|---|
 | `host.c` | Embedding clove in a C program (`#define CLOVE_NO_MAIN`); build with `make example` |
-| `hello-bundle.clj` | A script meant for `clove bundle.clj` → a standalone binary |
+| `libhost.c` | A C host for a script built with `clove bundle --library` |
+| `hello-bundle.clj` | A script meant for `clove bundle` → a standalone binary |
 
 ## Notes on the dialect
 
-A few of these examples bumped into deliberate divergences from JVM Clojure,
-worth knowing if you write your own:
-
-- **`nth` doesn't index strings** — use `subs`/`get`, or `(vec s)` first.
-- **`Math/PI` and `Math/E` are real constants**, but they're *values*, not
-  functions — write `Math/PI`, never `(Math/PI)`.
-- **No `double` cast fn** — force a double with `(* 1.0 x)` (and `/` already
-  yields a double for inexact division, since there's no Ratio type).
-- **`extend-type` takes a type keyword and method impls directly**, with no
-  protocol-name argument; records get keywords like `:Circle` from `type`.
-- **Quasiquote has no auto-gensym** (`x#`) — call `gensym` explicitly when a
-  macro needs a fresh name.
+These run on clove as written, and nearly all of them would run unchanged on
+JVM Clojure or babashka. Where clove differs from Clojure on purpose is listed
+in the main README under
+[Deliberate divergences](../README.md#deliberate-divergences-from-clojure).

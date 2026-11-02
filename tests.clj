@@ -842,6 +842,11 @@
 (assert= 0 (:exit (sh "true")))
 (assert= 1 (:exit (sh "false")))
 (assert= "ping\n" (:out (sh "echo ping")))
+;; children get the stack limit clove started with, not the 1 GB main()
+;; raises for itself (threaded programs failed in pthread_create)
+(let [own (:out (sh "ulimit -s"))]
+  (assert= true (not= "1048576\n" own))
+  (assert= own (:out (clojure.java.shell/sh "sh" "-c" "ulimit -s"))))
 (ffi/define [[:double cos [:double]]
              [:double hypot [:double :double]]
              [:int abs [:int]]
@@ -1509,6 +1514,14 @@
 (assert= :code (:kind (first (clerk/parse "(def s \";; not prose\")\n"))))
 (assert= 1 (count (clerk/parse "(def a\n  1)\n")))           ; multiline form = one cell
 (assert= {"hide-code" true} (:dirs (second (clerk/parse ";; intro\n;; @clerk:hide-code\n(+ 1 1)\n"))))
+; percent cells (opt-in by any ;; %% line): a cell is the run of code between
+; boundaries (;; %%, prose, directives); blank lines and ; comments stay inside
+(assert= ["(def a 1)\n\n; note\n(+ a 1)" "(g 5)\n(g 6)" "(+ 1 1)"]
+         (mapv :text (filter #(= :code (:kind %))
+                             (clerk/parse ";; %%\n(def a 1)\n\n; note\n(+ a 1)\n;; %% two\n(g 5)\n(g 6)\n;; prose\n(+ 1 1)\n"))))
+(assert= [{:kind :code :text "(def a 1)\n(inc a)" :dirs {"hide-code" true}} {:kind :code :text "(+ 1 1)" :dirs {}}]
+         (clerk/parse ";; %%\n;; @clerk:hide-code\n(def a 1)\n(inc a)\n;; %%\n(+ 1 1)\n"))
+(assert= 2 (count (clerk/parse "(def s \";; %% not a marker\")\n(+ 1 1)\n")))  ; no marker: per-form
 (assert= {:value 3 :error nil :out ""} (clerk/eval-cell "(+ 1 2)"))
 (assert= {:value 2 :error nil :out "side"} (clerk/eval-cell "(print \"side\") (+ 1 1)"))
 (assert= true (string? (:error (clerk/eval-cell "(/ 1 0)"))))
@@ -1521,6 +1534,27 @@
 (assert= "<ol><li>a</li><li>b</li></ol>" (clerk/md->html "1. a\n2. b"))
 (assert= "<p>x</p><p>y</p>" (clerk/md->html "x\n\ny"))
 (assert= "<p>math $e^x$ stays</p>" (clerk/md->html "math $e^x$ stays"))
+; a wrapped list item continues the item; fenced code (C escaped, Clojure
+; highlighted); quotes; all used by doc/ pages
+(assert= "<ul><li>long item that wraps</li><li>b</li></ul><p>p</p>" (clerk/md->html "- long item\n  that wraps\n- b\n\np"))
+(assert= "<pre class=\"src\">int x = a &lt; b;</pre>" (clerk/md->html "```c\nint x = a < b;\n```"))
+(assert= true (str/includes? (clerk/md->html "```\n(inc 1)\n```") "<span class=\"pun\">(</span>"))
+;; tables: a |---| row marks a header; an all-empty header is dropped
+(assert= "<table><thead><tr><th>a</th><th><code>b</code></th></tr></thead><tbody><tr><td>1</td><td></td></tr></tbody></table>"
+         (clerk/md->html "| a | `b` |\n|---|---|\n| 1 | |"))
+(assert= "<p>x</p><table><tbody><tr><td>k</td><td>v</td></tr></tbody></table>"
+         (clerk/md->html "x\n\n| | |\n|---|---|\n| k | v |"))
+(assert= "<blockquote><p>q <em>r</em> s</p></blockquote><p>t</p>" (clerk/md->html "> q *r*\n> s\n\nt"))
+;; every name on the docs site's cheat sheet exists here
+(when-let [cs (clove/slurp-maybe "doc/cheatsheet.edn")]
+  (clove/ensure-docs!)
+  (require '[clojure.set :as set] 'clojure.walk 'clojure.data)
+  (assert= [] (vec (for [[_ & boxes] (read-string cs), [_ & rows] boxes, [_ & names] rows, n names
+                         :when (and (symbol? n) (nil? (clove/doc-info* n)))]
+                     n))))
+; notebook css inlines brand/palette.css's tokens verbatim, in order
+(when-let [pal (clove/slurp-maybe "brand/palette.css")]
+  (assert= (re-seq #"--[a-z-]+: +[^;]+;" pal) (re-seq #"--[a-z-]+: +[^;]+;" clove/clerk-css)))
 (assert= true (str/includes? (clerk/hl "(def x \"s\")") "<span class=\"str\">\"s\"</span>"))
 (assert= true (str/includes? (clerk/hl "; note") "class=\"com\""))
 (assert= true (str/includes? (clerk/hl ":kw") "class=\"kwd\""))
@@ -1555,6 +1589,30 @@
 (spit "/tmp/clove-nb.clj" ";; #\n(defn rf [] 5)\n(def junk 7)\n(def rres (rf))\n")
 (clerk/render-file "/tmp/clove-nb.clj" false)
 (assert= 5 rres)                                      ; remove B's redef: falls back to A
+(sh "rm -f /tmp/clove-nb.clj")
+; percent cell renders only its last value; a trailing nil suppresses output
+(spit "/tmp/clove-nb.clj" ";; %%\n(def pa 1)\n(+ pa 100)\n;; %%\n(+ pa 200)\nnil\n")
+(let [h (clerk/render-file "/tmp/clove-nb.clj" false)]
+  (assert= ["101"] (mapv second (re-seq #"<pre class=\"value\">([^<]*)</pre>" h))))
+(sh "rm -f /tmp/clove-nb.clj")
+; standalone pages (-S): flags in any order; cells carry their source for the
+; in-browser interpreter; --wasm-url references a hosted interpreter (no emcc)
+(assert= {:file "nb.clj" :out "o.html" :standalone true :wasm-url "u.js"}
+         (clerk/parse-args ["-S" "nb.clj" "--wasm-url" "u.js" "-o" "o.html"]))
+(assert= {:file "nb" :port "9000"} (clerk/parse-args ["nb" "9000"]))
+(spit "/tmp/clove-nb.clj" ";; %%\n(def sa 1)\n(+ sa \"<x>\")\n")
+(let [h (clerk/render-file "/tmp/clove-nb.clj" false {:standalone true :wasm-url "https://x.test/c.js"})]
+  (assert= true (str/includes? h "<textarea class=\"clerk-t\" hidden>\n(def sa 1)\n(+ sa \"&lt;x&gt;\")</textarea>"))
+  (assert= true (str/includes? h "<script src=\"https://x.test/c.js\"></script>"))
+  (assert= true (str/includes? h "<textarea id=\"clerk-lib\" hidden>"))
+  (assert= false (str/includes? (clerk/render-file "/tmp/clove-nb.clj" false) "clerk-live")))
+(assert= true (str/includes? (clerk/wasm-cell "(+ 1 2)" {}) "<pre class=\"value\">3</pre>"))
+; the full inlined build, only where emscripten is installed (cached per clove.c)
+(when (zero? (:exit (sh "command -v emcc >/dev/null")))
+  (let [h (clerk/render-file "/tmp/clove-nb.clj" false {:standalone true})]
+    (assert= true (str/includes? h "CloveWasm"))
+    ; the inlined interpreter must not close its own <script> early
+    (assert= (count (re-seq #"<script" h)) (count (re-seq #"</script>" h)))))
 (sh "rm -f /tmp/clove-nb.clj")
 ) ; end when-unix
 

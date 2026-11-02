@@ -1,8 +1,9 @@
 # Library compatibility
 
 Tested with `clove vendor` / `(vendor! …)` on 2026-07-07 (v0.2.0+). "Works"
-means a functional smoke test passed, not just loading. Transitive
-dependencies are not auto-resolved — vendor them too (listed where needed).
+means a functional smoke test passed, not just loading. `clove vendor` with
+no argument resolves a `deps.edn` transitively; vendoring a single coordinate
+does not, so vendor its dependencies too (listed where needed).
 
 ## Works — verified functionally
 
@@ -22,7 +23,7 @@ dependencies are not auto-resolved — vendor them too (listed where needed).
 
 emmy (CAS), datascript, core.logic, core.async (vendored port), hiccup,
 instaparse, camel-snake-kebab, clj-yaml, cheshire (vendored port),
-nextjournal.markdown, clojure.tools.logging, clojure.data.priority-map,
+nextjournal.markdown, clojure.tools.logging,
 stuartsierra/component, weavejester/dependency, rewrite-clj (all namespaces
 load; zip API untested), org.clojure/tools.reader, riddley,
 borkdude/deflet.
@@ -45,19 +46,19 @@ borkdude/deflet.
 
 | Library | Status |
 |---|---|
-| meander `m/rewrite` | its self-hosted clause analyzer reports non-exhaustive — match/search/find are fine |
+| meander `m/rewrite` | not yet: see the meander row above. match/search/find are fine |
+| clojure.data.priority-map | `priority-map`, `assoc`, `peek`, `pop` work; `conj`/`into` bypass its `cons` and printing shows the internals |
 
 ## Won't work (JVM-native by design)
 
 Anything wrapping Java libraries directly: clj-http (Apache HTTP),
-data.xml (SAX), next.jdbc, tools.namespace (java.io scanning), aleph/netty,
+data.xml (a Java XML parser), next.jdbc, tools.namespace (java.io scanning), aleph/netty,
 … Use clove's batteries (`http.clj`, `json.clj`, `fs.clj`, `process.clj`)
 for those needs.
 
 ## Notes
 
-- `org.clojure/*` coordinates resolve via Maven Central automatically;
-  everything else tries Clojars first, then GitHub.
+- Every coordinate tries Clojars, then Maven Central, then GitHub.
 - A namespace that fails only because a sibling loads later alphabetically
   is retried automatically; failures reported are real.
 - File issues with the smallest failing `(require …)` — the error usually

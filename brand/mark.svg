@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <title>clove</title>
+  <defs>
+    <linearGradient id="ring" x1="0.15" y1="0.1" x2="0.85" y2="0.9">
+      <stop offset="0" stop-color="#7b855e"/>
+      <stop offset="0.55" stop-color="#4a6146"/>
+      <stop offset="1" stop-color="#364c3b"/>
+    </linearGradient>
+    <linearGradient id="bulb" x1="0" y1="0" x2="1" y2="0.3">
+      <stop offset="0" stop-color="#f1ecdb"/>
+      <stop offset="1" stop-color="#d8ccae"/>
+    </linearGradient>
+    <clipPath id="bulbclip">
+      <path id="bulbpath" d="M94 18 C92 32 88 44 76 54 C52 70 30 92 30 120 C30 148 50 168 74 172 L126 172 C150 168 170 148 170 120 C170 92 148 70 124 54 C112 44 108 32 106 18 C102 14 97 14 94 18 Z"/>
+    </clipPath>
+  </defs>
+  <circle cx="100" cy="100" r="72" fill="#989c6c"/>
+  <circle cx="100" cy="100" r="85" fill="none" stroke="url(#ring)" stroke-width="10"/>
+  <use href="#bulbpath" fill="url(#bulb)"/>
+  <g clip-path="url(#bulbclip)">
+    <rect x="20" y="160" width="160" height="20" fill="#625f49"/>
+    <path d="M92 52 C70 82 64 132 80 172 M108 52 C130 82 136 132 120 172" fill="none" stroke="#b9b48a" stroke-width="2.5"/>
+  </g>
+  <use href="#bulbpath" fill="none" stroke="#47422f" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M70 98 C62 110 62 130 70 142 M130 98 C138 110 138 130 130 142" fill="none" stroke="#364c3b" stroke-width="6" stroke-linecap="round"/>
+  <path d="M87 92 C94 91 97 96 100 103 L114 140 M102 112 L87 140" fill="none" stroke="#47422f" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
