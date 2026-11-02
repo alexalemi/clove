@@ -7,6 +7,11 @@
   clove differs from JVM Clojure, what libraries load, and where the docs
   are. The docs site serves it at its root.
 - A docs page on `clove judge` snapshot tests.
+- The docs site is published to GitHub Pages on every push to main.
+
+### Changed
+- The esoteric-language interpreter example is now `examples/tape.clj`
+  ("Tape Machine").
 
 ## v0.9.0 — 2026-11-02
 

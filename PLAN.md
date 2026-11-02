@@ -11,7 +11,7 @@ are in [CHANGELOG.md](CHANGELOG.md); the feature surface is in the README.
 
 ## Status (as of 2026-11-02, v0.9.0)
 
-~18,000 lines, zero warnings, ~2200 assertions in `tests.clj` + ~540-expression
+~20,600 lines, zero warnings, ~2200 assertions in `tests.clj` + ~540-expression
 conformance corpus diffed against a JVM golden (`make conformance`), ASan/UBSan clean
 (ASan needs `ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0` —
 required by conservative stack scanning, same as Boehm GC). CI: Linux (+ASan at
@@ -104,10 +104,13 @@ type.
 Things the history log leaves unresolved, roughly by value:
 
 - **Docs site** (`doc/`, built by `./clove doc/build.clj` into `_site/`).
-  Drafted 2026-11-02, awaiting review. Still to do: a GitHub Actions deploy
-  to Pages (needs emsdk for the wasm and Chrome for the cheat sheet PDF),
-  self-hosted fonts, search beyond the reference filter. `doc/cheatsheet.edn`
-  is checked by tests.clj; the build lists documented names it leaves out.
+  Live at alexalemi.com/clove (alexalemi.github.io/clove redirects), deployed
+  by `.github/workflows/pages.yml` on every push to main; the workflow fails
+  if the wasm interpreter, the cheat sheet PDF or `llms.txt` is missing.
+  Still to do: self-hosted fonts, search beyond the reference filter.
+  `doc/cheatsheet.edn` is checked by tests.clj; the build lists documented
+  names it leaves out. `llms.txt` (repo root, copied to the site) is the
+  agent-facing summary: keep its claims in step with the README.
 - **Startup**: ~8 ms (`benchmarks/01-startup.clj`, 2026-11-02; bb 7 ms,
   v0.7.0 8 ms). The 0.8.0 regression to ~10 ms was linear root-binding
   lookups and a 1,024-bucket intern table; both fixed. What's left is
