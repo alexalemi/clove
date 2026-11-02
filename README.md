@@ -405,7 +405,6 @@ multi-file libraries with internal cross-references load in isolation — `defty
 | **SCI** | a Clojure interpreter, running *inside* clove |
 | **clojure.data.csv** / **clojure.tools.cli** | CSV, command-line parsing |
 | **test.check** | generative property testing |
-| **minijax** | JAX-style composable function transforms — `grad`/`jvp`/`jet`/`vmap`, symbolic + interval + arbitrary-precision tracing (74/74 tests) |
 
 **Not yet** — these need a JVM library reimplemented from scratch (a real XML
 parser, a host serializer): `clojure.data.xml` (StAX), `cognitect.transit`,
