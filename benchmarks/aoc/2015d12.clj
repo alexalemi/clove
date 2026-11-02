@@ -1,6 +1,6 @@
 (require '[clojure.data.json :as json])
-(def data (json/read-str "[1,{\"a\":2,\"b\":[3,4]},5,{\"x\":-6}]"))
+(def data (json/read-str "[{\"k\":[7,-2]},10,{\"m\":{\"n\":4,\"o\":\"s\"}},-3]"))
 (defn sum-nums [x] (cond (number? x) x (map? x) (apply + (map sum-nums (vals x))) (sequential? x) (apply + (map sum-nums x)) :else 0))
 (println "sum" (sum-nums data))
-(assert (= 9 (sum-nums data)))
+(assert (= 16 (sum-nums data)))
 (println "2015d12 OK")

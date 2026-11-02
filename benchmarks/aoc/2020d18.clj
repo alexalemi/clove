@@ -7,7 +7,7 @@
                        (if (#{"+" "*"} op) (do (swap! toks rest) (recur ((if (= op "+") + *) acc (value)))) acc))))]
       (expr))))
 (defn solve [line] (evl (tokenize line)))
-(println "r" (solve "2 * 3 + (4 * 5)"))
-(assert (= 26 (solve "2 * 3 + (4 * 5)")))
-(assert (= 437 (solve "5 + (8 * 3 + 9 + 3 * 4 * 3)")))
+(println "r" (solve "3 + 4 * (2 + 1)"))
+(assert (= 21 (solve "3 + 4 * (2 + 1)")))
+(assert (= 136 (solve "(2 * 6) + 5 * (1 + 3 * 2)")))
 (println "2020d18 OK")

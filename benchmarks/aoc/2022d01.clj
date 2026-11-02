@@ -1,5 +1,5 @@
-(def input "1000\n2000\n3000\n\n4000\n\n5000\n6000\n\n7000\n8000\n9000\n\n10000")
+(def input "1500\n2500\n\n6000\n700\n\n4200\n\n3100\n900\n1800\n\n5200\n\n800\n800\n800")
 (def groups (map (fn [g] (apply + (map parse-long (clojure.string/split-lines g)))) (clojure.string/split input #"\n\n")))
 (println "max" (apply max groups) "top3" (apply + (take 3 (sort > groups))))
-(assert (= 24000 (apply max groups))) (assert (= 45000 (apply + (take 3 (sort > groups)))))
+(assert (= 6700 (apply max groups))) (assert (= 17700 (apply + (take 3 (sort > groups)))))
 (println "2022d01 OK")

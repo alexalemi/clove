@@ -1,4 +1,4 @@
-(def adapters [16 10 15 5 1 11 7 19 6 12 4])
+(def adapters [3 1 4 7 8 10 11 14 2 5 13])
 (defn solve [xs]
   (let [s (sort (conj (set xs) 0 (+ 3 (apply max xs))))
         diffs (map - (rest s) s)
@@ -11,5 +11,5 @@
                                  (swap! mem assoc i r) r))))]
          (ways 0)))]))
 (let [[p1 p2] (solve adapters)] (println "p1" p1 "p2" p2)
-  (assert (= 35 p1)) (assert (= 8 p2)))
+  (assert (= 8 p1)) (assert (= 225 p2)))
 (println "2020d10 OK")
