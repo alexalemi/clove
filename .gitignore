@@ -8,6 +8,6 @@ target/
 benchmarks/aoc/target/
 .clj-kondo/.cache/
 brand/*.html
-.claude/scheduled_tasks.lock
+.claude/
 _site/
 inbox/
