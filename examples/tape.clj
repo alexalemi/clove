@@ -1,15 +1,16 @@
-;; brainfuck.clj — a complete Brainfuck interpreter in clove.
+;; tape.clj — an interpreter for a tiny eight-command language, in clove.
 ;;
 ;; Showcases: hosting another language, mutable arrays (int-array/aget/aset —
 ;; clove's transient-vector-backed arrays), precomputing jump tables, and
 ;; with-out-str-free streaming output via `print`.
 ;;
-;; Brainfuck has 8 commands operating on a tape of byte cells:
+;; The language is a classic toy from esoteric-language circles: eight
+;; commands working on a tape of byte cells.
 ;;   > <  move the data pointer       + -  inc/dec the current cell
 ;;   . ,  output / input a byte        [ ]  loop while current cell != 0
 ;;
-;; Run:  clove examples/brainfuck.clj            ; runs the built-in "Hello"
-;;       clove examples/brainfuck.clj prog.bf    ; run a program from a file
+;; Run:  clove examples/tape.clj              ; runs the built-in "Hello"
+;;       clove examples/tape.clj prog.txt     ; run a program from a file
 
 ;; Precompute matching-bracket targets so `[` / `]` are O(1) jumps instead of
 ;; rescanning. A stack of `[` positions pairs each with its closing `]`.
@@ -49,7 +50,7 @@
                                (inc ip) (inc (get jumps ip))) dp)
             :else     (recur (inc ip) dp)))))))
 
-;; "Hello World!" — the canonical Brainfuck program.
+;; "Hello World!", the usual first program for it.
 (def hello
   "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.")
 

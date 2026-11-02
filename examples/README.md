@@ -28,7 +28,7 @@ primitives and shells out to `clove` to run each example.
 | `nqueens.clj` | N-Queens solver | recursive backtracking, `mapcat` search |
 | `sudoku.clj` | Sudoku solver | backtracking + the most-constrained heuristic, `clojure.set` |
 | `calc.clj` | Arithmetic expression evaluator | recursive-descent parsing, regex tokenizing |
-| `brainfuck.clj` | A complete Brainfuck interpreter | mutable arrays (`int-array`/`aset`), hosting a language |
+| `tape.clj` | An interpreter for a tiny eight-command tape language | mutable arrays (`int-array`/`aset`), hosting a language |
 | `macros.clj` | `unless`, `dbg`, `my-and`, `infix` | `defmacro`, quasiquote, `gensym` hygiene |
 | `shapes.clj` | Areas & FizzBuzz | protocols, multimethods, records — all three dispatch styles |
 | `dijkstra.clj` | Shortest paths in a road network | maps as graphs, immutable state through `loop` |

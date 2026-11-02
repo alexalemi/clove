@@ -603,7 +603,7 @@ user-facing view.
 37. ~~Example suite + FFI structs/floats + GUI/DB bindings~~ ✅ done
     2026-06-21 — (a) examples/ gallery: 15 self-contained programs
     (mandelbrot, life, primes/lazy, nqueens, sudoku, calc parser,
-    brainfuck, macros, shapes/polymorphism, dijkstra, wordfreq, bank/
+    tape machine, macros, shapes/polymorphism, dijkstra, wordfreq, bank/
     atoms, ffi-demo, sqlite, fractal-svg) + examples/serve.clj, a gallery
     HTTP server written IN cljc (runs each example, captures output,
     highlight.js page). (b) FFI gained :float (marshals via as_double/

@@ -27,8 +27,8 @@
     :run "./clove examples/sudoku.clj </dev/null"}
    {:file "calc.clj"        :title "Expression Parser"   :tag "recursive descent · regex"
     :run "./clove examples/calc.clj </dev/null"}
-   {:file "brainfuck.clj"   :title "Brainfuck Interpreter" :tag "mutable arrays · hosting a language"
-    :run "./clove examples/brainfuck.clj </dev/null"}
+   {:file "tape.clj"        :title "Tape Machine"        :tag "mutable arrays · hosting a language"
+    :run "./clove examples/tape.clj </dev/null"}
    {:file "macros.clj"      :title "Macros & DSLs"       :tag "defmacro · quasiquote · gensym"
     :run "./clove examples/macros.clj </dev/null"}
    {:file "shapes.clj"      :title "Polymorphism"        :tag "protocols · multimethods · records"
