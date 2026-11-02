@@ -17,6 +17,7 @@
    {:group "Start"     :src "doc/tutorial.clj"     :out "tutorial.html"     :nav "Tutorial"}
    {:group "Start"     :src "doc/from-clojure.clj" :out "from-clojure.html" :nav "Coming from Clojure"}
    {:group "Guides"    :src "doc/scripting.clj"    :out "scripting.html"    :nav "Scripts and the REPL"}
+   {:group "Guides"    :src "doc/judge.clj"        :out "judge.html"        :nav "Snapshot tests"}
    {:group "Guides"    :src "doc/libraries.clj"    :out "libraries.html"    :nav "Libraries"}
    {:group "Guides"    :src "doc/notebooks.clj"    :out "notebooks.html"    :nav "Notebooks"}
    {:group "Guides"    :src "doc/binaries.clj"     :out "binaries.html"     :nav "Standalone binaries"}

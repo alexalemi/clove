@@ -100,7 +100,9 @@
 ;;
 ;; `clove judge` is for snapshot tests. Write `(test expr)` forms with no
 ;; expected value and `clove judge -a file.clj` fills in what they return.
-;; Later runs fail when the value changes.
+;; Later runs fail when the value changes. It's borrowed from Janet's
+;; [Judge](https://github.com/ianthehenry/judge), and
+;; [Snapshot tests](judge.html) walks through it.
 ;;
 ;; ## Editors
 ;;
