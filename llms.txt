@@ -1,0 +1,84 @@
+# clove
+
+> clove is a Clojure interpreter in one C99 file. It runs `.clj` scripts with
+> about 8 ms of startup and no JVM, and it can be embedded in a C program or
+> bundled with a script into a single native binary. Clojure's semantics are
+> the spec: when clove and JVM Clojure disagree, that's a clove bug unless it
+> is in the list of deliberate divergences below.
+
+clove is a hobby project written mostly by Claude, and it isn't meant for
+critical work. If the code you're writing matters, use JVM Clojure or
+babashka. Where clove fits: quick scripts, tools you'll run yourself,
+embedding a scripting language in C, and small standalone binaries.
+
+## Using clove from an agent
+
+- `clove file.clj a b` runs a script. Arguments are in `*args*` (a vector)
+  and `*command-line-args*` (a list).
+- `clove -e '<expr>'` evaluates and prints the last value. It's the quickest
+  way to check how something behaves.
+- `clove -m my.app` requires `my.app` and calls its `-main`.
+- Errors go to stderr as a framed message with the failing form, and the exit
+  status is 1. Stdout carries only what the program printed.
+- `clove test` runs every `*_test.clj` under the current directory with
+  `clojure.test` and exits 1 on any failure.
+- `clove judge -a file.clj` fills in `(test expr)` snapshot tests. Files
+  need `(require '[judge :refer [test]])` to also run as plain scripts.
+- `clove lint file.clj` checks that a file reads, without running it.
+- `clove doctor` shows the load path and which libraries it can find.
+- `(doc f)`, `(source f)`, `(dir ns)` and `(apropos "str")` work in scripts
+  and at the REPL, and are the fastest way to check a function exists here.
+- `clove.edn` (bb.edn-style `:paths` and `:tasks`) is read from the current
+  directory or a parent. `clove tasks` lists tasks; `clove run <task>` runs one.
+
+## Things that differ from JVM Clojure
+
+- There is no JVM. Java interop is limited to modeled classes and methods:
+  `Math/*`, `System/*`, `String` methods, `java.io.File`, `java.time.LocalDate`,
+  `Instant`, `java.util` collections, `UUID`, and the common exception
+  classes. Don't reach for arbitrary Java libraries; there aren't any.
+- Strings index by codepoint, not UTF-16 unit: `(count "𝄞")` is 1.
+- Hash maps keep insertion order at every size. Sets don't.
+- Syntax quote leaves symbols unqualified: `` `map `` is `map`, not
+  `clojure.core/map`. Nested syntax quote doesn't work.
+- Float division by zero gives `##Inf`/`##NaN` instead of throwing.
+- Namespaces are a flat global with per-namespace aliases. Defs in `user` are
+  visible from every namespace. A namespace is its symbol.
+- Only `#inst` and `#uuid` tagged literals; other tags are read errors.
+- Concurrency is coroutines on one OS thread: `future`, `go`, agents and refs
+  all work, but nothing runs in parallel. None of it exists on Windows.
+- `#?(:clove ...)` is the reader-conditional feature for clove-specific code.
+
+## Libraries
+
+- Built in: `clojure.string`, `set`, `walk`, `zip`, `edn`, `data`, `math`,
+  `pprint`, `test`, `core.async`, `core.match`; plus `clojure.data.json`,
+  `cheshire.core`, `babashka.fs`, `babashka.process`, `babashka.cli`,
+  `clj-yaml.core`, `medley.core`, and `taoensso.timbre`. Plain `require`.
+- clove's own batteries: `json`, `fs`, `process`, `http` (client and
+  server), `peg` (parsing expression grammars), `csp`, `libc`.
+- Other pure-Clojure libraries: `clove vendor <group/artifact>` or
+  `clove vendor <git-url>` copies the source into `./vendor/`, and `clove
+  vendor` with no argument resolves `./deps.edn`. Libraries that wrap Java
+  won't load.
+
+## Docs
+
+- [Tutorial](https://alexalemi.github.io/clove/tutorial.html): the language, by example
+- [Coming from Clojure](https://alexalemi.github.io/clove/from-clojure.html): what's different, in more detail
+- [Scripts and the REPL](https://alexalemi.github.io/clove/scripting.html): the CLI, tasks, tests, editors
+- [Snapshot tests](https://alexalemi.github.io/clove/judge.html): `clove judge`
+- [Libraries](https://alexalemi.github.io/clove/libraries.html): the load path, vendoring, what runs
+- [Standalone binaries](https://alexalemi.github.io/clove/binaries.html): `clove bundle`
+- [Embedding in C](https://alexalemi.github.io/clove/embedding.html): the C API and the GC rules
+- [FFI and the JIT](https://alexalemi.github.io/clove/ffi.html): calling C from clove
+- [Concurrency](https://alexalemi.github.io/clove/concurrency.html): futures, core.async, agents, refs
+- [Core functions](https://alexalemi.github.io/clove/reference.html): every documented name, with arglists
+- [Cheat sheet](https://alexalemi.github.io/clove/cheatsheet.html): core functions by topic
+
+## Source
+
+- [README](https://github.com/alexalemi/clove/blob/main/README.md): features, performance, the full divergence list
+- [COMPATIBILITY.md](https://github.com/alexalemi/clove/blob/main/COMPATIBILITY.md): which third-party libraries work
+- [The doc pages as source](https://github.com/alexalemi/clove/tree/main/doc): the same pages as commented `.clj` files
+- [AGENTS.md](https://github.com/alexalemi/clove/blob/main/AGENTS.md): for working on clove itself

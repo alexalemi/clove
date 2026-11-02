@@ -33,7 +33,7 @@ Clojure's own policy on generated code.
 
 Documentation, a tutorial, a cheat sheet and an in-browser playground live at
 **[alexalemi.github.io/clove](https://alexalemi.github.io/clove/)** (sources
-in [`doc/`](doc/)).
+in [`doc/`](doc/)). Coding agents should start with [`llms.txt`](llms.txt).
 
 ## Quick start
 

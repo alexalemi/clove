@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `llms.txt`, a short guide for coding agents: the commands to use, how
+  clove differs from JVM Clojure, what libraries load, and where the docs
+  are. The docs site serves it at its root.
+- A docs page on `clove judge` snapshot tests.
+
 ## v0.9.0 — 2026-11-02
 
 ### Changed

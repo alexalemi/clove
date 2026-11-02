@@ -458,6 +458,7 @@ pre.install{background:var(--surface);padding:.7rem .95rem;border-radius:8px;ove
     (doseq [f ["logo.svg" "logo-dark.svg" "logo-horizontal.svg" "logo-horizontal-dark.svg" "favicon.svg" "mark.svg"]]
       (copy! (str "brand/" f) site-dir))
     (copy! "clerk.clj" site-dir)
+    (copy! "llms.txt" site-dir)          ; the agent-facing summary, at the site root
     (doseq [p pages]
       (let [body (case (:gen p)
                    :reference (reference-html)
