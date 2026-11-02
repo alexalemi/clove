@@ -10,3 +10,4 @@ benchmarks/aoc/target/
 brand/*.html
 .claude/scheduled_tasks.lock
 _site/
+inbox/
