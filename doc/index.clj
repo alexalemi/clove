@@ -1,5 +1,5 @@
-;; clove is Clojure, the language, reimplemented as a single C99 file with no
-;; dependencies beyond libc. It has persistent collections, lazy seqs,
+;; clove is Clojure, the language, reimplemented by AI as a single C99 file
+;; with no dependencies beyond libc. It has persistent collections, lazy seqs,
 ;; macros, destructuring, protocols, records, ratios, BigInts, namespaces and
 ;; a REPL, and it runs real libraries unmodified: DataScript, core.logic,
 ;; Emmy, instaparse, hiccup.

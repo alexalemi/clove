@@ -392,7 +392,9 @@ pre.install{background:var(--surface);padding:.7rem .95rem;border-radius:8px;ove
 (def hero
   (str "<div class=\"hero\"><picture><source srcset=\"logo-dark.svg\" media=\"(prefers-color-scheme: dark)\">"
        "<img src=\"logo.svg\" alt=\"clove logo\"></picture><div>"
-       "<p>A Clojure interpreter in one C file.</p>"
+       "<p>An AI-generated Clojure interpreter in one C file.</p>"
+       "<p style=\"font-size:1rem;color:var(--ink-soft)\">Written almost entirely by Claude, and not meant for critical work. "
+       "<a href=\"how-clove-is-made.html\">How it's made</a>.</p>"
        "<p style=\"font-size:1rem;color:var(--ink-soft)\">Embed it with an "
        "<code>#include</code>, or bundle a script into a 500 KB binary with no dependencies.</p></div></div>"))
 
@@ -400,7 +402,7 @@ pre.install{background:var(--surface);padding:.7rem .95rem;border-radius:8px;ove
   (let [title (or (page-title body) (:nav p))]
     (str "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
          "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-         "<title>" (if (= (:out p) "index.html") "clove: Clojure in one C file" (str title " · clove")) "</title>"
+         "<title>" (if (= (:out p) "index.html") "clove: an AI-generated Clojure in one C file" (str title " · clove")) "</title>"
          "<link rel=\"icon\" href=\"favicon.svg\" type=\"image/svg+xml\">"
          "<style>" clove/clerk-css clove/clerk-live-css site-css
          (case (:gen p) :cheatsheet cheatsheet-css :playground playground-css "") "</style>"

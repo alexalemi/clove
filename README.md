@@ -1,9 +1,14 @@
 # clove
 
-A small Clojure in a single C file. Inspired by [Janet](https://janet-lang.org/)'s
+An AI-generated Clojure interpreter in one C file. Inspired by [Janet](https://janet-lang.org/)'s
 embeddability, aimed at [babashka](https://babashka.org/)-flavored scripting and
 beyond: persistent collections, macros, destructuring, protocols, ratios,
 namespaces, coroutines, regex — in one ~20,000-line C99 file with no dependencies.
+
+Nearly all of clove was written by Claude, with a person deciding what to
+build and checking it against real Clojure. It's a hobby project and not meant
+for critical work; [how clove is made](doc/how-clove-is-made.clj) has the
+details.
 
 ```clojure
 (defn top-words [text n]
