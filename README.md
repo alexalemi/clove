@@ -289,9 +289,9 @@ version stays. fib(32): **5 ms** vs babashka's 520 ms and JVM Clojure's
 
 s7/cload-style: declare C signatures as data, clove generates glue, compiles a
 `.so` at runtime, `dlopen`s it, and the C function becomes a clove fn. Modules
-cache by content hash; `ffi/defstruct` generates struct accessors. The battery
-shelf builds on it: `libc.clj` (the libc surface — `getpid`, `cwd`, `env`…),
-`fs.clj` (babashka.fs-flavored, `list-dir` via real `readdir`), `process.clj`
+cache by content hash; `ffi/defstruct` generates struct accessors. `libc.clj`
+builds on it (the libc surface — `getpid`, `cwd`, `env`…). The other batteries
+need no compiler: `fs.clj` (babashka.fs-flavored), `process.clj`
 (`sh`/`shell`/`out`), `json.clj`, `http.clj`, `peg.clj` (Janet-style PEGs), plus
 `(sh "cmd")` ⇒ `{:exit :out}`.
 

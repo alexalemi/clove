@@ -1,5 +1,5 @@
 (ns babashka.fs
-  "babashka.fs API over clove's fs.clj battery (filesystem via libc FFI).")
+  "babashka.fs API over clove's fs.clj battery.")
 (clove/in-ns* nil)
 (load-file "fs.clj")
 (clove/in-ns* "babashka.fs")

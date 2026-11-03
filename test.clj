@@ -191,8 +191,8 @@
 
 ;; ── discovery ───────────────────────────────────────────────────────────────
 ;; `clove test` with no file arguments walks the tree from . for *_test.clj(c).
-;; clove/list-dir* is a native primitive, unlike fs.clj's opendir/readdir FFI
-;; binding, so discovery works on Windows and on builds without FFI. It
+;; clove/list-dir* is a native primitive, so discovery works on Windows and
+;; on builds without FFI. It
 ;; returns nil for a non-directory and [] for an empty one -- and [] is
 ;; truthy -- so it doubles as the directory test.
 (def clove/test-skip-dirs #{"vendor" "target" "node_modules" "out"})

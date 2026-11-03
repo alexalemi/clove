@@ -1454,7 +1454,7 @@
 (assert= {:a [1 2]} (edn/read-string "{:a [1 2]}"))
 
 ; ── fs.clj / process.clj batteries ──
-(when clove-test-unix?  ; fs.clj is FFI-built; process tests use POSIX tools
+(when clove-test-unix?  ; process tests use POSIX tools
 (load-file "fs.clj")
 (load-file "process.clj")
 (assert= true (fs/exists? "clove.c"))
@@ -4075,7 +4075,23 @@
     (assert= nil (ask "d2:op1x:y"))
     (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
     (sh (str "kill " pid))
-    (sh (str "rm -rf '" T "'"))))
+    (sh (str "rm -rf '" T "'")))
+  ;; fs.clj passes paths as data, never through sh -c, and loads without cc
+  (load-file "fs.clj")
+  (let [T (str (fs/temp-dir) "/clove-fs-c2")
+        evil (str T "/x$(touch " T "/pwned)")]
+    (fs/create-dir T)
+    (assert= [false false false] [(fs/directory? evil) (fs/regular-file? evil) (fs/exists? (str T "/pwned"))])
+    (spit (str T "/a b.txt") "hi")
+    (assert= true (fs/copy (str T "/a b.txt") (str T "/c'd.txt")))
+    (assert= "hi" (slurp (str T "/c'd.txt")))
+    (assert= false (fs/exists? (str T "/pwned")))
+    (assert= true (fs/create-dir T))                    ; already there: still true
+    (assert= ["a b.txt" "c'd.txt"] (vec (fs/list-dir T)))
+    (assert= true (fs/regular-file? (str T "/a b.txt")))
+    (sh "rm" "-rf" T))
+  (assert= "true\n" (:out (sh "env" "PATH=/clove-no-such-dir" (str (clove/exe-dir*) "/clove")
+                               "-e" "(require 'fs) (println (fs/directory? \"/\"))"))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

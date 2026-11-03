@@ -25,6 +25,11 @@
 - The nREPL server (`clove nrepl`) rejects a bencode string length that is
   not all digits or exceeds 64 MB. A length past 2^64 wrapped around and
   overflowed a heap buffer.
+- `fs.clj` no longer runs paths through `sh -c`:
+  `(fs/directory? "x$(touch pwned)")` ran the command. It now uses clove's
+  file natives, so it no longer needs a C compiler to load (neither does
+  `clove vendor`, which uses it). The libc globals (`getpid`, `cwd`, `env`…)
+  are no longer pulled in by loading it.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02
