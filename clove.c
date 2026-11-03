@@ -1861,7 +1861,8 @@ static void gc_collect(void) {
     while (empty) {
         CellBlock *b = empty;
         empty = b->next;
-        if (spare >= gc_threshold) { cell_block_free(b); blocks_freed++; continue; }
+        /* stress mode unmaps every empty block, to exercise this path */
+        if (gc_stress || spare >= gc_threshold) { cell_block_free(b); blocks_freed++; continue; }
         for (size_t i = 0; i < b->used; i++) {
             Clove *c = &b->cells[i];
             c->as.cons.head = cell_freelist;
@@ -1880,7 +1881,7 @@ static void gc_collect(void) {
 #ifdef __GLIBC__
     /* glibc keeps freed small chunks in its heap; after a big release
      * (whole blocks, or MBs of arrays) ask it to return the pages */
-    if (blocks_freed || pool_trimmed > (8u << 20)) malloc_trim(0);
+    if ((blocks_freed && !gc_stress) || pool_trimmed > (8u << 20)) malloc_trim(0);
 #endif
 }
 

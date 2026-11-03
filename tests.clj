@@ -4067,6 +4067,11 @@
   (assert= [1 2 9] (persistent! (conj! (transient (subvec v 1 3)) 9)))
   (assert= :ioobe (try (subvec v 5 101) (catch IndexOutOfBoundsException e :ioobe))))
 (assert= :done (loop [v (vec (range 20000))] (if (seq v) (recur (subvec v 1)) :done)))
+;; seq consumers past the first 32-element chunk of a vector
+(assert= [true 500 499500 99 1000 '(40 41 42) 99 70]
+         [(= (map inc (vec (range 1000))) (map inc (range 1000))) (count (filter odd? (vec (range 1000))))
+          (apply + (vec (range 1000))) (let [[a & r] (vec (range 100))] (count r)) (count (into #{} (vec (range 1000))))
+          (take 3 (drop 40 (vec (range 100)))) (last (vec (range 100))) (nth (seq (vec (range 100))) 70)])
 (assert= true (= (hash (cons 1 (lazy-seq [2]))) (hash [1 2])))
 ;; sorted seqs walk lazily; subseq/rsubseq seek to the bound
 (let [s (into (sorted-set) (range 100000))]
