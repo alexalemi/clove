@@ -542,3 +542,7 @@ true
 ["one thousand, two hundred thirty-four|twenty-second|MCMXCIV|minus seven" "1.2345678E+4|1.000E+1|-1.234E-3|1000000000000000000000.0|0.00001" "-1234.50|0001.50|+2.00|      1.50|"]
 ["Space|\\a|Big-World Foo|Hello world|hello" "ab   |abcdefghijkl |3 4 55"]
 [[true true 1]]
+[[false 2 -1] false false]
+[5 true true]
+[[3 4 5 6] (95 96 97 98 99) [1 2 :x] [:y 2] [1 2] [15 16 17 18 19] 70 49 true 100 (2 3) (3 2 1)]
+[nil () () nil (5 8) () (5 3) (3 2 1) ([1 :a]) ([1 :a] [2 :b]) (3 5 8) (8 5 3 2 1)]

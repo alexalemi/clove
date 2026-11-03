@@ -4056,6 +4056,26 @@
 (assert= [true true false] [(= (hash (zipmap (range 100) (range 100))) (hash (into {} (map vector (range 100) (range 100)))))
                             (= (set (range 100)) (set (reverse (range 100))))
                             (= (zipmap (range 100) (range 100)) (assoc (zipmap (range 100) (range 100)) 5 6))])
+;; vector seqs are chunked lazy walks and subvec is an O(1) slice
+(let [v (vec (range 100))]
+  (assert= [[3 4 5 6] '(95 96 97 98 99) [1 2 :x] [:y 2] [1 2] [15 16 17 18 19] {:a 1} 70 49]
+           [(subvec v 3 7) (seq (subvec v 95)) (conj (subvec v 1 3) :x) (assoc (subvec v 1 3) 0 :y)
+            (pop (subvec v 1 4)) (subvec (subvec v 10 90) 5 10) (meta (with-meta (subvec v 1 3) {:a 1}))
+            (nth (subvec v 40 80) 30) (peek (subvec v 1 50))])
+  (assert= [true true true 100 true true] [(= (subvec v 1 4) [1 2 3]) (= (hash (subvec v 1 4)) (hash [1 2 3]))
+                                           (seq? (seq v)) (count (seq v)) (= (seq v) v) (= (hash (seq v)) (hash v))])
+  (assert= [1 2 9] (persistent! (conj! (transient (subvec v 1 3)) 9)))
+  (assert= :ioobe (try (subvec v 5 101) (catch IndexOutOfBoundsException e :ioobe))))
+(assert= :done (loop [v (vec (range 20000))] (if (seq v) (recur (subvec v 1)) :done)))
+(assert= true (= (hash (cons 1 (lazy-seq [2]))) (hash [1 2])))
+;; sorted seqs walk lazily; subseq/rsubseq seek to the bound
+(let [s (into (sorted-set) (range 100000))]
+  (assert= [5000 4999 '(3 4 5) '(99999 99998)] [(first (subseq s >= 5000)) (first (rsubseq s < 5000))
+                                                (take 3 (subseq s > 2)) (take 2 (rseq s))]))
+(assert= ['(3 4 5) '(2 3) '(3 2 1) '(4 3 2) '([1 :a] [2 :b]) '(3 2 1) nil]
+         [(subseq (sorted-set 1 2 3 4 5) > 2) (subseq (sorted-set 1 2 3 4 5) >= 2 < 4)
+          (rsubseq (sorted-set 1 2 3 4 5) < 4) (rsubseq (sorted-set 1 2 3 4 5) > 1 <= 4)
+          (subseq (sorted-map 1 :a 2 :b 3 :c) <= 2) (rseq (sorted-set 3 1 2)) (rseq (sorted-set))])
 (when clove-test-coro?
   ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
   (let [v (reduce (fn [a _] [a]) [] (range 100000))

@@ -568,3 +568,8 @@
 [(clojure.pprint/cl-format nil "~r|~:r|~@r|~r" 1234 22 1994 -7) (clojure.pprint/cl-format nil "~e|~,3e|~e|~f|~f" 12345.678 9.9996 -0.001234 1e21 1e-5) (clojure.pprint/cl-format nil "~$|~,4$|~@$|~,,10$|" -1234.5 1.5 2 1.5)]
 [(clojure.pprint/cl-format nil "~:c|~@c|~:(~a~)|~@(~a~)|~(~a~)" \space \a "big-world foo" "hello WORLD" "HeLLo") (clojure.pprint/cl-format nil "ab~5,4t|abcdefghijkl~10t|~2*~a ~a ~a~:*~a" 1 2 3 4 5)]
 [(do (defrecord CvMR [a b]) [(contains? (map->CvMR {:a 5}) :b) (= (map->CvMR {:a 5}) (->CvMR 5 nil)) (:z (map->CvMR {:z 1}))])]
+;; workstream D: NUL strings, double hashes, subvec slices, vector seqs, sorted iteration
+[(let [a (str "a" (char 0) "b") b (str "a" (char 0) "c")] [(= a b) (count #{a b}) (compare a b)]) (= "" (str (char 0))) (= (keyword (str "a" (char 0) "b")) (keyword (str "a" (char 0) "c")))]
+[(count (hash-set 1e300 ##NaN ##Inf 0.0 -0.0 1.0)) (= (hash 0.0) (hash -0.0)) (= (hash 1) (hash 1N))]
+(let [v (vec (range 100))] [(subvec v 3 7) (seq (subvec v 95)) (conj (subvec v 1 3) :x) (assoc (subvec v 1 3) 0 :y) (pop (subvec v 1 4)) (subvec (subvec v 10 90) 5 10) (nth (subvec v 40 80) 30) (peek (subvec v 1 50)) (= (hash (seq v)) (hash v)) (count (seq v)) (rest [1 2 3]) (rseq [1 2 3])])
+(let [s (sorted-set 1 2 3 5 8) m (sorted-map-by > 1 :a 2 :b 3 :c)] [(rseq (sorted-set)) (subseq s = 2) (subseq s < 0) (subseq s > 8) (subseq s >= 4) (subseq s > 3 < 4) (rsubseq s > 2 < 8) (rsubseq s <= 4) (subseq m > 2) (rsubseq m >= 2) (subseq s > 2 > 1) (rseq s)])
