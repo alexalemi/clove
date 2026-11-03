@@ -12485,7 +12485,8 @@ static Clove *prim_tcp_send_some(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs < 2) clove_error("tcp/send-some*: (fd str [start])");
     int fd = (int)as_int(argv[0], "tcp/send-some*");
     char *s = as_str(argv[1], "tcp/send-some*");
-    size_t total = strlen(s);
+    /* start and the result are byte counts */
+    size_t total = argv[1]->tag == CLOVE_STRING ? argv[1]->as.strx.nbytes : strlen(s);
     size_t start = nargs > 2 ? (size_t)as_int(argv[2], "tcp/send-some*") : 0;
     if (start >= total) return mk_int(0);
     int flags = MSG_NOSIGNAL;

@@ -13,9 +13,10 @@
 (require '[csp :as csp])
 
 ;; ── bencode ────────────────────────────────────────────────────────────────
+;; String lengths are UTF-8 byte counts; clove's count/subs work in codepoints.
 (defn bencode [v]
   (cond
-    (string? v)  (str (count v) ":" v)
+    (string? v)  (str (clove/str-nbytes* v) ":" v)
     (int? v)     (str "i" v "e")
     (vector? v)  (str "l" (apply str (map bencode v)) "e")
     (map? v)     (str "d" (apply str (for [k (sort (keys v))]
@@ -43,8 +44,16 @@
         (re-find #"[0-9]" c)
         (when-let [colon (str/index-of s ":")]
           (let [n (parse-long (subs s 0 colon)) start (inc colon)]
-            (when (>= (count s) (+ start n))
-              [(subs s start (+ start n)) (subs s (+ start n))])))
+            (when (and n (>= (clove/str-nbytes* s) (+ start n)))   ; digits are 1 byte each
+              ;; n bytes span at most n codepoints: binary-search the end
+              (let [e (loop [lo start hi (min (count s) (+ start n))]
+                        (if (>= lo hi)
+                          lo
+                          (let [mid (quot (+ lo hi 1) 2)]
+                            (if (<= (clove/str-nbytes* (subs s start mid)) n)
+                              (recur mid hi)
+                              (recur lo (dec mid))))))]
+                [(subs s start e) (subs s e)]))))
         :else nil))))
 
 ;; ── ops ──────────────────────────────────────────────────────────────────

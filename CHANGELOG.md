@@ -30,6 +30,13 @@
   file natives, so it no longer needs a C compiler to load (neither does
   `clove vendor`, which uses it). The libc globals (`getpid`, `cwd`, `env`…)
   are no longer pulled in by loading it.
+- Network framing counts bytes, not characters: `nrepl.clj` bencode
+  (`(nrepl/bencode {"value" "\"é\""})` gave `3:`), `csp/send!` and
+  `tcp/send-some*` (which also stopped at a NUL), and the clerk server's
+  Content-Length.
+- `http.clj` reads a request in linear time (it rebuilt the buffer on every
+  chunk) and answers 413 past `http/*max-head-bytes*` (64 KB) or
+  `http/*max-body-bytes*` (16 MB).
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02

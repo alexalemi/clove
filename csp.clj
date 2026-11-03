@@ -171,9 +171,9 @@
 
 ;; send! — backpressure-correct: one non-blocking send at a time, parking on
 ;; POLLOUT when the socket buffer is full, so a slow client can't stall the
-;; loop. Returns true if fully sent, false on a dead peer.
+;; loop. Returns true if fully sent, false on a dead peer. Offsets are bytes.
 (defn send! [fd s]
-  (let [len (count s)]
+  (let [len (clove/str-nbytes* s)]
     (loop [sent 0]
       (if (>= sent len)
         true

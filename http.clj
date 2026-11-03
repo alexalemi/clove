@@ -47,26 +47,46 @@
     (let [t (subs s 0 e)]
       (if (<= (clove/str-nbytes* t) clen) t (recur (dec e))))))
 
+;; Requests past these sizes get a 413 and the connection is dropped.
+(def ^:dynamic *max-head-bytes* (* 64 1024))
+(def ^:dynamic *max-body-bytes* (* 16 1024 1024))
+
 ;; Read one full request off a connection (headers, then Content-Length bytes of
-;; body). Returns the request map, or nil if the client hung up first.
+;; body). Returns the request map, :too-large, or nil if the client hung up
+;; first. Chunks pile up in a vector and are joined once, so a large request
+;; costs linear time.
 (defn- read-request [conn]
-  (loop [buf ""]
-    (let [idx (str/index-of buf "\r\n\r\n")]
-      (if idx
-        (let [req  (parse-request-head (subs buf 0 idx))
-              clen (parse-long (or ((:headers req) "content-length") "0"))]
-          (loop [body (subs buf (+ idx 4))]
-            (if (>= (clove/str-nbytes* body) clen)
-              (assoc req :body (trim-to-bytes body clen))
-              (let [more (csp/recv! conn)]
-                (if (nil? more) (assoc req :body body) (recur (str body more)))))))
-        (let [more (csp/recv! conn)]
-          (if (nil? more) nil (recur (str buf more))))))))
+  (loop [chunks [] nbytes 0 tail ""]
+    (let [more (csp/recv! conn)]
+      (cond
+        (nil? more) nil
+        (str/includes? (str tail more) "\r\n\r\n")
+        (let [buf  (apply str (conj chunks more))
+              idx  (str/index-of buf "\r\n\r\n")
+              req  (parse-request-head (subs buf 0 idx))
+              clen (or (parse-long (str/trim (or ((:headers req) "content-length") "0"))) 0)
+              body (subs buf (+ idx 4))]
+          (if (or (> idx *max-head-bytes*) (neg? clen) (> clen *max-body-bytes*))
+            :too-large
+            (loop [parts [body] have (clove/str-nbytes* body)]
+              (if (>= have clen)
+                (assoc req :body (trim-to-bytes (apply str parts) clen))
+                (let [more (csp/recv! conn)]
+                  (if (nil? more)
+                    (assoc req :body (apply str parts))
+                    (recur (conj parts more) (+ have (clove/str-nbytes* more)))))))))
+        :else
+        (let [nbytes (+ nbytes (clove/str-nbytes* more))]
+          (if (> nbytes *max-head-bytes*)
+            :too-large
+            (recur (conj chunks more) nbytes
+                   (let [t (str tail more)] (subs t (max 0 (- (count t) 3)))))))))))
 
 (def ^:private status-text
   {200 "OK" 201 "Created" 204 "No Content" 301 "Moved Permanently"
    302 "Found" 304 "Not Modified" 400 "Bad Request" 401 "Unauthorized"
    403 "Forbidden" 404 "Not Found" 405 "Method Not Allowed"
+   413 "Payload Too Large"
    500 "Internal Server Error" 503 "Service Unavailable"})
 
 (defn- normalize [resp]
@@ -127,10 +147,12 @@
       (when-let [conn (csp/accept! srv)]
         (csp/go                          ; one goroutine per connection
           (when-let [req (read-request conn)]
+            (if (= req :too-large)
+              (csp/send! conn (response->str {:status 413 :body "Payload Too Large"}))
             (let [resp (try (handler req)
                             (catch Throwable e
                               {:status 500 :body (str "Internal Error: " (ex-message e))}))]
-              (csp/send! conn (response->str resp))))
+              (csp/send! conn (response->str resp)))))
           (tcp/close conn))
         (recur)))
     srv)))

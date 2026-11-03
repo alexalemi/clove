@@ -868,7 +868,7 @@ else if(cells.length)boot().then(runAll,function(){});
 (defn clove/clerk-respond [fd status ctype body]
   (tcp/send fd (str "HTTP/1.1 " status
                     "\r\nContent-Type: " ctype
-                    "\r\nContent-Length: " (count body)
+                    "\r\nContent-Length: " (clove/str-nbytes* body)
                     "\r\nConnection: close\r\n\r\n" body))
   (tcp/close fd))
 

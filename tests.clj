@@ -4042,6 +4042,22 @@
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
 ;; ── workstream C: host IO, processes, batteries ──
+;; bencode lengths and network framing count UTF-8 bytes, not codepoints
+(require '[nrepl :as clove-wc-n])
+(assert= "d5:value4:\"é\"e" (clove-wc-n/bencode {"value" "\"é\""}))
+(assert= [{"code" "\"é\""} ""] (clove-wc-n/bdecode "d4:code4:\"é\"e"))
+(assert= [{"code" "(str \"日本語 é\")" "x" ["ü" 1]} ""]
+         (clove-wc-n/bdecode (clove-wc-n/bencode {"code" "(str \"日本語 é\")" "x" ["ü" 1]})))
+(assert= nil (clove-wc-n/bdecode "4:\"é"))                ; 3 of 4 bytes: incomplete
+(when clove-test-coro?
+  (require '[http :as clove-wc-h] '[csp :as clove-wc-csp])
+  (clove-wc-h/serve 8096 (clove-wc-h/router
+                          [[:post "/echo" (fn [req] (str (count (:body req)) ":" (clove/str-nbytes* (:body req))))]]))
+  (assert= "11:13" (:body (clove-wc-csp/<!! (clove-wc-h/post "http://127.0.0.1:8096/echo" "héllo wörld"))))
+  (assert= "40000:60000" (:body (clove-wc-csp/<!! (clove-wc-h/post "http://127.0.0.1:8096/echo"
+                                                                  (apply str (repeat 20000 "aé"))))))
+  (binding [clove-wc-h/*max-body-bytes* 10]                ; request size is capped
+    (assert= 413 (:status (clove-wc-csp/<!! (clove-wc-h/post "http://127.0.0.1:8096/echo" "01234567890"))))))
 (when clove-test-unix?
   ;; IO errors throw (spit to a full disk returned nil; slurp of a dir gave "")
   (assert= "/tmp (Is a directory)"
