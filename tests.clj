@@ -4062,5 +4062,48 @@
          (pr-str (mapv read-string ["0xFFN" "0x8000000000000000" "-0x8000000000000000" "0xffffffffffffffffffff" "2r1010" "1." "1.e5"])))
 (assert= :err (try (bigint "12abc") (catch Exception _ :err)))
 
+;; string escapes: a surrogate pair is one char, \u needs four digits, octal \012
+(assert= ["😀" "\n" "A" "é"] [(read-string "\"\\uD83D\\uDE00\"") (read-string "\"\\012\"") (read-string "\"\\101\"") (read-string "\"\\u00e9\"")])
+(assert= [:err :err :err :err] (mapv #(try (read-string %) (catch Exception _ :err)) ["\"\\u004\"" "\"\\400\"" "\\o400" "\"\\08\""]))
+;; a trailing #_ reads as nothing; read-string takes an opts map
+(assert= 1 (load-string "1 #_2"))
+(assert= nil (read-string "#_ 1"))
+(assert= [:x 3] [(read-string {:eof :x} "") (read-string {:read-cond :allow} "3")])
+;; deep nesting inside a future (1 MiB fiber stack) is a catchable error, not a segfault
+(assert= :so (try @(future (read-string (apply str (repeat 3000 "[")))) (catch Throwable _ :so)))
+(assert= :so (try @(future (pr-str (reduce (fn [a _] [a]) [] (range 100000)))) (catch Throwable _ :so)))
+(assert= 30000 @(future (count (re-find #"\w+" (apply str (repeat 30000 "a"))))))
+;; #() finds % inside a set literal and past 254 forms
+(assert= #{5} (#(do #{%}) 5))
+;; regex: single-char loops iterate (no per-char recursion or budget)
+(assert= [1000000 700000] [(count (re-matches #".*" (apply str (repeat 1000000 "a")))) (count (re-find #"\w+" (apply str (repeat 700000 "a"))))])
+;; regex: negated shorthands in classes, unknown escapes throw, Java escapes and anchors
+(assert= [["" "1" "2"] ", " "ab"] [(str/split "a1b2" #"[\D]") (re-find #"[\W]+" "ab, cd") (re-find #"[\S]+" "  ab cd")])
+(assert= [:err :err :err] (mapv #(try (re-pattern %) (re-find (re-pattern %) "y") (catch Exception _ :err)) ["\\y" "(?z)a" "(?<=a)b"]))
+(assert= ["a.b**" nil "ab" nil "ab" "ab" "ABC" "θηα" 100]
+         [(re-find #"\Qa.b*\E+" "a.b**x") (re-find #"\Qa.b\E" "axb") (re-find #"\Aab" "ab") (re-find #"ab\z" "ab\n")
+          (re-find #"ab\Z" "ab\n") (re-find #"ab$" "ab\n") (re-find #"\x41\u0042\0103" "ABC") (re-find #"[αβγδεζηθ]+" "xθηα")
+          (count (re-find #"a{100}" (apply str (repeat 150 "a"))))])
+(assert= '[("héllo" "wörld" "日本") ("B" "É") ("12" "3") ("h" "llo")]
+         [(re-seq #"\p{L}+" "héllo wörld 123 日本") (re-seq #"\p{Lu}" "aBcÉd") (re-seq #"\p{N}+" "a12b3") (re-seq #"\p{Alpha}+" "héllo")])
+(assert= ["Ab" nil "]a]" "bc" '("h" "ll" "w" "rld") nil nil nil ["2024-03" "2024" "03"] nil nil]
+         [(re-find #"(?i:a)b" "Ab") (re-find #"(?i:a)b" "AB") (re-find #"[]a]+" "]a]b") (re-find #"[^]a]+" "]a]bc")
+          (re-seq #"[a-z&&[^aeiou]]+" "hello world") (re-find #"a++a" "aaa") (re-find #"(?>a+)a" "aaa") (re-find #"(ab)*+ab" "ababab")
+          (re-find #"(?<year>\d{4})-(?<m>\d\d)" "on 2024-03-05") (re-find #"a.b" "a\rb") (re-find #"\1(a)" "aa")])
+;; printing keeps bytes after a NUL, and escapes \b \f like the JVM
+(assert= [3 5 "\"\\b\\f\""] [(count (str "a" (char 0) "b")) (count (pr-str (str "a" (char 0) "b"))) (pr-str "\b\f")])
+
+;; format: widths and precision count codepoints, nil is "null", %d wants an integer
+(assert= ["    é|" "日本  |" "é|" "  é|" "null" " null|" "日本    |"]
+         [(format "%5s|" "é") (format "%-4s|" "日本") (format "%.1s|" "é") (format "%3c|" \é) (format "%s" nil) (format "%5s|" nil) (format "%-6.2s|" "日本語")])
+(assert= [:err :err :err] (mapv #(try (format "%d" %) (catch Exception _ :err)) [2.0 1/2 \a]))
+;; Math/round saturates and rounds exactly; max/min let NaN win; parse-double is Double/parseDouble
+(assert= [9223372036854775807 9223372036854775807 0 0 -2 3 -9223372036854775808]
+         [(Math/round 1e19) (Math/round 1e20) (Math/round 0.49999999999999994) (Math/round ##NaN) (Math/round -2.5) (Math/round 2.5) (Math/round -1e20)])
+(assert= "[##NaN ##NaN ##NaN ##NaN 2.0 2 1.0 1]" (pr-str [(max ##NaN 1) (max 1 ##NaN) (min ##NaN 1) (max 1 2 ##NaN 3) (max 1 2.0) (max 2 1.0) (min 1 1.0) (max 1.0 1)]))
+(assert= "(nil nil ##NaN ##Inf 8.0 1.5 1.5 0.5 5.0 nil nil)"
+         (pr-str (map parse-double ["inf" "nan" "NaN" "Infinity" "0x1p3" " 1.5 " "1.5f" ".5" "5." "0x10" "1_0"])))
+(assert= [:err :err] [(try (char -1) (catch Exception _ :err)) (try (nth [1 2] 9.223372036854775807E18) (catch Exception _ :err))])
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

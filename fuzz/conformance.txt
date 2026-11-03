@@ -574,3 +574,10 @@
 [(rem 7/2 1) (mod -7/2 2) (mod 1/2 1/3) (quot 7/2 1) (quot 7/2 1/3) (rem 7/2 1/3) (quot 7 2/3) (mod 7 -2/3) (quot 1/2 0.25) (quot 7N 2.0) (quot 3/2 2N)]
 [(read-string "0xFFN") (read-string "0x8000000000000000") (read-string "-0x8000000000000000") (read-string "36rZZZZZZZZZZZZZZ") (read-string "1.e5")]
 (mapv #(try (read-string %) (catch Exception _ :err)) ["12abc" "1.2.3" "1e" "2r2" "37r1" "0x" "0xG" "1/-2"])
+[(read-string "\"\\uD83D\\uDE00\"") (read-string "\"\\012\"") (read-string "\"\\101\"") (load-string "1 #_2") (pr-str "\b\f")]
+[(clojure.string/split "a1b2" #"[\D]") (re-find #"[\W]+" "ab, cd") (re-find #"\Qa.b*\E+" "a.b**x") (re-find #"ab\Z" "ab\n") (re-find #"ab$" "ab\n") (re-find #"\x41\u0042\0103" "ABC") (count (re-find #"a{100}" (apply str (repeat 150 "a"))))]
+[(re-find #"(?i:a)b" "Ab") (re-find #"(?i:a)b" "AB") (re-find #"[]a]+" "]a]b") (re-seq #"[a-z&&[^aeiou]]+" "hello world") (re-find #"a++a" "aaa") (re-find #"(?>a+)a" "aaa") (re-find #"(?<year>\d{4})-(?<m>\d\d)" "on 2024-03-05") (re-find #"a.b" "a\rb") (re-seq #"\p{Alpha}+" "hello1")]
+[(format "%5s|" "é") (format "%-4s|" "日本") (format "%.1s|" "é") (format "%3c|" \é) (format "%s" nil) (format "%5s|" nil) (format "%-6.2s|" "日本語") (format "%S" nil)]
+[(Math/round 1e19) (Math/round 1e20) (Math/round 0.49999999999999994) (Math/round ##NaN) (Math/round -2.5) (Math/round -1e20)]
+[(max ##NaN 1) (max 1 ##NaN) (min ##NaN 1) (max 1 2 ##NaN 3) (max 1 2.0) (max 2 1.0) (min 1 1.0)]
+(map parse-double ["inf" "nan" "NaN" "Infinity" "-Infinity" "0x1p3" " 1.5 " "1.5f" "1.5d" ".5" "5." "+1" "1_0" "" "0x10" "1e400"])

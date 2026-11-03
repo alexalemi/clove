@@ -13,6 +13,40 @@
 - The esoteric-language interpreter example is now `examples/tape.clj`
   ("Tape Machine").
 
+### Fixed
+- `(quot Long/MIN_VALUE -1)`, `rem` and `mod` crashed the process with
+  SIGFPE; they now wrap like the JVM. `quot`, `rem` and `mod` on doubles and
+  ratios no longer truncate to longs: `(mod 7.5 2)` is 1.5, `(rem 7/2 1)` is
+  1/2.
+- BigInt division is limb-wise instead of bit-by-bit: summing `(map / (range
+  1 1500))` went from 45 s to 0.3 s. Parsing long BigInt literals is ~15x
+  faster.
+- Number literals must parse as a whole: `[12abc 3]`, `1.2.3`, `1e`, `2r2`,
+  `0x` and `1/-2` are read errors instead of truncated values. Hex and radix
+  literals past a Long read as BigInts (`0xFFN` is `255N`), and
+  `(bigint "12abc")` throws.
+- String literals: `"\uD83D\uDE00"` is one character, `\u` needs four hex
+  digits, and octal escapes (`"\012"`) work. `\o400` is rejected.
+- Reading, printing and regex matching deep or long input inside a `future`
+  raises a catchable stack-overflow error instead of segfaulting.
+- Regex: `x*`, `\w+` and `.*` loop instead of recursing per character, so
+  long inputs no longer hit "too much backtracking". `[\D]`, `[\W]` and
+  `[\S]` match, unknown escapes like `\y` throw, `$` matches before a final
+  newline, and `.` skips `\r`. New: `\p{…}`, `\Q…\E`, `\A` `\z` `\Z`,
+  `\xHH` `\uHHHH` `\0ooo` `\e` `\cX` `\h` `\v` `\R`, scoped flags `(?i:…)`,
+  `[]a]`, class intersection, possessive quantifiers, atomic and named
+  groups, `a{100}` and longer classes of non-ASCII characters.
+- `format` pads and truncates `%s`/`%c` by characters, not bytes; `nil`
+  formats as `null`; `(format "%d" 2.0)` throws.
+- `str`, `pr-str` and `upper-case` keep the bytes after a NUL in a string;
+  `pr-str` escapes `\b` and `\f`.
+- `Math/round` saturates at the Long range and rounds 0.49999999999999994
+  to 0. `(max ##NaN 1)` is `##NaN`. `parse-double` follows
+  `Double/parseDouble` (`"Infinity"`, `" 1.5 "`, `"0x1p3"`; not `"inf"`).
+  `(char -1)` throws.
+- A trailing `#_form` at the end of input reads as nothing, and
+  `read-string` takes an options map (`:eof`).
+
 ## v0.9.0 — 2026-11-02
 
 ### Changed
