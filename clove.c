@@ -367,6 +367,8 @@ static bool int_value(Clove *v, int64_t *out);
 static char *big_to_decimal(Clove *v);
 static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R);
 static bool big_is_zero(Clove *A);
+static Clove *big_addsub(Clove *A, Clove *B, int sub);
+static Clove *big_mul(Clove *A, Clove *B);
 static Clove *bd_parse(const char *t, size_t n);
 static Clove *make_ratio(Clove *num, Clove *den);
 static Clove *to_seq(Clove *v);
@@ -3104,6 +3106,82 @@ static Clove *read_tagged(Clove *tag, Clove *form) {
     return mk_cons(mk_sym(intern("quote", 5)), mk_cons(tl, NIL));
 }
 
+/* Digits in a radix as a magnitude (INT, or BIGINT past int64); NULL when
+ * a character is not a digit of that radix or there are none. */
+static Clove *radix_digits(const char *s, size_t len, int radix) {
+    if (len == 0) return NULL;
+    uint64_t u = 0; Clove *acc = NULL;
+    for (size_t i = 0; i < len; i++) {
+        int c = (unsigned char)s[i];
+        int dv = c >= '0' && c <= '9' ? c - '0' : isalpha(c) ? tolower(c) - 'a' + 10 : 99;
+        if (dv >= radix) return NULL;
+        if (!acc && u <= ((uint64_t)INT64_MAX - (uint64_t)dv) / (uint64_t)radix) { u = u * (uint64_t)radix + (uint64_t)dv; continue; }
+        if (!acc) acc = mk_int((int64_t)u);
+        acc = big_addsub(big_mul(acc, mk_int(radix)), mk_int(dv), 0);
+    }
+    return acc ? acc : mk_int((int64_t)u);
+}
+
+/* A number token, by Clojure's LispReader patterns: the whole token must
+ * match or it is an error ([12abc 3] is not [12 3]). Integers: decimal
+ * (leading zeros stay decimal, a clove choice: 017 is 17), 0x hex, NNrDDD
+ * radix, optional N; hex and radix past a Long become BigInts. Ratios
+ * d/d, floats d(.d*)?(e[+-]?d)?, and a trailing M for BigDecimal. */
+static Clove *read_number(const char *start, size_t n) {
+    const char *q = start, *e = start + n;
+    bool neg = false;
+    if (*q == '+' || *q == '-') neg = *q++ == '-';
+    size_t m = (size_t)(e - q);
+#define BADNUM() rd_error("Invalid number: %.*s", (int)(n > 80 ? 80 : n), start)
+    size_t dn = 0; while (dn < m && isdigit((unsigned char)q[dn])) dn++;
+    Clove *mag = NULL; bool hasN = false;
+    if (dn == m || (dn + 1 == m && q[dn] == 'N')) {            /* decimal integer */
+        hasN = dn < m;
+        if (!hasN && dn < 19) {
+            int64_t v = 0; for (size_t i = 0; i < dn; i++) v = v * 10 + (q[i] - '0');
+            return mk_int(neg ? -v : v);
+        }
+        mag = big_from_decimal(q);                               /* stops at N */
+    } else if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {   /* hex */
+        hasN = e[-1] == 'N';
+        mag = radix_digits(q + 2, m - 2 - hasN, 16);
+    } else if (dn >= 1 && dn <= 2 && q[0] != '0' && (q[dn] == 'r' || q[dn] == 'R')) {
+        int radix = atoi(q);
+        if (radix < 2 || radix > 36) rd_error("Radix out of range: %.*s", (int)(n > 80 ? 80 : n), start);
+        mag = radix_digits(q + dn + 1, m - dn - 1, radix);
+    } else if (dn > 0 && q[dn] == '/') {                        /* ratio */
+        const char *d = q + dn + 1;
+        if (d == e) BADNUM();
+        for (const char *t = d; t < e; t++) if (!isdigit((unsigned char)*t)) BADNUM();
+        Clove *num = big_from_decimal(q);                        /* stops at / */
+        return make_ratio(neg ? big_addsub(mk_int(0), num, 1) : num, big_from_decimal(d));
+    } else if (e[-1] == 'M') {
+        Clove *d = bd_parse(start, n - 1);
+        if (!d || !isdigit((unsigned char)q[0])) BADNUM();
+        return d;
+    } else {                                                     /* float */
+        size_t i = dn;
+        if (i < m && q[i] == '.') { i++; while (i < m && isdigit((unsigned char)q[i])) i++; }
+        if (i < m && (q[i] == 'e' || q[i] == 'E')) {
+            i++;
+            if (i < m && (q[i] == '+' || q[i] == '-')) i++;
+            size_t j = i; while (i < m && isdigit((unsigned char)q[i])) i++;
+            if (i == j) BADNUM();
+        }
+        if (i != m) BADNUM();
+        char sbuf[64];
+        char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
+        memcpy(buf, start, n); buf[n] = '\0';
+        double dv = strtod(buf, NULL);
+        if (buf != sbuf) free(buf);
+        return mk_double(dv);
+    }
+    if (!mag) BADNUM();
+#undef BADNUM
+    if (neg) mag = big_addsub(mk_int(0), mag, 1);
+    return hasN ? to_bigint(mag) : mag;
+}
+
 static Clove *read_atom(const char **p) {
     const char *start = *p;
     while (is_sym_char((unsigned char)**p)) (*p)++;
@@ -3114,88 +3192,7 @@ static Clove *read_atom(const char **p) {
     bool is_num = (isdigit((unsigned char)start[0]) ||
                    ((start[0] == '+' || start[0] == '-') && n > 1 &&
                     isdigit((unsigned char)start[1])));
-    if (is_num) {
-        /* Plain decimal integer (optional sign, digits, optional trailing N):
-         * may exceed int64 -> bigint. Detected first, before the 64-char buf cap,
-         * so arbitrarily long literals parse. An N suffix is a BigInt at any
-         * size (1N); without one, a value that fits is a Long. */
-        {
-            const char *q = start; size_t m = n;
-            if (m && (*q == '+' || *q == '-')) { q++; m--; }
-            bool hasN = m > 0 && q[m - 1] == 'N';
-            size_t dn = hasN ? m - 1 : m;
-            bool alldig = dn > 0;
-            for (size_t i = 0; i < dn && alldig; i++) if (q[i] < '0' || q[i] > '9') alldig = false;
-            if (alldig && (hasN || dn >= 19)) {
-                char *tmp = xmalloc(n + 1); memcpy(tmp, start, n); tmp[n] = '\0';
-                Clove *r = big_from_decimal(tmp);   /* stops at the trailing N */
-                free(tmp);
-                return hasN ? to_bigint(r) : r;
-            }
-        }
-        /* BigDecimal literal: 1.5M, 1M, 1E+3M -- the decimal text before M */
-        if (start[n - 1] == 'M') {
-            Clove *d = bd_parse(start, n - 1);
-            if (!d) rd_error("invalid number: %.*s", (int)n, start);
-            return d;
-        }
-        /* ratio literal: [+-]?digits/digits -> exact rational */
-        {
-            const char *slash = memchr(start, '/', n);
-            const char *ns = start; if (*ns == '+' || *ns == '-') ns++;
-            if (slash && slash > ns && slash + 1 < start + n) {
-                bool ok = true;
-                for (const char *q = ns; q < slash && ok; q++) if (*q < '0' || *q > '9') ok = false;
-                for (const char *q = slash + 1; q < start + n && ok; q++) if (*q < '0' || *q > '9') ok = false;
-                if (ok) {
-                    char *nb = xmalloc(n + 1), *db = xmalloc(n + 1);
-                    size_t nl = (size_t)(slash - start), dl = (size_t)(start + n - slash - 1);
-                    memcpy(nb, start, nl); nb[nl] = '\0';
-                    memcpy(db, slash + 1, dl); db[dl] = '\0';
-                    Clove *num = big_from_decimal(nb), *den = big_from_decimal(db);
-                    free(nb); free(db);
-                    return make_ratio(num, den);
-                }
-            }
-        }
-        /* stack copy for the common case; a long literal (a 70-digit
-         * double) gets a heap copy instead of a "number too long" error.
-         * Only the double path below can return after a heap copy. */
-        char sbuf[64];
-        char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
-        memcpy(buf, start, n); buf[n] = '\0';
-        if (buf != sbuf) {
-            double dv = strtod(buf, NULL);
-            bool flt = memchr(buf, '.', n) || memchr(buf, 'e', n) || memchr(buf, 'E', n);
-            free(buf);
-            if (!flt) rd_error("invalid number: %.*s", (int)(n > 80 ? 80 : n), start);
-            return mk_double(dv);
-        }
-        int64_t sign = 1;
-        char *d = buf;
-        if (*d == '+' || *d == '-') { if (*d == '-') sign = -1; d++; }
-        /* hex: 0x1F / 0XFF — parse UNSIGNED then cast, so a full-width literal
-         * like 0xbf58476d1ce4e5b9 wraps to its signed long value (Java-like)
-         * instead of clamping to LLONG_MAX. */
-        if (d[0] == '0' && (d[1] == 'x' || d[1] == 'X') && d[2])
-            return mk_int(sign * (int64_t)strtoull(d + 2, NULL, 16));
-        /* radix: 2r1010, 16rFF, 36rZ (Clojure's <radix>r<digits>) */
-        char *rp = strchr(d, 'r'); if (!rp) rp = strchr(d, 'R');
-        if (rp && rp != d && rp[1]) {
-            *rp = '\0';
-            long radix = strtol(d, NULL, 10);
-            if (radix >= 2 && radix <= 36)
-                return mk_int(sign * (int64_t)strtoull(rp + 1, NULL, (int)radix));
-            *rp = 'r';
-        }
-        bool is_float = false;
-        for (size_t i = 0; i < n; i++)
-            if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') is_float = true;
-        if (is_float) return mk_double(strtod(buf, NULL));
-        /* NB: leading-zero stays DECIMAL (017 => 17), not octal — a deliberate
-         * clove choice to avoid the octal footgun (see tests.clj). */
-        return mk_int(strtoll(buf, NULL, 10));
-    }
+    if (is_num) return read_number(start, n);
 
     /* Keyword? */
     if (start[0] == ':') {

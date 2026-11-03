@@ -4055,5 +4055,12 @@
          (map str [(quot 999999999999999999999999999999999999999999999999999999999999N 3333333333333333333345678N) (rem 999999999999999999999999999999999999999999999999999999999999N 3333333333333333333345678N) (quot -999999999999999999999999999999999999999999999999999999999999N 3333333333333333333345678N) (rem -999999999999999999999999999999999999999999999999999999999999N 3333333333333333333345678N)]))
 (assert= 1312 (count (str (reduce + (map / (range 1 1500))))))
 
+;; number tokens must parse whole: [12abc 3] used to read as [12 3]
+(assert= [:err :err :err :err :err :err :err :err :err]
+         (mapv #(try (read-string %) (catch Exception _ :err)) ["12abc" "1.2.3" "1e" "2r2" "37r1" "0x" "0xG" "1/-2" "3.14abc"]))
+(assert= "[255N 9223372036854775808N -9223372036854775808 1208925819614629174706175N 10 1.0 100000.0]"
+         (pr-str (mapv read-string ["0xFFN" "0x8000000000000000" "-0x8000000000000000" "0xffffffffffffffffffff" "2r1010" "1." "1.e5"])))
+(assert= :err (try (bigint "12abc") (catch Exception _ :err)))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

@@ -516,6 +516,8 @@ embeddability matter; use bb or the JVM where throughput does.
 - There is no separate `java.math.BigInteger`: `biginteger` returns a BigInt
   (same arithmetic as the JVM's, but it prints `3N` where Java prints `3`),
   and `numerator`/`denominator` of a ratio return longs when they fit
+- An integer literal with a leading zero is decimal: `017` reads as 17 and
+  `08` as 8. Clojure reads `017` as octal 15 and rejects `08`
 - Float division by zero is `##Inf`/`##NaN` whatever the operand types, as in
   compiled Clojure with primitive doubles; boxed JVM math (and babashka) throws
 - Hash maps iterate in **insertion order at every size**. The JVM agrees up
