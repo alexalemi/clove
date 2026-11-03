@@ -3713,6 +3713,12 @@ static const char *sym_amp(void) {
  *   {:keys [a b] :or {a 1} :as m}
  * :or defaults are forms, evaluated in `scope` when the key is missing. */
 static Clove *kvseq_to_map(Clove *s);
+/* "a/b" -> "b"; a name without a namespace is returned as is */
+static const char *bare_name(const char *nm) {
+    const char *sl = strrchr(nm, '/');
+    return (sl && sl != nm && sl[1]) ? sl + 1 : nm;
+}
+
 static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
     /* ^{..}sym in a binding position arrives as the deferred (with-meta sym m)
      * form — bind the symbol, drop the meta (Clojure keeps only type hints
@@ -3776,7 +3782,20 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                     env_define(scope, sym_name(spec, ":as"), value);
                     continue;
                 }
-                if (k->as.kw == KW_KEYS) {
+                /* {:a/keys [b]} / {::keys [b]} / {:a/syms [b]}: bare names
+                 * look up keys (or symbols) in namespace a */
+                const char *dir = k->as.kw, *kns = NULL;
+                size_t knl = 0;
+                {
+                    const char *ks = strrchr(dir, '/');
+                    if (ks && ks != dir && ks[1]) {
+                        kns = dir; knl = (size_t)(ks - dir);
+                        dir = intern(ks + 1, strlen(ks + 1));
+                        if (dir != KW_KEYS && dir != KW_SYMS)
+                            clove_error("destructure: unsupported map directive :%s", k->as.kw);
+                    }
+                }
+                if (dir == KW_KEYS) {
                     if (spec == NIL || spec->tag != CLOVE_VECTOR)
                         clove_error("destructure: :keys needs a vector of symbols");
                     for (size_t j = 0; j < vec_len(spec); j++) {
@@ -3785,6 +3804,7 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                         if (elt == NIL) continue;   /* a #?(:cljs ..)-only key elides to nil */
                         const char *nm = elt->tag == CLOVE_KEYWORD
                                          ? elt->as.kw : sym_name(elt, ":keys");
+                        if (kns) nm = intern_qual_n(kns, knl, bare_name(nm), strlen(bare_name(nm)));
                         Clove *kw = mk_kw(nm);   /* lookup key keeps the namespace */
                         /* a namespaced key ({:keys [a/b]} / {:keys [::foo]}) binds
                          * the BARE local name (b / foo) to the namespaced value. */
@@ -3803,24 +3823,28 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                     }
                     continue;
                 }
-                if (k->as.kw == KW_STRS || k->as.kw == KW_SYMS) {
+                if (dir == KW_STRS || dir == KW_SYMS) {
                     /* {:strs [a b]} → (get m "a"); {:syms [a b]} → (get m 'a) */
                     if (spec == NIL || spec->tag != CLOVE_VECTOR)
                         clove_error("destructure: :%s needs a vector of symbols", k->as.kw);
-                    bool syms = (k->as.kw == KW_SYMS);
+                    bool syms = (dir == KW_SYMS);
                     for (size_t j = 0; j < vec_len(spec); j++) {
                         Clove *elt = vec_nth(spec, j);
                         if (elt == NIL) continue;
                         const char *nm = sym_name(elt, syms ? ":syms" : ":strs");
+                        if (kns) nm = intern_qual_n(kns, knl, bare_name(nm), strlen(bare_name(nm)));
+                        const char *slash = syms ? strrchr(nm, '/') : NULL;
+                        const char *local = (slash && slash[1])
+                                            ? intern(slash + 1, strlen(slash + 1)) : nm;
                         Clove *key = syms ? mk_sym(nm) : mk_str(nm, strlen(nm));
                         Clove *v = NIL;
                         bool found = value != NIL && value->tag == CLOVE_MAP &&
                                      map_find(value, key, &v);
                         if (!found && defaults && defaults->tag == CLOVE_MAP) {
                             Clove *d;
-                            if (map_find(defaults, mk_sym(nm), &d)) v = eval(scope, d);
+                            if (map_find(defaults, mk_sym(local), &d)) v = eval(scope, d);
                         }
-                        env_define(scope, nm, v);
+                        env_define(scope, local, v);
                     }
                     continue;
                 }
@@ -8840,8 +8864,16 @@ static Clove *prim_merge(CloveEnv *env, Clove **argv, int nargs) {
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Clove *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("merge: %s is not a map", val_desc(m));
-        if (r == NIL) { r = m; continue; }
+        bool mapish = m->tag == CLOVE_MAP || m->tag == CLOVE_SORTED;
+        if (r == NIL) {
+            if (mapish) { r = m; continue; }
+            r = mk_map();
+        }
+        if (!mapish || (r->tag != CLOVE_MAP && r->tag != CLOVE_SORTED)) {
+            Clove *ca[2] = { r, m };
+            r = prim_conj(env, ca, 2);
+            continue;
+        }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
         if (m->tag == CLOVE_SORTED) {
             for (Clove *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
@@ -13788,7 +13820,8 @@ static const char *PRELUDE =
     "(defn mapcat [f coll] (apply concat (map f coll)))\n"
     "(defn remove [pred coll] (filter (complement pred) coll))\n"
     "(defn keep [f coll] (filter some? (map f coll)))\n"
-    "(defn butlast [coll] (reverse (rest (reverse coll))))\n"
+    "(defn butlast [coll]\n"
+    "  (loop [ret [] s (seq coll)] (if (next s) (recur (conj ret (first s)) (next s)) (seq ret))))\n"
     "(defn every? [pred coll]\n"
     "  (loop [s (seq coll)]\n"
     "    (cond (nil? s) true\n"
@@ -13806,8 +13839,8 @@ static const char *PRELUDE =
     "      (recur (next s) (cons (first s) acc))\n"
     "      (reverse acc))))\n"
     "(defn drop-while [pred coll]\n"
-    "  (loop [s (seq coll)]\n"
-    "    (if (and s (pred (first s))) (recur (next s)) s)))\n"
+    "  (lazy-seq (loop [s (seq coll)]\n"
+    "              (if (and s (pred (first s))) (recur (next s)) s))))\n"
     "(defn interleave [c1 c2]\n"
     "  (loop [a (seq c1) b (seq c2) acc (list)]\n"
     "    (if (and a b)\n"
@@ -13817,25 +13850,27 @@ static const char *PRELUDE =
     "(defn partition\n"
     "  ([n coll] (partition n n coll))\n"
     "  ([n step coll]\n"
-    "   (loop [s (seq coll) acc (list)]\n"
-    "     (let [chunk (take n s)]\n"
-    "       (if (< (count chunk) n)\n"
-    "         (reverse acc)\n"
-    "         (recur (seq (drop step s)) (cons chunk acc))))))\n"
+    "   (lazy-seq (let [s (seq coll) p (take n s)]\n"
+    "               (if (and s (= n (count p)))\n"
+    "                 (cons p (partition n step (drop step s)))))))\n"
     "  ([n step pad coll]\n"          /* pad the final short partition (Clojure's 4-arity) */
-    "   (loop [s (seq coll) acc (list)]\n"
-    "     (if s\n"
-    "       (let [chunk (take n s)]\n"
-    "         (if (= n (count chunk))\n"
-    "           (recur (seq (drop step s)) (cons chunk acc))\n"
-    "           (reverse (cons (take n (concat chunk pad)) acc))))\n"
-    "       (reverse acc)))))\n"
-    "(defn distinct [coll]\n"
-    "  (reverse (loop [s (seq coll) acc (list)]\n"
-    "    (if s\n"
-    "      (let [x (first s)]\n"
-    "        (recur (next s) (if (some (fn [y] (= x y)) acc) acc (cons x acc))))\n"
-    "      acc))))\n"
+    "   (lazy-seq (let [s (seq coll) p (take n s)]\n"
+    "               (if s\n"
+    "                 (if (= n (count p))\n"
+    "                   (cons p (partition n step pad (drop step s)))\n"
+    "                   (list (take n (concat p pad)))))))))\n"
+    "(defn distinct\n"
+    "  ([] (distinct-xf))\n"
+    "  ([coll]\n"
+    "   (let [step (fn step [s seen]\n"
+    "                (lazy-seq\n"
+    "                  (loop [s (seq s)]\n"
+    "                    (when s\n"
+    "                      (let [x (first s)]\n"
+    "                        (if (contains? seen x)\n"
+    "                          (recur (next s))\n"
+    "                          (cons x (step (rest s) (conj seen x)))))))))]\n"
+    "     (step coll #{}))))\n"
     "(defn group-by [f coll]\n"
     "  (reduce (fn [m x] (let [k (f x)] (assoc m k (conj (get m k []) x)))) {} coll))\n"
     "(defn frequencies [coll]\n"
@@ -13865,8 +13900,7 @@ static const char *PRELUDE =
     /* string helpers */
     "(defn str/join\n"
     "  ([coll] (apply str coll))\n"
-    "  ([sep coll] (if (empty? coll) \"\"\n"
-    "                  (reduce (fn [a b] (str a sep b)) (str (first coll)) (rest coll)))))\n"
+    "  ([sep coll] (apply str (interpose sep coll))))\n"
     /* control-flow macros */
     "(defmacro if-let [bindings then & else]\n"
     "  `(let [t# ~(nth bindings 1)]\n"
@@ -14110,7 +14144,7 @@ static const char *PRELUDE =
     "        (if (= hit :clove/memo-miss)\n"
     "          (let [v (apply f args)] (swap! cache assoc args v) v)\n"
     "          hit)))))\n"
-    "(defn take-last [n coll] (drop (max 0 (- (count coll) n)) coll))\n"
+    "(defn take-last [n coll] (seq (drop (max 0 (- (count coll) n)) coll)))\n"
     "(defn drop-last\n"
     "  ([coll] (drop-last 1 coll))\n"
     "  ([n coll] (take (max 0 (- (count coll) n)) coll)))\n"
@@ -14559,7 +14593,7 @@ static const char *PRELUDE =
     "        (persistent! t)))))\n"
     "(defn replace\n"
     "  ([smap] (map (fn [x] (if (contains? smap x) (get smap x) x))))\n"
-    "  ([smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
+    "  ([smap coll] ((if (vector? coll) mapv map) (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
     "(defn replicate [n x] (repeat n x))\n"
     "(defn nthnext [coll n] (loop [n n s (seq coll)] (if (and (pos? n) s) (recur (dec n) (next s)) s)))\n"
     "(defn rseq [v] (seq (reverse v)))\n"
@@ -14650,7 +14684,7 @@ static const char *PRELUDE =
     "  ([bindings then else]\n"
     "   `(let [v# ~(second bindings)] (if (nil? v#) ~else (let [~(first bindings) v#] ~then)))))\n"
     "(defn ->Eduction [xform coll] (sequence xform coll))\n"
-    "(defn eduction [& args] (sequence (apply comp (butlast args)) (last args)))\n"
+
     "(defn str/triml [s]\n"
     "  (let [n (count s)] (loop [i 0] (if (and (< i n) (str/blank? (subs s i (inc i)))) (recur (inc i)) (subs s i)))))\n"
     "(defn str/trimr [s]\n"
@@ -15096,24 +15130,21 @@ static const char *PRELUDE =
     "              (cons (f i (first s)) (clove/map-indexed-step f (inc i) (rest s))))))\n"
     "(defn map-indexed [f coll] (clove/map-indexed-step f 0 coll))\n"
     "(defn keep-indexed [f coll] (filter some? (map-indexed f coll)))\n"
-    "(defn partition-all [n coll]\n"
-    "  (loop [s (seq coll) acc (list)]\n"
-    "    (if s\n"
-    "      (recur (seq (drop n s)) (cons (take n s) acc))\n"
-    "      (reverse acc))))\n"
+
     "(defn zipmap [ks vs]\n"
     "  (loop [k (seq ks) v (seq vs) m {}]\n"
     "    (if (and k v)\n"
     "      (recur (next k) (next v) (assoc m (first k) (first v)))\n"
     "      m)))\n"
     "(defn merge-with [f & ms]\n"
-    "  (reduce (fn [acc m]\n"
-    "            (reduce (fn [a [k v]]\n"
-    "                      (if (contains? a k)\n"
-    "                        (assoc a k (f (get a k) v))\n"
-    "                        (assoc a k v)))\n"
-    "                    acc (seq m)))\n"
-    "          {} ms))\n"
+    "  (when (some identity ms)\n"
+    "    (reduce (fn [acc m]\n"
+    "              (reduce (fn [a [k v]]\n"
+    "                        (if (contains? a k)\n"
+    "                          (assoc a k (f (get a k) v))\n"
+    "                          (assoc a k v)))\n"
+    "                      (or acc {}) (seq m)))\n"
+    "            ms)))\n"
     "(defn reduce-kv [f init m]\n"
     "  (if (map? m)\n"
     "    (reduce (fn [acc [k v]] (f acc k v)) init (seq m))\n"
@@ -15137,16 +15168,18 @@ static const char *PRELUDE =
     "                   fnspecs)]\n"
     "     ~@body))\n"
     "(defmacro condp [pred expr & clauses]\n"
-    "  (let [p (gensym \"p\") e (gensym \"e\")]\n"
-    "    (list 'let [p pred e expr]\n"
-    "      (cons 'cond\n"
-    "        (loop [cs clauses acc (list)]\n"
-    "          (if (empty? cs)\n"
-    "            (reverse (cons '(throw (IllegalArgumentException. \"condp: no matching clause\")) (cons :else acc)))\n"
-    "            (if (empty? (rest cs))\n"
-    "              (reverse (cons (first cs) (cons :else acc)))\n"
-    "              (recur (rest (rest cs))\n"
-    "                     (cons (first (rest cs)) (cons (list p (first cs) e) acc))))))))))\n"
+    "  (let [p (gensym \"p\") e (gensym \"e\")\n"
+    "        emit (fn emit [cs]\n"
+    "               (cond\n"
+    "                 (empty? cs) (list 'throw (list 'IllegalArgumentException.\n"
+    "                                                (list 'str \"No matching clause: \" e)))\n"
+    "                 (empty? (rest cs)) (first cs)\n"
+    "                 (= :>> (second cs))\n"
+    "                 (let [r (gensym \"r\")]\n"
+    "                   (list 'let [r (list p (first cs) e)]\n"
+    "                         (list 'if r (list (nth cs 2) r) (emit (drop 3 cs)))))\n"
+    "                 :else (list 'if (list p (first cs) e) (second cs) (emit (drop 2 cs)))))]\n"
+    "    (list 'let [p pred e expr] (emit clauses))))\n"
     /* clojure.core.match subset: match a value against vector patterns. A symbol
        binds (a bare _ is a wildcard), a keyword/number/etc. compares by =, and a
        vector pattern recurses element-wise. Enough for Emmy's arity combination. */
@@ -15215,7 +15248,7 @@ static const char *PRELUDE =
     "  ([coll] (dorun coll) coll)\n"
     "  ([n coll] (loop [k n s (seq coll)] (when (and s (pos? k)) (recur (dec k) (next s)))) coll))\n"
     "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
-    "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
+    "  (filter (complement sequential?) (rest (tree-seq sequential? seq coll))))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defn ifn? [x] (or (fn? x) (keyword? x) (symbol? x) (map? x) (set? x) (vector? x)))\n"
     /* var? is a real predicate now (see CLOVE_VAR / resolve-var above) */
@@ -15694,7 +15727,7 @@ CloveEnv *clove_new_env(void) {
         "                   (cons (first s) (cat (rest s) zs))\n"
         "                   (when (seq zs) (cat (first zs) (rest zs))))))]\n"
         "     (cat (concat a b) more))))\n"
-        "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
+        "(defn cycle [c] (lazy-seq (when (seq c) (concat c (cycle c)))))\n"
         "(defn map-xf [f]\n"
         "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x)))\n"
         "             ([acc x & xs] (rf acc (apply f x xs))))))\n"   /* multi-coll transduce */
@@ -15738,7 +15771,21 @@ CloveEnv *clove_new_env(void) {
         "  ([xform f coll] (transduce xform f (f) coll))\n"
         "  ([xform f init coll]\n"
         "   (let [rf (xform f)] (rf (reduce rf init coll)))))\n"
-        "(defn sequence*2 [xform coll] (seq (transduce xform conj [] coll)))\n"
+        "(defn sequence*2 [xform coll]\n"
+        "  (let [buf (volatile! []) done (volatile! false)\n"
+        "        rf (xform (fn ([] nil) ([acc] acc) ([acc x] (vswap! buf conj x) acc)))\n"
+        "        step (fn step [s]\n"
+        "               (lazy-seq\n"
+        "                 (loop [s s]\n"
+        "                   (let [b @buf]\n"
+        "                     (cond\n"
+        "                       (seq b) (do (vreset! buf []) (concat b (step s)))\n"
+        "                       @done nil\n"
+        "                       :else (let [xs (seq s)]\n"
+        "                               (if (and xs (not (reduced? (rf nil (first xs)))))\n"
+        "                                 (recur (rest xs))\n"
+        "                                 (do (vreset! done true) (rf nil) (recur nil)))))))))]\n"
+        "    (step coll)))\n"
         "(defn eduction [& args]\n"
         "  (sequence*2 (apply comp (butlast args)) (last args)))\n"
         /* cheap tier */
@@ -16096,9 +16143,11 @@ CloveEnv *clove_new_env(void) {
         "  ([end] (range 0 end 1))\n"
         "  ([start end] (range start end 1))\n"
         "  ([start end step]\n"
-        "   (if (clove/range-small? start end step)\n"
+        "   (cond\n"
+        "     (zero? step) (if (= start end) () (repeat start))\n"
+        "     (clove/range-small? start end step)\n"
         "     (clove/range-eager start end step)\n"
-        "     (clove/range* start end step))))\n"
+        "     :else (clove/range* start end step))))\n"
         "(defn interleave\n"
         "  ([] (list)) ([c1] (lazy-seq c1))\n"
         "  ([c1 c2]\n"
@@ -16223,14 +16272,12 @@ CloveEnv *clove_new_env(void) {
         "(defn map-indexed ([f] (map-indexed-xf f)) ([f c] (clove/map-indexed-impl f c)))\n"
         "(def clove/keep-indexed-impl keep-indexed)\n"
         "(defn keep-indexed ([f] (keep-indexed-xf f)) ([f c] (clove/keep-indexed-impl f c)))\n"
-        "(def clove/distinct-impl distinct)\n"
-        "(defn distinct ([] (distinct-xf)) ([c] (clove/distinct-impl c)))\n"
+
         "(def clove/dedupe-impl dedupe)\n"
         "(defn dedupe ([] (dedupe-xf)) ([c] (clove/dedupe-impl c)))\n"
         "(def clove/interpose-impl interpose)\n"
         "(defn interpose ([sep] (interpose-xf sep)) ([sep c] (clove/interpose-impl sep c)))\n"
-        "(def clove/partition-all-impl partition-all)\n"
-        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (clove/partition-all-impl n c))\n"
+        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (partition-all n n c))\n"
         "  ([n step c] (lazy-seq (when-let [s (seq c)]\n"
         "                          (cons (take n s) (partition-all n step (drop step s)))))))\n"
         "(def clove/partition-by-impl partition-by)\n"

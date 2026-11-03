@@ -568,3 +568,11 @@
 [(clojure.pprint/cl-format nil "~r|~:r|~@r|~r" 1234 22 1994 -7) (clojure.pprint/cl-format nil "~e|~,3e|~e|~f|~f" 12345.678 9.9996 -0.001234 1e21 1e-5) (clojure.pprint/cl-format nil "~$|~,4$|~@$|~,,10$|" -1234.5 1.5 2 1.5)]
 [(clojure.pprint/cl-format nil "~:c|~@c|~:(~a~)|~@(~a~)|~(~a~)" \space \a "big-world foo" "hello WORLD" "HeLLo") (clojure.pprint/cl-format nil "ab~5,4t|abcdefghijkl~10t|~2*~a ~a ~a~:*~a" 1 2 3 4 5)]
 [(do (defrecord CvMR [a b]) [(contains? (map->CvMR {:a 5}) :b) (= (map->CvMR {:a 5}) (->CvMR 5 nil)) (:z (map->CvMR {:z 1}))])]
+;; workstream B: evaluator, special forms, prelude
+[(let [x 1 f (fn [] x) x 2] (f)) (let [n 1 xs (map #(+ n %) [10 20]) n 100] (vec xs)) (let [[n] [1] g (fn [] n) [n] [2]] (g))]
+[((fn [n & xs] (if (zero? n) xs (recur (dec n) (cons n xs)))) 3) ((fn [acc & more] (if more (recur (+ acc (first more)) (next more)) acc)) 0 1 2 3)]
+[(take 3 (distinct (range))) (take 2 (partition 2 1 (range))) (partition 3 3 [:p] (range 7)) (take 2 (partition-all 2 (range)))]
+[(take 3 (sequence (map inc) (range))) (sequence (map inc) []) (sequence (partition-all 2) [1 2 3]) (take 3 (eduction (map inc) (filter odd?) (range)))]
+[(replace {1 :one} '(1 2)) (replace {1 :one} [1 2]) (cycle []) (butlast [1]) (take-last 0 [1 2]) (str/join "," [1 nil 2])]
+[(condp some [1 2] #{2} :>> inc :none) (let [{:a/keys [b x/c]} {:a/b 1 :x/c 2}] [b c]) (let [{:a/syms [b]} {'a/b 7}] b)]
+[(merge-with + nil nil) (merge-with +) (merge {:a 1} [:b 2]) (flatten {:a 1}) (take 3 (range 0 10 0)) (drop-while odd? [1])]

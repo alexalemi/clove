@@ -568,6 +568,10 @@ embeddability matter; use bb or the JVM where throughput does.
 - Regex `(?i)` folds ASCII case only, and so does `(?iu)`
 - `format` accepts flags after the width (`%10,d`), where Java throws
   `UnknownFormatConversionException`
+- Dereferencing a future whose body threw rethrows that exception itself.
+  The JVM wraps it in an `ExecutionException` (the original is its
+  `ex-cause`), so `(catch ExceptionInfo e …)` around a deref catches here
+  but not there
 
 The live plan (open threads, GC invariants) is in [PLAN.md](PLAN.md); the full
 milestone log is in [HISTORY.md](HISTORY.md).

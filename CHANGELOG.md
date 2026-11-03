@@ -20,6 +20,18 @@
 - `recur` in a variadic fn binds the rest param to the value given, as
   Clojure does; it used to wrap it in another list, so loops over `& more`
   nested, errored or never ended.
+- `distinct`, `partition` (every arity), `partition-all`, `sequence` with a
+  transducer, `eduction`, `replace` on a list, `drop-while` and `split-with`
+  are lazy, so they work on infinite seqs. `distinct` was also quadratic.
+  `(cycle [])` is `()` instead of hanging.
+- `str/join` with a separator is linear; it was quadratic.
+- `butlast` and `take-last` return nil, not `()`, when nothing is left.
+- `condp` supports `:>>`, and with no match it throws "No matching clause: x".
+- Namespaced map destructuring: `{:a/keys [b]}`, `{::keys [b]}`,
+  `{:a/syms [b]}`.
+- `merge-with` of only nils is nil; `merge` takes a `[k v]` entry;
+  `(flatten {:a 1})` is `()`; `(range 0 10 0)` repeats 0 instead of throwing;
+  `(drop-while odd? [1])` is `()`.
 
 ## v0.9.0 — 2026-11-02
 
