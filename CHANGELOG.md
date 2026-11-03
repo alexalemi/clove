@@ -27,6 +27,19 @@
 - A finished coroutine frees its 1 MiB stack at once rather than at the next
   collection (200,000 short coroutines peaked at 2 GB).
 - Hashing or comparing a map or set no longer builds an entry list.
+- Transient maps and sets are real: `assoc!`, `conj!`, `dissoc!` and `disj!`
+  edit in place instead of falling back to the persistent ops. `frequencies`,
+  `group-by`, `into`, `set`, `zipmap` and `update-vals`/`update-keys` build
+  through them: at a million elements `frequencies` went from 2.6 s to 0.5 s
+  and `(into #{} ...)` from 2.6 s to 0.6 s. A transient map or set is no
+  longer `map?`/`set?`, and `persistent!` of one carries no metadata, as on
+  the JVM.
+- Replacing a value in a big map copies only the trie path, not the
+  insertion-order index too: persistent `update`/`assoc-in` loops are about
+  1.6x faster.
+- `update` takes up to three args before the rest, and `fnil` takes two or
+  three defaults, as in Clojure. `(update-in m [] f)` updates the `nil` key
+  as on the JVM (it applied `f` to the whole map).
 
 ### Fixed
 - Strings containing NUL bytes compared, hashed and interned (as keywords

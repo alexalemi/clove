@@ -583,3 +583,8 @@ true
 ["clojure.lang.ExceptionInfo: x {:a 1}" ["java.lang.IllegalStateException: bad" true]]
 [[true "clojure.lang.ExceptionInfo: p {:x 1}"] [true "d"]]
 ["java.lang.ArithmeticException: Divide by zero" :exc "java.util.concurrent.ExecutionException: clojure.lang.ExceptionInfo: x {:a 1}"]
+[2 2 3 9 true ([:b 2] [:c 3])]
+[3 9 false (nil 1 9)]
+[false false nil {:m 1} {:m 1}]
+[{:a 6} {:a 15} 3 6 {nil 1} {:a {:b 1}} [[1 9]] "#{1}"]
+[true 50000 (0 1 2 3 4) true]
