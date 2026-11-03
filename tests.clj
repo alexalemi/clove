@@ -4576,5 +4576,55 @@
 (assert= "#{1}" (pr-str (persistent! (conj! (transient #{1}) 1N))))
 (assert= "#{1}" (pr-str (conj #{1} 1N)))
 
+;; ── workstream H: call path, native update fns, stale stack words ──
+(assert= [nil nil 1 nil 2] [(first []) (next []) (first [1]) (next [1]) (first (next [1 2]))])
+(assert= "(2 3)" (pr-str (next [1 2 3])))
+(assert= {:a 2} (update {:a 1} :a inc))
+(assert= {:a nil} (update {} :a identity))
+(assert= [1 3] (update [1 2] 1 inc))
+(assert= {:a [1 {:b 2}]} (update-in {:a [1 {:b 1}]} [:a 1 :b] inc))
+(assert= {:a {:b 1}} (update-in {} '(:a :b) (fnil inc 0)))
+(assert= {nil 5} (assoc-in {} [] 5))
+(assert= :threw (try (update-in 5 [:a] inc) (catch Exception _ :threw)))
+;; a macro defined after the fn that uses it: the compiled body falls back
+(declare wsh-m)
+(defn wsh-f [x] (wsh-m x))
+(defmacro wsh-m [x] `(let [y# ~x] (fn [] (* 2 y#))))
+(let [gs (doall (for [i (range 500)] (wsh-f i)))]
+  (System/gc)
+  (dotimes [_ 3] (vec (range 20000)))
+  (assert= 249500 (reduce + (map #(%) gs))))
+;; recur into a variadic arity, multi-arity dispatch, arity errors
+(defn wsh-vr [n & xs] (if (zero? n) (count xs) (recur (dec n) (cons n xs))))
+(assert= 10000 (wsh-vr 10000))
+(defn wsh-vr2 [n & [a b]] (if (zero? n) [a b] (recur (dec n) [n a])))
+(assert= [1 2] (wsh-vr2 5000))
+(defn wsh-multi ([] 0) ([a] a) ([a b] (+ a b)) ([a b & more] (apply wsh-multi (+ a b) more)))
+(assert= [0 1 3 15] [(wsh-multi) (wsh-multi 1) (wsh-multi 1 2) (wsh-multi 1 2 3 4 5)])
+(defn wsh-ff ([a] a) ([a b c] c))
+(assert= :threw (try (wsh-ff 1 2) (catch Exception _ :threw)))
+(assert= [3 [1 2]] (let [f (fn [a b & r] [(+ a b) (vec r)])] [(first (f 1 2)) (second (f 0 0 1 2))]))
+;; a self-referential lazy seq still realizes through the forwarding chain
+(def wsh-fib (lazy-cat [0 1] (map + wsh-fib (rest wsh-fib))))
+(assert= 23416728348467685 (nth wsh-fib 80))
+(assert= [0 2 4 6 8] (take 5 (filter even? (iterate inc 0))))
+;; dead data reachable only from stale stack words is released
+(when-not (System/getenv "CLOVE_GC_STRESS")
+  (let [run (fn [src] (try (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src)))
+                           (catch Exception _ nil)))]
+    ;; the loop's locals and the transient's tail used to pin the vector
+    (assert= true (< 3000000 (or (run (str "(let [big (atom (loop [v (transient []) i 0]"
+                                           "  (if (< i 3000000) (recur (conj! v i) (inc i)) (persistent! v))))]"
+                                           "  (gc) (reset! big nil) (prn (gc)))"))
+                                 0)))
+    ;; the realized prefix of an iterate before the first match (1 GB before)
+    (let [[x h] (run (str "(let [h (atom nil)"
+                          "      x (first (filter #(do (when (= % 3000000) (gc) (reset! h (clove/heap-bytes*)))"
+                          "                            (= % 3000000))"
+                          "                       (iterate inc 0)))]"
+                          "  (prn [x @h]))"))]
+      (assert= 3000000 x)
+      (assert= true (< (or h Long/MAX_VALUE) (* 100 1024 1024))))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

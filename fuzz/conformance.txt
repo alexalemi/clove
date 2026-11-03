@@ -622,3 +622,7 @@
 [(= (frequencies (map #(mod % 37) (range 5000))) (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} (map #(mod % 37) (range 5000)))) (count (into #{} (range 50000))) (sort (keys (group-by #(mod % 5) (range 100)))) (= (set (range 3000)) (into #{} (map identity) (range 3000)))]
 ;; workstream G: heap retention
 (System/gc)
+;; workstream H: call path, native update fns
+[(first []) (next []) (next [1]) (next [1 2 3]) (update [1 2] 1 inc) (update {} :a identity) (update-in {:a [1 {:b 1}]} [:a 1 :b] inc) (assoc-in {} [] 5) (update-in {} '(:a :b) (fnil inc 0))]
+(do (defn h-vr [n & xs] (if (zero? n) (count xs) (recur (dec n) (cons n xs)))) (defn h-vr2 [n & [a b]] (if (zero? n) [a b] (recur (dec n) [n a]))) (defn h-m ([] 0) ([a] a) ([a b] (+ a b)) ([a b & more] (apply h-m (+ a b) more))) [(h-vr 2000) (h-vr2 500) (h-m) (h-m 1) (h-m 1 2) (h-m 1 2 3 4 5)])
+(do (def h-fib (lazy-cat [0 1] (map + h-fib (rest h-fib)))) [(nth h-fib 80) (first (filter #(= % 100000) (iterate inc 0)))])

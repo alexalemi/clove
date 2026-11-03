@@ -190,11 +190,13 @@ Things the history log leaves unresolved, roughly by value:
   is bounded by 16x live, so retention tracks the live set. What remains:
   (1) a program that stops allocating never collects, so it holds its last
   cycle's heap until it calls `(System/gc)`; (2) false retention from the
-  conservative scan. `eval_inner`'s ~4 KB frame keeps uninitialized local
-  arrays whose stale words pin dead envs/seqs (e.g. a `loop` env holding a
-  5M vector built by `(atom (loop ... (persistent! v)))` survives every
-  `(gc)` in that form), and a lazy seq's whole tail is pinned by one such
-  word; (3) Binding structs and the malloc arena (`malloc_trim` only on
+  conservative scan. The big special forms live in noinline helpers
+  (`eval_try`, `eval_loop`, ...), so `eval_inner`'s frame is ~150 bytes
+  and holds no arrays; `apply` zeroes its stack env; `vm_compile` and
+  `lazy_force` scrub the stack below them. `lazy_force` forwards each
+  realized step to the end of the chain, so one stale word on an early
+  lazy cell no longer pins the whole tail. At -O0 stale `eval_inner`
+  slots still pin data (not a CI build); (3) Binding structs and the malloc arena (`malloc_trim` only on
   glibc) are not returned. `clove/heap-bytes*` measures (1)-(2) without RSS
   noise.
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
