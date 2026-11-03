@@ -4608,8 +4608,12 @@
 (def wsh-fib (lazy-cat [0 1] (map + wsh-fib (rest wsh-fib))))
 (assert= 23416728348467685 (nth wsh-fib 80))
 (assert= [0 2 4 6 8] (take 5 (filter even? (iterate inc 0))))
-;; dead data reachable only from stale stack words is released
-(when-not (System/getenv "CLOVE_GC_STRESS")
+;; dead data reachable only from stale stack words is released.
+;; Linux only: which dead pointers survive in spill slots and callee-saved
+;; registers is up to the compiler. With clang (macOS) a register save in
+;; apply's prologue can still hold the iterate head, and mingw keeps the
+;; loop's vector in a stale slot; the conservative scan has to honor those.
+(when (and (= :linux (clove/os*)) (not (System/getenv "CLOVE_GC_STRESS")))
   (let [run (fn [src] (try (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src)))
                            (catch Exception _ nil)))]
     ;; the loop's locals and the transient's tail used to pin the vector
