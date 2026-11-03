@@ -22,8 +22,17 @@
 - The fiber scheduler's ready queue pops in O(1): 8,000 futures took 25 s
   and 50,000 ran out of memory.
 - Symbol and keyword intern tables grow; 200,000 distinct keywords took 10 s.
-- The heap shrinks: the collector returns empty cell blocks and surplus
-  recycled arrays to the OS instead of keeping its peak size forever.
+- The heap shrinks: the collector returns empty cell blocks, empty
+  environment blocks and surplus recycled arrays to the OS instead of
+  keeping its peak size forever. `(gc)` and the new `(System/gc)` keep only
+  a small margin; automatic collections release blocks the last cycle never
+  reached. A dropped 5M-element vector goes from 500 MB RSS to 65 MB after
+  one `(gc)` (it stayed at 580 MB).
+- Smaller heaps for small live sets: the adaptive collection floor stays
+  within 16x the live data, and headroom over a large live set is capped at
+  16M cells. A 5M-iteration `loop` peaks at 72 MB instead of 530 MB (system
+  time 0.29 s to 0.03 s); the test suite peaks at 2.7 GB instead of 5.2 GB.
+- `(clove/heap-bytes*)` reports the bytes the collector has mapped for cells.
 - A finished coroutine frees its 1 MiB stack at once rather than at the next
   collection (200,000 short coroutines peaked at 2 GB).
 - Hashing or comparing a map or set no longer builds an entry list.
@@ -42,6 +51,11 @@
   as on the JVM (it applied `f` to the whole map).
 
 ### Fixed
+- The collector no longer keeps dead data alive through its own stack
+  frame (uninitialized words, and the unwritten signal-mask part of the
+  `jmp_buf`) or through words that hold the high half of an old heap
+  pointer over a small int; cell blocks now avoid the addresses those words
+  point at. Each kept a dropped structure alive in some runs.
 - Strings containing NUL bytes compared, hashed and interned (as keywords
   and symbols) only up to the first NUL: `(= "" (str (char 0)))` was true.
 - Hashing a double no longer has undefined behavior for NaN, infinities and

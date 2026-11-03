@@ -620,3 +620,5 @@
 [(map? (transient {})) (set? (transient #{})) (meta (persistent! (transient (with-meta {:a 1} {:m 1})))) (meta (into (with-meta {} {:m 1}) [[:a 1]])) (meta (update-vals (with-meta {:a 1} {:m 1}) inc))]
 [(update {:a 1} :a + 2 3) (update {:a 1} :a + 2 3 4 5) ((fnil + 1 2) nil nil) ((fnil + 1 2 3) nil nil nil) (update-in {} [] (fnil inc 0)) (assoc-in nil [:a :b] 1) (assoc-in [[1 2]] [0 1] 9) (pr-str (conj #{1} 1N))]
 [(= (frequencies (map #(mod % 37) (range 5000))) (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} (map #(mod % 37) (range 5000)))) (count (into #{} (range 50000))) (sort (keys (group-by #(mod % 5) (range 100)))) (= (set (range 3000)) (into #{} (map identity) (range 3000)))]
+;; workstream G: heap retention
+(System/gc)

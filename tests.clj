@@ -4094,8 +4094,11 @@
         _ (clove/file-op* :mkdirs T)
         client (str T "/client.clj")
         ;; no `timeout` wrapper: macOS doesn't ship one; the finally kills it
-        pid (str/trim (:out (sh (str "cd '" T "' && env -u CLOVE_GC_STRESS " exe
-                                     " nrepl 8095 >/dev/null 2>&1 & echo $!"))))]
+        ;; `exec` so $! is the server itself: with `cd && cmd &` some shells
+        ;; (bash on macOS) background a subshell, the kill missed the
+        ;; server, and the orphan kept the CI job open for 30 minutes
+        pid (str/trim (:out (sh (str "(cd '" T "' && exec env -u CLOVE_GC_STRESS " exe
+                                     " nrepl 8095 </dev/null >/dev/null 2>&1) & echo $!"))))]
     (spit client (str "(defn conn [] (loop [i 0] (or (try (tcp/connect \"127.0.0.1\" 8095) (catch Exception e nil))"
                       "  (when (< i 100) (Thread/sleep 50) (recur (inc i))))))\n"
                       "(defn ask [msg] (when-let [fd (conn)] (tcp/send fd msg) (let [r (tcp/recv fd)] (tcp/close fd) r)))\n"
@@ -4337,9 +4340,9 @@
   (assert= "true\n"
            (:out (sh (str (clove/exe-dir*) "/clove") "-e"
                      (str "(let [rss (fn [] (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))))"
-                          "      big (atom (vec (range 5000000))) before (rss)]"
+                          "      big (atom (vec (range 5000000))) before (rss) hb (clove/heap-bytes*)]"
                           "  (reset! big nil) (dotimes [_ 4] (gc) (count (vec (range 1000))))"
-                          "  (prn (< (rss) (quot before 2))))")))))
+                          "  (prn (and (< (clove/heap-bytes*) (quot hb 4)) (< (rss) (quot (* 3 before) 4)))))")))))
 (when clove-test-coro?
   ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
   (let [v (reduce (fn [a _] [a]) [] (range 100000))
@@ -4355,6 +4358,43 @@
   (let [order (atom [])]
     (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
     (assert= [0 1 2 3 4] @order)))
+;; ── workstream G: heap retention ──
+(assert= nil (System/gc))
+;; Fresh processes, so the collector state does not depend on the suite.
+;; clove/heap-bytes* is what the collector has mapped; RSS bounds are looser
+;; (Linux only, not under ASan, whose quarantine holds freed memory).
+(when-not (System/getenv "CLOVE_GC_STRESS")
+  (let [run (fn [src] (try (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src)))
+                           (catch Exception _ (vec (repeat 4 Long/MAX_VALUE)))))  ; fails every check
+        rss? (and (= :linux (clove/os*)) (not (System/getenv "ASAN_OPTIONS")))
+        rss "(fn [] (if (= :linux (clove/os*)) (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))) 0))"]
+    ;; one (gc) after dropping a 5M-element vector gives its blocks back
+    ;; (stale words in the collector's own frame used to pin it)
+    (let [[h0 h1 r0 r1] (run (str "(let [rss " rss " big (atom (vec (range 5000000)))"
+                                  "      h0 (clove/heap-bytes*) r0 (rss)]"
+                                  "  (reset! big nil) (gc)"
+                                  "  (prn [h0 (clove/heap-bytes*) r0 (rss)]))"))]
+      (assert= true (< h1 (quot h0 4)))
+      (when rss? (assert= true (< r1 (quot r0 2)))))
+    ;; after a churn-heavy phase, light allocation shrinks the heap on its
+    ;; own, closures' env blocks included (no explicit gc). The churn runs
+    ;; deep in the stack so no stale word in the shallow frames pins a list.
+    (let [[h0 h1 r1] (run (str "(let [rss " rss
+                               "      deep (fn deep [n f] (if (zero? n) (f) (let [r (deep (dec n) f)] r)))"
+                               "      h0 (deep 20 (fn [] (dotimes [_ 40] (count (doall (map inc (range 300000)))))"
+                               "                        (clove/heap-bytes*)))]"
+                               "  (dotimes [i 3000000] (vector i))"
+                               "  (prn [h0 (clove/heap-bytes*) (rss)]))"))]
+      ;; the churn peak itself varies run to run (130-500 MB here, with GC
+      ;; timing), so assert that it shrank and where it settled, not a ratio
+      (assert= true (< h1 h0))
+      (assert= true (< h1 (* 100 1024 1024)))
+      (when rss? (assert= true (< r1 (* 200 1024)))))
+    ;; a loop with a tiny live set keeps a small heap (it grew to ~500 MB)
+    (let [[r h] (run (str "(let [r (loop [i 0 acc 0] (if (< i 5000000) (recur (inc i) (+ acc i)) acc))]"
+                          "  (prn [r (clove/heap-bytes*)]))"))]
+      (assert= 12499997500000 r)
+      (assert= true (< h (* 100 1024 1024))))))
 
 ;; ── argv spawning round-trips awkward arguments on every platform ──
 ;; On Windows clove/proc* builds a CreateProcess command line, so quotes,
