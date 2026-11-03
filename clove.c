@@ -11830,6 +11830,50 @@ static void sb_child_limits(SBuf *b) {
 #endif
 }
 
+#ifdef _WIN32
+#include <io.h>      /* _open_osfhandle */
+#include <fcntl.h>   /* _O_RDONLY, _O_BINARY */
+/* Quote one argument for CommandLineToArgvW / the MSVCRT argv parser:
+ * backslashes double only before a quote or the closing quote. */
+static void win_quote_arg(SBuf *cmd, const char *a) {
+    if (*a && !strpbrk(a, " \t\n\v\"")) { sb_puts(cmd, a); return; }
+    sb_putc(cmd, '"');
+    for (const char *p = a;; p++) {
+        size_t bs = 0;
+        while (*p == '\\') { p++; bs++; }
+        if (!*p) { for (size_t i = 0; i < bs * 2; i++) sb_putc(cmd, '\\'); break; }
+        size_t nb = *p == '"' ? bs * 2 + 1 : bs;
+        for (size_t i = 0; i < nb; i++) sb_putc(cmd, '\\');
+        sb_putc(cmd, *p);
+    }
+    sb_putc(cmd, '"');
+}
+
+/* An inheritable handle on a new, uniquely named temp file that is deleted
+ * when the last handle on it closes. */
+static HANDLE win_temp_handle(void) {
+    char dir[MAX_PATH + 1], name[MAX_PATH + 1];
+    DWORD n = GetTempPathA(sizeof dir, dir);
+    if (n == 0 || n > sizeof dir || !GetTempFileNameA(dir, "clv", 0, name))
+        return INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, 1 };   /* inheritable */
+    HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    if (h == INVALID_HANDLE_VALUE) DeleteFileA(name);
+    return h;
+}
+
+/* Read a temp handle from the start into sb, then close it (deleting the file). */
+static void win_read_handle(SBuf *sb, HANDLE h) {
+    SetFilePointer(h, 0, NULL, FILE_BEGIN);
+    int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
+    FILE *f = fd >= 0 ? _fdopen(fd, "rb") : NULL;
+    if (!f) { if (fd >= 0) _close(fd); else CloseHandle(h); return; }
+    sb_read_all(sb, f);
+    fclose(f);
+}
+#endif
+
 /* (clove/proc* argv in env dir) → {:exit n :out s :err s}: run a program
  * with an argument vector (no shell), as clojure.java.shell/sh does. in is a
  * string fed to stdin (or nil); env a map that REPLACES the environment (or
@@ -11848,38 +11892,68 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     sb_grow(&err, 1); err.data[0] = '\0';
     int code = -1;
 #ifdef _WIN32
-    /* No fork: quote each argument into a cmd line; stderr goes through a
-     * temp file, stdin through another. :env is not supported here. */
+    /* No fork and no shell: CreateProcess gets a command line quoted so the
+     * child's argv parser hands back the same strings. stdin, stdout and
+     * stderr are fresh temp files that delete themselves when closed. */
     SBuf cmd = {0};
-    if (dir != NIL) { sb_puts(&cmd, "cd /d \""); sb_puts(&cmd, as_str(dir, "sh")); sb_puts(&cmd, "\" && "); }
     for (size_t i = 0; i < n; i++) {
         SBuf a = {0}; str_to(&a, vec_nth(av, i));
         if (i) sb_putc(&cmd, ' ');
-        sb_putc(&cmd, '"');
-        for (size_t j = 0; j < a.len; j++) { if (a.data[j] == '"') sb_putc(&cmd, '\\'); sb_putc(&cmd, a.data[j]); }
-        sb_putc(&cmd, '"');
+        win_quote_arg(&cmd, a.data ? a.data : "");
         free(a.data);
     }
-    char errf[L_tmpnam + 8], inf[L_tmpnam + 8];
-    tmpnam(errf);
-    sb_puts(&cmd, " 2>\""); sb_puts(&cmd, errf); sb_puts(&cmd, "\"");
-    if (in != NIL) {
-        tmpnam(inf);
-        FILE *fi = fopen(inf, "wb");
-        if (fi) { SBuf ib = {0}; str_to(&ib, in); if (ib.data) fwrite(ib.data, 1, ib.len, fi); free(ib.data); fclose(fi); }
-        sb_puts(&cmd, " <\""); sb_puts(&cmd, inf); sb_puts(&cmd, "\"");
+    SBuf envb = {0};
+    if (envm != NIL && envm->tag == CLOVE_MAP) {   /* "k=v\0k=v\0\0" */
+        for (Clove *e = map_entry_list(envm); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+            Clove *k = e->as.cons.head->as.cons.head;
+            if (k != NIL && k->tag == CLOVE_KEYWORD) sb_puts(&envb, k->as.kw); else str_to(&envb, k);
+            sb_putc(&envb, '=');
+            str_to(&envb, e->as.cons.head->as.cons.tail);
+            sb_putc(&envb, '\0');
+        }
+        sb_putc(&envb, '\0'); sb_putc(&envb, '\0');
     }
-    FILE *p = popen(cmd.data, "r");
-    free(cmd.data);
-    if (!p) clove_error_cls("IOException", "sh: cannot run %s", as_str(vec_nth(av, 0), "sh"));
-    char buf[4096]; size_t k;
-    while ((k = fread(buf, 1, sizeof buf, p)) > 0) { sb_grow(&out, k); memcpy(out.data + out.len, buf, k); out.len += k; out.data[out.len] = '\0'; }
-    code = pclose(p);
-    FILE *fe = fopen(errf, "rb");
-    if (fe) { while ((k = fread(buf, 1, sizeof buf, fe)) > 0) { sb_grow(&err, k); memcpy(err.data + err.len, buf, k); err.len += k; err.data[err.len] = '\0'; } fclose(fe); }
-    remove(errf);
-    if (in != NIL) remove(inf);
-    (void)envm;
+    const char *cdir = dir != NIL ? as_str(dir, "sh") : NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, 1 };   /* inheritable */
+    HANDLE hin, hout = win_temp_handle(), herr = win_temp_handle();
+    if (in != NIL) {
+        hin = win_temp_handle();
+        SBuf ib = {0}; str_to(&ib, in);
+        DWORD w = 0;
+        if (hin != INVALID_HANDLE_VALUE && ib.len) WriteFile(hin, ib.data, (DWORD)ib.len, &w, NULL);
+        free(ib.data);
+        if (hin != INVALID_HANDLE_VALUE) SetFilePointer(hin, 0, NULL, FILE_BEGIN);
+    } else hin = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    if (hin == INVALID_HANDLE_VALUE || hout == INVALID_HANDLE_VALUE || herr == INVALID_HANDLE_VALUE) {
+        if (hin != INVALID_HANDLE_VALUE) CloseHandle(hin);
+        if (hout != INVALID_HANDLE_VALUE) CloseHandle(hout);
+        if (herr != INVALID_HANDLE_VALUE) CloseHandle(herr);
+        free(cmd.data); free(envb.data); free(out.data); free(err.data);
+        clove_error_cls("IOException", "sh: cannot create temp files");
+    }
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = hin; si.hStdOutput = hout; si.hStdError = herr;
+    PROCESS_INFORMATION pi;
+    if (CreateProcessA(NULL, cmd.data, NULL, NULL, 1 /* inherit handles */, 0, envb.data, cdir, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD ec = 1;
+        GetExitCodeProcess(pi.hProcess, &ec);
+        code = (int)ec;
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    } else {
+        code = 127;   /* what the POSIX child reports; the sh wrapper throws on it */
+        char msg[512];
+        snprintf(msg, sizeof msg, "Cannot run program \"%s\": error %lu\n",
+                 as_str(vec_nth(av, 0), "sh"), (unsigned long)GetLastError());
+        sb_puts(&err, msg);
+    }
+    free(cmd.data); free(envb.data);
+    CloseHandle(hin);
+    win_read_handle(&out, hout);
+    win_read_handle(&err, herr);
 #else
     char **cargv = xmalloc(sizeof(char *) * (n + 1));
     SBuf *parts = xmalloc(sizeof(SBuf) * n);

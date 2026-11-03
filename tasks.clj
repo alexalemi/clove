@@ -166,9 +166,17 @@
 
 ;; ── shell ───────────────────────────────────────────────────────────────────
 
-(defn shell-quote [win? s]
+(defn shell-quote
+  "Quote s as one word for the task shell (sh, or cmd.exe when win?).
+  Inside cmd.exe double quotes & | < > ^ are literal, but no escape stops %VAR%
+  expansion or a \" ending the quote, so such arguments are refused rather
+  than passed on to run something else."
+  [win? s]
   (if win?
-    (str "\"" (str/replace s "\"" "\\\"") "\"")   ; cmd.exe has no real quoting
+    (do (when (re-find #"[\"%\r\n]" s)
+          (fail (str "argument cannot be quoted for cmd.exe: " (pr-str s))))
+        ;; trailing backslashes would escape the closing quote for the child's argv parser
+        (str "\"" s (re-find #"\\*$" s) "\""))
     (process/escape s)))
 
 (defn shell-command
@@ -330,10 +338,8 @@
      ".cpcache/\n.nrepl-port\ntarget/\n"}))
 
 (defn- mkdirs [d]
-  (if (windows?)
-    (sh (str "mkdir " (shell-quote true (str/replace d "/" "\\"))))
-    (sh (str "mkdir -p " (shell-quote false d))))
-  (when-not (clove/dir?* d) (fail (str "cannot create directory " d))))
+  (when-not (or (clove/dir?* d) (clove/file-op* :mkdirs d))
+    (fail (str "cannot create directory " d))))
 
 (defn new-main [args]
   (try

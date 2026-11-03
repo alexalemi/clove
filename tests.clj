@@ -4042,6 +4042,13 @@
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
 ;; ── workstream C: host IO, processes, batteries ──
+;; tasks.clj: cmd.exe has no escape for " or %, so such args are refused;
+;; trailing backslashes are doubled so the child's argv keeps them
+(require '[tasks :as clove-wc-t])
+(assert= :refused (try (clove-wc-t/shell-quote true "a\" & calc & \"") (catch Exception e :refused)))
+(assert= :refused (try (clove-wc-t/shell-quote true "%PATH%") (catch Exception e :refused)))
+(assert= "\"a & b\"" (clove-wc-t/shell-quote true "a & b"))
+(assert= "\"C:\\dir\\\\\"" (clove-wc-t/shell-quote true "C:\\dir\\"))
 ;; bencode lengths and network framing count UTF-8 bytes, not codepoints
 (require '[nrepl :as clove-wc-n])
 (assert= "d5:value4:\"é\"e" (clove-wc-n/bencode {"value" "\"é\""}))

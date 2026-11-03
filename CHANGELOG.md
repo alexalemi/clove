@@ -43,6 +43,15 @@
 - `clove bundle` runs the compiler with an argument vector, so an output
   path with spaces or quotes works, and it deletes the generated `.gen.c`
   even when the compile fails.
+- Windows: `clojure.java.shell/sh` and multi-argument `sh` start the
+  program with `CreateProcess` instead of a `cmd.exe` line, so an argument
+  like `a" & calc & "` stays one argument and `%VAR%` is not expanded.
+  Arguments are quoted by the MSVCRT rules, temp files are created
+  atomically and delete themselves, and `:env` works. As on the JVM, cmd
+  builtins (`echo`, `dir`) are not programs and need `cmd /c`.
+- Windows: `clove run` refuses task arguments containing `"`, `%` or a
+  newline, which `cmd.exe` cannot quote, and `clove new` creates directories
+  without a shell.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02
