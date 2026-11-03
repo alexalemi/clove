@@ -706,10 +706,30 @@ static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
 static void coro_free_stacks(Coro *co);
 #endif
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+#define CLOVE_ASAN 1
+void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noreturn))
 #endif
 static void clove_raise(void) {
+#if defined(CLOVE_ASAN) && defined(CLOVE_HAVE_CORO)
+    /* ASan does not know a coroutine stack's bounds, so on longjmp it skips
+     * clearing the redzones of the frames being abandoned ("ignoring requested
+     * __asan_handle_no_return"); frames that later reuse that memory then get
+     * false reports. Clear everything below the catching frame, as ASan does
+     * on the main stack. Each coro's ErrFrames live on its own stack. */
+    if (coro_current && coro_current->stack) {
+        char *lo = coro_current->stack, *hi = coro_current->stack_top;
+        if (err_top && (char *)err_top > lo && (char *)err_top < hi) hi = (char *)err_top;
+        __asan_unpoison_memory_region(lo, (size_t)(hi - lo));
+    }
+#endif
     if (err_top) longjmp(err_top->jb, 1);
     longjmp(err_jmp, 1);
 }
@@ -2991,75 +3011,12 @@ static const char *sym_name(Clove *v, const char *what) {
     return v->as.sym;
 }
 
-/* Peel reader metadata off a def/defmacro name: (def ^:private x ..) reads the
- * name as (with-meta x m) — possibly stacked. :private is retained (via the
- * priv out-param; def/defmacro record it in the private-defs table), and a
- * ^{:doc "…"} string surfaces through doc_out for the doc registry. */
-static Clove *peel_meta_sym_doc(Clove *v, bool *priv, Clove **doc_out) {
-    while (v != NIL && v->tag == CLOVE_LIST &&
-           v->as.cons.head->tag == CLOVE_SYMBOL &&
-           !strcmp(v->as.cons.head->as.sym, "with-meta") &&
-           v->as.cons.tail != NIL) {
-        if (priv || doc_out) {
-            Clove *mt = v->as.cons.tail->as.cons.tail;
-            Clove *mf = (mt != NIL && mt->tag == CLOVE_LIST) ? mt->as.cons.head : NIL;
-            if (mf != NIL && mf->tag == CLOVE_MAP) {
-                Clove *pv;
-                if (priv && map_find(mf, mk_kw(intern("private", 7)), &pv) && is_truthy(pv))
-                    *priv = true;
-                if (doc_out && map_find(mf, mk_kw(intern("doc", 3)), &pv) &&
-                    pv != NIL && pv->tag == CLOVE_STRING)
-                    *doc_out = pv;
-            }
-        }
-        v = v->as.cons.tail->as.cons.head;
-    }
-    return v;
-}
-static Clove *peel_meta_sym(Clove *v) { return peel_meta_sym_doc(v, NULL, NULL); }
-
 /* ── Var metadata ──
  * Var cells are fresh per (var x), so a var's own metadata lives here, keyed
  * by the stored (qualified, interned) binding name: what def found on its
  * name (^:foo, ^{:test f}, a defn attr-map) plus alter-meta!/reset-meta!.
  * A GC root (gc_collect). (meta #'x) merges it over the synthesized
  * :name/:ns/:doc/:arglists. */
-static Clove *eval(CloveEnv *env, Clove *form);
-
-/* Evaluate the metadata maps the reader wrapped around a def name, as
- * Clojure's def does, so ^{:test (fn [] ..)} stores a fn. :tag stays the
- * unevaluated symbol (a type hint names a class clove may not have). Outer
- * maps win a duplicate key, as the reader's later ^ merges over the earlier.
- * NIL when there is no metadata. */
-static Clove *def_name_meta(CloveEnv *env, Clove *namef) {
-    Clove *m = NIL;
-    Clove *kw_tag = mk_kw(intern("tag", 3));
-    while (namef != NIL && namef->tag == CLOVE_LIST &&
-           namef->as.cons.head->tag == CLOVE_SYMBOL &&
-           !strcmp(namef->as.cons.head->as.sym, "with-meta") &&
-           namef->as.cons.tail != NIL) {
-        Clove *mt = namef->as.cons.tail->as.cons.tail;
-        Clove *mf = (mt != NIL && mt->tag == CLOVE_LIST) ? mt->as.cons.head : NIL;
-        if (mf != NIL && mf->tag == CLOVE_MAP) {
-            for (Clove *e = map_entry_list(mf); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-                Clove *k = eval(env, e->as.cons.head->as.cons.head);
-                if (m != NIL && map_find(m, k, NULL)) continue;
-                Clove *vf = e->as.cons.head->as.cons.tail;
-                Clove *val = k == kw_tag ? vf : eval(env, vf);
-                m = map_assoc(m == NIL ? mk_map() : m, k, val);
-            }
-        }
-        namef = namef->as.cons.tail->as.cons.head;
-    }
-    /* ^Type hints the reader attached to the symbol itself: already data */
-    if (namef != NIL && namef->tag == CLOVE_SYMBOL && namef->meta && namef->meta->tag == CLOVE_MAP)
-        for (Clove *e = map_entry_list(namef->meta); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-            Clove *k = e->as.cons.head->as.cons.head;
-            if (m != NIL && map_find(m, k, NULL)) continue;
-            m = map_assoc(m == NIL ? mk_map() : m, k, e->as.cons.head->as.cons.tail);
-        }
-    return m;
-}
 
 /* Record def-time metadata for `qual`; a redef without any clears it
  * (Clojure resets a var's metadata on redef). */
@@ -3629,27 +3586,38 @@ static Clove *read_form(const char **p) {
     }
     if (c == '#' && (*p)[1] == '^') { (*p)++; c = '^'; }  /* #^ = archaic ^ metadata */
     if (c == '^') {
-        /* ^{...} and ^:kw compile to (with-meta form m), evaluated at
-         * runtime like Clojure; a ^Tag type hint on a symbol attaches
-         * {:tag Tag} to the (fresh, per-read) symbol cell at read time, so
-         * (meta '^double x) => {:tag double} and jit.clj can honor hints.
-         * Hints on non-symbol forms are discarded as before. */
+        /* ^m form attaches m to the form itself, as Clojure's reader does:
+         * ^:kw is {:kw true}, ^Sym and ^"str" are {:tag ..}, ^[..] is
+         * {:param-tags [..]}. The entries stay unevaluated; eval evaluates
+         * them where Clojure does (collection literals, fn, def). An outer
+         * ^ wins a key over an inner one. */
         (*p)++;
         Clove *m = read_form(p);
         Clove *form = m ? read_form(p) : NULL;
         if (!m || !form) clove_error("unexpected EOF after ^ metadata");
-        if (m != NIL && m->tag == CLOVE_KEYWORD) {
-            Clove *mm = mk_map();
-            m = map_assoc(mm, m, TRUE);
+        CloveTag mt = m == NIL ? CLOVE_NIL : m->tag;
+        if (mt == CLOVE_KEYWORD) m = map_assoc(mk_map(), m, TRUE);
+        else if (mt == CLOVE_SYMBOL || mt == CLOVE_STRING)
+            m = map_assoc(mk_map(), mk_kw(intern("tag", 3)), m);
+        else if (mt == CLOVE_VECTOR)
+            m = map_assoc(mk_map(), mk_kw(intern("param-tags", 10)), m);
+        else if (mt != CLOVE_MAP)
+            rd_error("Metadata must be Symbol,Keyword,String or Map");
+        CloveTag ft = form == NIL ? CLOVE_NIL : form->tag;
+        if (ft == CLOVE_EMPTY) form = alloc(CLOVE_EMPTY);   /* () is a shared singleton */
+        else if (ft != CLOVE_SYMBOL && ft != CLOVE_LIST && ft != CLOVE_VECTOR &&
+                 ft != CLOVE_MAP && ft != CLOVE_SET)
+            rd_error("Metadata can only be applied to IMetas");
+        if (form->meta && form->meta->tag == CLOVE_MAP) {
+            Clove *merged = form->meta;
+            for (Clove *e = map_entry_list(m); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+                merged = map_assoc(merged, e->as.cons.head->as.cons.head,
+                                   e->as.cons.head->as.cons.tail);
+            m = merged;
         }
-        if (m == NIL || m->tag != CLOVE_MAP) {  /* ^Tag type hint */
-            if (m != NIL && m->tag == CLOVE_SYMBOL &&
-                form != NIL && form->tag == CLOVE_SYMBOL)
-                form->meta = map_assoc(mk_map(), mk_kw(intern("tag", 3)), m);
-            return form;
-        }
-        return mk_cons(mk_sym(intern("with-meta", 9)),
-                       mk_cons(form, mk_cons(m, NIL)));
+        if (ft == CLOVE_VECTOR) return vec_with_meta(form, m);  /* [] is a singleton */
+        form->meta = m;
+        return form;
     }
     if (c == '\\') {  /* char literal => CLOVE_CHAR */
         (*p)++;
@@ -3980,11 +3948,6 @@ static const char *bare_name(const char *nm) {
 }
 
 static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
-    /* ^{..}sym in a binding position arrives as the deferred (with-meta sym m)
-     * form — bind the symbol, drop the meta (Clojure keeps only type hints
-     * there, which clove discards anyway). core.match's generated matchers tag
-     * every occurrence binding this way. */
-    pattern = peel_meta_sym(pattern);
     if (pattern != NIL && pattern->tag == CLOVE_SYMBOL) {
         env_define(scope, pattern->as.sym, value);
         return;
@@ -4369,6 +4332,7 @@ static Clove *resolve_symbol(CloveEnv *env, Clove *form) {
  * compiled bodies are coarser (no per-subform eval_stack frames). */
 
 static Clove *make_fn(CloveEnv *env, Clove *forms, bool is_macro);
+static bool form_has_user_meta(Clove *form);
 static void print_to(SBuf *sb, Clove *v, bool readably);
 static void str_to(SBuf *sb, Clove *v);
 
@@ -4722,7 +4686,7 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
         }
         case CLOVE_VECTOR: {
             size_t n = vec_len(form);
-            if (n > 0xff) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
+            if (n > 0xff || form->meta) { vmc_emit(c, VOP_EVAL, vmc_const(c, form)); return; }
             for (size_t i = 0; i < n; i++) vmc_form(c, cenv, vec_nth(form, i), false);
             vmc_emit(c, VOP_VEC, (uint32_t)n);
             return;
@@ -4936,8 +4900,10 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
             return;
         }
         if (s == S_FN) {
-            /* named fns get name-stripping in the tree-walk path */
-            if (rest != NIL && rest->as.cons.head->tag == CLOVE_SYMBOL) {
+            /* named fns get name-stripping in the tree-walk path, and a fn
+             * form's metadata is attached there */
+            if ((rest != NIL && rest->as.cons.head->tag == CLOVE_SYMBOL) ||
+                form_has_user_meta(form)) {
                 vmc_emit(c, VOP_EVAL, vmc_const(c, form));
                 return;
             }
@@ -5677,19 +5643,11 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
 
 /* One arity: validate a [params] vector and pair it with its body. */
 static Clove *build_arity(Clove *params_vec, Clove *body) {
-    /* a return-type hint reads as (with-meta [params] {..}) (reader turns ^{..}
-     * into a with-meta call) — unwrap to the param vector. ^Symbol hints are
-     * dropped by the reader already, so only the map-meta form reaches here. */
-    if (params_vec != NIL && params_vec->tag == CLOVE_LIST &&
-        params_vec->as.cons.head->tag == CLOVE_SYMBOL &&
-        params_vec->as.cons.head->as.sym == intern("with-meta", 9) &&
-        params_vec->as.cons.tail != NIL)
-        params_vec = params_vec->as.cons.tail->as.cons.head;
     if (params_vec == NIL || params_vec->tag != CLOVE_VECTOR)
         clove_error("fn params must be a vector");
     Clove *params = NIL, **t = &params;
     for (size_t i = 0; i < vec_len(params_vec); i++) {
-        Clove *p = peel_meta_sym(vec_nth(params_vec, i));  /* drop ^:foo / ^{..} on a param */
+        Clove *p = vec_nth(params_vec, i);
         if (p == NIL) continue;     /* a #?(:cljs ..)-only param elides to nil */
         bool is_amp = p->tag == CLOVE_SYMBOL && p->as.sym == sym_amp();
         if (is_amp && i + 2 != vec_len(params_vec))
@@ -5781,15 +5739,6 @@ static Clove *make_fn(CloveEnv *env, Clove *forms, bool is_macro) {
         return f;
     }
     forms = realize_spine(forms);
-    /* single arity with a return-type hint: (fn ^{:tag T} [x] ..) reads its
-     * params as (with-meta [x] {..}); unwrap so it's seen as a [params] head. */
-    if (forms != NIL && forms->as.cons.head->tag == CLOVE_LIST) {
-        Clove *h = forms->as.cons.head;
-        if (h->as.cons.head->tag == CLOVE_SYMBOL &&
-            h->as.cons.head->as.sym == intern("with-meta", 9) &&
-            h->as.cons.tail != NIL && h->as.cons.tail->as.cons.head->tag == CLOVE_VECTOR)
-            forms = mk_cons(h->as.cons.tail->as.cons.head, forms->as.cons.tail);
-    }
     Clove *arities = NIL, **t = &arities;
     if (forms != NIL && forms->as.cons.head->tag == CLOVE_VECTOR) {
         *t = mk_cons(build_arity(forms->as.cons.head, forms->as.cons.tail), NIL);
@@ -5819,10 +5768,70 @@ static Clove *make_fn(CloveEnv *env, Clove *forms, bool is_macro) {
     return f;
 }
 
+static Clove *prim_with_meta(CloveEnv *env, Clove **argv, int nargs);
+static Clove *with_meta_of(Clove *v, Clove *m) {
+    if (!m) return v;
+    Clove *argv[2] = { v, m };
+    return prim_with_meta(NULL, argv, 2);
+}
+
+/* :line/:col/:file, which the reader puts on every list read from a file */
+static bool meta_loc_key(Clove *k) {
+    static const char *L, *C, *F;
+    if (!L) { L = intern("line", 4); C = intern("col", 3); F = intern("file", 4); }
+    return k != NIL && k->tag == CLOVE_KEYWORD && (k->as.kw == L || k->as.kw == C || k->as.kw == F);
+}
+
+/* Does the form carry metadata beyond reader locations? Allocation-free: it
+ * runs on every tree-walked fn form. */
+static bool form_has_user_meta(Clove *form) {
+    Clove *m = form->meta;
+    if (!m || m->tag != CLOVE_MAP) return false;
+    static Clove *L, *C, *F;
+    if (!L) { L = mk_kw(intern("line", 4)); C = mk_kw(intern("col", 3)); F = mk_kw(intern("file", 4)); }
+    size_t loc = 0;
+    if (form->tag == CLOVE_LIST)
+        loc = (size_t)map_find(m, L, NULL) + map_find(m, C, NULL) + map_find(m, F, NULL);
+    return m->as.map.count > loc;
+}
+
+/* The reader's metadata on a collection literal or fn form, evaluated as
+ * Clojure does: keys and values are expressions, except that a symbol :tag
+ * stays a symbol (a type hint names a class clove may not have). Location
+ * keys are dropped. NULL when nothing is left. */
+static Clove *eval_form_meta(CloveEnv *env, Clove *form) {
+    if (!form->meta || form->meta->tag != CLOVE_MAP) return NULL;
+    Clove *kw_tag = mk_kw(intern("tag", 3));
+    Clove *m = NULL;
+    for (Clove *e = map_entry_list(form->meta); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+        Clove *kf = e->as.cons.head->as.cons.head, *vf = e->as.cons.head->as.cons.tail;
+        if (meta_loc_key(kf)) continue;
+        Clove *k = eval(env, kf);
+        Clove *v = k == kw_tag && vf != NIL && vf->tag == CLOVE_SYMBOL ? vf : eval(env, vf);
+        m = map_assoc(m ? m : mk_map(), k, v);
+    }
+    return m;
+}
+
 /* Quasiquote template expansion: copy structure, evaluating ~x holes and
  * splicing ~@xs. Nested quasiquotes are not given Clojure's full treatment
  * (no level counting, no auto-gensym #-suffixes, no namespace resolution). */
+static Clove *qq_expand_1(CloveEnv *env, Clove *form);
 static Clove *qq_expand(CloveEnv *env, Clove *form) {
+    Clove *r = qq_expand_1(env, form);
+    /* metadata rides along, itself syntax-quoted, as in Clojure; an
+     * unquoted form's own metadata is dropped */
+    if (form == NULL || form == NIL || !form_has_user_meta(form)) return r;
+    if (form->tag == CLOVE_LIST && form->as.cons.head->tag == CLOVE_SYMBOL &&
+        form->as.cons.head->as.sym == intern("clojure.core/unquote", 20))
+        return r;
+    Clove *m = mk_map();
+    for (Clove *e = map_entry_list(form->meta); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+        if (!meta_loc_key(e->as.cons.head->as.cons.head))
+            m = map_assoc(m, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
+    return with_meta_of(r, qq_expand_1(env, m));
+}
+static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
     static const char *SYM_UQ, *SYM_UQS;
     if (!SYM_UQ) { SYM_UQ = intern("clojure.core/unquote", 20); SYM_UQS = intern("clojure.core/unquote-splicing", 29); }
 
@@ -6058,6 +6067,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
             Clove *v = mk_empty_vec();
             for (size_t i = 0; i < vec_len(form); i++)
                 v = vec_conj1(v, eval(env, vec_nth(form, i)));
+            if (form->meta) v = with_meta_of(v, eval_form_meta(env, form));
             return v;
         }
         case CLOVE_MAP: {
@@ -6089,13 +6099,14 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         clove_error("Duplicate key: %s", dk.data);
                     }
                 }
-                return m;
+            } else {
+                for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+                    Clove *k = eval(env, e->as.cons.head->as.cons.head);
+                    Clove *val = eval(env, e->as.cons.head->as.cons.tail);
+                    m = map_assoc(m, k, val);
+                }
             }
-            for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-                Clove *k = eval(env, e->as.cons.head->as.cons.head);
-                Clove *val = eval(env, e->as.cons.head->as.cons.tail);
-                m = map_assoc(m, k, val);
-            }
+            if (form->meta) m = with_meta_of(m, eval_form_meta(env, form));
             return m;
         }
         case CLOVE_SET: {
@@ -6103,6 +6114,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
             Clove *s = mk_set();
             for (Clove *e = set_element_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
                 s = set_conj(s, eval(env, e->as.cons.head));
+            if (form->meta) s = with_meta_of(s, eval_form_meta(env, form));
             return s;
         }
         case CLOVE_HNODE:
@@ -6383,7 +6395,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                          * the file is read with the ns active). */
                         {
                             Clove *nsn = rest != NIL && rest->tag == CLOVE_LIST
-                                        ? peel_meta_sym(rest->as.cons.head) : NIL;
+                                        ? rest->as.cons.head : NIL;
                             if (nsn != NIL && nsn->tag == CLOVE_SYMBOL)
                                 set_cur_ns(env_root(env), nsn->as.symc.name);
                         }
@@ -6531,9 +6543,14 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     need_args(rest, 2, "defmacro");
                     bool mac_private = false;
                     Clove *mac_doc = NIL;
-                    const char *name = sym_name(
-                        peel_meta_sym_doc(rest->as.cons.head, &mac_private, &mac_doc),
-                        "defmacro");
+                    Clove *mac_name = rest->as.cons.head;
+                    const char *name = sym_name(mac_name, "defmacro");
+                    if (mac_name->meta && mac_name->meta->tag == CLOVE_MAP) {
+                        Clove *pv;      /* ^:private / ^{:doc ".."} written as literals */
+                        mac_private = map_find(mac_name->meta, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
+                        if (map_find(mac_name->meta, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
+                            mac_doc = pv;
+                    }
                     Clove *mbody = rest->as.cons.tail;
                     if (mbody->as.cons.head->tag == CLOVE_STRING &&
                         mbody->as.cons.tail != NIL) {
@@ -6577,9 +6594,16 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                             map_find(fbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
                             dv != NIL && dv->tag == CLOVE_STRING)
                             fdoc = dv;
-                        /* the rest of it is var metadata: (with-meta name attr-map) */
-                        name = mk_cons(mk_sym(intern("with-meta", 9)),
-                                       mk_cons(name, mk_cons(fbody->as.cons.head, NIL)));
+                        /* the rest of it is var metadata, merged over the name's */
+                        if (name != NIL && name->tag == CLOVE_SYMBOL) {
+                            Clove *nm = name->meta && name->meta->tag == CLOVE_MAP ? name->meta : mk_map();
+                            for (Clove *e = map_entry_list(fbody->as.cons.head); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+                                nm = map_assoc(nm, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
+                            Clove *ns = alloc(CLOVE_SYMBOL);
+                            ns->as = name->as;
+                            ns->meta = nm;
+                            name = ns;
+                        }
                         fbody = fbody->as.cons.tail;
                     }
                     Clove *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
@@ -6602,22 +6626,24 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                 if (s == SYM_DEF) {
                     need_args(rest, 1, "def");
                     Clove *namef = rest->as.cons.head;
-                    /* (def ^:dynamic x v): the reader wrapped the name as
-                     * (with-meta x m) — unwrap; only :private is retained
-                     * (side table keyed by the stored qualified name).
-                     * Stacked metadata (^:dynamic ^:no-doc x) nests several
-                     * with-meta forms, so peel all of them. */
-                    bool def_private = false;
-                    Clove *def_doc = NIL;
-                    Clove *def_metaf = namef;          /* the with-meta wrappers, if any */
-                    namef = peel_meta_sym_doc(namef, &def_private, &def_doc);
                     /* a #?(:cljs ..)-only def name elides to nil here — skip it */
                     if (namef == NIL) return NIL;
                     const char *name = sym_name(namef, "def");
+                    /* The name's metadata is evaluated, as Clojure's def does, so
+                     * ^{:test (fn [] ..)} stores a fn. :private also goes to the
+                     * private-defs table, :doc to the doc registry. */
+                    Clove *dm = eval_form_meta(env, namef);
+                    bool def_private = false;
+                    Clove *def_doc = NIL;
+                    if (dm) {
+                        Clove *pv;
+                        def_private = map_find(dm, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
+                        if (map_find(dm, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
+                            def_doc = pv;
+                    } else dm = NIL;
                     Clove *valf = rest->as.cons.tail;
                     /* (def name): no value — an unbound-var declaration => nil */
                     if (valf == NIL) {
-                        Clove *dm = def_name_meta(env, def_metaf);
                         const char *st = env_define_root(env_root(env), name, NIL);
                         if (strchr(st, '/')) mark_private_def(st, def_private);
                         var_meta_on_def(st, dm);
@@ -6631,7 +6657,6 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         def_doc = valf->as.cons.head;
                         valf = valf->as.cons.tail;
                     }
-                    Clove *dm = def_name_meta(env, def_metaf);
                     Clove *val = eval(env, valf->as.cons.head);
                     /* def is always global; a redef without ^:private clears
                      * the mark (Clojure resets var meta on redef) */
@@ -6684,7 +6709,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                      * other target (a field access) just evaluates val. */
                     if (rest == NIL || rest->as.cons.tail == NIL || rest->as.cons.tail->tag != CLOVE_LIST)
                         clove_error("set! needs a target and a value");
-                    Clove *place = peel_meta_sym(rest->as.cons.head);
+                    Clove *place = rest->as.cons.head;
                     Clove *val = eval(env, rest->as.cons.tail->as.cons.head);
                     if (place == NIL || place->tag != CLOVE_SYMBOL) return val;
                     for (CloveEnv *e = env; e && e->parent; e = e->parent)
@@ -6868,9 +6893,16 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         self_name = body->as.cons.head->as.sym;
                         body = body->as.cons.tail;
                     }
-                    if (!self_name) return make_fn(env, body, false);
+                    /* metadata on the fn form is the fn's metadata */
+                    Clove *fm = form_has_user_meta(form) ? eval_form_meta(env, form) : NULL;
+                    if (!self_name) {
+                        Clove *f = make_fn(env, body, false);
+                        if (fm) f->meta = fm;
+                        return f;
+                    }
                     CloveEnv *fenv = env_new(env);
                     Clove *f = make_fn(fenv, body, false);
+                    if (fm) f->meta = fm;
                     env_define(fenv, self_name, f);
                     return f;
                 }
@@ -11381,7 +11413,7 @@ static Clove *prim_with_meta(CloveEnv *env, Clove **argv, int nargs) {
      * attach it to immutable scalars they treat as values (Emmy on a ratio
      * coefficient, notebook annotations on nil). Pass the value through. */
     switch (v == NIL ? CLOVE_NIL : v->tag) {
-        case CLOVE_LIST: case CLOVE_VECTOR: case CLOVE_MAP: case CLOVE_SET:
+        case CLOVE_LIST: case CLOVE_VECTOR: case CLOVE_MAP: case CLOVE_SET: case CLOVE_EMPTY:
         case CLOVE_FN: case CLOVE_SYMBOL: case CLOVE_STRING: break;
         default: return v;
     }
@@ -15216,9 +15248,7 @@ static const char *PRELUDE =
     "(defmacro taoensso.timbre/debug [& _] nil) (defmacro taoensso.timbre/error [& _] nil)\n"
     "(defmacro taoensso.timbre/trace [& _] nil) (defmacro taoensso.timbre/spy [& body] (last body))\n"
     "(defmacro taoensso.timbre/warnf [& _] nil) (defmacro taoensso.timbre/errorf [& _] nil)\n"
-    /* defn- marks the def ^:private via a with-meta name wrapper — the same
-       shape reader meta produces, so def's peel/record path sees it. */
-    "(defmacro defn- [name & body] `(defn (with-meta ~name {:private true}) ~@body))\n"
+    "(defmacro defn- [name & body] `(defn ~(with-meta name (assoc (meta name) :private true)) ~@body))\n"
     "(defn vary-meta [x f & args] (with-meta x (apply f (meta x) args)))\n"
     /* c resolves to a type keyword (deftype name, or a host-class stub/keyword);
        compare against the value's (type x). Unknown host classes are keywords
@@ -15405,15 +15435,8 @@ static const char *PRELUDE =
        for mutable fields — and (set! f v) becomes (reset! (:f this) v), then
        registered as defmethods on :T. Field metadata (^:unsynchronized-mutable
        etc.) marks a field mutable; bare fields are immutable values. */
-    "(defn clove/field-sym [f]\n"
-    "  (loop [f f] (if (and (list? f) (= 'with-meta (first f))) (recur (second f)) f)))\n"
     "(defn clove/field-mut? [f]\n"
-    "  (loop [f f]\n"
-    "    (if (and (list? f) (= 'with-meta (first f)))\n"
-    "      (let [m (nth f 2 nil)]\n"
-    "        (if (and (map? m) (or (:unsynchronized-mutable m) (:volatile-mutable m) (:mutable m)))\n"
-    "          true (recur (second f))))\n"
-    "      false)))\n"
+    "  (let [m (meta f)] (boolean (or (:unsynchronized-mutable m) (:volatile-mutable m) (:mutable m)))))\n"
     /* symbols bound by a binding pattern (so deftype-walk can drop them from
        fset — a local shadows a same-named field). */
     "(defn clove/binding-syms [pat]\n"
@@ -15472,11 +15495,10 @@ static const char *PRELUDE =
     "                                           (clove/deftype-walk (second kv) fset mset this)]) form))\n"
     "    :else form)))\n"
     "(defmacro deftype [tname fields & specs]\n"
-    "  (let [tname (clove/field-sym tname)\n"   /* peel ^{:doc ..} off the name */
-    "        tkw   (keyword (str tname))\n"
-    "        fsyms (mapv clove/field-sym fields)\n"
+    "  (let [tkw   (keyword (str tname))\n"
+    "        fsyms (vec fields)\n"
     "        fset  (set fsyms)\n"
-    "        mset  (set (filter some? (map (fn [f] (when (clove/field-mut? f) (clove/field-sym f))) fields)))\n"
+    "        mset  (set (filter some? (map (fn [f] (when (clove/field-mut? f) f)) fields)))\n"
     "        ms    (filter list? specs)\n"
     "        _     (doseq [m ms] (clove/note-method! (first m)))\n"
     /* every declared marker interface / protocol (definterface -> a keyword,
@@ -17502,7 +17524,10 @@ CloveEnv *clove_new_env(void) {
         "  ([n] (take-nth-xf n))\n"
         "  ([n coll] (lazy-seq (when-let [s (seq coll)]\n"
         "                        (cons (first s) (take-nth n (drop n s)))))))\n"
-        "(def pmap map)\n"   /* single-threaded: same results, no parallelism */
+        /* single-threaded: same results, no parallelism. A throw surfaces
+           wrapped, as from the JVM's future deref. */
+        "(defn pmap [f & colls]\n"
+        "  (apply map (fn [& xs] (try (apply f xs) (catch Throwable e (throw (clove/execution-exception e))))) colls))\n"
         /* peek/pop on maps: priority-map semantics — the entry with the
          * smallest value. O(n) scan; backs clojure.data.priority-map. */
         "(def clove/peek-impl peek)\n"
@@ -17863,12 +17888,7 @@ CloveEnv *clove_new_env(void) {
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
         "(defmacro defmulti [name & args]\n"
-        /* peel reader metadata off the name (e.g. (defmulti ^:no-doc add ..) —
-         * Emmy's defgeneric does this) so the table key matches defmethod's bare
-         * name; otherwise methods register under `add` but dispatch reads the
-         * (with-meta add ..) form's empty table. */
-        "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))\n"
-        "        key (clove/mmk name)\n"
+        "  (let [key (clove/mmk name)\n"
         "        args (if (string? (first args)) (rest args) args)\n"
         "        args (if (map? (first args)) (rest args) args)\n"
         "        dispatch (first args)\n"
@@ -17895,10 +17915,7 @@ CloveEnv *clove_new_env(void) {
         "                                      \" for \" (pr-str dv#))))))))\n"
         "         {:clove/mm-key '~key})))))\n"
         "(defmacro defmethod [name dval params & body]\n"
-        /* peel reader metadata off the multimethod name (e.g. defgeneric passes
-           ^:no-doc add): otherwise ~name evaluates to (with-meta add ..), losing
-           the :clove/mm-key and keying the method under the wrong table entry */
-        "  (let [name (loop [n name] (if (and (seq? n) (= 'with-meta (first n))) (recur (second n)) n))]\n"
+        "  (do\n"
         /* skip a host-class dispatch value (dotted / $-inner-class) that clove
            can't resolve — it would never match anyway; bare typos still error */
         "  (if (and (symbol? dval)\n"
@@ -18008,9 +18025,8 @@ CloveEnv *clove_new_env(void) {
            Protocol method bodies are field-rewritten and registered like
            deftype's. */
         "(defmacro defrecord [rname fields & specs]\n"
-        "  (let [rname (clove/field-sym rname)\n"
-        "        kw    (keyword (str rname))\n"
-        "        fsyms (mapv clove/field-sym fields)\n"
+        "  (let [kw    (keyword (str rname))\n"
+        "        fsyms (vec fields)\n"
         "        fset  (set fsyms)\n"
         "        ms    (filter list? specs)\n"
         "        _     (doseq [m ms] (clove/note-method! (first m)))\n"
@@ -18195,6 +18211,10 @@ CloveEnv *clove_new_env(void) {
         "  (if (and (map? p) (= :ClovePromise (:clove/type p)))\n"
         "    (when (clove/pending-realize! (:state p) v nil) p)\n"   /* nil if already delivered */
         "    (do (reset! p v) p)))\n"                               /* legacy atom-as-promise */
+        /* deref of a failed future throws an ExecutionException wrapping the
+           original, as on the JVM: the message is (str cause), ex-data is nil */
+        "(defn clove/execution-exception [e]\n"
+        "  (clove/ex-typed* :ExecutionException (ex-info (str e) nil e)))\n"
         "(deftype CloveFuture [state]\n"
         "  clojure.lang.IDeref\n"
         "  (deref [_] (clove/pending-await state \"future\"))\n"
@@ -18207,7 +18227,7 @@ CloveEnv *clove_new_env(void) {
         "          (clove/pending-realize! state nil (ex-info \"future cancelled\" {:clove/cancelled true}))\n"
         "          (do (swap! state assoc :started true)\n"
         "              (try (clove/pending-realize! state (f) nil)\n"
-        "                   (catch Throwable e (clove/pending-realize! state nil e)))))))\n"
+        "                   (catch Throwable e (clove/pending-realize! state nil (clove/execution-exception e))))))))\n"
         "    (CloveFuture. state)))\n"
         "(defmacro future [& body] `(future-call (fn [] ~@body)))\n"
         "(defn future? [x] (and (map? x) (= :CloveFuture (:clove/type x))))\n"

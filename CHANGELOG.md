@@ -142,6 +142,22 @@
 - A trailing `#_form` at the end of input reads as nothing, and
   `read-string` takes an options map (`:eof`).
 
+### Fixed (reader metadata, futures)
+- Reader metadata is data: `^m form` attaches `m` to the form instead of
+  reading as a `(with-meta form m)` call, so `(meta (read-string "^:k [a]"))`,
+  `(meta '^:k [a])` and a macro's `(meta x)` see it. Collection literals and
+  `fn` forms evaluate their metadata (`(meta ^{:x (+ 1 2)} [1])` is
+  `{:x 3}`), `def` evaluates its name's, syntax-quote carries it, and
+  metadata on a call form is dropped, as in Clojure. `^:k 1` is a read error.
+- Dereferencing a future whose body threw throws a
+  `java.util.concurrent.ExecutionException` with the original as its
+  `ex-cause`, as on the JVM; it rethrew the original. `pmap` and `pcalls`
+  wrap the same way. Code that caught a specific exception type around
+  `@fut` now needs `(ex-cause e)`.
+- ASan builds no longer report false stack-buffer-underflows after a throw
+  caught inside a coroutine: the frames a throw abandons have their
+  redzones cleared, which ASan does not do on a coroutine stack.
+
 ## v0.9.0 — 2026-11-02
 
 ### Changed

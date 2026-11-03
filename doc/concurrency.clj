@@ -21,8 +21,9 @@
 ;; (deref (future (Thread/sleep 1000) :slow) 50 :timeout)  ;=> :timeout
 ;; ```
 ;;
-;; A future that throws rethrows when you `deref` it. `promise` and
-;; `deliver` work as in Clojure.
+;; A future that throws throws again when you `deref` it, wrapped in a
+;; `java.util.concurrent.ExecutionException` whose `ex-cause` is the
+;; original, as on the JVM. `promise` and `deliver` work as in Clojure.
 ;;
 ;; ## core.async
 ;;
