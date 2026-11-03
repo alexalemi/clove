@@ -307,9 +307,11 @@ struct Clove {
          * Also a hash map's entry cell; edit is the transient that owns it. */
         struct { Clove *left; Clove *right; Clove *key; Clove *val; uint32_t size; uint32_t edit; } tnode;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
-         * subnode. Collision nodes hold same-hash entries linearly. */
+         * subnode. Collision nodes hold same-hash entries linearly. An array
+         * node (a dense level, Clojure's ArrayNode) has 32 kids indexed by
+         * hash fragment, each a subnode or NULL; bitmap marks the used ones. */
         struct { Clove **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
-                 bool collision; uint32_t edit_id; } hnode;
+                 bool collision; bool array; uint32_t edit_id; } hnode;
         /* arities: list of (params-list . body-list) pairs; dispatch by argc */
         struct { Clove *arities; CloveEnv *env; bool is_macro; } fn;
         CloveNativeFn native;
@@ -1526,6 +1528,8 @@ static size_t gc_freed_last;
 static bool clove_interactive;
 static bool gc_stress;             /* CLOVE_GC_STRESS=1: collect every 512 allocs */
 static bool gc_explicit;           /* this collection is a (gc) call: give memory back */
+static bool gc_released = true;    /* the last collection gave memory back */
+static bool gc_idling;             /* gc_explicit, but from gc_idle: keep the floor */
 static void *gc_stack_base;
 static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
@@ -1949,6 +1953,7 @@ static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp) {
     }
 
     gc_freed_last = freed;
+    gc_released = gc_explicit;
     if (getenv("CLOVE_GC_LOG")) {
         size_t tagn[CLOVE_TNODE + 1] = {0};
         for (CellBlock *b = cell_blocks; b; b = b->next)
@@ -1979,7 +1984,7 @@ static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp) {
      * often; when much survives (retentive), shrink it back to cap memory.
      * Bounded by GC_CHURN_CAP (peak ≈ that many cells of garbage). */
     size_t total = live + freed;
-    if (gc_explicit)
+    if (gc_explicit && !gc_idling)
         churn_floor = GC_MIN_THRESHOLD;   /* (gc): start over from the floor */
     else if (live * 8 < total && churn_floor < GC_CHURN_CAP)
         churn_floor *= 2;                 /* <12.5% live: amortize fixed cost */
@@ -2044,6 +2049,59 @@ static void maybe_gc(void) {
     if (++gc_allocs >= (gc_stress ? 512 : gc_threshold) ||
         gc_extra_bytes >= GC_BYTES_CAP)
         gc_collect();
+}
+
+/* Idle collection. A program that stops allocating never reaches the next
+ * threshold, so it would hold its last cycle's heap for as long as it sleeps
+ * or waits for input. Natives about to block call gc_idle first: it runs a
+ * releasing collection, like (gc), when a regular collection ran since memory
+ * was last given back or a fair amount was allocated since the last one.
+ * At most one a second (a loop that sleeps between bursts pays for regrowing
+ * the heap after each), and never more than 1/20 of the time. */
+static uint64_t gc_idle_next;   /* monotonic ms before which gc_idle waits */
+
+static uint64_t mono_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static bool gc_idle_due(void) {
+#ifdef __EMSCRIPTEN__
+    return false;   /* a GC there unwinds the caller (ASYNCIFY) */
+#endif
+    if (!gc_stack_base) return false;
+    if (gc_released && gc_allocs < (1u << 16) && gc_extra_bytes < (4u << 20)) return false;
+    return mono_ms() >= gc_idle_next;
+}
+
+static void gc_idle(void) {
+    if (!gc_idle_due()) return;
+    uint64_t t0 = mono_ms();
+    gc_explicit = gc_idling = true;
+    gc_collect();
+    gc_explicit = gc_idling = false;
+    uint64_t t1 = mono_ms(), wait = 20 * (t1 - t0);
+    gc_idle_next = t1 + (wait > 1000 ? wait : 1000);
+}
+
+/* Before a read on fd: collect only if the read would block. */
+static void gc_idle_fd(int fd) {
+    if (!gc_idle_due()) return;
+#ifndef _WIN32
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&p, 1, 0) > 0) {        /* data waiting: not idle. Probe again */
+        gc_idle_next = mono_ms() + 10;   /* later, not once per line */
+        return;
+    }
+#else
+    (void)fd;
+#endif
+    gc_idle();
 }
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
@@ -2267,6 +2325,11 @@ static Clove *mk_hnode_nz(uint32_t bitmap, uint16_t nkids, bool collision, uint3
 
 static bool hamt_find(Clove *node, uint32_t shift, uint32_t hash, Clove *key, Clove **out) {
     while (node) {
+        if (node->as.hnode.array) {
+            node = node->as.hnode.kids[(hash >> shift) & HAMT_MASK];
+            shift += HAMT_BITS;
+            continue;
+        }
         if (node->as.hnode.collision) {
             if (hash != node->as.hnode.chash) return false;
             for (size_t i = 0; i < node->as.hnode.nkids; i += 2)
@@ -2318,6 +2381,69 @@ static Clove *hamt_two(uint32_t shift, uint32_t h1, Clove *k1, Clove *v1,
     return n;
 }
 
+/* Array nodes. A bitmap node about to hold more than HAMT_ARRAY_MIN
+ * entries becomes an array node, its inline entries pushed down a level into
+ * one-entry nodes; an array node left with HAMT_PACK_MAX children packs back
+ * into a bitmap node of subnodes. A dense level then copies 32 slots per
+ * path copy instead of 64 (half the bytes a big map's update churns). */
+#define HAMT_ARRAY_MIN 16
+#define HAMT_PACK_MAX 8
+
+static Clove *mk_anode(uint32_t bitmap, uint32_t id) {
+    Clove *n = mk_hnode(bitmap, 32, false, 0);
+    n->as.hnode.array = true;
+    n->as.hnode.edit_id = id;
+    return n;
+}
+
+static Clove *anode_copy(Clove *node) {
+    Clove *n = mk_hnode_nz(node->as.hnode.bitmap, 32, false, 0);
+    n->as.hnode.array = true;
+    memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 32);
+    return n;
+}
+
+/* The array node for bitmap node `node` at `shift`; new nodes get edit id
+ * `id`. Slots fill one by one, so a collection mid-way sees NULLs. */
+static Clove *hamt_promote(Clove *node, uint32_t shift, uint32_t id) {
+    Clove *a = mk_anode(0, id);
+    uint32_t bm = node->as.hnode.bitmap;
+    size_t pos = 0;
+    for (unsigned i = 0; i < 32; i++) {
+        if (!(bm & (1u << i))) continue;
+        Clove *k = node->as.hnode.kids[2 * pos], *v = node->as.hnode.kids[2 * pos + 1];
+        pos++;
+        if (k) {
+            uint32_t h = clove_hash(k);
+            Clove *c = mk_hnode(1u << ((h >> (shift + HAMT_BITS)) & HAMT_MASK), 2, false, 0);
+            c->as.hnode.kids[0] = k;
+            c->as.hnode.kids[1] = v;
+            c->as.hnode.edit_id = id;
+            v = c;
+        }
+        a->as.hnode.kids[i] = v;
+        a->as.hnode.bitmap |= 1u << i;
+    }
+    return a;
+}
+
+/* Array node `node` without child `skip`, as a bitmap node of subnodes
+ * (NULL when nothing is left). */
+static Clove *hamt_pack(Clove *node, unsigned skip, uint32_t id) {
+    uint32_t bm = node->as.hnode.bitmap & ~(1u << skip);
+    if (!bm) return NULL;
+    Clove *n = mk_hnode_nz(bm, (uint16_t)(2 * popcnt32(bm)), false, 0);
+    n->as.hnode.edit_id = id;
+    size_t p = 0;
+    for (unsigned i = 0; i < 32; i++)
+        if (bm & (1u << i)) {
+            n->as.hnode.kids[2 * p] = NULL;
+            n->as.hnode.kids[2 * p + 1] = node->as.hnode.kids[i];
+            p++;
+        }
+    return n;
+}
+
 /* What hamt_assoc does with a key already present: */
 enum { HA_REPLACE,   /* store val */
        HA_ENTRY,     /* val is a fresh map entry cell: give it the old entry's
@@ -2343,6 +2469,16 @@ static Clove *hamt_assoc(Clove *node, uint32_t shift, uint32_t hash,
         Clove *n = mk_hnode(1u << ((hash >> shift) & HAMT_MASK), 2, false, 0);
         n->as.hnode.kids[0] = key; n->as.hnode.kids[1] = val;
         *added = true;
+        return n;
+    }
+    if (node->as.hnode.array) {
+        uint32_t idx = (hash >> shift) & HAMT_MASK;
+        Clove *child = node->as.hnode.kids[idx];
+        Clove *nc = hamt_assoc(child, shift + HAMT_BITS, hash, key, val, mode, added);
+        if (nc == child) return node;
+        Clove *n = anode_copy(node);
+        n->as.hnode.kids[idx] = nc;
+        n->as.hnode.bitmap |= 1u << idx;
         return n;
     }
     if (node->as.hnode.collision) {
@@ -2375,6 +2511,13 @@ static Clove *hamt_assoc(Clove *node, uint32_t shift, uint32_t hash,
     size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
     uint16_t n_old = node->as.hnode.nkids;
     if (!(node->as.hnode.bitmap & bit)) {
+        if (n_old / 2 >= HAMT_ARRAY_MIN && shift + HAMT_BITS < 32) {
+            Clove *a = hamt_promote(node, shift, 0);
+            Clove *c = hamt_assoc(NULL, shift + HAMT_BITS, hash, key, val, mode, added);
+            a->as.hnode.kids[(hash >> shift) & HAMT_MASK] = c;
+            a->as.hnode.bitmap |= bit;
+            return a;
+        }
         /* New slot: copy with a 2-wide gap at the insertion point. */
         Clove *n = mk_hnode_nz(node->as.hnode.bitmap | bit, (uint16_t)(n_old + 2), false, 0);
         memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 2 * pos);
@@ -2418,14 +2561,26 @@ static Clove *hamt_assoc(Clove *node, uint32_t shift, uint32_t hash,
 }
 
 static Clove *hamt_dissoc(Clove *node, uint32_t shift, uint32_t hash,
-                         Clove *key, bool *removed) {
-    if (!node) { *removed = false; return NULL; }
+                         Clove *key, Clove **removed) {
+    if (!node) { *removed = NULL; return NULL; }
+    if (node->as.hnode.array) {
+        uint32_t idx = (hash >> shift) & HAMT_MASK;
+        Clove *child = node->as.hnode.kids[idx];
+        Clove *nc = hamt_dissoc(child, shift + HAMT_BITS, hash, key, removed);
+        if (!*removed) return node;
+        if (!nc && popcnt32(node->as.hnode.bitmap) - 1 <= HAMT_PACK_MAX)
+            return hamt_pack(node, idx, 0);
+        Clove *n = anode_copy(node);
+        n->as.hnode.kids[idx] = nc;
+        if (!nc) n->as.hnode.bitmap &= ~(1u << idx);
+        return n;
+    }
     if (node->as.hnode.collision) {
-        if (hash != node->as.hnode.chash) { *removed = false; return node; }
+        if (hash != node->as.hnode.chash) { *removed = NULL; return node; }
         uint16_t n_old = node->as.hnode.nkids;
         for (size_t i = 0; i < n_old; i += 2) {
             if (clove_eq(node->as.hnode.kids[i], key)) {
-                *removed = true;
+                *removed = node->as.hnode.kids[i + 1];
                 if (n_old == 2) return NULL;
                 Clove *n = mk_hnode_nz(0, (uint16_t)(n_old - 2), true, hash);
                 memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * i);
@@ -2434,18 +2589,18 @@ static Clove *hamt_dissoc(Clove *node, uint32_t shift, uint32_t hash,
                 return n;
             }
         }
-        *removed = false;
+        *removed = NULL;
         return node;
     }
     uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
-    if (!(node->as.hnode.bitmap & bit)) { *removed = false; return node; }
+    if (!(node->as.hnode.bitmap & bit)) { *removed = NULL; return node; }
     size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
     uint16_t n_old = node->as.hnode.nkids;
     Clove *ek = node->as.hnode.kids[2 * pos];
     Clove *ev = node->as.hnode.kids[2 * pos + 1];
     if (ek) {
-        if (!clove_eq(ek, key)) { *removed = false; return node; }
-        *removed = true;
+        if (!clove_eq(ek, key)) { *removed = NULL; return node; }
+        *removed = ev;
         if (n_old == 2) return NULL;
         Clove *n = mk_hnode_nz(node->as.hnode.bitmap & ~bit, (uint16_t)(n_old - 2), false, 0);
         memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * 2 * pos);
@@ -2566,6 +2721,11 @@ static Clove *map_assoc(Clove *m, Clove *k, Clove *v) {
 
 /* Put a big map's entries in stamp order: a[stamp] = entry, gaps NULL. */
 static void hamt_scatter(Clove *node, Clove **a) {
+    if (node->as.hnode.array) {
+        for (size_t i = 0; i < 32; i++)
+            if (node->as.hnode.kids[i]) hamt_scatter(node->as.hnode.kids[i], a);
+        return;
+    }
     for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
         Clove *k = node->as.hnode.kids[i];
         if (k == NULL && !node->as.hnode.collision) hamt_scatter(node->as.hnode.kids[i + 1], a);
@@ -2597,6 +2757,11 @@ static Clove **map_order(Clove *m, Clove **buf, Clove **hold, uint32_t *n) {
  * in HAMT order (x, x). Stops early when f returns false; returns false then. */
 static bool hamt_each(Clove *node, EntryFn f, void *ctx) {
     if (!node) return true;
+    if (node->as.hnode.array) {
+        for (size_t i = 0; i < 32; i++)
+            if (!hamt_each(node->as.hnode.kids[i], f, ctx)) return false;
+        return true;
+    }
     for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
         Clove *k = node->as.hnode.kids[i];
         if (k == NULL && !node->as.hnode.collision) {
@@ -2627,6 +2792,14 @@ static bool map_each(Clove *m, EntryFn f, void *ctx) {
     return ok;
 }
 
+/* A removed entry's stamp stays a gap until compaction rebuilds the map.
+ * Gaps cost a scratch slot per iteration; compacting copies every entry.
+ * Removing the oldest key in a loop (a queue, an LRU cache) makes a gap
+ * every time, so let them reach 4x the entries before paying for a copy. */
+static bool map_too_dead(Clove *m) {
+    return m->as.map.dead > 8 && m->as.map.dead > 4 * (uint64_t)m->as.map.count;
+}
+
 /* Rebuild without tombstones (restamps every entry), through a transient. */
 static Clove *thash_new(bool set);
 static Clove *thash_persist(Clove *th);
@@ -2651,12 +2824,10 @@ static Clove *map_dissoc_one(Clove *m, Clove *k) {
         memcpy(kv + at, o->as.vec.tail + at + 2, sizeof(Clove *) * (n - at - 2));
         return map_small_cell(m, kv, n - 2);
     }
-    bool removed = false;
     Clove *old = NULL;
-    uint32_t h = clove_hash(k);
-    if (!hamt_find(m->as.map.root, 0, h, k, &old)) return m;
-    Clove *root = hamt_dissoc(m->as.map.root, 0, h, k, &removed);
-    Clove *nm = alloc(CLOVE_MAP);
+    Clove *root = hamt_dissoc(m->as.map.root, 0, clove_hash(k), k, &old);
+    if (!old) return m;
+    Clove *nm = alloc(CLOVE_MAP);   /* root is stack-rooted here */
     nm->meta = m->meta;
     nm->as.map.count = m->as.map.count - 1;
     if (nm->as.map.count == 0) return nm;            /* empty: no root */
@@ -2664,13 +2835,17 @@ static Clove *map_dissoc_one(Clove *m, Clove *k) {
     /* the newest entry leaves no gap: the next insert reuses its stamp */
     bool last = old->as.tnode.size + 1 == m->as.map.count + m->as.map.dead;
     nm->as.map.dead = m->as.map.dead + (last ? 0 : 1);
-    if (nm->as.map.dead > 8 && nm->as.map.dead > nm->as.map.count) return map_compact(nm);
+    if (map_too_dead(nm)) return map_compact(nm);
     return nm;
 }
 
 /* Flatten to a list of (k . v) cons pairs for iteration (print, eq, seq). */
 static void hamt_entries(Clove *node, Clove ***t) {
     if (!node) return;
+    if (node->as.hnode.array) {
+        for (size_t i = 0; i < 32; i++) hamt_entries(node->as.hnode.kids[i], t);
+        return;
+    }
     for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
         Clove *k = node->as.hnode.kids[i];
         if (k == NULL && !node->as.hnode.collision) {
@@ -2727,7 +2902,7 @@ static Clove *set_conj(Clove *s, Clove *x) {
 }
 
 static Clove *set_disj(Clove *s, Clove *x) {
-    bool removed = false;
+    Clove *removed = NULL;
     Clove *root = hamt_dissoc(s->as.map.root, 0, clove_hash(x), x, &removed);
     if (!removed) return s;
     Clove *ns = alloc(CLOVE_SET);
@@ -2762,6 +2937,7 @@ static Clove *thamt_own(Clove *node, uint32_t id) {
     uint16_t nk = node->as.hnode.nkids;
     Clove *n = mk_hnode_nz(node->as.hnode.bitmap, nk, node->as.hnode.collision, node->as.hnode.chash);
     memcpy(n->as.hnode.kids, node->as.hnode.kids, sizeof(Clove *) * nk);
+    n->as.hnode.array = node->as.hnode.array;
     n->as.hnode.edit_id = id;
     return n;
 }
@@ -2796,6 +2972,16 @@ static Clove *thamt_assoc(Clove *node, uint32_t shift, uint32_t hash, Clove *key
         *added = true;
         return n;
     }
+    if (node->as.hnode.array) {
+        uint32_t idx = (hash >> shift) & HAMT_MASK;
+        Clove *child = node->as.hnode.kids[idx];
+        Clove *nc = thamt_assoc(child, shift + HAMT_BITS, hash, key, val, id, keep, added);
+        if (nc == child) return node;        /* unchanged, or edited in place */
+        Clove *n = thamt_own(node, id);
+        n->as.hnode.kids[idx] = nc;
+        n->as.hnode.bitmap |= 1u << idx;
+        return n;
+    }
     if (node->as.hnode.collision) {
         if (hash != node->as.hnode.chash) {   /* push the collision node down a level */
             Clove *wrap = mk_hnode(1u << ((node->as.hnode.chash >> shift) & HAMT_MASK), 2, false, 0);
@@ -2820,6 +3006,13 @@ static Clove *thamt_assoc(Clove *node, uint32_t shift, uint32_t hash, Clove *key
     uint32_t bit = 1u << ((hash >> shift) & HAMT_MASK);
     size_t pos = popcnt32(node->as.hnode.bitmap & (bit - 1));
     if (!(node->as.hnode.bitmap & bit)) {
+        if (node->as.hnode.nkids / 2 >= HAMT_ARRAY_MIN && shift + HAMT_BITS < 32) {
+            Clove *a = hamt_promote(node, shift, id);
+            Clove *c = thamt_assoc(NULL, shift + HAMT_BITS, hash, key, val, id, keep, added);
+            a->as.hnode.kids[(hash >> shift) & HAMT_MASK] = c;
+            a->as.hnode.bitmap |= bit;
+            return a;
+        }
         Clove *n = thamt_own(node, id);
         hnode_resize2(n, 2 * pos, true, key, val);
         n->as.hnode.bitmap |= bit;
@@ -2860,14 +3053,26 @@ static Clove *thamt_assoc(Clove *node, uint32_t shift, uint32_t hash, Clove *key
 
 /* Returns the new subtree (NULL once empty). */
 static Clove *thamt_dissoc(Clove *node, uint32_t shift, uint32_t hash, Clove *key,
-                          uint32_t id, bool *removed) {
-    *removed = false;
+                          uint32_t id, Clove **removed) {
+    *removed = NULL;
     if (!node) return NULL;
+    if (node->as.hnode.array) {
+        uint32_t idx = (hash >> shift) & HAMT_MASK;
+        Clove *child = node->as.hnode.kids[idx];
+        Clove *nc = thamt_dissoc(child, shift + HAMT_BITS, hash, key, id, removed);
+        if (!*removed || nc == child) return node;
+        if (!nc && popcnt32(node->as.hnode.bitmap) - 1 <= HAMT_PACK_MAX)
+            return hamt_pack(node, idx, id);
+        Clove *n = thamt_own(node, id);
+        n->as.hnode.kids[idx] = nc;
+        if (!nc) n->as.hnode.bitmap &= ~(1u << idx);
+        return n;
+    }
     if (node->as.hnode.collision) {
         if (hash != node->as.hnode.chash) return node;
         for (size_t i = 0; i < node->as.hnode.nkids; i += 2)
             if (clove_eq(node->as.hnode.kids[i], key)) {
-                *removed = true;
+                *removed = node->as.hnode.kids[i + 1];
                 if (node->as.hnode.nkids == 2) return NULL;
                 Clove *n = thamt_own(node, id);
                 hnode_resize2(n, i, false, NULL, NULL);
@@ -2882,7 +3087,7 @@ static Clove *thamt_dissoc(Clove *node, uint32_t shift, uint32_t hash, Clove *ke
     Clove *child = NULL;
     if (ek) {
         if (!clove_eq(ek, key)) return node;
-        *removed = true;
+        *removed = ev;
     } else {
         child = thamt_dissoc(ev, shift + HAMT_BITS, hash, key, id, removed);
         if (!*removed) return node;
@@ -2966,18 +3171,15 @@ static Clove *thash_persist(Clove *th) {
 
 static void thash_dissoc(Clove *t, Clove *k) {
     if (!t->as.map.is_set && !t->as.map.root) { thash_take(t, map_dissoc_one(t, k)); return; }
-    bool removed = false;
-    uint32_t h = clove_hash(k);
-    Clove *old = NULL;
-    if (!t->as.map.is_set && !hamt_find(t->as.map.root, 0, h, k, &old)) return;
-    Clove *root = thamt_dissoc(t->as.map.root, 0, h, k, t->as.map.edit_id, &removed);
-    if (!removed) return;
+    Clove *old = NULL;   /* the removed entry cell (a set's element) */
+    Clove *root = thamt_dissoc(t->as.map.root, 0, clove_hash(k), k, t->as.map.edit_id, &old);
+    if (!old) return;
     t->as.map.root = root;
     t->as.map.count--;
     if (t->as.map.is_set) return;
     if (t->as.map.count == 0) { t->as.map.root = NULL; t->as.map.dead = 0; return; }
     if (old->as.tnode.size + 1 != t->as.map.count + 1 + t->as.map.dead) t->as.map.dead++;
-    if (t->as.map.dead > 8 && t->as.map.dead > t->as.map.count) thash_take(t, map_compact(t));
+    if (map_too_dead(t)) thash_take(t, map_compact(t));
 }
 
 /* ───── Persistent vectors ───────────────────────────────────────────── */
@@ -3433,6 +3635,89 @@ static Clove *prim_dissoc_bang(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_disj_bang(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     return thash_remove_bang(argv, nargs, true, "disj!");
+}
+
+/* ── frequencies and group-by ──
+ * Natives so the input is walked with seq1_slot, like reduce, and the
+ * consumed part of a lazy seq can be collected as they go (a defn's `coll`
+ * local would pin it all), and so each step is a lookup and an in-place
+ * update instead of a get, an assoc! and a closure call. */
+
+/* The value slot of k in a transient map that the caller built from empty:
+ * its entry cells and small-map order vector are private, so the slot can be
+ * written in place. NULL when k is absent. */
+static Clove **thash_private_slot(Clove *t, Clove *k) {
+    if (!t->as.map.root) {
+        size_t at;
+        return map_small_find(t, k, &at) ? &t->as.map.order->as.vec.tail[at + 1] : NULL;
+    }
+    Clove *ent;
+    return hamt_find(t->as.map.root, 0, clove_hash(k), k, &ent) ? &ent->as.tnode.val : NULL;
+}
+
+static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
+                          bool public_only);
+/* A deftype or record reduces through its own methods: leave it to the
+ * prelude's reduce-based definition, clove/<name>-reduce. */
+static Clove *builder_fallback(CloveEnv *env, const char *name, Clove **argv, int nargs) {
+    Clove *coll = argv[nargs - 1];
+    static Clove *KW_TYPE;
+    if (!KW_TYPE) KW_TYPE = mk_kw(intern("clove/type", 10));
+    if (coll == NIL || coll->tag != CLOVE_MAP || !map_find(coll, KW_TYPE, NULL)) return NULL;
+    Binding *b = root_find(env_root(env), intern(name, strlen(name)), NULL, false);
+    if (!b) clove_error("%s is not defined", name);
+    return apply(env, b->value, argv, nargs);
+}
+
+static Clove *prim_frequencies(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 1, "frequencies");
+    Clove *r = builder_fallback(env, "clove/frequencies-reduce", argv, 1);
+    if (r) return r;
+    Clove *t = thash_new(false);
+    for (Clove *l = seq1_slot(&argv[0]); l != NIL; argv[0] = l->as.cons.tail, l = seq1_slot(&argv[0])) {
+        Clove *x = l->as.cons.head, **slot = thash_private_slot(t, x);
+        if (slot) {
+            Clove *n = mk_int((*slot)->as.i + 1);   /* allocate, then store */
+            *slot = n;
+        } else thash_assoc(t, x, mk_int(1));
+    }
+    return thash_persist(t);
+}
+
+static Clove *prim_group_by(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 2, "group-by");
+    Clove *r = builder_fallback(env, "clove/group-by-reduce", argv, 2);
+    if (r) return r;
+    Clove *f = argv[0], *t = thash_new(false), *empty = mk_empty_vec();
+    /* groups are transient vectors while the map is built */
+    for (Clove *l = seq1_slot(&argv[1]); l != NIL; argv[1] = l->as.cons.tail, l = seq1_slot(&argv[1])) {
+        Clove *x = l->as.cons.head;
+        Clove *k = apply(env, f, &x, 1);
+        Clove **slot = thash_private_slot(t, k);
+        Clove *two[2] = { slot ? *slot : prim_transient(env, &empty, 1), x };
+        prim_conj_bang(env, two, 2);
+        if (!slot) thash_assoc(t, k, two[0]);
+    }
+    /* then each becomes persistent in place: no assoc can reorder or copy */
+    if (!t->as.map.root) {
+        Clove *o = t->as.map.order;
+        for (uint32_t i = 1; o && i < o->as.vec.count; i += 2) {
+            Clove *v = prim_persistent_bang(env, &o->as.vec.tail[i], 1);
+            o->as.vec.tail[i] = v;
+        }
+    } else {
+        Clove *buf[MAP_ORDER_BUF], *hold;
+        uint32_t n;
+        Clove **a = map_order(t, buf, &hold, &n);
+        Clove *volatile keep_hold = hold;
+        for (uint32_t i = 0; i < n; i++)
+            if (a[i]) {
+                Clove *v = prim_persistent_bang(env, &a[i]->as.tnode.val, 1);
+                a[i]->as.tnode.val = v;
+            }
+        (void)keep_hold;
+    }
+    return thash_persist(t);
 }
 
 /* Build a vector from a C array (small n — entry pairs, literals). */
@@ -13924,6 +14209,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     si.hStdInput = hin; si.hStdOutput = hout; si.hStdError = herr;
     PROCESS_INFORMATION pi;
     if (CreateProcessA(NULL, cmd.data, NULL, NULL, 1 /* inherit handles */, 0, envb.data, cdir, &si, &pi)) {
+        gc_idle();
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD ec = 1;
         GetExitCodeProcess(pi.hProcess, &ec);
@@ -14000,6 +14286,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     if (inb.len == 0) { close(pin[1]); pin[1] = -1; }
     else fcntl(pin[1], F_SETFL, fcntl(pin[1], F_GETFL) | O_NONBLOCK);
     int open_fds = 2;
+    gc_idle();
     while (open_fds > 0 || pin[1] >= 0) {
         struct pollfd fds[3]; int nf = 0;
         int io = -1, ie = -1, ii = -1;
@@ -14136,6 +14423,7 @@ static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     char buf[4096];
     SBuf sb = {0};
+    gc_idle_fd(0);
     for (;;) {                       /* loop: a line may exceed one buffer */
         if (!fgets(buf, sizeof buf, stdin)) {
             if (sb.len == 0) { free(sb.data); return NIL; }
@@ -14154,6 +14442,7 @@ static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_stdin_slurp(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     SBuf sb = {0};
+    gc_idle_fd(0);
     sb_read_all(&sb, stdin);
     Clove *res = mk_str(sb.data, sb.len);
     free(sb.data);
@@ -14230,6 +14519,7 @@ static Clove *prim_read_key(CloveEnv *env, Clove **argv, int nargs) {
     return NIL;
 #else
     char buf[32]; size_t n = 0;
+    gc_idle_fd(0);
     int c = raw_getc();
     if (c < 0) return NIL;
     buf[n++] = (char)c;
@@ -14368,6 +14658,10 @@ static Clove *prim_sleep_ms(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs < 1) return NIL;
     double ms = as_num(argv[0]);
     if (ms <= 0) return NIL;
+    uint64_t t0 = mono_ms();
+    gc_idle();
+    ms -= (double)(mono_ms() - t0);
+    if (ms <= 0) return NIL;
 #ifdef _WIN32
     Sleep((DWORD)ms);
 #else
@@ -14399,6 +14693,7 @@ static Clove *prim_poll_fds(CloveEnv *env, Clove **argv, int nargs) {
         pfd[i].events = (short)(((ev & 1) ? POLLIN : 0) | ((ev & 2) ? POLLOUT : 0));
         pfd[i].revents = 0;
     }
+    if (timeout != 0) gc_idle();
     poll(pfd, (nfds_t)n, timeout);
     /* revents are 0..3 — all smallints (immortal), so building the result
      * vector triggers no GC hazard for the in-flight item array. */
@@ -14495,6 +14790,7 @@ static Clove *prim_tcp_accept(CloveEnv *env, Clove **argv, int nargs) {
     int srv = (int)as_int(argv[0], "tcp/accept");
     int timeout = nargs > 1 ? (int)as_int(argv[1], "tcp/accept") : -1;
     struct pollfd p = { .fd = srv, .events = POLLIN };
+    if (timeout != 0) gc_idle_fd(srv);
     if (poll(&p, 1, timeout) <= 0) return NIL;
     int fd = accept(srv, NULL, NULL);
     if (fd >= 0) clove_no_sigpipe(fd);
@@ -14506,6 +14802,7 @@ static Clove *prim_tcp_recv(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int fd = (int)as_int(argv[0], "tcp/recv");
     char buf[65536];
+    gc_idle_fd(fd);
     ssize_t n = recv(fd, buf, sizeof buf, 0);
     if (n <= 0) return NIL;
     return mk_str(buf, (size_t)n);
@@ -15960,10 +16257,11 @@ static const char *PRELUDE =
     "                          (recur (next s))\n"
     "                          (cons x (step (rest s) (conj seen x)))))))))]\n"
     "     (step coll #{}))))\n"
-    "(defn group-by [f coll]\n"
+    /* group-by and frequencies are natives; these serve deftypes and records */
+    "(defn clove/group-by-reduce [f coll]\n"
     "  (persistent!\n"
     "    (reduce (fn [m x] (let [k (f x)] (assoc! m k (conj (get m k []) x)))) (transient {}) coll)))\n"
-    "(defn frequencies [coll]\n"
+    "(defn clove/frequencies-reduce [coll]\n"
     "  (persistent! (reduce (fn [m x] (assoc! m x (inc (get m x 0)))) (transient {}) coll)))\n"
     "(defn juxt [& fs] (fn [& args] (mapv (fn [f] (apply f args)) fs)))\n"
     "(defn sort-by\n"
@@ -17628,6 +17926,8 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "transient",   prim_transient);
     clove_define_native(e, "clove/editable?", prim_editable_p);
     clove_define_native(e, "persistent!", prim_persistent_bang);
+    clove_define_native(e, "frequencies", prim_frequencies);
+    clove_define_native(e, "group-by", prim_group_by);
     clove_define_native(e, "conj!",       prim_conj_bang);
     clove_define_native(e, "assoc!",      prim_assoc_bang);
     clove_define_native(e, "pop!",        prim_pop_bang);
@@ -21576,6 +21876,7 @@ static bool ed_is_change(int k) {
  * end, so a proposed line can be accepted with Enter or edited first. */
 static bool rl_edit_init(const char *prompt, char *buf, size_t bufcap, const char *init) {
     RlTermState st;
+    gc_idle_fd(0);
     if (!rl_raw_enter(&st)) {   /* not a capable console: plain line input */
         fputs(prompt, stdout);
         if (init) fputs(init, stdout);
@@ -22062,6 +22363,7 @@ static bool br_skip(FILE *f, int c) {
 /* Read one top-level dict message; returns false on EOF/garbage. */
 static bool nrepl_read(FILE *f, NreplMsg *m) {
     memset(m, 0, sizeof *m);
+    gc_idle_fd(fileno(f));
     int c = fgetc(f);
     if (c != 'd') return false;
     for (;;) {
@@ -22309,6 +22611,7 @@ static int nrepl_server(CloveEnv *env, int port) {
     if (pf) { fprintf(pf, "%d", port); fclose(pf); }
     fprintf(stderr, "clove nREPL server on 127.0.0.1:%d\n", port);
     for (;;) {
+        gc_idle();
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
         clove_no_sigpipe(fd);

@@ -4625,6 +4625,68 @@
                           "  (prn [x @h]))"))]
       (assert= 3000000 x)
       (assert= true (< (or h Long/MAX_VALUE) (* 100 1024 1024))))))
+;; ── workstream I: idle collection, map/set builders ──
+;; A program that churns and then blocks gives its heap back without (gc):
+;; sleeping, and waiting on read-line from a pipe nobody has written to yet.
+(when-not (System/getenv "CLOVE_GC_STRESS")
+  (let [exe (str (clove/exe-dir*) "/clove")
+        churn (fn [wait]
+                (str "(let [deep (fn deep [n f] (if (zero? n) (f) (let [r (deep (dec n) f)] r)))"
+                     "      h0 (deep 20 (fn [] (dotimes [_ 40] (count (doall (map inc (range 300000)))))"
+                     "                    (clove/heap-bytes*)))]"
+                     wait
+                     "  (prn [h0 (clove/heap-bytes*)]))"))
+        parse (fn [r] (try (read-string (:out r)) (catch Exception _ [0 Long/MAX_VALUE])))
+        small? (and (= :linux (clove/os*)) (not (System/getenv "ASAN_OPTIONS")))
+        check (fn [[h0 h1]]
+                (assert= true (< h1 h0))
+                (when small? (assert= true (< h1 (* 100 1024 1024)))))]
+    (check (parse (sh exe "-e" (churn "(Thread/sleep 50)"))))
+    (when clove-test-unix?
+      (let [f "clove-idle-rl.clj" ready "clove-idle-rl.ready"]
+        (spit f (churn (str "(spit \"" ready "\" \"\") (read-line)")))
+        (try
+          ;; the writer holds the line back until the reader is waiting
+          (check (parse (sh "sh" "-c" (str "rm -f " ready "; (while [ ! -e " ready " ]; do sleep 0.02; done;"
+                                           " sleep 0.2; echo x) | '" exe "' " f))))
+          (finally (clove/file-op* :delete f) (clove/file-op* :delete ready)))))))
+
+;; frequencies and group-by are natives over a transient map
+(assert= "{1 2, 2 1}" (pr-str (frequencies [1 1N 2])))
+(assert= "{1 [\"a\" \"c\"], 2 [\"bb\"], 0 [nil]}" (pr-str (group-by count ["a" "bb" "c" nil])))
+(assert= [{} {} {\a 2 \b 1}] [(frequencies nil) (group-by identity nil) (frequencies "aba")])
+(assert= (range 25) (keys (frequencies (map #(mod % 25) (range 1000)))))
+(assert= (repeat 25 40) (vals (frequencies (map #(mod % 25) (range 1000)))))
+(let [g (group-by #(mod % 30) (range 3000))]
+  (assert= (range 30) (keys g))
+  (assert= [true 100 (range 7 3000 30)] [(every? vector? (vals g)) (count (g 5)) (g 7)])
+  (assert= "[0 30]" (pr-str (subvec (g 0) 0 2))))
+(assert= :boom (try (group-by (fn [x] (if (= x 50) (throw (ex-info "b" {})) x)) (range 100))
+                    (catch Exception e :boom)))
+(assert= {:a [{:a :a}]} (group-by :a [{:a :a}]))
+(assert= {[1 2] 2} (frequencies [[1 2] '(1 2)]))
+(defrecord WsiPair [a b])
+(assert= 3 (count (frequencies (->WsiPair 1 1))))
+;; a lazy input is consumed as it goes, not held whole
+(assert= 1000 (count (frequencies (map #(mod % 1000) (range 2000000)))))
+;; dense HAMT levels are array nodes: they grow, shrink and pack back
+(let [ks (concat (range 3000) (map str (range 1000)) (map #(keyword (str "k" %)) (range 1000)))
+      m (zipmap ks (range))
+      gone (take-nth 3 ks)
+      m2 (apply dissoc m gone)
+      t2 (persistent! (reduce dissoc! (transient m) gone))]
+  (assert= [5000 (- 5000 (count gone))] [(count m) (count m2)])
+  (assert= (remove (set gone) ks) (keys m2))
+  (assert= [true true] [(= m2 t2) (= (hash m2) (hash t2))])
+  (assert= {} (apply dissoc m ks))
+  (assert= {} (persistent! (reduce dissoc! (transient m) ks)))
+  (assert= [2999 :gone] [(get m 2999) (get m2 2997 :gone)])
+  (assert= #{} (apply disj (set ks) ks))
+  (assert= (set (remove (set gone) ks)) (persistent! (reduce disj! (transient (set ks)) gone))))
+;; a key queue (oldest out, newest in) keeps order and compacts its gaps
+(let [m (reduce (fn [m i] (assoc (dissoc m i) (+ i 1000) i)) (zipmap (range 1000) (range 1000)) (range 9000))]
+  (assert= (range 9000 10000) (keys m))
+  (assert= true (= m (zipmap (range 9000 10000) (range 8000 9000)))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

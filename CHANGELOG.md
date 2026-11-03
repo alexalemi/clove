@@ -33,6 +33,12 @@
   16M cells. A 5M-iteration `loop` peaks at 72 MB instead of 530 MB (system
   time 0.29 s to 0.03 s); the test suite peaks at 2.7 GB instead of 5.2 GB.
 - `(clove/heap-bytes*)` reports the bytes the collector has mapped for cells.
+- An idle program gives its heap back without calling `(gc)`: before
+  blocking in `Thread/sleep`, the fiber scheduler's wait, `read-line` or
+  `slurp` of stdin, `tcp/accept`/`tcp/recv`, `sh`, or the REPL and nREPL
+  waiting for input, the collector runs a releasing collection if the
+  program allocated since memory was last given back (at most one a
+  second). A 300 MB churn followed by `(Thread/sleep 50)` ends at 60 MB.
 - A finished coroutine frees its 1 MiB stack at once rather than at the next
   collection (200,000 short coroutines peaked at 2 GB).
 - Hashing or comparing a map or set no longer builds an entry list.
@@ -46,6 +52,16 @@
 - Replacing a value in a big map copies only the trie path, not the
   insertion-order index too: persistent `update`/`assoc-in` loops are about
   1.6x faster.
+- Dense levels of a big hash map or set are array nodes (32 child slots,
+  as in Clojure's `PersistentHashMap`), so an update copies half the bytes
+  along its path; removing a key no longer looks it up twice; and a map that
+  keeps dropping its oldest key compacts its insertion order a quarter as
+  often. A dissoc/assoc loop on a 100k-entry map went from 2.7 s to 1.8 s.
+- `frequencies` and `group-by` are natives: each element is one lookup and
+  an in-place update, group-by's groups grow as transient vectors, and a
+  lazy input is consumed as they go instead of being held whole. On a
+  million elements `frequencies` went from 0.43 s to 0.22 s and `group-by`
+  from 0.57 s to 0.25 s.
 - `update` takes up to three args before the rest, and `fnil` takes two or
   three defaults, as in Clojure. `(update-in m [] f)` updates the `nil` key
   as on the JVM (it applied `f` to the whole map).

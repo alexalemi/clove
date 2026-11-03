@@ -175,10 +175,14 @@ Things the history log leaves unresolved, roughly by value:
   (synchronous, likely faster, and would lift the depth cap). Tested only
   against Debian's emcc 3.1.6, in node and Chrome.
 - **Persistent map update loops are ~4x bb** (`(reduce #(update %1 k f) {} ..)`,
-  `assoc-in`/`update-in` at 1M steps; 2026-11-02). Builders that use
-  transients (`frequencies`, `group-by`, `into`, `set`) are within ~2.5x.
+  `assoc-in`/`update-in` at 1M steps; 2026-11-02). Builders are within 2x
+  (2026-11-03, CPU time vs bb: `frequencies` 1.4x, `group-by` 1.1x,
+  `(into #{} ..)` 1.0x, `(into {} ..)` 1.5x, a dissoc/assoc loop on a 100k
+  map 1.7x). `frequencies`/`group-by` are natives; `into` is still a defn,
+  so its `from` local pins a lazy input whole while it builds.
   Big maps keep an insertion stamp in each HAMT entry cell (iteration sorts
-  by stamp), so a value update copies only the trie path. What is left per
+  by stamp), so a value update copies only the trie path; dense levels are
+  32-slot array nodes. What is left per
   persistent assoc: ~3 cells plus ~2.6 kid arrays of up to 64 slots copied,
   and the GC/page-fault cost of that churn; the interpreter's call overhead
   is most of the rest. Levers: the fast-call path in `apply` handles only
@@ -187,17 +191,19 @@ Things the history log leaves unresolved, roughly by value:
 - **Heap retention**: the sweep frees empty cell blocks beyond the next
   threshold, empty blocks the last cycle never reached, and empty env blocks
   beyond 3x live envs; `(gc)` keeps max(2x live, 1M cells). The churn floor
-  is bounded by 16x live, so retention tracks the live set. What remains:
-  (1) a program that stops allocating never collects, so it holds its last
-  cycle's heap until it calls `(System/gc)`; (2) false retention from the
-  conservative scan. The big special forms live in noinline helpers
-  (`eval_try`, `eval_loop`, ...), so `eval_inner`'s frame is ~150 bytes
-  and holds no arrays; `apply` zeroes its stack env; `vm_compile` and
-  `lazy_force` scrub the stack below them. `lazy_force` forwards each
-  realized step to the end of the chain, so one stale word on an early
-  lazy cell no longer pins the whole tail. At -O0 stale `eval_inner`
-  slots still pin data (not a CI build); (3) Binding structs and the malloc arena (`malloc_trim` only on
-  glibc) are not returned. `clove/heap-bytes*` measures (1)-(2) without RSS
+  is bounded by 16x live, so retention tracks the live set. A program that
+  blocks (sleep, scheduler wait, stdin/socket read, `sh`, REPL/nREPL input)
+  gets the same releasing collection from `gc_idle` when it allocated since
+  memory was last given back, at most once a second. What remains:
+  (1) false retention from the conservative scan is mostly gone: the big
+  special forms live in noinline helpers (`eval_try`, `eval_loop`, ...), so
+  `eval_inner`'s frame is ~150 bytes and holds no arrays; `apply` zeroes its
+  stack env; `vm_compile` and `lazy_force` scrub the stack below them;
+  `lazy_force` forwards each realized step to the end of the chain, so one
+  stale word on an early lazy cell no longer pins the whole tail. At -O0
+  stale `eval_inner` slots still pin data (not a CI build); (2) Binding
+  structs and the malloc arena (`malloc_trim` only on glibc) are not
+  returned. `clove/heap-bytes*` measures (1) without RSS
   noise.
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
   item 36 and the July perf-campaign summary.
