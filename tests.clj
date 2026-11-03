@@ -2131,9 +2131,9 @@
 (assert= :delivered (let [p (promise)]
                       (future (Thread/sleep 20) (deliver p :delivered))
                       @p))
-; a failed future rethrows at the deref site
+; a failed future throws at the deref site, wrapped in an ExecutionException
 (assert= "boom" (try @(future (throw (ex-info "boom" {})))
-                     (catch Exception e (ex-message e))))
+                     (catch Exception e (ex-message (ex-cause e)))))
 ; deref of an undeliverable promise is a deadlock error, not a hang or nil
 (assert= :deadlock (try @(promise) (catch Exception e :deadlock)))
 (assert= [false true] (let [p (promise)] [(realized? p) (do (deliver p 1) (realized? p))]))
@@ -3563,8 +3563,8 @@
 (assert= :iae (try (case 3 1 :one) (catch IllegalArgumentException e :iae)))
 (when clove-test-coro?
   (assert= "f" (try @(future (throw (IllegalStateException. "f")))
-                    (catch IllegalArgumentException e :wrong)
-                    (catch IllegalStateException e (ex-message e)))))
+                    (catch IllegalStateException e :wrong)
+                    (catch java.util.concurrent.ExecutionException e (ex-message (ex-cause e))))))
 
 ; ── printing bigints/decimals: print/println/pr carry the N/M suffix, str of a
 ;    bare number drops it (toString), and str of a COLLECTION prints its
@@ -4342,6 +4342,98 @@
   (let [order (atom [])]
     (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
     (assert= [0 1 2 3 4] @order)))
+
+;; ── workstream E: reader metadata as data, failed-future deref ──
+;; the reader attaches ^meta to the form; it is no longer a (with-meta ..) call
+(assert= [{:k true} {:k true} {:m true} {:a 1} {:k true}]
+         [(meta (read-string "^:k [a]")) (meta '^:k [a]) (meta (first (read-string "[^:m {}]")))
+          (select-keys (meta '^{:a 1} (x y)) [:a]) (meta '^:k ())])
+(assert= '[x {:tag String} {:tag "s"} {:param-tags [a b]} {:a 1 :b true} {:k true}]
+         [(read-string "^:k x") (meta (read-string "^String x")) (meta (read-string "^\"s\" x"))
+          (meta (read-string "^[a b] x")) (meta (read-string "^{:a 1} ^{:a 2 :b true} x"))
+          (meta (read-string "#^:k [1]"))])
+(assert= [:err :err] [(try (read-string "^:k 1") (catch Exception _ :err))
+                      (try (read-string "^1 x") (catch Exception _ :err))])
+(assert= '{:a (+ 1 2)} (meta '^{:a (+ 1 2)} [1]))
+;; literals evaluate their metadata; the bytecode VM path agrees
+(assert= [{:x 3} {:kw true} {:k true} {:k true} {:x 1} nil]
+         [(meta ^{:x (+ 1 2)} [1]) (meta ^:kw [1]) (meta ^:k #{1}) (meta ^:k {:a 1})
+          (meta ^{:x 1} []) (meta [])])
+(let [f (fn [i] [(meta ^{:i i} [i]) (meta ^{:i i} {:a i}) (meta ^{:i i} #{i})])]
+  (assert= [[{:i 0} {:i 0} {:i 0}] [{:i 1} {:i 1} {:i 1}]] [(f 0) (f 1)]))
+(defn e-vec-meta [n] (loop [i 0 acc []] (if (< i n) (recur (inc i) (conj acc (meta ^{:i i} [i]))) acc)))
+(assert= [{:i 0} {:i 1} {:i 2}] (e-vec-meta 3))
+(assert= {:x 3} (eval (read-string "(meta ^{:x (+ 1 2)} [1])")))
+(assert= [nil {:foo true} {:a 2}] [(meta ^:k (list 1 2)) (meta ^:foo (fn [] 1)) (meta ^{:a (+ 1 1)} (fn foo [] 1))])
+(defn e-fn-meta [] (meta ^{:v (+ 1 2)} (fn [] 1)))
+(assert= [{:v 3} {:v 3}] [(e-fn-meta) (e-fn-meta)])
+;; syntax-quote carries metadata; macros see the form's metadata
+(assert= [{:k true} {:k true} {:h true} {:n 3}]
+         [(meta `^:k [a]) (meta `^:k a) (meta (second `(a ^:h b))) (let [n 3] (meta `^{:n ~n} [n]))])
+(defmacro e-meta-of [x] (meta x))
+(assert= [{:k true} {:a 1} {:k true}] [(e-meta-of ^:k [1]) (e-meta-of ^{:a 1} {}) (e-meta-of ^:k sym)])
+;; ^meta on a call form merges with the reader's :line, which &form still sees
+(defmacro e-where [] [(integer? (:line (meta &form))) (:k (meta &form))])
+(assert= [[true nil] [true true]] [(e-where) ^:k (e-where)])
+(defmacro e-hinted [t] `(let [~(with-meta 'y {:tag t}) 1] ~'y))
+(assert= 1 (e-hinted long))
+;; def evaluates the name's metadata
+(def ^{:doc (str "a" "b")} e-doc-x 1)
+(def ^{:arglists '([x])} e-arg-f (fn [x] x))
+(def ^{:test (fn [] :t)} e-test-v 1)
+(def ^:dynamic *e-dyn* 1)
+(assert= ["ab" '([x]) :t 2] [(:doc (meta #'e-doc-x)) (:arglists (meta #'e-arg-f))
+                             ((:test (meta #'e-test-v))) (binding [*e-dyn* 2] *e-dyn*)])
+(assert= 1 (eval (read-string "(do (def ^{:test (fn [] 1)} e-test-w 1) ((:test (meta #'e-test-w))))")))
+(defn ^:private e-priv [] 1)
+(defn- e-priv2 [] 2)
+(defn e-hint "d" {:added "1.0"} ^long [^long x ^String s] (+ x (count s)))
+(assert= [true true "1.0" "d" 3] [(:private (meta #'e-priv)) (:private (meta #'e-priv2))
+                                  (:added (meta #'e-hint)) (:doc (meta #'e-hint)) (e-hint 1 "ab")])
+(defmacro e-defpriv [n] `(defn ~(vary-meta n assoc :private true) [] 1))
+(e-defpriv e-priv3)
+(assert= true (:private (meta #'e-priv3)))
+(assert= [7 {:tag 'double}] [((^:once fn* [] 7)) (meta (first (second (read-string "(fn [^double x] x)"))))])
+(deftype ECnt [^:unsynchronized-mutable n ^long k]
+  clojure.lang.IDeref (deref [_] (set! n (+ n k)) n))
+(defrecord EPt [^double x ^double y])
+(assert= [2 4 1.0] (let [c (ECnt. 0 2)] [@c @c (:x (->EPt 1.0 2.0))]))
+(defmulti ^:no-doc e-mm (fn [x] x))
+(defmethod e-mm 1 [_] :one)
+(assert= :one (e-mm 1))
+(ns e.meta-ns {:doc "x"})
+(ns ^{:doc "y"} e.meta-ns2)
+(defn e-g [] 2)
+(ns user)
+(assert= 2 (e.meta-ns2/e-g))
+;; deref of a failed future throws an ExecutionException wrapping the original
+(when clove-test-coro?
+  (assert= [:ee "clojure.lang.ExceptionInfo: x {:a 1}" {:a 1} nil]
+           (try @(future (throw (ex-info "x" {:a 1})))
+                (catch clojure.lang.ExceptionInfo e :wrong)
+                (catch java.util.concurrent.ExecutionException e
+                  [:ee (ex-message e) (ex-data (ex-cause e)) (ex-data e)])))
+  (assert= "java.util.concurrent.ExecutionException: clojure.lang.ExceptionInfo: x {}"
+           (try @(future (throw (ex-info "x" {}))) (catch Throwable e (str e))))
+  (assert= ["java.lang.IllegalStateException: bad" true]
+           (try (deref (future-call #(throw (IllegalStateException. "bad"))) 1000 :to)
+                (catch Exception e [(ex-message e) (instance? IllegalStateException (ex-cause e))])))
+  (assert= :exc (try @(future (throw (Error. "err"))) (catch Exception e :exc)))
+  (assert= [:ee :ee] (let [f (future (/ 1 0))]
+                       [(try @f (catch java.util.concurrent.ExecutionException e :ee))
+                        (try @f (catch java.util.concurrent.ExecutionException e :ee))]))
+  (assert= :ee (try (doall (pcalls #(throw (ex-info "pc" {}))))
+                    (catch java.util.concurrent.ExecutionException e :ee)))
+  ;; promise, delay and agents are unchanged: no wrapping
+  (assert= "d" (try @(delay (throw (ex-info "d" {}))) (catch clojure.lang.ExceptionInfo e (ex-message e))))
+  (let [a (agent 0)]
+    (send a (fn [_] (throw (ex-info "ag" {:z 1}))))
+    (Thread/sleep 20)
+    (assert= {:z 1} (ex-data (agent-error a)))))
+(assert= "clojure.lang.ExceptionInfo: p {:x 1}"
+         (try (doall (pmap (fn [x] (throw (ex-info "p" {:x x}))) [1 2]))
+              (catch java.util.concurrent.ExecutionException e (ex-message e))))
+(assert= [2 3] (pmap inc [1 2]))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
