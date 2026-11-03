@@ -4343,5 +4343,79 @@
     (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
     (assert= [0 1 2 3 4] @order)))
 
+;; ── workstream F: map/set update speed, real transients ──
+;; big maps keep insertion order through value replacement, dissoc, compaction
+(let [m (zipmap (range 20) (range 20))]
+  (assert= "{0 0, 1 1, 2 2, 3 3, 4 4, 5 :x, 6 6, 7 7, 8 8, 9 9, 10 10, 11 11, 12 12, 13 13, 14 14, 15 15, 16 16, 17 17, 18 18, 19 19}"
+           (pr-str (assoc m 5 :x)))
+  (assert= [0 1 2 4 6 7 8 9 10 11 12 13 14 15 16 17 18 40] (keys (assoc (dissoc m 3 5 19) 40 1)))
+  (assert= [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19] (keys (dissoc (assoc m 30 1) 30))))
+(let [m (reduce #(dissoc (assoc %1 (+ %2 1000) %2) %2) (zipmap (range 100) (range 100)) (range 100))]
+  (assert= (range 1000 1100) (keys m))
+  (assert= true (= m (zipmap (range 1000 1100) (range 100)))))
+;; transient builds iterate exactly like persistent ones
+(let [xs (map (fn [i] [(mod (* i 7919) 5003) i]) (range 20000))
+      p (reduce (fn [m [k v]] (assoc m k v)) {} xs)
+      t (persistent! (reduce (fn [t [k v]] (assoc! t k v)) (transient {}) xs))]
+  (assert= 5003 (count t))
+  (assert= (seq p) (seq t)))
+(let [ks (concat (range 3000) (map str (range 500)) (map keyword (map str (range 500))) [nil 1.5 2N [1 2] {:a 1} #{3}])]
+  (assert= (seq (reduce conj #{} ks)) (seq (persistent! (reduce conj! (transient #{}) ks))))
+  (assert= (seq (reduce conj #{} ks)) (seq (into #{} ks)))
+  (assert= (seq (reduce disj (set ks) (take 2000 ks)))
+           (seq (persistent! (reduce disj! (transient (set ks)) (take 2000 ks))))))
+(assert= {0 143, 7 143, 1 143, 4 143, 13 143, 6 143, 3 143, 12 143, 2 143, 11 142, 9 143, 5 142, 10 143, 8 142}
+         (frequencies (map #(mod (* % 3) 14) (range 1999))))
+(assert= (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} (map #(mod (* % 31) 97) (range 3000)))
+         (frequencies (map #(mod (* % 31) 97) (range 3000))))
+(assert= "{1 [1 3 5], 0 [2 4]}" (pr-str (group-by #(mod % 2) [1 2 3 4 5])))
+;; the source map is untouched by edits to its transient
+(let [m (zipmap (range 40) (range 40)) t (transient m)]
+  (dotimes [i 40] (assoc! t i (- i)))
+  (dissoc! t 7)
+  (assert= (range 40) (vals m))
+  (assert= (map - (remove #{7} (range 40))) (vals (persistent! t))))
+(let [t (transient {:a 1})]
+  (assoc! t :b 2 :c 3)
+  (assert= [3 1 2 3 true nil 9] [(count t) (get t :a) (t :b) (:c t) (contains? t :b) (t :zz) (get t :zz 9)])
+  (assert= "{:a 1, :b 2, :c 3}" (pr-str (persistent! t)))
+  (assert= :threw (try (assoc! t :d 4) (catch Throwable e :threw)))
+  (assert= :threw (try (get t :a) (catch Throwable e :threw))))
+(let [t (transient #{1 2 3})]
+  (disj! t 2 3) (conj! t 9)
+  (assert= [2 9 false] [(count t) (t 9) (contains? t 2)])
+  (assert= #{1 9} (persistent! t)))
+(assert= [false false] [(map? (transient {})) (set? (transient #{}))])
+(assert= :threw (try (dissoc! (transient #{1}) 1) (catch Exception e :threw)))
+(assert= :threw (try (disj! (transient {1 1}) 1) (catch Exception e :threw)))
+(assert= :threw (try (assoc! (transient #{}) 1 1) (catch Exception e :threw)))
+(assert= "{:a 1, :b 2}" (pr-str (persistent! (conj! (transient {}) {:a 1 :b 2}))))
+(assert= {:x 0} (persistent! (conj! (transient {:x 0}) nil)))
+(assert= nil (meta (persistent! (transient (with-meta {:a 1} {:m 1})))))
+(assert= {:m 1} (meta (into (with-meta {} {:m 1}) [[:a 1]])))
+(assert= {:m 1} (meta (into (with-meta #{} {:m 1}) (map inc) [1])))
+(assert= {:m 1} (meta (update-vals (with-meta {:a 1} {:m 1}) inc)))
+;; records stay records through into
+(defrecord WsfPoint [x y])
+(assert= true (record? (into (->WsfPoint 1 2) {:x 5})))
+;; one transient dissoc'd far past its count compacts and keeps going
+(let [t (transient (zipmap (range 100) (range 100)))]
+  (doseq [i (range 1000)] (dissoc! t i) (assoc! t (+ i 100) i))
+  (let [p (persistent! t)]
+    (assert= 100 (count p))
+    (assert= (range 1000 1100) (keys p))))
+;; update/fnil/update-in/assoc-in arities, as on the JVM
+(assert= {:a 6} (update {:a 1} :a + 2 3))
+(assert= {:a 15} (update {:a 1} :a + 2 3 4 5))
+(assert= 3 ((fnil + 1 2) nil nil))
+(assert= 6 ((fnil + 1 2 3) nil nil nil))
+(assert= {nil 1} (update-in {} [] (fnil inc 0)))
+(assert= {:a {:b 3}} (update-in {:a {:b 1}} [:a :b] + 2))
+(assert= {:a {:b {:c 1}}} (assoc-in nil [:a :b :c] 1))
+(assert= [[1 9]] (assoc-in [[1 2]] [0 1] 9))
+;; a set's conj of an equal element keeps the one already there
+(assert= "#{1}" (pr-str (persistent! (conj! (transient #{1}) 1N))))
+(assert= "#{1}" (pr-str (conj #{1} 1N)))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

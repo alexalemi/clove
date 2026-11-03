@@ -206,7 +206,7 @@ same `tests.clj` runs everywhere.
 |---|---|
 | **Numbers** | int64 with **checked overflow** (`+ - * inc dec` throw "long overflow" like Clojure; `unchecked-*` wrap), **BigInts** with Clojure's contagion (`1N` literals, `(+ 1N 1)` ⇒ `2N`, the auto-promoting `+'`/`-'`/`*'`), doubles, **ratios** (`3/4`, `(/ 22 7)` ⇒ `22/7`, `numerator`/`denominator`) |
 | **Lazy seqs** | `lazy-seq`, infinite `range`/`iterate`/`repeat`/`cycle`/`repeatedly`, lazy `map`/`filter`/`take`/`concat`, true call-by-need, 32-element chunking |
-| **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT, **insertion-ordered at every size**), **persistent sets**, **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
+| **Data** | nil, bools, strings (escapes), symbols, keywords, lists, **persistent vectors** (32-way tries + tail, transients `transient`/`conj!`/`assoc!`/`persistent!`), **persistent maps** (HAMT, **insertion-ordered at every size**), **persistent sets** (both with transients: `assoc!`/`conj!`/`dissoc!`/`disj!`), **sorted maps/sets** (weight-balanced trees: `subseq`/`rsubseq`/`sorted-set-by`), atoms |
 | **Special forms & core macros** | special forms `quote if do def let fn loop recur try/catch/finally throw var`, plus `defn defmacro and or when cond` and syntax-quote |
 | **Macros** | `defmacro` + quasiquote (`` ` `` `~` `~@`, splices into lists/vectors/maps/sets), **auto-gensym `x#`**; `->` `->>` `some->` `cond->` `as->` `case` `condp` `for` `doseq` `dotimes` `doto` `letfn` `with-out-str` `with-redefs` … most written in clove itself (the prelude) |
 | **Functions** | multi-arity `(fn ([x] …) ([x y] …))`, variadic `& rest`, full destructuring (`[a b & r :as v]`, `{:keys [x] :or {…} :as m}`), `:pre`/`:post` conditions |
@@ -537,7 +537,8 @@ embeddability matter; use bb or the JVM where throughput does.
   bare, so they're visible from other namespaces (real Clojure isolates
   them); `Math/sqrt` resolves as a host-method symbol
 - Metadata works (`with-meta`/`meta`/`^{}`) and propagates through collection
-  ops (`conj`/`assoc`/`into`, incl. transient roundtrips)
+  ops (`conj`/`assoc`/`into`); a vector also keeps it through a transient
+  roundtrip, which the JVM drops (maps and sets drop it, as on the JVM)
 - `#?(:clove …)` reader conditionals; `#(…)`, `\a` char literals, `^meta` supported
 - Tagged literals: `#inst` and `#uuid` only. `*data-readers*` and
   `data_readers.clj` are not consulted, so any other tag is a read error. An

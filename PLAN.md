@@ -181,14 +181,16 @@ Things the history log leaves unresolved, roughly by value:
   Binaryen `--spill-pointers` with a current emsdk instead of ASYNCIFY
   (synchronous, likely faster, and would lift the depth cap). Tested only
   against Debian's emcc 3.1.6, in node and Chrome.
-- **Map updates are 4-15x slower than bb** (`frequencies`, `group-by`,
-  `into #{}` at 1M elements). gprof on `frequencies`: about 13 cells per
-  element; replacing a value in a big map path-copies the HAMT and also the
-  insertion-order vector (two 32-slot nodes plus the tail), which alone is a
-  quarter of the time. Options: an order vector of keys only (updates leave
-  it alone, iteration pays a lookup per key), or real map transients (the
-  `transient` shim is persistent). Also seen: `fnv1a` once per element,
-  an `intern` on some per-call path in get/assoc.
+- **Persistent map update loops are ~4x bb** (`(reduce #(update %1 k f) {} ..)`,
+  `assoc-in`/`update-in` at 1M steps; 2026-11-02). Builders that use
+  transients (`frequencies`, `group-by`, `into`, `set`) are within ~2.5x.
+  Big maps keep an insertion stamp in each HAMT entry cell (iteration sorts
+  by stamp), so a value update copies only the trie path. What is left per
+  persistent assoc: ~3 cells plus ~2.6 kid arrays of up to 64 slots copied,
+  and the GC/page-fault cost of that churn; the interpreter's call overhead
+  is most of the rest. Levers: the fast-call path in `apply` handles only
+  single fixed-arity fns (multi-arity `update`/`fnil` take the slow path);
+  cell allocation and sweep cost.
 - **Heap retention**: after a sweep the collector keeps empty cell blocks up
   to the next collection threshold and unmaps the rest. The threshold's
   adaptive floor can reach 16M cells (~900 MB), so a program that churned

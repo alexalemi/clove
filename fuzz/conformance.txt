@@ -598,3 +598,9 @@
 [(count (hash-set 1e300 ##NaN ##Inf 0.0 -0.0 1.0)) (= (hash 0.0) (hash -0.0)) (= (hash 1) (hash 1N))]
 (let [v (vec (range 100))] [(subvec v 3 7) (seq (subvec v 95)) (conj (subvec v 1 3) :x) (assoc (subvec v 1 3) 0 :y) (pop (subvec v 1 4)) (subvec (subvec v 10 90) 5 10) (nth (subvec v 40 80) 30) (peek (subvec v 1 50)) (= (hash (seq v)) (hash v)) (count (seq v)) (rest [1 2 3]) (rseq [1 2 3])])
 (let [s (sorted-set 1 2 3 5 8) m (sorted-map-by > 1 :a 2 :b 3 :c)] [(rseq (sorted-set)) (subseq s = 2) (subseq s < 0) (subseq s > 8) (subseq s >= 4) (subseq s > 3 < 4) (rsubseq s > 2 < 8) (rsubseq s <= 4) (subseq m > 2) (rsubseq m >= 2) (subseq s > 2 > 1) (rseq s)])
+;; workstream F: transient maps and sets, update/fnil/update-in arities
+(let [t (transient {:a 1})] (assoc! t :b 2 :c 3) (dissoc! t :a) [(count t) (get t :b) (t :c) (:zz t 9) (contains? t :b) (sort (persistent! t))])
+(let [t (transient #{1 2 3})] (disj! t 2 3) (conj! t 9) (conj! t nil) [(count t) (t 9) (contains? t 2) (sort-by str (persistent! t))])
+[(map? (transient {})) (set? (transient #{})) (meta (persistent! (transient (with-meta {:a 1} {:m 1})))) (meta (into (with-meta {} {:m 1}) [[:a 1]])) (meta (update-vals (with-meta {:a 1} {:m 1}) inc))]
+[(update {:a 1} :a + 2 3) (update {:a 1} :a + 2 3 4 5) ((fnil + 1 2) nil nil) ((fnil + 1 2 3) nil nil nil) (update-in {} [] (fnil inc 0)) (assoc-in nil [:a :b] 1) (assoc-in [[1 2]] [0 1] 9) (pr-str (conj #{1} 1N))]
+[(= (frequencies (map #(mod % 37) (range 5000))) (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} (map #(mod % 37) (range 5000)))) (count (into #{} (range 50000))) (sort (keys (group-by #(mod % 5) (range 100)))) (= (set (range 3000)) (into #{} (map identity) (range 3000)))]

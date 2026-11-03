@@ -2083,6 +2083,9 @@ static Clove **kids_alloc(uint16_t n) {
     Clove **p = tail_freelist[n];
     if (!p) return xmalloc(sizeof(Clove *) * n);
     tail_freelist[n] = (Clove **)p[0];
+#if defined(__GNUC__) || defined(__clang__)
+    if (tail_freelist[n]) __builtin_prefetch(tail_freelist[n], 1);   /* the pool is cold after a sweep */
+#endif
     if (--tail_nfree[n] < tail_low[n]) tail_low[n] = tail_nfree[n];
     return p;
 }
