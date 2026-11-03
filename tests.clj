@@ -7,11 +7,17 @@
 
 (def clove-test-passed (atom 0))
 (def clove-test-failed (atom 0))
-(defn assert= [expected actual]
+;; assert= is a macro so a failure names the expression that failed
+;; (and, where the reader recorded it, its line): with ~2300 assertions a bare
+;; "expected true got false" from a CI log was hard to place.
+(defn assert=* [expected actual form line]
   (if (= expected actual)
     (do (swap! clove-test-passed inc) (println "PASS"))
     (do (swap! clove-test-failed inc)
-        (println "FAIL: expected" (pr-str expected) "got" (pr-str actual)))))
+        (println "FAIL: expected" (pr-str expected) "got" (pr-str actual))
+        (println "  in" (str (when line (str "line " line ": "))) (pr-str form)))))
+(defmacro assert= [expected actual]
+  `(assert=* ~expected ~actual '~actual ~(:line (meta &form))))
 
 ; Platform capability probes — sections that need a POSIX shell + cc (FFI,
 ; JIT, subprocess e2e) or coroutines (csp, futures, core.async) self-skip
@@ -4240,9 +4246,11 @@
 (assert= nil (read-string "#_ 1"))
 (assert= [:x 3] [(read-string {:eof :x} "") (read-string {:read-cond :allow} "3")])
 ;; deep nesting inside a future (1 MiB fiber stack) is a catchable error, not a segfault
-(assert= :so (try @(future (read-string (apply str (repeat 3000 "[")))) (catch Throwable _ :so)))
-(assert= :so (try @(future (pr-str (reduce (fn [a _] [a]) [] (range 100000)))) (catch Throwable _ :so)))
-(assert= 30000 @(future (count (re-find #"\w+" (apply str (repeat 30000 "a"))))))
+;; (futures need coroutines; without them the try would pass for the wrong reason)
+(when clove-test-coro?
+  (assert= :so (try @(future (read-string (apply str (repeat 3000 "[")))) (catch Throwable _ :so)))
+  (assert= :so (try @(future (pr-str (reduce (fn [a _] [a]) [] (range 100000)))) (catch Throwable _ :so)))
+  (assert= 30000 @(future (count (re-find #"\w+" (apply str (repeat 30000 "a")))))))
 ;; #() finds % inside a set literal and past 254 forms
 (assert= #{5} (#(do #{%}) 5))
 ;; regex: single-char loops iterate (no per-char recursion or budget)
