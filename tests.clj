@@ -4064,7 +4064,13 @@
     (assert= :so (coro/resume c)))
   ;; finished coroutines release their stacks right away
   (dotimes [i 3000] (coro/resume (coro/new (fn [] i))))
-  (assert= 6 (coro/resume (coro/new (fn [] (* 2 3))))))
+  (assert= 6 (coro/resume (coro/new (fn [] (* 2 3)))))
+  ;; the fiber ready queue pops in O(1) and keeps FIFO order
+  (let [fs (doall (for [i (range 5000)] (future (* i 2))))]
+    (assert= 24995000 (reduce + (map deref fs))))
+  (let [order (atom [])]
+    (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
+    (assert= [0 1 2 3 4] @order)))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

@@ -13540,9 +13540,11 @@ static Clove *coro_new(Clove *thunk) {
     co->s_vsp = 0;
     co->s_vstack_cap = CORO_VSTACK_CAP;
     coro_stack_alloc(co);
-    /* the stacks live outside the cell pools: count them toward GC pressure,
-     * or a loop making coroutines grows by ~1 MiB each between collections */
-    gc_extra_bytes += CORO_STACK_SIZE + sizeof(Clove *) * CORO_VSTACK_CAP;
+    /* the stacks live outside the cell pools: count them toward GC pressure.
+     * Only the pages a coro touches are resident (tens of KiB, not the 1 MiB
+     * reserved), and a dead coro frees its stacks at once, so count 64 KiB:
+     * the full size made 50k live futures collect every ~230 spawns. */
+    gc_extra_bytes += 64u * 1024;
     co->stack_size = CORO_STACK_SIZE;
     co->stack_top = co->stack + CORO_STACK_SIZE;
     getcontext(&co->ctx);
@@ -16938,10 +16940,14 @@ CloveEnv *clove_new_env(void) {
      * the main thread. Defined after deftype (promise/future are deftypes). */
     clove_eval_string(e,
         "(def ^:dynamic fiber/*self* nil)\n"   /* coroutine currently running */
-        "(def fiber/ready (atom []))\n"        /* queue of ready 0-arg thunks */
+        /* queue of ready 0-arg thunks: [front-seq back-vector]. Pop from the
+           front; when it runs dry the back becomes the new front. O(1) amortized
+           (popping a vector with subvec copied it: O(n^2) for n futures). */
+        "(def fiber/ready (atom [nil []]))\n"
         "(def fiber/timers (atom []))\n"       /* vector of [deadline-ms wake-fn] */
         "(def fiber/io-waiters (atom []))\n"   /* vector of {:fd :ev :co} */
-        "(defn fiber/dispatch! [thunk] (swap! fiber/ready conj thunk) nil)\n"
+        "(defn fiber/dispatch! [thunk]\n"
+        "  (swap! fiber/ready (fn [q] [(nth q 0) (conj (nth q 1) thunk)])) nil)\n"
         "(defn fiber/schedule! [co v]\n"
         "  (fiber/dispatch!\n"
         "    (fn [] (when (coro/alive? co)\n"
@@ -16949,10 +16955,11 @@ CloveEnv *clove_new_env(void) {
         "(defn fiber/spawn! [thunk] (let [co (coro/new thunk)] (fiber/schedule! co nil) co))\n"
         "(defn fiber/timer! [deadline wake] (swap! fiber/timers conj [deadline wake]) nil)\n"
         "(defn fiber/run-one! []\n"
-        "  (let [q (deref fiber/ready)]\n"
-        "    (when (seq q)\n"
-        "      (swap! fiber/ready subvec 1)\n"
-        "      ((nth q 0))\n"
+        "  (let [q (deref fiber/ready)\n"
+        "        f (or (nth q 0) (seq (nth q 1)))]\n"
+        "    (when f\n"
+        "      (reset! fiber/ready [(next f) (if (nth q 0) (nth q 1) [])])\n"
+        "      ((first f))\n"
         "      true)))\n"
         "(defn fiber/fire-timers! []\n"
         "  (let [now (clove/now-ms*)\n"
