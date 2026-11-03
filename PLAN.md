@@ -181,9 +181,20 @@ Things the history log leaves unresolved, roughly by value:
   Binaryen `--spill-pointers` with a current emsdk instead of ASYNCIFY
   (synchronous, likely faster, and would lift the depth cap). Tested only
   against Debian's emcc 3.1.6, in node and Chrome.
-- **Intern table never grows**: `intern` has a fixed 1024 buckets and does a
-  `strlen` per node, so creating 300k distinct keywords takes ~20 s
-  (quadratic). Resize on load factor and store the length.
+- **Map updates are 4-15x slower than bb** (`frequencies`, `group-by`,
+  `into #{}` at 1M elements). gprof on `frequencies`: about 13 cells per
+  element; replacing a value in a big map path-copies the HAMT and also the
+  insertion-order vector (two 32-slot nodes plus the tail), which alone is a
+  quarter of the time. Options: an order vector of keys only (updates leave
+  it alone, iteration pays a lookup per key), or real map transients (the
+  `transient` shim is persistent). Also seen: `fnv1a` once per element,
+  an `intern` on some per-call path in get/assoc.
+- **Heap retention**: after a sweep the collector keeps empty cell blocks up
+  to the next collection threshold and unmaps the rest. The threshold's
+  adaptive floor can reach 16M cells (~900 MB), so a program that churned
+  hard and then went idle can hold that much. Retaining less made
+  allocation-heavy loops page-fault their way back (03-loop: +35% system
+  time).
 - **Performance**: ~1.3–6x of babashka; remaining levers are in HISTORY.md
   item 36 and the July perf-campaign summary.
 

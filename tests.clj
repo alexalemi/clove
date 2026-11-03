@@ -4274,6 +4274,74 @@
 (assert= "(nil nil ##NaN ##Inf 8.0 1.5 1.5 0.5 5.0 nil nil)"
          (pr-str (map parse-double ["inf" "nan" "NaN" "Infinity" "0x1p3" " 1.5 " "1.5f" ".5" "5." "0x10" "1_0"])))
 (assert= [:err :err] [(try (char -1) (catch Exception _ :err)) (try (nth [1 2] 9.223372036854775807E18) (catch Exception _ :err))])
+;; ── workstream D: GC, coroutines, equality/hash/interning, vectors, sorted colls ──
+;; strings compare, hash and intern by their full length, NUL bytes included
+(assert= [false 2 -1] (let [a (str "a" (char 0) "b") b (str "a" (char 0) "c")] [(= a b) (count #{a b}) (compare a b)]))
+(assert= false (= "" (str (char 0))))
+(assert= [false false] [(= (keyword (str "a" (char 0) "b")) (keyword (str "a" (char 0) "c")))
+                        (= (symbol (str "a" (char 0) "b")) (symbol (str "a" (char 0) "c")))])
+;; doubles hash by bits (no UB cast for NaN/Inf/huge); 0.0 and -0.0 are = so hash alike
+(assert= [5 true true] [(count (hash-set 1e300 ##NaN ##Inf 0.0 -0.0 1.0)) (= (hash 0.0) (hash -0.0)) (= (hash 1) (hash 1N))])
+;; intern tables grow: many distinct keywords stay distinct and identical to themselves
+(assert= 50000 (count (set (map #(keyword (str "kw-d-" %)) (range 50000)))))
+(assert= true (identical? (keyword "kw-d-49999") :kw-d-49999))
+;; map/set hash and = walk entries without building lists
+(assert= [true true false] [(= (hash (zipmap (range 100) (range 100))) (hash (into {} (map vector (range 100) (range 100)))))
+                            (= (set (range 100)) (set (reverse (range 100))))
+                            (= (zipmap (range 100) (range 100)) (assoc (zipmap (range 100) (range 100)) 5 6))])
+;; vector seqs are chunked lazy walks and subvec is an O(1) slice
+(let [v (vec (range 100))]
+  (assert= [[3 4 5 6] '(95 96 97 98 99) [1 2 :x] [:y 2] [1 2] [15 16 17 18 19] {:a 1} 70 49]
+           [(subvec v 3 7) (seq (subvec v 95)) (conj (subvec v 1 3) :x) (assoc (subvec v 1 3) 0 :y)
+            (pop (subvec v 1 4)) (subvec (subvec v 10 90) 5 10) (meta (with-meta (subvec v 1 3) {:a 1}))
+            (nth (subvec v 40 80) 30) (peek (subvec v 1 50))])
+  (assert= [true true true 100 true true] [(= (subvec v 1 4) [1 2 3]) (= (hash (subvec v 1 4)) (hash [1 2 3]))
+                                           (seq? (seq v)) (count (seq v)) (= (seq v) v) (= (hash (seq v)) (hash v))])
+  (assert= [1 2 9] (persistent! (conj! (transient (subvec v 1 3)) 9)))
+  (assert= :ioobe (try (subvec v 5 101) (catch IndexOutOfBoundsException e :ioobe))))
+(assert= :done (loop [v (vec (range 20000))] (if (seq v) (recur (subvec v 1)) :done)))
+;; seq consumers past the first 32-element chunk of a vector
+(assert= [true 500 499500 99 1000 '(40 41 42) 99 70]
+         [(= (map inc (vec (range 1000))) (map inc (range 1000))) (count (filter odd? (vec (range 1000))))
+          (apply + (vec (range 1000))) (let [[a & r] (vec (range 100))] (count r)) (count (into #{} (vec (range 1000))))
+          (take 3 (drop 40 (vec (range 100)))) (last (vec (range 100))) (nth (seq (vec (range 100))) 70)])
+(assert= true (= (hash (cons 1 (lazy-seq [2]))) (hash [1 2])))
+;; sorted seqs walk lazily; subseq/rsubseq seek to the bound
+(let [s (into (sorted-set) (range 100000))]
+  (assert= [5000 4999 '(3 4 5) '(99999 99998)] [(first (subseq s >= 5000)) (first (rsubseq s < 5000))
+                                                (take 3 (subseq s > 2)) (take 2 (rseq s))]))
+(assert= ['(3 4 5) '(2 3) '(3 2 1) '(4 3 2) '([1 :a] [2 :b]) '(3 2 1) nil]
+         [(subseq (sorted-set 1 2 3 4 5) > 2) (subseq (sorted-set 1 2 3 4 5) >= 2 < 4)
+          (rsubseq (sorted-set 1 2 3 4 5) < 4) (rsubseq (sorted-set 1 2 3 4 5) > 1 <= 4)
+          (subseq (sorted-map 1 :a 2 :b 3 :c) <= 2) (rseq (sorted-set 3 1 2)) (rseq (sorted-set))])
+;; the heap shrinks after a big structure is dropped (Linux: read VmRSS).
+;; Runs in a fresh process: inside the suite the GC threshold depends on
+;; everything allocated before, so whether a block gets released was luck.
+;; Skipped under ASan (ASAN_OPTIONS is always set there): its quarantine holds
+;; freed malloc memory, so RSS does not fall.
+(when (and (= :linux (clove/os*)) (not (System/getenv "CLOVE_GC_STRESS"))
+           (not (System/getenv "ASAN_OPTIONS")))
+  (assert= "true\n"
+           (:out (sh (str (clove/exe-dir*) "/clove") "-e"
+                     (str "(let [rss (fn [] (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))))"
+                          "      big (atom (vec (range 5000000))) before (rss)]"
+                          "  (reset! big nil) (dotimes [_ 4] (gc) (count (vec (range 1000))))"
+                          "  (prn (< (rss) (quot before 2))))")))))
+(when clove-test-coro?
+  ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
+  (let [v (reduce (fn [a _] [a]) [] (range 100000))
+        c (coro/new (fn [] (let [w (reduce (fn [a _] [a]) [] (range 100000))]
+                             (try (= w v) (catch StackOverflowError e :so)))))]
+    (assert= :so (coro/resume c)))
+  ;; finished coroutines release their stacks right away
+  (dotimes [i 3000] (coro/resume (coro/new (fn [] i))))
+  (assert= 6 (coro/resume (coro/new (fn [] (* 2 3)))))
+  ;; the fiber ready queue pops in O(1) and keeps FIFO order
+  (let [fs (doall (for [i (range 5000)] (future (* i 2))))]
+    (assert= 24995000 (reduce + (map deref fs))))
+  (let [order (atom [])]
+    (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
+    (assert= [0 1 2 3 4] @order)))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

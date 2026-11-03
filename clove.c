@@ -75,6 +75,9 @@
 #include <errno.h>
 #include <limits.h>   /* INT_MAX — clamping the length delta in str_compare */
 #include <setjmp.h>
+#ifdef __GLIBC__
+#include <malloc.h>      /* malloc_trim — hand freed heap back after a big drop */
+#endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>        /* scan_registers + exports (clove notebook -S) */
 #include <emscripten/stack.h>
@@ -138,7 +141,9 @@ static int clove_wsa_init(void) {   /* idempotent winsock startup */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
 #ifndef __EMSCRIPTEN__      /* no ucontext in wasm: notebooks run without coroutines */
 #include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
+#include <sys/mman.h>       /* mmap — coroutine stacks, GC cell blocks */
 #define CLOVE_HAVE_CORO 1
+#define CLOVE_HAVE_MMAP 1
 #endif
 #define sock_close close
 #define clove_wsa_init() 0
@@ -227,7 +232,7 @@ typedef enum {
     CLOVE_TNODE,     /* internal: a node of a sorted collection's weight-balanced
                      * tree (Adams' tree). Holds key, val (set: val==key; map: the
                      * value), left/right subtrees, and subtree size. Not user-
-                     * visible. */
+                     * visible. Keep last: the GC log sizes its histogram by it. */
 } CloveTag;
 
 typedef struct Clove Clove;
@@ -269,8 +274,13 @@ struct Clove {
         /* vec doubles as the transient view (CLOVE_TVEC): edit_id marks tree
          * nodes this transient owns (may mutate); alive flips off at
          * persistent!. Transient tails are full 32-cap chunk buffers. */
+        /* A subvec is a slice of a backing vector: root/shift/tail are the
+         * backing's (tail copied), bcount its count, off the slice start;
+         * count is the slice length. bcount == 0 marks a plain vector. Only
+         * vec_nth reads a slice; everything that edits flattens it first. */
         struct { Clove *root; Clove **tail; uint32_t count; uint32_t edit_id;
-                 uint8_t shift; uint8_t taillen; bool alive; } vec;
+                 uint8_t shift; uint8_t taillen; bool alive;
+                 uint32_t off, bcount; } vec;
         /* HAMT persistent map: root tree node (NULL when empty) + entry count */
         /* lit_order is set only on a map LITERAL as read: the reader's
          * original (k1 v1 k2 v2 ...) form list, kept so eval can evaluate
@@ -306,7 +316,11 @@ struct Clove {
         struct { Clove *num; Clove *den; } ratio;   /* CLOVE_RATIO */
         struct { Clove *u; int64_t s; } bigdec;     /* CLOVE_BIGDEC: u * 10^-s */
         struct { const char *name; } var;          /* CLOVE_VAR: canonical binding name */
-        struct { Clove *thunk; Clove *cached; bool done; } lazy;
+        /* A thunk that is a vector is not called: forcing yields the next
+         * chunk of its elements from index vidx (vec_seq_from). A thunk that
+         * is a CLOVE_TNODE is a sorted-collection iterator whose node stack
+         * is `state` (sorted_iter_chunk). */
+        struct { Clove *thunk; Clove *cached; bool done; Clove *state; uint32_t vidx; } lazy;
         /* recur sentinel: up to 3 values inline (covers real loops);
          * wider recurs spill to a heap array stored in iv[0]. */
         struct { Clove *iv[3]; uint8_t n; bool spill; } recur;
@@ -373,6 +387,8 @@ static Clove *bd_parse(const char *t, size_t n);
 static Clove *make_ratio(Clove *num, Clove *den);
 static Clove *to_seq(Clove *v);
 static Clove *seq1(Clove *v);
+static Clove *sorted_iter_chunk(Clove *it, Clove *stack);
+static Clove *sorted_seq(Clove *coll, bool rev);
 static Clove *seq1_slot(Clove **slot);
 static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
 static Clove *sorted_entry_list(Clove *coll);
@@ -652,8 +668,10 @@ typedef struct Coro {
     Clove *xfer;            /* value handed across resume/yield (GC root) */
     Clove *error;           /* value of an uncaught throw, else NULL (GC root) */
     ucontext_t ctx;        /* machine context saved while suspended */
-    char *stack;           /* malloc'd stack (low address) */
+    char *stack;           /* usable stack (low address); NULL once freed */
     size_t stack_size;
+    char *stack_map;       /* mmap base (guard page below stack), or NULL
+                            * when the stack came from malloc */
     char *stack_top;       /* stack + stack_size (high address) */
     void *saved_sp;        /* approx SP at last switch-away — GC scan low bound */
     CoroStatus status;
@@ -685,6 +703,7 @@ static Clove **main_s_vstack;
 static size_t main_s_vsp;
 static size_t main_s_vstack_cap;
 static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
+static void coro_free_stacks(Coro *co);
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -930,20 +949,42 @@ static Clove *mk_sym(const char *s) {
  * name, allocated outside the GC pools — so (identical? :a :a) holds and
  * keyword-heavy code allocates nothing per read. */
 typedef struct KwNode { const char *name; Clove *cell; struct KwNode *next; } KwNode;
-static KwNode *kw_table[256];
+static KwNode **kw_table;               /* kw_cap buckets, doubled at load 1 */
+static size_t kw_cap, kw_n;
+
+static size_t kw_slot(const char *s, size_t cap) {
+    uint64_t x = (uint64_t)(uintptr_t)s;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t)x & (cap - 1);
+}
 
 static Clove *mk_kw(const char *s) {   /* s is already interned */
-    uint32_t h = (uint32_t)((uintptr_t)s >> 4) & 255u;
-    for (KwNode *n = kw_table[h]; n; n = n->next)
-        if (n->name == s) return n->cell;
+    if (kw_table)
+        for (KwNode *n = kw_table[kw_slot(s, kw_cap)]; n; n = n->next)
+            if (n->name == s) return n->cell;
+    if (kw_n >= kw_cap) {               /* grow (or create) and rehash */
+        size_t ncap = kw_cap ? kw_cap * 2 : 1024;
+        KwNode **nt = calloc(ncap, sizeof *nt);
+        if (!nt) clove_error("out of memory");
+        for (size_t i = 0; i < kw_cap; i++)
+            for (KwNode *n = kw_table[i], *next; n; n = next) {
+                next = n->next;
+                size_t h = kw_slot(n->name, ncap);
+                n->next = nt[h]; nt[h] = n;
+            }
+        free(kw_table);
+        kw_table = nt; kw_cap = ncap;
+    }
     Clove *v = xmalloc(sizeof *v);     /* immortal: never in a pool, never swept */
     memset(v, 0, sizeof *v);
     v->tag = CLOVE_KEYWORD;
     v->gcmark = 1;
     v->as.kw = s;
     KwNode *n = xmalloc(sizeof *n);
+    size_t h = kw_slot(s, kw_cap);
     n->name = s; n->cell = v; n->next = kw_table[h];
     kw_table[h] = n;
+    kw_n++;
     return v;
 }
 static size_t gc_extra_bytes;   /* string buffer bytes since last GC —
@@ -1100,7 +1141,22 @@ typedef struct InternNode {
     uint32_t hash;
     uint32_t len;
 } InternNode;
-static InternNode *intern_table[INTERN_BUCKETS];
+static InternNode **intern_table;     /* intern_cap buckets, doubled at load 1 */
+static size_t intern_cap, intern_n;
+
+static void intern_grow(void) {
+    size_t ncap = intern_cap ? intern_cap * 2 : INTERN_BUCKETS;
+    InternNode **nt = calloc(ncap, sizeof *nt);
+    if (!nt) { fputs("out of memory\n", stderr); exit(1); }
+    for (size_t i = 0; i < intern_cap; i++)
+        for (InternNode *n = intern_table[i], *next; n; n = next) {
+            next = n->next;
+            n->next = nt[n->hash & (ncap - 1)];
+            nt[n->hash & (ncap - 1)] = n;
+        }
+    free(intern_table);
+    intern_table = nt; intern_cap = ncap;
+}
 
 static uint32_t fnv1a(const char *s, size_t n) {
     uint32_t h = 2166136261u;
@@ -1109,10 +1165,13 @@ static uint32_t fnv1a(const char *s, size_t n) {
 }
 
 static const char *intern(const char *s, size_t n) {
-    uint32_t full = fnv1a(s, n), h = full & (INTERN_BUCKETS - 1);
+    if (!intern_table) intern_grow();
+    uint32_t full = fnv1a(s, n), h = full & (intern_cap - 1);
     for (InternNode *node = intern_table[h]; node; node = node->next)
         if (node->hash == full && node->len == n && memcmp(node->str, s, n) == 0)
             return node->str;
+    if (intern_n >= intern_cap) { intern_grow(); h = full & (intern_cap - 1); }
+    intern_n++;
     char *copy = xmalloc(n + 1);
     memcpy(copy, s, n);
     copy[n] = '\0';
@@ -1359,6 +1418,29 @@ static CloveEnv *env_root(CloveEnv *e) {
 typedef struct CellBlock { struct CellBlock *next; size_t used; Clove cells[CELL_BLOCK_N]; } CellBlock;
 static CellBlock *cell_blocks;
 static Clove *cell_freelist;        /* linked through as.cons.head */
+static size_t cell_nblocks;
+
+/* Blocks are mmap'd where we can: the sweep hands empty ones back, and a
+ * malloc'd block that size can stay in the C heap after free. */
+static CellBlock *cell_block_new(void) {
+#ifdef CLOVE_HAVE_MMAP
+    void *p = mmap(NULL, sizeof(CellBlock), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    CellBlock *b = p == MAP_FAILED ? NULL : p;
+#else
+    CellBlock *b = malloc(sizeof *b);
+#endif
+    if (b) cell_nblocks++;
+    return b;
+}
+static void cell_block_free(CellBlock *b) {
+    cell_nblocks--;
+#ifdef CLOVE_HAVE_MMAP
+    munmap(b, sizeof(CellBlock));
+#else
+    free(b);
+#endif
+}
 
 #define ENV_BLOCK_N 1024
 typedef struct EnvBlock { struct EnvBlock *next; size_t used; CloveEnv envs[ENV_BLOCK_N]; } EnvBlock;
@@ -1390,6 +1472,8 @@ static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
 
 static void gc_mark_env(CloveEnv *e);
+static void chunk_pools_trim(void);
+static size_t pool_trimmed;   /* bytes freed by the trims of this sweep */
 
 /* Marking uses an explicit worklist, not C-stack recursion: a 10k-deep
  * closure/env chain (long reduce over lazy pipelines) overflowed the C
@@ -1476,6 +1560,7 @@ static void gc_drain(void) {
             case CLOVE_LAZY:
                 mark_push(v->as.lazy.thunk);
                 mark_push(v->as.lazy.cached);
+                mark_push(v->as.lazy.state);
                 break;
             case CLOVE_CHUNK:
                 for (uint16_t i = 0; i < v->as.chunk.nconst; i++)
@@ -1655,13 +1740,20 @@ static void gc_collect(void) {
     }
     gc_scan_range(&regs, (char *)&regs + sizeof regs);
 
-    /* Sweep cells: free owned arrays once, rebuild the free list. */
-    size_t live = 0, freed = 0;
+    /* Sweep cells: free owned arrays once, rebuild the free list. Blocks
+     * left with no live cell move to `empty`; after the new threshold is
+     * known, enough of them to feed the next cycle rejoin the pool and the
+     * rest go back to the OS (the heap used to only ever grow). */
+    size_t live = 0, freed = 0, spare = 0;
+    CellBlock *empty = NULL;
     cell_freelist = NULL;
-    for (CellBlock *b = cell_blocks; b; b = b->next) {
+    for (CellBlock **pb = &cell_blocks; *pb; ) {
+        CellBlock *b = *pb;
+        size_t blive = 0;
+        Clove *bhead = NULL, *btail = NULL;
         for (size_t i = 0; i < b->used; i++) {
             Clove *c = &b->cells[i];
-            if (c->gcmark) { c->gcmark = 0; live++; continue; }
+            if (c->gcmark) { c->gcmark = 0; live++; blive++; continue; }
             if (c->tag != CLOVE_FREE) {
                 switch (c->tag) {
                     case CLOVE_STRING: free(c->as.str); break;
@@ -1683,8 +1775,7 @@ static void gc_collect(void) {
 #ifdef CLOVE_HAVE_CORO
                     case CLOVE_CORO:
                         if (c->as.coro) {
-                            free(c->as.coro->stack);
-                            free(c->as.coro->s_vstack);
+                            coro_free_stacks(c->as.coro);
                             free(c->as.coro);
                         }
                         break;
@@ -1695,9 +1786,19 @@ static void gc_collect(void) {
                 freed++;
             }
             memset(&c->as, 0, sizeof c->as);
-            c->as.cons.head = cell_freelist;
-            cell_freelist = c;
+            c->as.cons.head = bhead;
+            bhead = c;
+            if (!btail) btail = c;
         }
+        if (blive == 0) {                  /* unlink; decided below */
+            *pb = b->next;
+            b->next = empty;
+            empty = b;
+            continue;
+        }
+        if (bhead) { btail->as.cons.head = cell_freelist; cell_freelist = bhead; }
+        spare += CELL_BLOCK_N - blive;     /* includes a fresh block's unbumped tail */
+        pb = &b->next;
     }
 
     /* Sweep envs: free owned binding chains, rebuild the free list. */
@@ -1724,13 +1825,13 @@ static void gc_collect(void) {
 
     gc_freed_last = freed;
     if (getenv("CLOVE_GC_LOG")) {
-        size_t tagn[24] = {0};
+        size_t tagn[CLOVE_TNODE + 1] = {0};
         for (CellBlock *b = cell_blocks; b; b = b->next)
             for (size_t i = 0; i < b->used; i++)
-                if (b->cells[i].tag != CLOVE_FREE && b->cells[i].tag < 24)
+                if (b->cells[i].tag != CLOVE_FREE && b->cells[i].tag <= CLOVE_TNODE)
                     tagn[b->cells[i].tag]++;
         fprintf(stderr, "[gc] live=%zu freed=%zu", live, freed);
-        for (int t = 0; t < 24; t++)
+        for (int t = 0; t <= CLOVE_TNODE; t++)
             if (tagn[t] > 100000) fprintf(stderr, " tag%d=%zu", t, tagn[t]);
         fprintf(stderr, "\n");
     }
@@ -1752,6 +1853,39 @@ static void gc_collect(void) {
         churn_floor /= 2;                 /* >50% live: tighten, save memory */
     size_t floor = churn_floor;
     gc_threshold = live * 4 > floor ? live * 4 : floor;
+
+    /* Keep empty blocks until the pool can absorb the next cycle's
+     * allocations without growing; unmap the rest. A kept block rejoins
+     * fully free (used = N), at the tail of the list so bump allocation
+     * in the head block is unaffected. */
+    size_t blocks_freed = 0;
+    CellBlock **tailp = &cell_blocks;
+    while (*tailp) tailp = &(*tailp)->next;
+    while (empty) {
+        CellBlock *b = empty;
+        empty = b->next;
+        /* stress mode unmaps every empty block, to exercise this path */
+        if (gc_stress || spare >= gc_threshold) { cell_block_free(b); blocks_freed++; continue; }
+        for (size_t i = 0; i < b->used; i++) {
+            Clove *c = &b->cells[i];
+            c->as.cons.head = cell_freelist;
+            cell_freelist = c;
+        }
+        spare += b->used;
+        b->next = NULL;
+        *tailp = b;
+        tailp = &b->next;
+    }
+    pool_trimmed = 0;
+    chunk_pools_trim();
+    /* the mark worklist grows to the deepest mark ever seen (8 bytes per
+     * queued cell: ~100 MB after a 5M-element vector); drop it if large */
+    if (mark_cap > (1u << 20)) { free(mark_stack); mark_stack = NULL; mark_cap = 0; }
+#ifdef __GLIBC__
+    /* glibc keeps freed small chunks in its heap; after a big release
+     * (whole blocks, or MBs of arrays) ask it to return the pages */
+    if ((blocks_freed && !gc_stress) || pool_trimmed > (8u << 20)) malloc_trim(0);
+#endif
 }
 
 #define GC_BYTES_CAP (256u << 20)   /* string-churn slack ceiling: 256MB */
@@ -1764,8 +1898,9 @@ static void maybe_gc(void) {
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
 
-/* Must agree with clove_eq: (= 1 1.0) → same hash; (= [1 2] '(1 2)) → lists
- * and vectors hash identically (ordered); maps hash order-independently. */
+/* Must agree with clove_eq: (= 1 1N) → same hash; (= [1 2] '(1 2)) → lists
+ * and vectors hash identically (ordered); maps hash order-independently.
+ * Doubles never = an integer, so they hash by bits alone. */
 
 static uint32_t mix64(uint64_t x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
@@ -1775,9 +1910,17 @@ static uint32_t mix64(uint64_t x) {
 }
 
 static Clove *map_entry_list(Clove *m);
+typedef bool (*EntryFn)(Clove *k, Clove *v, void *ctx);
+static bool map_each(Clove *m, EntryFn f, void *ctx);
+static uint32_t clove_hash(Clove *v);
+static bool hash_entry_sum(Clove *k, Clove *v, void *ctx) {
+    *(uint32_t *)ctx += clove_hash(k) * 31 + clove_hash(v);
+    return true;
+}
 
 static uint32_t clove_hash(Clove *v) {
     if (v == NULL || v == NIL) return 0x9e3779b9u;
+    if (v->tag >= CLOVE_LIST) clove_check_stack();   /* collections recurse */
     switch (v->tag) {
         case CLOVE_NIL:  return 0x9e3779b9u;
         case CLOVE_BOOL: return v->as.b ? 1231u : 1237u;
@@ -1795,13 +1938,12 @@ static uint32_t clove_hash(Clove *v) {
             return mix64(clove_hash(u) * 31 + (uint64_t)sc + 0x9e3779b97f4a7c15ull);
         }
         case CLOVE_DOUBLE: {
-            double d = v->as.d;
-            if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
+            double d = v->as.d == 0.0 ? 0.0 : v->as.d;   /* (= 0.0 -0.0) */
             uint64_t bits;
             memcpy(&bits, &d, sizeof bits);
             return mix64(bits);
         }
-        case CLOVE_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
+        case CLOVE_STRING:  return fnv1a(v->as.str, v->as.strx.nbytes);
         case CLOVE_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
         case CLOVE_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
         case CLOVE_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
@@ -1810,7 +1952,8 @@ static uint32_t clove_hash(Clove *v) {
         case CLOVE_EMPTY:   /* () hashes like an empty list/vector (= () []) */
         case CLOVE_LIST: {
             uint32_t h = 1;
-            for (Clove *l = v; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
+            /* seq1: a cons may end in a lazy tail, e.g. (seq v) of a vector */
+            for (Clove *l = v; l && l->tag == CLOVE_LIST; l = seq1(l->as.cons.tail))
                 h = h * 31 + clove_hash(l->as.cons.head);
             return h;
         }
@@ -1822,9 +1965,7 @@ static uint32_t clove_hash(Clove *v) {
         }
         case CLOVE_MAP: case CLOVE_SET: {
             uint32_t h = v->tag == CLOVE_SET ? 0xa5e3u : 0;  /* order-independent sum */
-            for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                h += clove_hash(e->as.cons.head->as.cons.head) * 31
-                   + clove_hash(e->as.cons.head->as.cons.tail);
+            map_each(v, hash_entry_sum, &h);
             return h;
         }
         case CLOVE_SORTED: {  /* must match the hash of an equal hash set/map */
@@ -1861,11 +2002,13 @@ static unsigned popcnt32(uint32_t x) {
  * nodes — both die young, so a free list beats malloc/free churn. The
  * next-chunk pointer reuses the first slot. */
 static Clove **chunk32_freelist;
+static size_t chunk32_nfree, chunk32_low;   /* low: fewest free since last GC */
 
 static Clove **chunk32_alloc(void) {
     if (chunk32_freelist) {
         Clove **p = chunk32_freelist;
         chunk32_freelist = (Clove **)p[0];
+        if (--chunk32_nfree < chunk32_low) chunk32_low = chunk32_nfree;
         return p;
     }
     return xmalloc(sizeof(Clove *) * 32);
@@ -1874,12 +2017,14 @@ static Clove **chunk32_alloc(void) {
 static void chunk32_free(Clove **p) {
     p[0] = (Clove *)chunk32_freelist;
     chunk32_freelist = p;
+    chunk32_nfree++;
 }
 
 /* Size-classed free lists for vector tails (1..32 pointers). Tail sizes
  * repeat heavily under conj churn, so exact-size recycling avoids both
  * malloc traffic and the memory inflation of always-32 chunks. */
 static Clove **tail_freelist[33];
+static size_t tail_nfree[33], tail_low[33];
 
 static Clove **tail_alloc(uint8_t n) {
     if (n == 0) n = 1;
@@ -1887,6 +2032,7 @@ static Clove **tail_alloc(uint8_t n) {
     if (tail_freelist[n]) {
         Clove **p = tail_freelist[n];
         tail_freelist[n] = (Clove **)p[0];
+        if (--tail_nfree[n] < tail_low[n]) tail_low[n] = tail_nfree[n];
         return p;
     }
     return xmalloc(sizeof(Clove *) * n);
@@ -1896,6 +2042,27 @@ static void tail_free(Clove **p, uint8_t n) {
     if (n == 0) n = 1;
     p[0] = (Clove *)tail_freelist[n];
     tail_freelist[n] = p;
+    tail_nfree[n]++;
+}
+
+/* After a sweep: free the arrays a pool held unused through the whole last
+ * cycle (its low-water mark), so dropping a big vector or map gives its node
+ * arrays back, while steady churn, which drains the pool, keeps recycling. */
+static void pool_trim(Clove ***list, size_t *nfree, size_t *low, size_t width) {
+    size_t k = *low < *nfree ? *low : *nfree;
+    pool_trimmed += k * width * sizeof(Clove *);
+    for (; k; k--) {
+        Clove **p = *list;
+        *list = (Clove **)p[0];
+        (*nfree)--;
+        free(p);
+    }
+    *low = *nfree;
+}
+static void chunk_pools_trim(void) {
+    pool_trim(&chunk32_freelist, &chunk32_nfree, &chunk32_low, 32);
+    for (int n = 1; n <= 32; n++)
+        pool_trim(&tail_freelist[n], &tail_nfree[n], &tail_low[n], (size_t)n);
 }
 
 /* Allocate a node with zeroed kid slots. Callers fill the slots immediately
@@ -2186,7 +2353,7 @@ static Clove *map_assoc(Clove *m, Clove *k, Clove *v) {
     Clove *kv[2 * MAP_SMALL + 2];
     if (n) memcpy(kv, o->as.vec.tail, sizeof(Clove *) * n);
     if (map_small_find(m, k, &at)) {
-        if (kv[at + 1] == v) return m;
+        if (o->as.vec.tail[at + 1] == v) return m;   /* found => o is set */
         kv[at + 1] = v;                       /* keeps the original key */
         return map_small_cell(m, kv, n);
     }
@@ -2266,6 +2433,35 @@ static void hamt_entries(Clove *node, Clove ***t) {
     }
 }
 
+/* Visit every entry without allocating: maps in insertion order (k, v), sets
+ * in HAMT order (x, x). Stops early when f returns false; returns false then. */
+static bool hamt_each(Clove *node, EntryFn f, void *ctx) {
+    if (!node) return true;
+    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
+        Clove *k = node->as.hnode.kids[i];
+        if (k == NULL && !node->as.hnode.collision) {
+            if (!hamt_each(node->as.hnode.kids[i + 1], f, ctx)) return false;
+        } else if (!f(k, node->as.hnode.kids[i + 1], ctx)) return false;
+    }
+    return true;
+}
+static bool map_each(Clove *m, EntryFn f, void *ctx) {
+    if (m->tag == CLOVE_SET) return hamt_each(m->as.map.root, f, ctx);
+    Clove *order = m->as.map.order;
+    if (!order || !m->as.map.count) return true;
+    uint32_t n = order->as.vec.count;
+    if (!m->as.map.root) {
+        for (uint32_t i = 0; i < n; i += 2)
+            if (!f(order->as.vec.tail[i], order->as.vec.tail[i + 1], ctx)) return false;
+        return true;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        Clove *e = vec_nth(order, i);
+        if (e && !f(e->as.tnode.key, e->as.tnode.val, ctx)) return false;
+    }
+    return true;
+}
+
 /* Maps iterate in insertion order (the order vector); sets in HAMT order. */
 static Clove *map_entry_list(Clove *m) {
     Clove *out = NIL, **t = &out;
@@ -2340,12 +2536,13 @@ static Clove *set_element_list(Clove *s) {
 static size_t vec_len(Clove *v) { return v->as.vec.count; }
 
 static size_t vec_tailoff(Clove *v) {
-    uint32_t cnt = v->as.vec.count;
+    uint32_t cnt = v->as.vec.bcount ? v->as.vec.bcount : v->as.vec.count;
     return cnt < 32 ? 0 : ((size_t)((cnt - 1) >> 5)) << 5;
 }
 
 static Clove *vec_nth(Clove *v, size_t i) {
     if (i >= v->as.vec.count) clove_error_cls("IndexOutOfBoundsException", "index %zu out of bounds for length %u", i, v->as.vec.count);
+    i += v->as.vec.off;                       /* 0 unless a subvec slice */
     size_t off = vec_tailoff(v);
     if (i >= off) return v->as.vec.tail[i - off];
     Clove *node = v->as.vec.root;
@@ -2415,7 +2612,38 @@ static Clove *vec_pushtail(int level, Clove *parent, Clove *tailnode, uint32_t c
     return ret;
 }
 
+static Clove *prim_transient(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_conj_bang(CloveEnv *env, Clove **argv, int nargs);
+static Clove *prim_persistent_bang(CloveEnv *env, Clove **argv, int nargs);
+
+/* A plain vector with a slice's elements (and meta): what conj/assoc/
+ * transient work on. O(n), as in building any vector. */
+static Clove *vec_flatten(Clove *v) {
+    if (!v->as.vec.bcount) return v;
+    Clove *a[2] = { mk_empty_vec(), NULL };
+    Clove *t = prim_transient(NULL, a, 1);
+    for (size_t i = 0; i < v->as.vec.count; i++) {
+        a[0] = t; a[1] = vec_nth(v, i);
+        prim_conj_bang(NULL, a, 2);
+    }
+    a[0] = t;
+    return vec_with_meta(prim_persistent_bang(NULL, a, 1), v->meta);
+}
+
+/* (subvec v start end) as an O(1) slice sharing v's trie. */
+static Clove *vec_slice(Clove *v, size_t start, size_t end) {
+    if (start == end) return mk_empty_vec();
+    uint32_t off = v->as.vec.off, bcount = v->as.vec.bcount;
+    if (!bcount) bcount = v->as.vec.count;      /* slicing a plain vector */
+    Clove *nv = vec_cell(v->as.vec.root, v->as.vec.shift, (uint32_t)(end - start),
+                         v->as.vec.tail, v->as.vec.taillen, NULL);
+    nv->as.vec.off = off + (uint32_t)start;
+    nv->as.vec.bcount = bcount;
+    return nv;
+}
+
 static Clove *vec_conj1(Clove *v, Clove *x) {
+    if (v->as.vec.bcount) v = vec_flatten(v);
     uint32_t cnt = v->as.vec.count;
     if (cnt - vec_tailoff(v) < 32) {  /* room in tail: the cheap path */
         Clove *nv = vec_cell(v->as.vec.root, v->as.vec.shift, cnt + 1,
@@ -2461,6 +2689,7 @@ static Clove *vec_doassoc(int level, Clove *node, size_t i, Clove *x) {
 }
 
 static Clove *vec_assoc_idx(Clove *v, size_t i, Clove *x) {
+    if (v->as.vec.bcount) v = vec_flatten(v);
     uint32_t cnt = v->as.vec.count;
     if (i == cnt) return vec_conj1(v, x);  /* assoc at len appends */
     if (i > cnt) clove_error_cls("IndexOutOfBoundsException", "assoc: index %zu out of bounds for length %u", i, cnt);
@@ -2509,6 +2738,7 @@ static Clove *prim_transient(CloveEnv *env, Clove **argv, int nargs) {
     if (v != NIL && (v->tag == CLOVE_MAP || v->tag == CLOVE_SET)) return v;
     if (v == NIL || v->tag != CLOVE_VECTOR)
         clove_error("transient: unsupported collection");
+    if (v->as.vec.bcount) v = vec_flatten(v);
     Clove *t = alloc(CLOVE_TVEC);
     t->as.vec.tail = chunk32_alloc();   /* private, mutable, full capacity */
     memset(t->as.vec.tail, 0, sizeof(Clove *) * 32);
@@ -2706,7 +2936,7 @@ static Clove *cell_alloc(bool zero) {
         cell_freelist = c->as.cons.head;
     } else {
         if (!cell_blocks || cell_blocks->used == CELL_BLOCK_N) {
-            CellBlock *b = malloc(sizeof *b);
+            CellBlock *b = cell_block_new();
             if (!b) clove_error("out of memory");
             b->used = 0;
             b->next = cell_blocks;
@@ -8221,6 +8451,7 @@ static Clove *prim_denominator(CloveEnv *env, Clove **argv, int nargs) {
  * (= [1 2 3] '(1 2 3)) is true. Seqs are forced one cell at a time, so a
  * finite side ends the walk: (= [0 1 2] (range)) is false, not a hang. */
 static bool seq_eq(Clove *a, Clove *b) {
+    clove_check_stack();   /* nested colls recurse: a coro has only 1 MiB */
     bool va = a->tag == CLOVE_VECTOR, vb = b->tag == CLOVE_VECTOR;
     Clove *la = va ? NULL : seq1(a), *lb = vb ? NULL : seq1(b);
     size_t ia = 0, ib = 0;
@@ -8266,6 +8497,15 @@ static bool maplike_eq_(Clove *a, Clove *b) {
     return true;
 }
 
+static bool map_entry_in(Clove *k, Clove *v, void *b) {
+    Clove *bv;
+    return map_find(b, k, &bv) && clove_eq(v, bv);
+}
+static bool set_elem_in(Clove *k, Clove *v, void *b) {
+    (void)v;
+    return set_contains(b, k, NULL);
+}
+
 static bool is_jcoll(Clove *v);
 static bool clove_eq(Clove *a, Clove *b) {
     if (a == b) return true;
@@ -8278,6 +8518,7 @@ static bool clove_eq(Clove *a, Clove *b) {
         return seq_eq(a, b);
     /* sorted collections compare as their set/map category, across tags */
     if (a->tag == CLOVE_SORTED || b->tag == CLOVE_SORTED) {
+        clove_check_stack();
         bool a_set = a->tag == CLOVE_SET || (a->tag == CLOVE_SORTED && !a->as.sorted.is_map);
         bool b_set = b->tag == CLOVE_SET || (b->tag == CLOVE_SORTED && !b->as.sorted.is_map);
         if (a_set && b_set) return setlike_eq_(a, b);
@@ -8308,7 +8549,8 @@ static bool clove_eq(Clove *a, Clove *b) {
         case CLOVE_BIGDEC: return num_cmp(a, b) == 0;   /* (= 1.0M 1.00M), as Clojure */
         case CLOVE_SYMBOL: return a->as.sym == b->as.sym;
         case CLOVE_KEYWORD: return a->as.kw == b->as.kw;
-        case CLOVE_STRING: return strcmp(a->as.str, b->as.str) == 0;
+        case CLOVE_STRING: return a->as.strx.nbytes == b->as.strx.nbytes &&
+                                  memcmp(a->as.str, b->as.str, a->as.strx.nbytes) == 0;
         case CLOVE_CHAR: return a->as.chr == b->as.chr;
         case CLOVE_MAP: {
             /* a deftype with a custom equiv/equals (e.g. DataScript's Datom
@@ -8325,19 +8567,13 @@ static bool clove_eq(Clove *a, Clove *b) {
               }
             }
             if (a->as.map.count != b->as.map.count) return false;
-            for (Clove *e = map_entry_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-                Clove *bv;
-                if (!map_find(b, e->as.cons.head->as.cons.head, &bv)) return false;
-                if (!clove_eq(e->as.cons.head->as.cons.tail, bv)) return false;
-            }
-            return true;
+            clove_check_stack();
+            return map_each(a, map_entry_in, b);
         }
-        case CLOVE_SET: {
+        case CLOVE_SET:
             if (a->as.map.count != b->as.map.count) return false;
-            for (Clove *e = set_element_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                if (!set_contains(b, e->as.cons.head, NULL)) return false;
-            return true;
-        }
+            clove_check_stack();
+            return map_each(a, set_elem_in, b);
         default: return false;
     }
 }
@@ -9208,6 +9444,23 @@ static Clove *prim_cons(CloveEnv *env, Clove **argv, int nargs) {
 
 /* ── Seq library ── */
 
+/* The seq of a vector from index start: up to 32 conses, then a lazy cell
+ * that yields the next 32 when forced (see lazy_force). (seq v), first and
+ * rest on a big vector stay O(1) instead of copying it into a list. */
+static Clove *vec_seq_from(Clove *v, size_t start) {
+    size_t n = vec_len(v);
+    if (start >= n) return NIL;
+    size_t end = start + 32 < n ? start + 32 : n;
+    Clove *out = NIL;
+    if (end < n) {
+        out = alloc(CLOVE_LAZY);
+        out->as.lazy.thunk = v;
+        out->as.lazy.vidx = (uint32_t)end;
+    }
+    for (size_t i = end; i > start; i--) out = mk_cons(vec_nth(v, i - 1), out);
+    return out;
+}
+
 /* Force a lazy cell once; thunk dropped after so its closure can be GC'd.
  * The thunk often returns ANOTHER lazy seq (e.g. (lazy-seq (map f xs)) yields
  * the map's own lazy); force through that chain to a realized cons/NIL before
@@ -9229,7 +9482,10 @@ static Clove *lazy_force(Clove *l) {
      * self-reference contract in the comment above). */
     Clove *cur = l, *r;
     for (;;) {
-        r = apply(gc_root_envs[0], cur->as.lazy.thunk, NULL, 0);
+        Clove *th = cur->as.lazy.thunk;
+        r = th->tag == CLOVE_VECTOR ? vec_seq_from(th, cur->as.lazy.vidx)
+          : th->tag == CLOVE_TNODE ? sorted_iter_chunk(th, cur->as.lazy.state)
+          : apply(gc_root_envs[0], th, NULL, 0);
         if (r == NULL || r == NIL || r->tag != CLOVE_LAZY) break;
         if (r->as.lazy.done) { r = r->as.lazy.cached; break; }
         cur->as.lazy.cached = r;   /* provisional next-link, not a result */
@@ -9243,6 +9499,7 @@ static Clove *lazy_force(Clove *l) {
         p->as.lazy.cached = r;
         p->as.lazy.done = true;
         p->as.lazy.thunk = NIL;
+        p->as.lazy.state = NULL;
         if (!next) break;
         p = next;
     }
@@ -9256,6 +9513,8 @@ static Clove *seq1(Clove *v) {
         if (v == NULL || v == NIL || v->tag == CLOVE_EMPTY) return NIL;
         if (v->tag == CLOVE_LIST) return v;
         if (v->tag == CLOVE_LAZY) { v = lazy_force(v); continue; }
+        if (v->tag == CLOVE_VECTOR) return vec_seq_from(v, 0);
+        if (v->tag == CLOVE_SORTED) return sorted_seq(v, false);
         return to_seq(v);  /* finite collections materialize */
     }
 }
@@ -9275,7 +9534,10 @@ static Clove *seq1_slot(Clove **slot) {
             v = lazy_force(v);     /* ...then advance: the old head drops */
             continue;
         }
-        *slot = v; return to_seq(v);
+        *slot = v;
+        if (v->tag == CLOVE_VECTOR) return vec_seq_from(v, 0);
+        if (v->tag == CLOVE_SORTED) return sorted_seq(v, false);
+        return to_seq(v);
     }
 }
 
@@ -11128,7 +11390,7 @@ static Clove *prim_with_meta(CloveEnv *env, Clove **argv, int nargs) {
         memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Clove *) * v->as.vec.taillen);
     }
     if (v->tag == CLOVE_STRING) {        /* string buffers are owned: copy */
-        size_t n = strlen(v->as.str);
+        size_t n = v->as.strx.nbytes;
         c->as.str = xmalloc(n + 1);
         memcpy(c->as.str, v->as.str, n + 1);
         c->as.strx.nbytes = (uint32_t)n;
@@ -11710,8 +11972,8 @@ static Clove *prim_swap(CloveEnv *env, Clove **argv, int nargs) {
  * UTF-8 preserves codepoint order the sign is right for any input. The
  * magnitude of a multi-byte mismatch is a byte difference rather than the
  * JVM's UTF-16 char difference; callers may only rely on the sign there. */
-static int str_compare(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b), lim = la < lb ? la : lb;
+static int str_compare_n(const char *a, size_t la, const char *b, size_t lb) {
+    size_t lim = la < lb ? la : lb;
     for (size_t i = 0; i < lim; i++) {
         int ca = (unsigned char)a[i], cb = (unsigned char)b[i];
         if (ca != cb) return ca - cb;
@@ -11720,6 +11982,9 @@ static int str_compare(const char *a, const char *b) {
     size_t d = la < lb ? lb - la : la - lb;
     int dd = d > (size_t)INT_MAX ? INT_MAX : (int)d;
     return la < lb ? -dd : dd;
+}
+static int str_compare(const char *a, const char *b) {
+    return str_compare_n(a, strlen(a), b, strlen(b));
 }
 
 static int cmp_values(Clove *a, Clove *b) {
@@ -11730,7 +11995,8 @@ static int cmp_values(Clove *a, Clove *b) {
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
     if (a->tag != b->tag) clove_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
-        case CLOVE_STRING:  return str_compare(a->as.str, b->as.str);
+        case CLOVE_STRING:  return str_compare_n(a->as.str, a->as.strx.nbytes,
+                                                 b->as.str, b->as.strx.nbytes);
         case CLOVE_CHAR:    return a->as.chr - b->as.chr;
         case CLOVE_KEYWORD: return str_compare(a->as.kw, b->as.kw);
         case CLOVE_SYMBOL:  return str_compare(a->as.sym, b->as.sym);
@@ -11770,11 +12036,6 @@ static Clove *mk_sorted(Clove *cmp, bool is_map) {
     return s;
 }
 
-/* the comparison key of an iteration entry: a set's element is its own key; a
- * map entry is a [k v] vector keyed by element 0. */
-static Clove *sorted_entry_key(Clove *coll, Clove *entry) {
-    return coll->as.sorted.is_map ? vec_nth(entry, 0) : entry;
-}
 
 static int sorted_cmp_call(CloveEnv *env, Clove *coll, Clove *a, Clove *b) {
     Clove *cmp = coll->as.sorted.cmp;
@@ -11946,36 +12207,162 @@ static Clove *prim_sorted_map_by(CloveEnv *env, Clove **argv, int nargs) {
     return m;
 }
 
-/* (subseq sc test key) / (subseq sc t1 k1 t2 k2): entries whose key satisfies
- * (test (compare entry-key key) 0). The satisfying set is contiguous (the data
- * is ordered). rev => descending order (rsubseq). */
+/* ── lazy in-order iteration ──
+ * An iterator is a CLOVE_TNODE record: left = the collection, right = an
+ * optional end test (NIL: none), key = the bound it compares against, size =
+ * 1 for descending. The pending-node stack (a cons list) rides in the lazy
+ * cell's `state`, so each chunk shares the rest of the walk. */
+static Clove *tnode_push_spine(Clove *n, Clove *stack, bool rev) {
+    for (; n != NIL; n = rev ? n->as.tnode.right : n->as.tnode.left)
+        stack = mk_cons(n, stack);
+    return stack;
+}
+
+/* Up to 32 entries off the stack, then a lazy cell for the rest. Stops for
+ * good at the first entry that fails the end test. */
+static Clove *sorted_iter_chunk(Clove *it, Clove *stack) {
+    Clove *coll = it->as.tnode.left, *test = it->as.tnode.right;
+    bool rev = it->as.tnode.size != 0;
+    Clove *out = NIL, **t = &out;
+    for (int k = 0; k < 32 && stack != NIL; k++) {
+        Clove *n = stack->as.cons.head;
+        stack = tnode_push_spine(rev ? n->as.tnode.left : n->as.tnode.right,
+                                 stack->as.cons.tail, rev);
+        if (test != NIL) {
+            Clove *a[2] = { mk_int(sorted_cmp_call(gc_root_envs[0], coll, n->as.tnode.key,
+                                                   it->as.tnode.key)), mk_int(0) };
+            if (!is_truthy(apply(gc_root_envs[0], test, a, 2))) { stack = NIL; break; }
+        }
+        Clove *e = coll->as.sorted.is_map ? mk_map_entry(n->as.tnode.key, n->as.tnode.val)
+                                          : n->as.tnode.key;
+        *t = mk_cons(e, NIL);
+        t = &(*t)->as.cons.tail;
+    }
+    if (stack != NIL) {
+        Clove *l = alloc(CLOVE_LAZY);
+        l->as.lazy.thunk = it;
+        l->as.lazy.state = stack;
+        *t = l;
+    }
+    return out;
+}
+
+static Clove *sorted_iter(Clove *coll, bool rev, Clove *test, Clove *key) {
+    Clove *it = alloc(CLOVE_TNODE);
+    it->as.tnode.left = coll;
+    it->as.tnode.right = test;
+    it->as.tnode.key = key;
+    it->as.tnode.val = NIL;
+    it->as.tnode.size = rev;
+    return it;
+}
+
+/* (seq coll) / (rseq coll), lazily. */
+static Clove *sorted_seq(Clove *coll, bool rev) {
+    if (coll->as.sorted.root == NIL) return NIL;
+    Clove *stack = tnode_push_spine(coll->as.sorted.root, NIL, rev);
+    return sorted_iter_chunk(sorted_iter(coll, rev, NIL, NIL), stack);
+}
+
+/* Clojure's seqFrom: the node stack for a walk starting at the first entry
+ * >= key (ascending) or <= key (descending), found in O(log n). NIL if none. */
+static Clove *sorted_seek(Clove *coll, Clove *key, bool rev) {
+    Clove *stack = NIL;
+    for (Clove *n = coll->as.sorted.root; n != NIL; ) {
+        int c = sorted_cmp_call(gc_root_envs[0], coll, key, n->as.tnode.key);
+        if (c == 0) { stack = mk_cons(n, stack); break; }
+        if (rev ? c > 0 : c < 0) { stack = mk_cons(n, stack); n = rev ? n->as.tnode.right : n->as.tnode.left; }
+        else n = rev ? n->as.tnode.left : n->as.tnode.right;
+    }
+    return stack;
+}
+
+/* Clojure's (if (include e) s (next s)) on a node stack: drop the first
+ * entry when its key fails the test. */
+static Clove *sorted_skip_unless(Clove *coll, Clove *stack, bool rev, Clove *test, Clove *key) {
+    Clove *n = stack->as.cons.head;
+    Clove *a[2] = { mk_int(sorted_cmp_call(gc_root_envs[0], coll, n->as.tnode.key, key)), mk_int(0) };
+    if (is_truthy(apply(gc_root_envs[0], test, a, 2))) return stack;
+    return tnode_push_spine(rev ? n->as.tnode.left : n->as.tnode.right, stack->as.cons.tail, rev);
+}
+
+static bool is_root_fn(Clove *f, const char *name) {
+    Clove *r = env_lookup_maybe(gc_root_envs[0], name);
+    return r != NULL && r == f;
+}
+
+/* (subseq sc test key) / (subseq sc t1 k1 t2 k2), and rsubseq: Clojure's
+ * definitions, step for step (nil where it has when-let, () where it ends in
+ * take-while). A start bound seeks in O(log n); an end bound ends the lazy
+ * walk at the first entry past it. */
 static Clove *sorted_subseq(CloveEnv *env, Clove **argv, int nargs, bool rev) {
+    (void)env;
     need_nargs(nargs, 3, "subseq");
     Clove *coll = argv[0];
     if (coll == NIL) return NIL;
     if (coll->tag != CLOVE_SORTED) clove_error("subseq: not a sorted collection");
-    bool two = nargs >= 5;
-    Clove *t1 = argv[1], *k1 = argv[2];
-    Clove *t2 = two ? argv[3] : NIL, *k2 = two ? argv[4] : NIL;
-    Clove *out = NIL, **t = &out;
-    for (Clove *e = sorted_entry_list(coll); e != NIL; e = e->as.cons.tail) {
-        Clove *entry = e->as.cons.head, *ek = sorted_entry_key(coll, entry);
-        Clove *a1[2] = { mk_int(sorted_cmp_call(env, coll, ek, k1)), mk_int(0) };
-        if (!is_truthy(apply(env, t1, a1, 2))) continue;
-        if (two) {
-            Clove *a2[2] = { mk_int(sorted_cmp_call(env, coll, ek, k2)), mk_int(0) };
-            if (!is_truthy(apply(env, t2, a2, 2))) continue;
-        }
-        if (rev) { out = mk_cons(entry, out); }          /* prepend => descending */
-        else { *t = mk_cons(entry, NIL); t = &(*t)->as.cons.tail; }
+    if (nargs >= 5) {
+        Clove *st = argv[1], *sk = argv[2], *et = argv[3], *ek = argv[4];
+        /* subseq seeks from the start key, rsubseq from the end key */
+        Clove *ft = rev ? et : st, *fk = rev ? ek : sk;   /* first-entry test */
+        Clove *wt = rev ? st : et, *wk = rev ? sk : ek;   /* take-while test */
+        Clove *stack = sorted_seek(coll, fk, rev);
+        if (stack == NIL) return NIL;
+        stack = sorted_skip_unless(coll, stack, rev, ft, fk);
+        Clove *s = sorted_iter_chunk(sorted_iter(coll, rev, wt, wk), stack);
+        return s == NIL ? EMPTY : s;
     }
-    return out;
+    Clove *test = argv[1], *key = argv[2];
+    bool seek = rev ? (is_root_fn(test, "<") || is_root_fn(test, "<="))
+                    : (is_root_fn(test, ">") || is_root_fn(test, ">="));
+    if (!seek) {                         /* take-while from the near end */
+        Clove *stack = tnode_push_spine(coll->as.sorted.root, NIL, rev);
+        Clove *s = sorted_iter_chunk(sorted_iter(coll, rev, test, key), stack);
+        return s == NIL ? EMPTY : s;
+    }
+    Clove *stack = sorted_seek(coll, key, rev);
+    if (stack == NIL) return NIL;
+    stack = sorted_skip_unless(coll, stack, rev, test, key);
+    return sorted_iter_chunk(sorted_iter(coll, rev, NIL, NIL), stack);
 }
 static Clove *prim_subseq(CloveEnv *env, Clove **argv, int nargs) {
     return sorted_subseq(env, argv, nargs, false);
 }
 static Clove *prim_rsubseq(CloveEnv *env, Clove **argv, int nargs) {
     return sorted_subseq(env, argv, nargs, true);
+}
+
+/* (rseq v): a vector or sorted collection, backwards; nil when empty. */
+static Clove *prim_rseq(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 1, "rseq");
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_SORTED) return sorted_seq(v, true);
+    if (v != NIL && v->tag == CLOVE_VECTOR) {
+        Clove *out = NIL;
+        for (size_t i = 0; i < vec_len(v); i++) out = mk_cons(vec_nth(v, i), out);
+        return out;
+    }
+    Clove *r = prim_reverse(env, argv, nargs);
+    return seq1(r);
+}
+
+static Clove *prim_vec(CloveEnv *env, Clove **argv, int nargs);
+/* (subvec v start) / (subvec v start end): an O(1) slice of v. */
+static Clove *prim_subvec(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env;
+    need_nargs(nargs, 2, "subvec");
+    Clove *v = argv[0];
+    if (v == NIL || v->tag != CLOVE_VECTOR) {    /* lenient: any seqable */
+        Clove *a[1] = { v };
+        v = prim_vec(env, a, 1);
+    }
+    int64_t n = (int64_t)vec_len(v);
+    int64_t st = as_int(argv[1], "subvec");
+    int64_t en = nargs > 2 ? as_int(argv[2], "subvec") : n;
+    if (st < 0 || en > n || st > en)
+        clove_error_cls("IndexOutOfBoundsException", "subvec: %lld to %lld out of bounds for length %lld",
+                        (long long)st, (long long)en, (long long)n);
+    return vec_slice(v, (size_t)st, (size_t)en);
 }
 
 /* qsort has no context parameter; the interpreter is single-threaded — but a
@@ -12041,11 +12428,25 @@ static Clove *prim_sort(CloveEnv *env, Clove **argv, int nargs) {
 
 static Clove *prim_vec(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Clove *s = to_seq(argv[0]);
-    Clove *v = mk_empty_vec();
-    for (Clove *l = s; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
-        v = vec_conj1(v, l->as.cons.head);
-    return v;
+    Clove *a[2] = { mk_empty_vec(), NULL };
+    Clove *t = prim_transient(NULL, a, 1);
+    int tag = argv[0] == NIL ? CLOVE_NIL : argv[0]->tag;
+    if (tag == CLOVE_LIST || tag == CLOVE_LAZY) {
+        /* walk advancing the root slot: a lazy source is collected behind
+         * the cursor instead of being realized whole first (to_seq) */
+        for (Clove *l = seq1_slot(&argv[0]); l != NIL; l = seq1_slot(&argv[0])) {
+            a[0] = t; a[1] = l->as.cons.head;
+            prim_conj_bang(NULL, a, 2);
+            argv[0] = l->as.cons.tail;
+        }
+    } else {
+        for (Clove *l = to_seq(argv[0]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
+            a[0] = t; a[1] = l->as.cons.head;
+            prim_conj_bang(NULL, a, 2);
+        }
+    }
+    a[0] = t;
+    return prim_persistent_bang(NULL, a, 1);
 }
 
 static const char *as_named(Clove *v, const char *what) {
@@ -12071,15 +12472,21 @@ static Clove *prim_name(CloveEnv *env, Clove **argv, int nargs) {
     return mk_str(n, strlen(n));
 }
 
+/* Byte length of a name from as_named: a string's own length (it may hold
+ * NUL bytes), else the C string's. */
+static size_t named_len(Clove *x, const char *n) {
+    return x != NIL && x->tag == CLOVE_STRING ? x->as.strx.nbytes : strlen(n);
+}
+
 static Clove *prim_keyword(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     /* (keyword \a) => nil, like Clojure — keyword rejects chars. */
     if (argv[0] != NIL && argv[0]->tag == CLOVE_CHAR) return NIL;
     if (nargs >= 2) {                       /* (keyword ns name) => :ns/name */
         const char *nm = as_named(argv[1], "keyword");
-        if (argv[0] == NIL) return mk_kw(intern(nm, strlen(nm)));  /* nil ns: bare kw */
+        if (argv[0] == NIL) return mk_kw(intern(nm, named_len(argv[1], nm)));  /* nil ns: bare kw */
         const char *ns = as_named(argv[0], "keyword");
-        size_t ln = strlen(ns), lm = strlen(nm);
+        size_t ln = named_len(argv[0], ns), lm = named_len(argv[1], nm);
         char *buf = xmalloc(ln + lm + 2);
         memcpy(buf, ns, ln); buf[ln] = '/';
         memcpy(buf + ln + 1, nm, lm); buf[ln + lm + 1] = '\0';
@@ -12088,7 +12495,7 @@ static Clove *prim_keyword(CloveEnv *env, Clove **argv, int nargs) {
         return r;
     }
     const char *n = as_named(argv[0], "keyword");
-    return mk_kw(intern(n, strlen(n)));
+    return mk_kw(intern(n, named_len(argv[0], n)));
 }
 
 /* string/symbol/keyword -> its name; a non-named, non-nil value (e.g. what
@@ -12114,8 +12521,9 @@ static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
         const char *nm = symbol_name_of(argv[1]);
         return mk_sym(intern_qual(ns, nm));
     }
-    const char *n = symbol_name_of(nargs >= 2 ? argv[1] : argv[0]);
-    return mk_sym(intern(n, strlen(n)));
+    Clove *x = nargs >= 2 ? argv[1] : argv[0];
+    const char *n = symbol_name_of(x);
+    return mk_sym(intern(n, x->tag == CLOVE_STRING ? named_len(x, n) : strlen(n)));
 }
 
 static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
@@ -14153,6 +14561,8 @@ static Clove *prim_pop(CloveEnv *env, Clove **argv, int nargs) {
     if (v != NIL && v->tag == CLOVE_VECTOR) {
         uint32_t cnt = v->as.vec.count;
         if (cnt == 0) clove_error_cls("IllegalStateException", "Can't pop empty vector");
+        if (v->as.vec.bcount)       /* a slice: one shorter */
+            return vec_with_meta(vec_slice(v, 0, cnt - 1), v->meta);
         if (v->as.vec.taillen > 1)  /* fast path: shrink the tail */
             return vec_cell(v->as.vec.root, v->as.vec.shift, cnt - 1,
                             v->as.vec.tail, (uint8_t)(v->as.vec.taillen - 1), NULL);
@@ -14230,6 +14640,7 @@ static Clove *coro_resume(Coro *target, Clove *val) {
     target->s_dyn = dyn_enter(target->s_dyn);
     swapcontext(resumer ? &resumer->ctx : &coro_main_ctx, &target->ctx);
     /* ← target yielded or died back to us; it already restored our state. */
+    if (target->status == CORO_DEAD) coro_free_stacks(target);
     return target->xfer;
 }
 
@@ -14278,6 +14689,50 @@ static void coro_trampoline(void) {
     /* unreachable */
 }
 
+/* The stack is mmap'd with a PROT_NONE page below it, so recursion that
+ * gets past clove_check_stack faults instead of overwriting the heap. If the
+ * mapping fails (e.g. vm.max_map_count), fall back to malloc, unguarded. */
+#define CORO_STACK_CACHE 16          /* recently freed mappings kept for reuse */
+static char *coro_stack_cache[CORO_STACK_CACHE];
+static int coro_stack_ncached;
+
+static void coro_stack_alloc(Coro *co) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (coro_stack_ncached) {           /* skip the mmap/mprotect/munmap round */
+        co->stack_map = coro_stack_cache[--coro_stack_ncached];
+        co->stack = co->stack_map + page;
+        return;
+    }
+    char *base = mmap(NULL, CORO_STACK_SIZE + page, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base != MAP_FAILED) {
+        if (mprotect(base, page, PROT_NONE) == 0) {
+            co->stack_map = base;
+            co->stack = base + page;
+            return;
+        }
+        munmap(base, CORO_STACK_SIZE + page);
+    }
+    co->stack_map = NULL;
+    co->stack = xmalloc(CORO_STACK_SIZE);
+}
+
+/* Release a coro's stacks. Only ever called when it is not running: from
+ * coro_resume once it has died (we are back on the resumer's stack), or
+ * from the sweep. */
+static void coro_free_stacks(Coro *co) {
+    if (co->stack_map && coro_stack_ncached < CORO_STACK_CACHE)
+        coro_stack_cache[coro_stack_ncached++] = co->stack_map;
+    else if (co->stack_map)
+        munmap(co->stack_map, CORO_STACK_SIZE + (size_t)(co->stack - co->stack_map));
+    else
+        free(co->stack);
+    free(co->s_vstack);
+    co->stack = co->stack_map = co->stack_top = NULL;
+    co->s_vstack = NULL;
+    co->s_vsp = 0;
+}
+
 static Clove *coro_new(Clove *thunk) {
     Clove *cell = alloc(CLOVE_CORO);     /* as.coro zeroed → GC-safe before attach */
     Coro *co = xmalloc(sizeof(Coro));
@@ -14287,7 +14742,12 @@ static Clove *coro_new(Clove *thunk) {
     co->s_vstack = xmalloc(sizeof(Clove *) * CORO_VSTACK_CAP);   /* this coro's own vstack */
     co->s_vsp = 0;
     co->s_vstack_cap = CORO_VSTACK_CAP;
-    co->stack = xmalloc(CORO_STACK_SIZE);
+    coro_stack_alloc(co);
+    /* the stacks live outside the cell pools: count them toward GC pressure.
+     * Only the pages a coro touches are resident (tens of KiB, not the 1 MiB
+     * reserved), and a dead coro frees its stacks at once, so count 64 KiB:
+     * the full size made 50k live futures collect every ~230 spawns. */
+    gc_extra_bytes += 64u * 1024;
     co->stack_size = CORO_STACK_SIZE;
     co->stack_top = co->stack + CORO_STACK_SIZE;
     getcontext(&co->ctx);
@@ -14793,12 +15253,7 @@ static const char *PRELUDE =
     "(defn unreduced [x] (if (reduced? x) (second x) x))\n"
     "(defn ensure-reduced [x] (if (reduced? x) x (reduced x)))\n"
     "(defn key [e] (first e))\n"
-    "(defn subvec\n"
-    "  ([v s] (subvec v s (count v)))\n"
-    "  ([v s e]\n"
-    "   (when (or (< s 0) (> e (count v)) (> s e))\n"
-    "     (throw (IndexOutOfBoundsException. (str \"subvec: \" s \" to \" e \" out of bounds for length \" (count v)))))\n"
-    "   (vec (take (- e s) (drop s v)))))\n"
+
     /* defrecord registers its type here so a deftype can be told apart from a
        record (both are tagged maps in clove). map? stays native (records, plain
        maps, AND deftypes all read as maps — instaparse relies on this). */
@@ -15343,7 +15798,7 @@ static const char *PRELUDE =
     "  ([smap coll] ((if (vector? coll) mapv map) (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
     "(defn replicate [n x] (repeat n x))\n"
     "(defn nthnext [coll n] (loop [n n s (seq coll)] (if (and (pos? n) s) (recur (dec n) (next s)) s)))\n"
-    "(defn rseq [v] (seq (reverse v)))\n"
+
     /* supers: a type's ancestors in the hierarchy deftype/defrecord derive from
        their declared interfaces; nil when there are none, as on the JVM */
     "(defn supers [c] (not-empty (set (ancestors c))))\n"
@@ -16310,6 +16765,8 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "sorted-map-by", prim_sorted_map_by);
     clove_define_native(e, "subseq",        prim_subseq);
     clove_define_native(e, "rsubseq",       prim_rsubseq);
+    clove_define_native(e, "rseq",          prim_rseq);
+    clove_define_native(e, "subvec",        prim_subvec);
     clove_define_native(e, "vec",     prim_vec);
     clove_define_native(e, "transient",   prim_transient);
     clove_define_native(e, "persistent!", prim_persistent_bang);
@@ -17622,10 +18079,14 @@ CloveEnv *clove_new_env(void) {
      * the main thread. Defined after deftype (promise/future are deftypes). */
     clove_eval_string(e,
         "(def ^:dynamic fiber/*self* nil)\n"   /* coroutine currently running */
-        "(def fiber/ready (atom []))\n"        /* queue of ready 0-arg thunks */
+        /* queue of ready 0-arg thunks: [front-seq back-vector]. Pop from the
+           front; when it runs dry the back becomes the new front. O(1) amortized
+           (popping a vector with subvec copied it: O(n^2) for n futures). */
+        "(def fiber/ready (atom [nil []]))\n"
         "(def fiber/timers (atom []))\n"       /* vector of [deadline-ms wake-fn] */
         "(def fiber/io-waiters (atom []))\n"   /* vector of {:fd :ev :co} */
-        "(defn fiber/dispatch! [thunk] (swap! fiber/ready conj thunk) nil)\n"
+        "(defn fiber/dispatch! [thunk]\n"
+        "  (swap! fiber/ready (fn [q] [(nth q 0) (conj (nth q 1) thunk)])) nil)\n"
         "(defn fiber/schedule! [co v]\n"
         "  (fiber/dispatch!\n"
         "    (fn [] (when (coro/alive? co)\n"
@@ -17633,10 +18094,11 @@ CloveEnv *clove_new_env(void) {
         "(defn fiber/spawn! [thunk] (let [co (coro/new thunk)] (fiber/schedule! co nil) co))\n"
         "(defn fiber/timer! [deadline wake] (swap! fiber/timers conj [deadline wake]) nil)\n"
         "(defn fiber/run-one! []\n"
-        "  (let [q (deref fiber/ready)]\n"
-        "    (when (seq q)\n"
-        "      (swap! fiber/ready subvec 1)\n"
-        "      ((nth q 0))\n"
+        "  (let [q (deref fiber/ready)\n"
+        "        f (or (nth q 0) (seq (nth q 1)))]\n"
+        "    (when f\n"
+        "      (reset! fiber/ready [(next f) (if (nth q 0) (nth q 1) [])])\n"
+        "      ((first f))\n"
         "      true)))\n"
         "(defn fiber/fire-timers! []\n"
         "  (let [now (clove/now-ms*)\n"
