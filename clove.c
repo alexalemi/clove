@@ -6445,7 +6445,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     b->value = val;
                     return val;
                 }
-                if (s == SYM_LETFN) {
+                if (s == SYM_LETFN && !head_shadowed(env, head->as.sym)) {
                     /* (letfn* [f (fn ..) g (fn ..)] body) — every fn closes
                      * over one frame holding all the names */
                     Clove *bv = rest->as.cons.head;
@@ -14434,7 +14434,7 @@ static const char *PRELUDE =
     "(defn clove/deftype-walk [form fset mset this]\n"
     /* macroexpand this node so macros that GENERATE field reads or (set! field
        ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
-       form so it stays a set! for the rewrite below (set! is itself a macro). */
+       form so it stays a set! for the rewrite below (set! is a special form, so macroexpand leaves it). */
     "  (let [form (loop [f form]\n"
     "               (if (and (list? f) (= 'set! (first f))) f\n"
     "                 (let [e (macroexpand-1 f)] (if (= e f) f (recur e)))))]\n"
@@ -15143,7 +15143,8 @@ static const char *PRELUDE =
     /* push-/pop-/get-thread-bindings and with-bindings* are natives on the
        same frames as binding (see dyn_run) */
     "(defmacro with-bindings [m & body] `(with-bindings* ~m (fn [] ~@body)))\n"
-    "(defn bound-fn* [f] (let [b (get-thread-bindings)] (fn [& a] (apply with-bindings* b f a))))\n"
+    "(defn bound-fn* [f]\n"
+    "  (let [b (get-thread-bindings)] (if (seq b) (fn [& a] (apply with-bindings* b f a)) f)))\n"
     "(defmacro bound-fn [& fntail] `(bound-fn* (fn ~@fntail)))\n"
     /* alter-meta!/reset-meta!: a deftype with a mutable :meta field (e.g. SCI's
        Var/Namespace) keeps its metadata in a :meta atom — mutate that. */
