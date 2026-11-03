@@ -4155,6 +4155,62 @@
     (sh "rm" "-rf" T))
   (assert= "true\n" (:out (sh "env" "PATH=/clove-no-such-dir" (str (clove/exe-dir*) "/clove")
                                "-e" "(require 'fs) (println (fs/directory? \"/\"))"))))
+;; ── workstream B: evaluator, special forms, prelude ──
+;; a later let binding of the same name must not change what earlier closures see
+(assert= [1 [11 21] 1] [(let [x 1 f (fn [] x) x 2] (f)) (let [n 1 xs (map #(+ n %) [10 20]) n 100] (vec xs)) (let [[n] [1] g (fn [] n) [n] [2]] (g))])
+(defn clove-b1 [] [(let [x 1 f (fn [] x) x 2 g (fn [] x) x 3] [(f) (g) x]) (let [n 1 xs (map #(+ n %) [10 20]) n 100] (vec xs))])
+(assert= [[1 2 3] [11 21]] (do (clove-b1) (clove-b1)))
+;; recur in a variadic arity binds the rest param directly
+(defn clove-b2a [n & xs] (if (zero? n) xs (recur (dec n) (cons n xs))))
+(defn clove-b2b [acc & more] (if more (recur (+ acc (first more)) (next more)) acc))
+(assert= ['(1 2 3) 6 :done] [(clove-b2a 3) (clove-b2b 0 1 2 3) ((fn [& xs] (if (seq xs) (recur (next xs)) :done)) 1 2 3)])
+
+;; lazy where Clojure is lazy (these hung on infinite input)
+(assert= ['(0 1 2) 100000 [1 nil 3 2]] [(take 3 (distinct (range))) (count (distinct (range 100000))) (vec (distinct [1 nil 1 nil 3 2]))])
+(assert= ['((0 1) (2 3)) '((0 1) (1 2)) '((0 1 2) (3 4 5)) '((0 1 2) (3 4 5) (6 :p))]
+         [(take 2 (partition 2 (range))) (take 2 (partition 2 1 (range))) (take 2 (partition 3 3 [:p] (range))) (partition 3 3 [:p] (range 7))])
+(assert= ['((0 1) (2 3)) '((1 2) (3))] [(take 2 (partition-all 2 (range))) (partition-all 2 [1 2 3])])
+(assert= ['(1 2 3) "()" '([1 2] [3]) '(0 0 1) '(1 3 5)]
+         [(take 3 (sequence (map inc) (range))) (pr-str (sequence (map inc) [])) (sequence (partition-all 2) [1 2 3])
+          (take 3 (sequence (mapcat (fn [x] [x x])) (range))) (take 3 (eduction (map inc) (filter odd?) (range)))])
+(assert= ['(:one 2) [:one 2] "()" '(1 2 1) '(1 2)]
+         [(replace {1 :one} '(1 2)) (replace {1 :one} [1 2]) (pr-str (cycle [])) (take 3 (cycle [1 2])) (take 2 (first (split-with pos? (iterate inc 1))))])
+;; butlast/take-last give nil, not (), when empty
+(assert= [nil nil nil '(2 3) 2] [(butlast [1]) (take-last 0 [1 2]) (take-last 2 []) (take-last 2 [1 2 3])
+                                (loop [xs [1 2 3] n 0] (if-let [b (butlast xs)] (recur b (inc n)) n))])
+(assert= ["1,,2" "" 588889] [(str/join "," [1 nil 2]) (str/join "," []) (count (str/join "," (range 100000)))])
+;; condp :>> passes the predicate's result to the fn
+(assert= [3 :none "No matching clause: 3"] [(condp some [1 2] #{2} :>> inc :none) (condp some [1 2] #{5} :>> inc :none)
+                                           (try (condp = 3 1 :a 2 :b) (catch IllegalArgumentException e (ex-message e)))])
+;; namespaced map destructuring directives
+(assert= [[1 2] 5 7 3 [1 nil]] [(let [{:a/keys [b c]} {:a/b 1 :a/c 2 :b 9}] [b c]) (let [{::keys [x]} {:user/x 5}] x)
+                                (let [{:a/syms [b]} {'a/b 7}] b) (let [{:a/keys [b] :or {b 3}} {}] b)
+                                (let [{:a/keys [b x/c]} {:a/b 1 :x/c 2}] [b c])])
+;; small core mismatches
+(assert= [nil nil {:a 1 :b 2} {:b 2} "()" '(0 0 0) "()" "()"]
+         [(merge-with + nil nil) (merge-with +) (merge {:a 1} [:b 2]) (merge nil [:b 2]) (pr-str (flatten {:a 1}))
+          (take 3 (range 0 10 0)) (pr-str (range 3 3 0)) (pr-str (drop-while odd? [1]))])
+
+;; binding frames: bound-fn and get-thread-bindings see binding; push/pop share the stack
+(def ^:dynamic *clove-b3* 1)
+(assert= [2 2 10 5 1]
+         [(let [f (binding [*clove-b3* 2] (bound-fn [] *clove-b3*))] (f))
+          (binding [*clove-b3* 2] (some (fn [[k v]] (when (= (str k) "#'*clove-b3*") v)) (get-thread-bindings)))
+          (with-bindings {(var *clove-b3*) 10} *clove-b3*)
+          (do (push-thread-bindings {(var *clove-b3*) 5}) (let [v *clove-b3*] (pop-thread-bindings) v))
+          *clove-b3*])
+;; set! only on a thread-bound var; never on a local
+(assert= [3 1 :root :local] [(binding [*clove-b3* 2] (set! *clove-b3* 3) *clove-b3*) *clove-b3*
+                             (try (set! *clove-b3* 9) (catch Exception e :root))
+                             (try ((fn [] (let [x 1] (set! x 2) x))) (catch Exception e :local))])
+(when clove-test-coro?
+  ;; a future conveys the caller's bindings; fibers don't clobber each other's
+  (assert= 2 @(binding [*clove-b3* 2] (future (Thread/sleep 5) *clove-b3*)))
+  (let [p (promise)
+        f (future (binding [*clove-b3* 5] @p *clove-b3*))]
+    (Thread/sleep 5)
+    (assert= [5 7] (binding [*clove-b3* 7] (deliver p :go) [@f *clove-b3*]))
+    (assert= 1 *clove-b3*)))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

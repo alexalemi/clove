@@ -668,6 +668,7 @@ typedef struct Coro {
     Clove *s_cur_exc;
     int s_eval_sp;
     int s_vm_tsp;
+    struct DynFrame *s_dyn; /* running: binding-frame base; suspended: own frames */
 } Coro;
 
 static Coro *coro_current;        /* NULL = main is the active context */
@@ -3710,6 +3711,12 @@ static const char *sym_amp(void) {
  *   {:keys [a b] :or {a 1} :as m}
  * :or defaults are forms, evaluated in `scope` when the key is missing. */
 static Clove *kvseq_to_map(Clove *s);
+/* "a/b" -> "b"; a name without a namespace is returned as is */
+static const char *bare_name(const char *nm) {
+    const char *sl = strrchr(nm, '/');
+    return (sl && sl != nm && sl[1]) ? sl + 1 : nm;
+}
+
 static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
     /* ^{..}sym in a binding position arrives as the deferred (with-meta sym m)
      * form — bind the symbol, drop the meta (Clojure keeps only type hints
@@ -3773,7 +3780,20 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                     env_define(scope, sym_name(spec, ":as"), value);
                     continue;
                 }
-                if (k->as.kw == KW_KEYS) {
+                /* {:a/keys [b]} / {::keys [b]} / {:a/syms [b]}: bare names
+                 * look up keys (or symbols) in namespace a */
+                const char *dir = k->as.kw, *kns = NULL;
+                size_t knl = 0;
+                {
+                    const char *ks = strrchr(dir, '/');
+                    if (ks && ks != dir && ks[1]) {
+                        kns = dir; knl = (size_t)(ks - dir);
+                        dir = intern(ks + 1, strlen(ks + 1));
+                        if (dir != KW_KEYS && dir != KW_SYMS)
+                            clove_error("destructure: unsupported map directive :%s", k->as.kw);
+                    }
+                }
+                if (dir == KW_KEYS) {
                     if (spec == NIL || spec->tag != CLOVE_VECTOR)
                         clove_error("destructure: :keys needs a vector of symbols");
                     for (size_t j = 0; j < vec_len(spec); j++) {
@@ -3782,6 +3802,7 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                         if (elt == NIL) continue;   /* a #?(:cljs ..)-only key elides to nil */
                         const char *nm = elt->tag == CLOVE_KEYWORD
                                          ? elt->as.kw : sym_name(elt, ":keys");
+                        if (kns) nm = intern_qual_n(kns, knl, bare_name(nm), strlen(bare_name(nm)));
                         Clove *kw = mk_kw(nm);   /* lookup key keeps the namespace */
                         /* a namespaced key ({:keys [a/b]} / {:keys [::foo]}) binds
                          * the BARE local name (b / foo) to the namespaced value. */
@@ -3800,24 +3821,28 @@ static void destructure(CloveEnv *scope, Clove *pattern, Clove *value) {
                     }
                     continue;
                 }
-                if (k->as.kw == KW_STRS || k->as.kw == KW_SYMS) {
+                if (dir == KW_STRS || dir == KW_SYMS) {
                     /* {:strs [a b]} → (get m "a"); {:syms [a b]} → (get m 'a) */
                     if (spec == NIL || spec->tag != CLOVE_VECTOR)
                         clove_error("destructure: :%s needs a vector of symbols", k->as.kw);
-                    bool syms = (k->as.kw == KW_SYMS);
+                    bool syms = (dir == KW_SYMS);
                     for (size_t j = 0; j < vec_len(spec); j++) {
                         Clove *elt = vec_nth(spec, j);
                         if (elt == NIL) continue;
                         const char *nm = sym_name(elt, syms ? ":syms" : ":strs");
+                        if (kns) nm = intern_qual_n(kns, knl, bare_name(nm), strlen(bare_name(nm)));
+                        const char *slash = syms ? strrchr(nm, '/') : NULL;
+                        const char *local = (slash && slash[1])
+                                            ? intern(slash + 1, strlen(slash + 1)) : nm;
                         Clove *key = syms ? mk_sym(nm) : mk_str(nm, strlen(nm));
                         Clove *v = NIL;
                         bool found = value != NIL && value->tag == CLOVE_MAP &&
                                      map_find(value, key, &v);
                         if (!found && defaults && defaults->tag == CLOVE_MAP) {
                             Clove *d;
-                            if (map_find(defaults, mk_sym(nm), &d)) v = eval(scope, d);
+                            if (map_find(defaults, mk_sym(local), &d)) v = eval(scope, d);
                         }
-                        env_define(scope, nm, v);
+                        env_define(scope, local, v);
                     }
                     continue;
                 }
@@ -4267,6 +4292,17 @@ static void vmc_bind(VmC *c, Clove *pat) {
     }
 }
 
+/* Did code emitted since `from` possibly capture the current env frame
+ * (a closure, a lazy thunk, or a tree-walked form)? */
+static bool vmc_may_capture(VmC *c, uint32_t from) {
+    if (!c->ok) return false;
+    for (uint32_t i = from; i < c->ncode; i++) {
+        uint8_t op = c->code[i] & 0xff;
+        if (op == VOP_CLOSURE || op == VOP_LAZY || op == VOP_EVAL) return true;
+    }
+    return false;
+}
+
 /* Enter/leave a runtime env frame (one VOP_NEWENV / VOP_POPENV). */
 static void vmc_frame_enter(VmC *c) {
     c->frame++;
@@ -4281,16 +4317,16 @@ static bool vm_special_name(const char *s) {
     /* must stay in sync with eval_inner's special forms (no shared
      * list); the first 11 are handled explicitly in vmc_form before
      * this is consulted — listed anyway as drift insurance */
-    static const char *names[24];
+    static const char *names[26];
     if (!names[0]) {
-        static const char *txt[24] = {
+        static const char *txt[26] = {
             "quote", "if", "do", "def", "let", "fn", "loop", "recur",
             "and", "or", "when", "cond", "defn", "defmacro", "quasiquote",
             "try", "catch", "finally", "ns", "use", "import", "binding",
-            "with-redefs", "**reader-splice**"};
-        for (int i = 0; i < 24; i++) names[i] = intern(txt[i], strlen(txt[i]));
+            "with-redefs", "**reader-splice**", "letfn*", "set!"};
+        for (int i = 0; i < 26; i++) names[i] = intern(txt[i], strlen(txt[i]));
     }
-    for (int i = 0; i < 24; i++)
+    for (int i = 0; i < 26; i++)
         if (s == names[i]) return true;
     return false;
 }
@@ -4547,9 +4583,20 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
             c->loop_depth++;
             vmc_emit(c, VOP_NEWENV, 0);
             vmc_frame_enter(c);
+            int extra = 0;                /* frames opened after a capture */
+            uint32_t frame_pc = c->ncode;
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Clove *pat = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1), false);
+                if (vmc_may_capture(c, frame_pc)) {
+                    /* a closure may hold this frame: later bindings go in a
+                     * child so (let [x 1 f (fn [] x) x 2] (f)) stays 1 */
+                    vmc_emit(c, VOP_NEWENV, 0);
+                    vmc_frame_enter(c);
+                    c->loop_depth++;
+                    extra++;
+                    frame_pc = c->ncode;
+                }
                 if (pat != NIL && pat->tag == CLOVE_SYMBOL)
                     vmc_emit(c, VOP_BIND, vmc_const(c, pat));
                 else
@@ -4557,9 +4604,11 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
                 vmc_bind(c, pat);
             }
             vmc_body(c, cenv, rest->as.cons.tail, tail);
-            vmc_emit(c, VOP_POPENV, 0);
-            vmc_frame_leave(c);
-            c->loop_depth--;
+            for (int x = 0; x <= extra; x++) {
+                vmc_emit(c, VOP_POPENV, 0);
+                vmc_frame_leave(c);
+                c->loop_depth--;
+            }
             c->nlocals = save_locals;
             return;
         }
@@ -5032,6 +5081,119 @@ static bool dispatch_deftype_method(CloveEnv *env, Clove *inst, const char *mnam
     return true;
 }
 
+/* ── Dynamic binding frames ──
+ * binding / with-bindings* push a frame. While it is in effect each var's
+ * root Binding holds the bound value and saved[i] the value it displaced,
+ * so pushing and popping are the same swap. A fiber's frames sit on top of
+ * whatever its resumer has bound: switching out undoes them innermost first
+ * and detaches them; switching back in re-applies them outermost first.
+ * Lexical frames live on the C stack of the context that pushed them (the
+ * GC scans suspended coro stacks); push-thread-bindings frames are malloc'd
+ * and keep their values in a CLOVE_RECUR box listed in dyn_boxes_b. */
+typedef struct DynFrame {
+    struct DynFrame *prev;
+    int n;
+    Binding **slots;
+    Clove **saved;
+    Clove *box;            /* heap frames only: the cell owning saved[] */
+} DynFrame;
+static DynFrame *dyn_top;
+static Binding *dyn_boxes_b;
+
+static void dyn_swap(DynFrame *f) {
+    for (int i = 0; i < f->n; i++) {
+        Clove *t = f->slots[i]->value;
+        f->slots[i]->value = f->saved[i];
+        f->saved[i] = t;
+    }
+}
+
+#ifdef CLOVE_HAVE_CORO
+/* Leaving a fiber whose frames start above `base`: undo them and return
+ * them as a detached chain (NULL if it bound nothing). */
+static DynFrame *dyn_leave(DynFrame *base) {
+    DynFrame *head = dyn_top == base ? NULL : dyn_top, *last = NULL;
+    for (DynFrame *f = dyn_top; f && f != base; f = f->prev) { dyn_swap(f); last = f; }
+    if (last) last->prev = NULL;
+    dyn_top = base;
+    return head;
+}
+
+static void dyn_reapply(DynFrame *f, DynFrame *base) {
+    if (f->prev) dyn_reapply(f->prev, base); else f->prev = base;
+    dyn_swap(f);
+}
+
+/* Entering a fiber: put its detached chain back on top of the current
+ * frames. Returns the base for the matching dyn_leave. */
+static DynFrame *dyn_enter(DynFrame *chain) {
+    DynFrame *base = dyn_top;
+    if (chain) { dyn_reapply(chain, base); dyn_top = chain; }
+    return base;
+}
+#endif
+
+static void dyn_pop(void) {
+    DynFrame *f = dyn_top;
+    dyn_swap(f);
+    dyn_top = f->prev;
+    if (f->box) {
+        /* unlink the box from the GC list, then free the frame */
+        for (Clove **p = &dyn_boxes_b->value; *p != NIL && (*p)->tag == CLOVE_LIST;
+             p = &(*p)->as.cons.tail)
+            if ((*p)->as.cons.head == f->box) { *p = (*p)->as.cons.tail; break; }
+        free(f->slots);
+        free(f);
+    }
+}
+
+/* Push `fr` (saved[] holding the new values), run body or (fn argv), pop on
+ * every exit path. */
+static Clove *dyn_run(CloveEnv *env, DynFrame *fr, Clove *body,
+                      Clove *fn, Clove **argv, int nargs) {
+    fr->prev = dyn_top;
+    fr->box = NULL;
+    dyn_swap(fr);
+    dyn_top = fr;
+    ErrFrame frame;
+    frame.prev = err_top;
+    frame.vsp_save = vsp;
+    frame.esp_save = eval_sp;
+    frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
+    frame.rd_line_save = rd_line;
+    frame.rd_start_save = rd_line_start;
+    frame.rd_file_save = rd_file_cell;
+    err_top = &frame;
+    Clove * volatile result = NIL;
+    volatile bool threw = false;
+    if (setjmp(frame.jb) == 0) {
+        result = body ? eval_body(env, body) : apply(env, fn, argv, nargs);
+        err_top = frame.prev;
+    } else {
+        err_top = frame.prev;
+        vsp = frame.vsp_save;
+        eval_sp = frame.esp_save;
+        vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
+        rd_line = frame.rd_line_save;
+        rd_line_start = frame.rd_start_save;
+        rd_file_cell = frame.rd_file_save;
+        threw = true;
+    }
+    /* frames pushed inside and never popped go too */
+    while (dyn_top && dyn_top != fr) dyn_pop();
+    if (dyn_top == fr) dyn_pop();
+    if (threw) clove_raise();
+    return result;
+}
+
+/* Is var Binding b bound by a frame in effect? (set! needs it) */
+static bool dyn_bound(Binding *b) {
+    for (DynFrame *f = dyn_top; f; f = f->prev)
+        for (int i = 0; i < f->n; i++)
+            if (f->slots[i] == b) return true;
+    return false;
+}
+
 /* ───── apply + tree-walking evaluator (special forms) ─────────────────── */
 
 static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
@@ -5051,11 +5213,30 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
         Clove * volatile recur_keep = NIL;
         (void)recur_keep;
         int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
+        Clove *recur_arity = NULL;   /* variadic arity a self-recur re-enters */
         for (;;) {
             if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
             Clove *chosen;
             CloveEnv *call;
-            if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
+            if (recur_arity) {
+                /* recur in a variadic arity passes the rest param as one
+                 * value, already a seq: bind it as-is, same arity */
+                chosen = recur_arity;
+                recur_arity = NULL;
+                call = env_new(fn->as.fn.env);
+                int i = 0;
+                for (Clove *p = chosen->as.cons.head; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+                    Clove *pat = p->as.cons.head;
+                    if (pat->tag == CLOVE_SYMBOL && pat->as.sym == sym_amp()) {
+                        if (nargs != i + 1)
+                            clove_error("recur: expected %d args, got %d", i + 1, nargs);
+                        destructure(call, p->as.cons.tail->as.cons.head, argv[i]);
+                        break;
+                    }
+                    if (i >= nargs) clove_error("recur: too few args (%d)", nargs);
+                    destructure(call, pat, argv[i++]);
+                }
+            } else if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
                 /* fast path: fill the frame's slots straight from argv, no
                  * arity_info walk and no bind_params/destructure calls. */
                 chosen = fn->as.fn.fc_arity;
@@ -5141,6 +5322,11 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
             argv = result->as.recur.spill
                 ? (Clove **)result->as.recur.iv[0] : result->as.recur.iv;
             nargs = (int)result->as.recur.n;
+            if (!result->meta && chosen != fn->as.fn.fc_arity) {
+                size_t fx; bool va;
+                arity_info(chosen->as.cons.head, &fx, &va);
+                if (va) recur_arity = chosen;
+            }
             if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
                 Clove *newfn = result->meta;
                 if (newfn->tag == CLOVE_FN) fn = newfn;         /* loop, replacing this frame */
@@ -5980,9 +6166,9 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         SYM_WITH_REDEFS = intern("with-redefs", 11);
                     }
                     if (s == SYM_BINDING || s == SYM_WITH_REDEFS) {
-                        /* (binding [*v* val ...] body) — root bindings mutate
-                         * in place (single-threaded), restored on every exit
-                         * path via a handler frame. with-redefs is identical. */
+                        /* (binding [*v* val ...] body) pushes a DynFrame (see
+                         * dyn_run). with-redefs mutates the roots in place,
+                         * restored on every exit path via a handler frame. */
                         Clove *bv = rest->as.cons.head;
                         if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
                             clove_error("binding needs an even-sized vector");
@@ -6039,6 +6225,10 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         Clove *newv[16];
                         for (size_t i = 0; i < n; i++)
                             newv[i] = eval(env, vec_nth(bv, i * 2 + 1));
+                        if (s == SYM_BINDING) {
+                            DynFrame fr = { NULL, (int)n, slots, newv, NULL };
+                            return dyn_run(env, &fr, rest->as.cons.tail, NULL, NULL, 0);
+                        }
                         for (size_t i = 0; i < n; i++) {
                             saved[i] = slots[i]->value;
                             slots[i]->value = newv[i];
@@ -6217,7 +6407,53 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     CloveEnv *scope = env_new(env);
                     for (size_t i = 0; i < vec_len(binds_vec); i += 2) {
                         Clove *val = eval(scope, vec_nth(binds_vec, i + 1));
+                        /* a closure holds this frame: bind into a child so
+                         * a later same-name binding doesn't leak into it */
+                        if (scope->captured) scope = env_new(scope);
                         destructure(scope, vec_nth(binds_vec, i), val);
+                    }
+                    return eval_body(scope, rest->as.cons.tail);
+                }
+                static const char *SYM_LETFN, *SYM_SET;
+                if (!SYM_LETFN) { SYM_LETFN = intern("letfn*", 6); SYM_SET = intern("set!", 4); }
+                if (s == SYM_SET && !head_shadowed(env, head->as.sym)) {
+                    /* (set! var val) — only a var bound by binding, or one of
+                     * the vars clojure.main binds for every REPL/script. Any
+                     * other target (a field access) just evaluates val. */
+                    if (rest == NIL || rest->as.cons.tail == NIL || rest->as.cons.tail->tag != CLOVE_LIST)
+                        clove_error("set! needs a target and a value");
+                    Clove *place = peel_meta_sym(rest->as.cons.head);
+                    Clove *val = eval(env, rest->as.cons.tail->as.cons.head);
+                    if (place == NIL || place->tag != CLOVE_SYMBOL) return val;
+                    for (CloveEnv *e = env; e && e->parent; e = e->parent)
+                        if (env_local_find(e, place->as.sym))
+                            clove_error("Can't set! local %s", place->as.symc.name);
+                    Binding *b = root_find(env_root(env), place->as.sym, place->as.symc.home_ns, false);
+                    if (!b) clove_error("set!: unable to resolve %s", place->as.symc.name);
+                    static const char *repl_bound[] = {
+                        "*warn-on-reflection*", "*unchecked-math*", "*print-length*",
+                        "*print-level*", "*print-meta*", "*print-namespace-maps*",
+                        "*math-context*", "*assert*", "*data-readers*",
+                        "*default-data-reader-fn*", "*compile-path*",
+                        "*command-line-args*", "*ns*", "*1", "*2", "*3", "*e", NULL };
+                    bool ok = dyn_bound(b);
+                    for (int i = 0; !ok && repl_bound[i]; i++) ok = !strcmp(b->name, repl_bound[i]);
+                    if (!ok) clove_error("Can't change/establish root binding of #'%s with set", b->name);
+                    b->value = val;
+                    return val;
+                }
+                if (s == SYM_LETFN && !head_shadowed(env, head->as.sym)) {
+                    /* (letfn* [f (fn ..) g (fn ..)] body) — every fn closes
+                     * over one frame holding all the names */
+                    Clove *bv = rest->as.cons.head;
+                    if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
+                        clove_error("letfn needs an even-sized binding vector");
+                    CloveEnv *scope = env_new(env);
+                    for (size_t i = 0; i < vec_len(bv); i += 2)
+                        env_define(scope, sym_name(vec_nth(bv, i), "letfn"), NIL);
+                    for (size_t i = 0; i < vec_len(bv); i += 2) {
+                        Clove *f = eval(scope, vec_nth(bv, i + 1));
+                        *env_local_find(scope, vec_nth(bv, i)->as.sym) = f;
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }
@@ -8768,8 +9004,16 @@ static Clove *prim_merge(CloveEnv *env, Clove **argv, int nargs) {
     for (int ai_ = 0; ai_ < nargs; ai_++) {
         Clove *m = argv[ai_];
         if (m == NIL) continue;
-        if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("merge: %s is not a map", val_desc(m));
-        if (r == NIL) { r = m; continue; }
+        bool mapish = m->tag == CLOVE_MAP || m->tag == CLOVE_SORTED;
+        if (r == NIL) {
+            if (mapish) { r = m; continue; }
+            r = mk_map();
+        }
+        if (!mapish || (r->tag != CLOVE_MAP && r->tag != CLOVE_SORTED)) {
+            Clove *ca[2] = { r, m };
+            r = prim_conj(env, ca, 2);
+            continue;
+        }
         /* preserve the first map's type (a sorted map merges into a sorted map) */
         if (m->tag == CLOVE_SORTED) {
             for (Clove *e = sorted_entry_list(m); e != NIL; e = e->as.cons.tail) {
@@ -10175,6 +10419,99 @@ static Clove *prim_root_names(CloveEnv *env, Clove **argv, int nargs) {
  * Var derefs to the binding's CURRENT value (so it tracks redefs) and carries
  * {:name :ns} metadata — this is what the public resolve / (var x) / #'x give,
  * so reflective code like potemkin's import-def can read a def's name. */
+static Clove *mk_var_cell(Binding *b) {
+    Clove *v = alloc(CLOVE_VAR);
+    v->as.var.name = b->name;
+    const char *slash = strrchr(b->name, '/');
+    const char *bare = slash ? slash + 1 : b->name;
+    Clove *m = map_assoc(mk_map(), mk_kw(intern("name", 4)), mk_sym(intern(bare, strlen(bare))));
+    if (slash)
+        m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
+    v->meta = m;
+    return v;
+}
+
+/* {var val ...} -> root Bindings + values; returns the count */
+static int dyn_map_slots(CloveEnv *env, Clove *m, Binding **slots, Clove **vals,
+                         int cap, const char *who) {
+    if (m == NIL) return 0;
+    if (m->tag != CLOVE_MAP) clove_error("%s: expected a map of vars, got %s", who, val_desc(m));
+    int n = 0;
+    for (Clove *e = map_entry_list(m); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+        Clove *k = e->as.cons.head->as.cons.head;
+        if (k == NIL || k->tag != CLOVE_VAR) clove_error("%s: %s is not a var", who, val_desc(k));
+        Binding *b = root_find(env_root(env), k->as.var.name, NULL, false);
+        if (!b) clove_error("%s: unbound var %s", who, k->as.var.name);
+        if (n == cap) clove_error("%s: too many vars", who);
+        slots[n] = b;
+        vals[n++] = e->as.cons.head->as.cons.tail;
+    }
+    return n;
+}
+
+/* (with-bindings* {var val} f & args) */
+static Clove *prim_with_bindings(CloveEnv *env, Clove **argv, int nargs) {
+    if (nargs < 2) clove_error("with-bindings*: needs a map and a fn");
+    Binding *slots[64];
+    Clove *vals[64];
+    int n = dyn_map_slots(env, argv[0], slots, vals, 64, "with-bindings*");
+    DynFrame fr = { NULL, n, slots, vals, NULL };
+    return dyn_run(env, &fr, NULL, argv[1], argv + 2, nargs - 2);
+}
+
+/* (get-thread-bindings) -> {var val} for every var bound in this fiber or
+ * its resumers. The fiber self var is left out: it names the running coroutine
+ * and must not be conveyed (bound-fn*, future). */
+static Clove *prim_get_thread_bindings(CloveEnv *env, Clove **argv, int nargs) {
+    (void)argv; (void)nargs;
+    const char *self_nm = intern("fiber/*self*", 12);
+    Clove *m = mk_map();
+    for (DynFrame *f = dyn_top; f; f = f->prev)
+        for (int i = 0; i < f->n; i++) {
+            Binding *b = f->slots[i];
+            if (b->name == self_nm) continue;
+            bool seen = false;
+            for (DynFrame *g = dyn_top; g != f && !seen; g = g->prev)
+                for (int j = 0; j < g->n; j++) if (g->slots[j] == b) { seen = true; break; }
+            for (int j = 0; j < i && !seen; j++) if (f->slots[j] == b) seen = true;
+            if (seen) continue;
+            m = map_assoc(m, mk_var_cell(b), b->value);
+        }
+    (void)env;
+    return m;
+}
+
+/* (push-thread-bindings {var val}) — an unscoped frame; pair with pop. */
+static Clove *prim_push_thread_bindings(CloveEnv *env, Clove **argv, int nargs) {
+    (void)nargs;
+    int cap = 255;
+    Binding **slots = xmalloc(sizeof(Binding *) * cap);
+    Clove *tmpv[255];
+    int n = dyn_map_slots(env, argv[0], slots, tmpv, cap, "push-thread-bindings");
+    Clove *box = alloc(CLOVE_RECUR);       /* GC-traced holder for saved[] */
+    Clove **vals = box->as.recur.iv;
+    if (n > 3) {
+        vals = xmalloc(sizeof(Clove *) * (size_t)n);
+        box->as.recur.iv[0] = (Clove *)vals;
+        box->as.recur.spill = true;
+    }
+    for (int i = 0; i < n; i++) vals[i] = tmpv[i];
+    box->as.recur.n = (uint8_t)n;
+    dyn_boxes_b->value = mk_cons(box, dyn_boxes_b->value);
+    DynFrame *fr = xmalloc(sizeof *fr);
+    fr->prev = dyn_top; fr->n = n; fr->slots = slots; fr->saved = vals; fr->box = box;
+    dyn_swap(fr);
+    dyn_top = fr;
+    return NIL;
+}
+
+static Clove *prim_pop_thread_bindings(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    if (!dyn_top || !dyn_top->box) clove_error("pop-thread-bindings without a matching push");
+    dyn_pop();
+    return NIL;
+}
+
 static Clove *prim_resolve_var(CloveEnv *env, Clove **argv, int nargs) {
     (void)nargs;
     /* A symbol arg keeps its home_ns so per-ns aliases resolve correctly (a
@@ -10187,15 +10524,7 @@ static Clove *prim_resolve_var(CloveEnv *env, Clove **argv, int nargs) {
     const char *name = intern(raw, strlen(raw));
     Binding *b = root_find(env_root(env), name, home_ns, false);
     if (!b) return NIL;
-    Clove *v = alloc(CLOVE_VAR);
-    v->as.var.name = b->name;
-    const char *slash = strrchr(b->name, '/');
-    const char *bare = slash ? slash + 1 : b->name;
-    Clove *m = map_assoc(mk_map(), mk_kw(intern("name", 4)), mk_sym(intern(bare, strlen(bare))));
-    if (slash)
-        m = map_assoc(m, mk_kw(intern("ns", 2)), mk_sym(intern(b->name, (size_t)(slash - b->name))));
-    v->meta = m;
-    return v;
+    return mk_var_cell(b);
 }
 
 /* (clove/fn-arities f) -> [[fixed variadic?] ..] per arity. Lets the reflective
@@ -13431,6 +13760,7 @@ static Clove *coro_resume(Coro *target, Clove *val) {
     target->xfer = val;
     coro_current = target; target->status = CORO_RUNNING;
     state_load(target);                  /* install target's vstack + scalars */
+    target->s_dyn = dyn_enter(target->s_dyn);
     swapcontext(resumer ? &resumer->ctx : &coro_main_ctx, &target->ctx);
     /* ← target yielded or died back to us; it already restored our state. */
     return target->xfer;
@@ -13438,6 +13768,7 @@ static Clove *coro_resume(Coro *target, Clove *val) {
 
 /* Switch OUT to the resumer with the given exit status (SUSPENDED or DEAD). */
 static void coro_switch_out(Coro *self, CoroStatus st, void *sp) {
+    self->s_dyn = dyn_leave(self->s_dyn);
     self->saved_sp = sp;
     state_save(self);                    /* keep self's vstack as-is for resume */
     self->status = st;
@@ -13802,7 +14133,8 @@ static const char *PRELUDE =
     "(defn mapcat [f coll] (apply concat (map f coll)))\n"
     "(defn remove [pred coll] (filter (complement pred) coll))\n"
     "(defn keep [f coll] (filter some? (map f coll)))\n"
-    "(defn butlast [coll] (reverse (rest (reverse coll))))\n"
+    "(defn butlast [coll]\n"
+    "  (loop [ret [] s (seq coll)] (if (next s) (recur (conj ret (first s)) (next s)) (seq ret))))\n"
     "(defn every? [pred coll]\n"
     "  (loop [s (seq coll)]\n"
     "    (cond (nil? s) true\n"
@@ -13820,36 +14152,33 @@ static const char *PRELUDE =
     "      (recur (next s) (cons (first s) acc))\n"
     "      (reverse acc))))\n"
     "(defn drop-while [pred coll]\n"
-    "  (loop [s (seq coll)]\n"
-    "    (if (and s (pred (first s))) (recur (next s)) s)))\n"
-    "(defn interleave [c1 c2]\n"
-    "  (loop [a (seq c1) b (seq c2) acc (list)]\n"
-    "    (if (and a b)\n"
-    "      (recur (next a) (next b) (cons (first b) (cons (first a) acc)))\n"
-    "      (reverse acc))))\n"
+    "  (lazy-seq (loop [s (seq coll)]\n"
+    "              (if (and s (pred (first s))) (recur (next s)) s))))\n"
     "(defn interpose [sep coll] (rest (mapcat (fn [x] (list sep x)) coll)))\n"
     "(defn partition\n"
     "  ([n coll] (partition n n coll))\n"
     "  ([n step coll]\n"
-    "   (loop [s (seq coll) acc (list)]\n"
-    "     (let [chunk (take n s)]\n"
-    "       (if (< (count chunk) n)\n"
-    "         (reverse acc)\n"
-    "         (recur (seq (drop step s)) (cons chunk acc))))))\n"
+    "   (lazy-seq (let [s (seq coll) p (take n s)]\n"
+    "               (if (and s (= n (count p)))\n"
+    "                 (cons p (partition n step (drop step s)))))))\n"
     "  ([n step pad coll]\n"          /* pad the final short partition (Clojure's 4-arity) */
-    "   (loop [s (seq coll) acc (list)]\n"
-    "     (if s\n"
-    "       (let [chunk (take n s)]\n"
-    "         (if (= n (count chunk))\n"
-    "           (recur (seq (drop step s)) (cons chunk acc))\n"
-    "           (reverse (cons (take n (concat chunk pad)) acc))))\n"
-    "       (reverse acc)))))\n"
-    "(defn distinct [coll]\n"
-    "  (reverse (loop [s (seq coll) acc (list)]\n"
-    "    (if s\n"
-    "      (let [x (first s)]\n"
-    "        (recur (next s) (if (some (fn [y] (= x y)) acc) acc (cons x acc))))\n"
-    "      acc))))\n"
+    "   (lazy-seq (let [s (seq coll) p (take n s)]\n"
+    "               (if s\n"
+    "                 (if (= n (count p))\n"
+    "                   (cons p (partition n step pad (drop step s)))\n"
+    "                   (list (take n (concat p pad)))))))))\n"
+    "(defn distinct\n"
+    "  ([] (distinct-xf))\n"
+    "  ([coll]\n"
+    "   (let [step (fn step [s seen]\n"
+    "                (lazy-seq\n"
+    "                  (loop [s (seq s)]\n"
+    "                    (when s\n"
+    "                      (let [x (first s)]\n"
+    "                        (if (contains? seen x)\n"
+    "                          (recur (next s))\n"
+    "                          (cons x (step (rest s) (conj seen x)))))))))]\n"
+    "     (step coll #{}))))\n"
     "(defn group-by [f coll]\n"
     "  (reduce (fn [m x] (let [k (f x)] (assoc m k (conj (get m k []) x)))) {} coll))\n"
     "(defn frequencies [coll]\n"
@@ -13879,8 +14208,7 @@ static const char *PRELUDE =
     /* string helpers */
     "(defn str/join\n"
     "  ([coll] (apply str coll))\n"
-    "  ([sep coll] (if (empty? coll) \"\"\n"
-    "                  (reduce (fn [a b] (str a sep b)) (str (first coll)) (rest coll)))))\n"
+    "  ([sep coll] (apply str (interpose sep coll))))\n"
     /* control-flow macros */
     "(defmacro if-let [bindings then & else]\n"
     "  `(let [t# ~(nth bindings 1)]\n"
@@ -14124,7 +14452,7 @@ static const char *PRELUDE =
     "        (if (= hit :clove/memo-miss)\n"
     "          (let [v (apply f args)] (swap! cache assoc args v) v)\n"
     "          hit)))))\n"
-    "(defn take-last [n coll] (drop (max 0 (- (count coll) n)) coll))\n"
+    "(defn take-last [n coll] (seq (drop (max 0 (- (count coll) n)) coll)))\n"
     "(defn drop-last\n"
     "  ([coll] (drop-last 1 coll))\n"
     "  ([n coll] (take (max 0 (- (count coll) n)) coll)))\n"
@@ -14188,7 +14516,7 @@ static const char *PRELUDE =
     "(defn clove/deftype-walk [form fset mset this]\n"
     /* macroexpand this node so macros that GENERATE field reads or (set! field
        ..) (e.g. tools.reader's update!) are rewritten too — but STOP at a set!
-       form so it stays a set! for the rewrite below (set! is itself a macro). */
+       form so it stays a set! for the rewrite below (set! is a special form, so macroexpand leaves it). */
     "  (let [form (loop [f form]\n"
     "               (if (and (list? f) (= 'set! (first f))) f\n"
     "                 (let [e (macroexpand-1 f)] (if (= e f) f (recur e)))))]\n"
@@ -14264,8 +14592,6 @@ static const char *PRELUDE =
     "(defn MessageDigest/getInstance [algo]\n"
     "  (if (= (str/upper-case algo) \"MD5\") :md5\n"
     "      (throw (ex-info (str \"MessageDigest: only MD5 (got \" algo \")\") {}))))\n"
-    "(defn .getBytes [s] s)\n"
-    "(defn .digest [algo s] (clove/md5* s))\n"   /* → 32-char hex string */
     "(defn .indexOf [coll x]\n"
     "  (if (string? coll)\n"
     "    (or (str/index-of coll x) -1)\n"
@@ -14286,7 +14612,6 @@ static const char *PRELUDE =
     "(defn Character/valueOf [c] c)\n"
     /* java.lang.System statics */
     "(defn System/getenv ([] {}) ([k] (clove/env* k)))\n"
-    "(defn System/getProperty ([k] nil) ([k d] d))\n"
     "(defn System/exit ([] (clove/exit* 0)) ([n] (clove/exit* n)))\n"
     "(defn System/currentTimeMillis [] (quot (clove/now-us*) 1000))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
@@ -14297,8 +14622,6 @@ static const char *PRELUDE =
     /* stopwatch.core/start returns an elapsed-nanos fn; clove has no real clock,
        so report 0 (Emmy's simplifier stopwatch then never times out) */
     "(defn stopwatch.core/start [] (constantly 0))\n"
-    "(def clove/uuid-counter (atom 0))\n"
-    "(defn UUID/randomUUID [] (symbol (str \"uuid-\" (swap! clove/uuid-counter inc))))\n"
     "(def clove/rt-id (atom 0))\n"   /* clojure.lang.RT/nextID: monotonic unique ids (core.logic lvars) */
     "(defn clojure.lang.RT/nextID [] (swap! clove/rt-id inc))\n"
     /* RT array ops (persistent-sorted-set's arrays.cljc expands aget/aset to these) */
@@ -14321,12 +14644,7 @@ static const char *PRELUDE =
     /* mutable java.util collections as atoms over a persistent coll (DataScript's
        serialization buffers + query_v3). clove's (pkg.Class. ..) resolves to the
        short ctor name. */
-    "(defn ArrayList. ([] (atom [])) ([_] (atom [])))\n"
-    "(defn HashSet. ([] (atom #{})) ([_] (atom #{})))\n"
-    "(defn .add [c x] (swap! c clojure.core/conj x) true)\n"
-    "(defn .put [m k v] (swap! m assoc k v) v)\n"
     "(defn .toArray [c] (object-array (deref c)))\n"
-    "(defn .contains [c x] (contains? (deref c) x))\n"
     "(defn .isArray [_] false)\n"   /* clove arrays are vectors, not host array classes */
     /* java.io char readers over a string, for libs like clojure.data.csv: a
        reader is {:clove/type <class-kw> :rdr (atom {:s :pos :pb})}; .read returns
@@ -14339,7 +14657,6 @@ static const char *PRELUDE =
     "                    (let [s (:s m) pos (:pos m)]\n"
     "                      (if (< pos (count s)) (do (swap! a assoc :pos (inc pos)) (int (nth s pos))) -1)))))\n"
     "(defn .unread [r ch] (swap! (:rdr r) assoc :pb (long ch)) nil)\n"
-    "(defn .close [_] nil)\n"
     /* java.io char writer: a StringBuilder prints as its content, so (str w)
        yields what was written. .write takes a string or an int codepoint. */
     "(defn StringWriter. [] (StringBuilder.))\n"
@@ -14353,9 +14670,6 @@ static const char *PRELUDE =
      * machinery, but unescaping a string literal IS what read-string does, so
      * the StringReader collapses to (read-string (str "\"" *in*)). */
     "(def ^:dynamic *in* nil)\n"
-    "(defmacro with-in-str [s & body] `(binding [*in* ~s] ~@body))\n"
-    "(defn clojure.lang.LispReader$StringReader. [] (fn [& _] (read-string (str \"\\\"\" *in*))))\n"
-    "(defn java.util.LinkedList. [] [])\n"
     /* java reflection: clove has no classes — inert */
     "(defn Class/forName [& _] nil)\n"
     "(defn .getName [x] (if (and (map? x) (:nm x)) (:nm x) (str x)))\n"   /* :nm = synthetic Method */
@@ -14363,7 +14677,6 @@ static const char *PRELUDE =
     /* threads: clove is single-threaded, so one stable identity/id */
     "(defn Thread/currentThread [] :main-thread)\n"
     "(defn .getId [_] 0)\n"
-    "(defn Thread/sleep [ms & _] (clove/sleep-ms* ms))\n"
     /* primitive TYPE fields (reflection tables) -> clove type keywords */
     "(def Character/TYPE :char) (def Integer/TYPE :int) (def Long/TYPE :int)\n"
     "(def Double/TYPE :double) (def Float/TYPE :double) (def Boolean/TYPE :bool)\n"
@@ -14417,10 +14730,6 @@ static const char *PRELUDE =
     /* java.util.regex Matcher over clove's own regex: re-matches returns the
        whole match (no groups) or a [whole g1 g2 ..] vector. */
     "(defn .matcher [pat s] (atom {:pat pat :s (clove/cs->str s) :groups nil}))\n"
-    "(defn .matches [m]\n"
-    "  (let [r (re-matches (:pat (deref m)) (:s (deref m)))]\n"
-    "    (swap! m assoc :groups (cond (vector? r) r (string? r) [r] :else nil))\n"
-    "    (boolean r)))\n"
     /* Matcher.lookingAt: match anchored at the front (a prefix, not the whole
        string). Stores groups like .matches so .group reads them. */
     "(defn .lookingAt [m]\n"
@@ -14438,8 +14747,6 @@ static const char *PRELUDE =
     "  ([a b] (if (string? a) (Integer/parseInt a (int b)) b)))\n"
     "(defn .bitLength [n] 1)\n"          /* always < 64 -> the long path */
     "(defn .negate [n] (- n))\n"
-    "(defn .longValue [n] n)\n"
-    "(defn .intValue [n] n)\n"
     "(def BigInt/fromBigInteger identity)\n"
     "(def Numbers/reduceBigInt identity)\n"
     /* java.lang.String instance methods over clove strings */
@@ -14449,8 +14756,6 @@ static const char *PRELUDE =
     "(defn .substring ([s a] (subs (str s) a)) ([s a b] (subs (str s) a b)))\n"
     "(defn .replace [s old new] (clojure.string/replace (str s) old new))\n"  /* String.replace: literal */
     "(defn String/valueOf [x] (str x))\n"
-    "(defn Integer/parseInt ([s] (parse-long s)) ([s _radix] (parse-long s)))\n"
-    "(defn Long/parseLong ([s] (parse-long s)) ([s _radix] (parse-long s)))\n"
     "(defn .toString [x] (str x))\n"
     "(defn .subSequence [s a b]\n"
     "  (if-let [m (clove/dt-method 'subSequence s)] (m s a b) (subs (str s) a b)))\n"
@@ -14465,12 +14770,6 @@ static const char *PRELUDE =
     "  (or (parse-double (str s)) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
     "(def Float/parseFloat Double/parseDouble)\n"
     /* STM refs: clove is single-threaded, so atoms model refs exactly */
-    "(defn ref [x & _] (atom x))\n"
-    "(defmacro dosync [& body] `(do ~@body))\n"
-    "(defn ref-set [r v] (reset! r v))\n"
-    "(defn alter [r f & args] (apply swap! r f args))\n"
-    "(defn commute [r f & args] (apply swap! r f args))\n"
-    "(defn ensure [r] (deref r))\n"
     /* sorted colls: approximated as unsorted (clove has no ordered colls) */
     /* sorted-set/-by, sorted-map/-by, sorted?, subseq, rsubseq are native */
     "(def clojure.edn/read-string read-string)\n"
@@ -14573,7 +14872,7 @@ static const char *PRELUDE =
     "        (persistent! t)))))\n"
     "(defn replace\n"
     "  ([smap] (map (fn [x] (if (contains? smap x) (get smap x) x))))\n"
-    "  ([smap coll] (mapv (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
+    "  ([smap coll] ((if (vector? coll) mapv map) (fn [x] (if (contains? smap x) (get smap x) x)) coll)))\n"
     "(defn replicate [n x] (repeat n x))\n"
     "(defn nthnext [coll n] (loop [n n s (seq coll)] (if (and (pos? n) s) (recur (dec n) (next s)) s)))\n"
     "(defn rseq [v] (seq (reverse v)))\n"
@@ -14588,7 +14887,6 @@ static const char *PRELUDE =
     "(defn munge [s] (let [m (apply str (map (fn [c] (get clove/munge-map c c)) (str s)))]\n"
     "  (if (symbol? s) (symbol m) m)))\n"
     "(defn namespace-munge [ns] (clojure.string/replace (str ns) \"-\" \"_\"))\n"
-    "(defn add-watch [r _ _] r) (defn remove-watch [r _] r)\n"
     /* promise/deliver/future are real (fiber-scheduler-backed, blocking deref)
        — defined in Tier 3.5 after deftype exists. */
     "(defn line-seq [rdr]\n"
@@ -14600,9 +14898,6 @@ static const char *PRELUDE =
     "      (seq (str/split-lines (or (clove/slurp-maybe s) s))))))\n"
     "(defn iterator-seq [x] (seq x)) (defn enumeration-seq [x] (seq x))\n"
     "(defn array-seq [x] (seq x)) (defn xml-seq [x] (seq x))\n"
-    "(defn re-matcher [pat s] (.matcher pat s))\n"
-    "(defn re-groups [m] (:groups (deref m)))\n"
-    "(defn prefers [_] {})\n"
     "(defn ex-cause [e] (when (map? e) (:cause e)))\n"
     "(defn tagged-literal [tag form] {:clove/type :TaggedLiteral :tag tag :form form})\n"
     "(defn compare-and-set! [a old new] (if (identical? (deref a) old) (do (reset! a new) true) false))\n"
@@ -14636,7 +14931,6 @@ static const char *PRELUDE =
     "          (recur (subs s (count t)) (str out (back t)))\n"
     "          (recur (subs s 1) (str out (if (= \\_ (first s)) \"-\" (first s)))))))))\n"
     "(def clojure.main/demunge demunge)\n"
-    "(defn seque ([coll] coll) ([_ coll] coll))\n"
     "(defn update-proxy [& _] nil) (defn proxy-mappings [_] {}) (defn proxy-call-with-super [f _ _] (f))\n"
     "(defn reader-conditional [form splicing?] {:clove/type :ReaderConditional :form form :splicing? splicing?})\n"
     "(defn inst-ms [x] (if (inst? x) (:ms x) (throw (IllegalArgumentException. (str \"inst-ms: not an inst: \" (pr-str x)))))) (defn to-array-2d [coll] (mapv vec coll))\n"
@@ -14664,7 +14958,7 @@ static const char *PRELUDE =
     "  ([bindings then else]\n"
     "   `(let [v# ~(second bindings)] (if (nil? v#) ~else (let [~(first bindings) v#] ~then)))))\n"
     "(defn ->Eduction [xform coll] (sequence xform coll))\n"
-    "(defn eduction [& args] (sequence (apply comp (butlast args)) (last args)))\n"
+
     "(defn str/triml [s]\n"
     "  (let [n (count s)] (loop [i 0] (if (and (< i n) (str/blank? (subs s i (inc i)))) (recur (inc i)) (subs s i)))))\n"
     "(defn str/trimr [s]\n"
@@ -14738,18 +15032,11 @@ static const char *PRELUDE =
     "    (when-not (= (* 2 (count m)) (count v)) (throw (IllegalArgumentException. \"Duplicate key\")))\n"
     "    m))\n"
     /* java.util.HashMap: a mutable map as an atom holding a persistent map */
-    "(defn HashMap. ([] (atom {})) ([_] (atom {})) ([_ _] (atom {})))\n"
-    "(defn .putAll [hm m] (swap! hm merge m) hm)\n"
     "(defn .put [hm k v] (swap! hm assoc k v) v)\n"
     /* aget/aset/alength are C natives (IARRAY fast path, legacy fallback) */
 
     /* remaining array constructors / ops as transient (mutable) arrays */
     "(def float-array double-array) (def short-array int-array)\n"
-    "(def char-array int-array) (def boolean-array int-array)\n"
-    "(defn make-array [_ & dims] (object-array (first dims)))\n"
-    "(defn to-array [coll] (int-array (vec coll)))\n"
-    "(defn into-array ([coll] (int-array (vec coll))) ([_t coll] (int-array (vec coll))))\n"
-    "(defn aclone [a] (int-array (vec a)))\n"
     "(defn aset-int [a i v] (aset a i v)) (defn aset-long [a i v] (aset a i v))\n"
     "(defn aset-double [a i v] (aset a i v)) (defn aset-float [a i v] (aset a i v))\n"
     "(defn aset-boolean [a i v] (aset a i v)) (defn aset-byte [a i v] (aset a i v))\n"
@@ -14808,15 +15095,12 @@ static const char *PRELUDE =
     "(def java.lang.IndexOutOfBoundsException :IndexOutOfBoundsException)\n"
     "(def java.lang.UnsupportedOperationException :UnsupportedOperationException)\n"
     "(def java.lang.InterruptedException :InterruptedException)\n"
-    "(defn File. [path] path)\n"
     /* date/uuid host classes (#inst/#uuid data-reader setup) — inert stubs */
     "(defn java.text.SimpleDateFormat. [& _] (atom nil))\n"
-    "(defn java.util.Date. [& _] 0)\n"
     "(defn java.util.GregorianCalendar. [& _] (atom nil))\n"
     "(defn .setTimeZone [& _] nil)\n"
     "(defn .setCalendar [& _] nil)\n"
     "(defn java.util.TimeZone/getTimeZone [_] nil)\n"
-    "(defn java.util.UUID/fromString [s] s)\n"
     "(defn java.util.UUID. [& _] \"00000000-0000-0000-0000-000000000000\")\n"
     "(defn ImageIO/write [img fmt file] true)\n"
     /* :paths from a project's deps.edn / bb.edn feed *load-path*, so the SAME
@@ -14893,7 +15177,6 @@ static const char *PRELUDE =
     "(defn .deref [r] (deref r))\n"
     "(defn .idx [x] (:idx x))\n"   /* BindingNode field via (.idx node) in :clj */
     "(defn .containsKey [m k] (contains? (if (= (type m) :atom) (deref m) m) k))\n"
-    "(defn .entryAt [m k] (find m k))\n"
     "(defn .set [x v] (when (= :atom (type x)) (reset! x v)) nil)\n"
     "(defn .remove [& _] nil)\n"
     /* exception accessors (clove errors carry :message/:data; ex-* read them) */
@@ -14902,10 +15185,7 @@ static const char *PRELUDE =
     "(defn .getCause [e] (when (map? e) (:cause e)))\n"
     "(defn .getData [e] (ex-data e))\n"
     "(defn .getStackTrace [_] [])\n"
-    "(defn .printStackTrace [& _] nil)\n"
-    /* set! on a var/symbol rebinds the global (clove vars are mutable globals);
-       set! on a deftype field is rewritten to reset! before this is reached. */
-    "(defmacro set! [place val] (if (symbol? place) `(def ~place ~val) val))\n"
+
     /* (Object.) is used as a unique sentinel; a fresh atom is a clean identity
        object that never equals read data. */
     "(defn Object. [] (atom nil))\n"
@@ -14940,24 +15220,13 @@ static const char *PRELUDE =
     "                (clove/ns-aliases* (str (ns-name (the-ns n)))))))\n"
     "(defn alias [a ns-sym] (clove/alias* (str a) (str ns-sym)))\n"
     "(defn var? [x] (= (type x) :var))\n"
-    "(defn var-get [v] (deref v))\n"
     "(defn find-var [sym] (clove/resolve-var sym))\n"
     "(defn alter-var-root [v f & args] (clove/set-var! v (apply f (deref v) args)))\n"
-    /* thread-binding primitives (hiccup's binding* / clojure.core internals):
-       clove is single-threaded, so a global save/restore stack suffices. */
-    "(def clove/tbind-stack (atom ()))\n"
-    "(defn push-thread-bindings [m]\n"
-    "  (swap! clove/tbind-stack conj (into {} (map (fn [[v _]] [v (deref v)]) m)))\n"
-    "  (doseq [[v val] m] (clove/set-var! v val)))\n"
-    "(defn pop-thread-bindings []\n"
-    "  (let [saved (first (deref clove/tbind-stack))]\n"
-    "    (swap! clove/tbind-stack rest)\n"
-    "    (doseq [[v val] saved] (clove/set-var! v val))))\n"
-    "(defn get-thread-bindings [] (apply merge {} (reverse (deref clove/tbind-stack))))\n"
-    "(defn with-bindings* [m f & args]\n"
-    "  (push-thread-bindings m) (try (apply f args) (finally (pop-thread-bindings))))\n"
+    /* push-/pop-/get-thread-bindings and with-bindings* are natives on the
+       same frames as binding (see dyn_run) */
     "(defmacro with-bindings [m & body] `(with-bindings* ~m (fn [] ~@body)))\n"
-    "(defn bound-fn* [f] (let [b (get-thread-bindings)] (fn [& a] (with-bindings* b #(apply f a)))))\n"
+    "(defn bound-fn* [f]\n"
+    "  (let [b (get-thread-bindings)] (if (seq b) (fn [& a] (apply with-bindings* b f a)) f)))\n"
     "(defmacro bound-fn [& fntail] `(bound-fn* (fn ~@fntail)))\n"
     /* alter-meta!/reset-meta!: a deftype with a mutable :meta field (e.g. SCI's
        Var/Namespace) keeps its metadata in a :meta atom — mutate that. */
@@ -15110,24 +15379,21 @@ static const char *PRELUDE =
     "              (cons (f i (first s)) (clove/map-indexed-step f (inc i) (rest s))))))\n"
     "(defn map-indexed [f coll] (clove/map-indexed-step f 0 coll))\n"
     "(defn keep-indexed [f coll] (filter some? (map-indexed f coll)))\n"
-    "(defn partition-all [n coll]\n"
-    "  (loop [s (seq coll) acc (list)]\n"
-    "    (if s\n"
-    "      (recur (seq (drop n s)) (cons (take n s) acc))\n"
-    "      (reverse acc))))\n"
+
     "(defn zipmap [ks vs]\n"
     "  (loop [k (seq ks) v (seq vs) m {}]\n"
     "    (if (and k v)\n"
     "      (recur (next k) (next v) (assoc m (first k) (first v)))\n"
     "      m)))\n"
     "(defn merge-with [f & ms]\n"
-    "  (reduce (fn [acc m]\n"
-    "            (reduce (fn [a [k v]]\n"
-    "                      (if (contains? a k)\n"
-    "                        (assoc a k (f (get a k) v))\n"
-    "                        (assoc a k v)))\n"
-    "                    acc (seq m)))\n"
-    "          {} ms))\n"
+    "  (when (some identity ms)\n"
+    "    (reduce (fn [acc m]\n"
+    "              (reduce (fn [a [k v]]\n"
+    "                        (if (contains? a k)\n"
+    "                          (assoc a k (f (get a k) v))\n"
+    "                          (assoc a k v)))\n"
+    "                      (or acc {}) (seq m)))\n"
+    "            ms)))\n"
     "(defn reduce-kv [f init m]\n"
     "  (if (map? m)\n"
     "    (reduce (fn [acc [k v]] (f acc k v)) init (seq m))\n"
@@ -15136,7 +15402,6 @@ static const char *PRELUDE =
     "        (cond (reduced? acc) (unreduced acc)\n"
     "              (< i n) (recur (inc i) (f acc i (nth m i)))\n"
     "              :else acc)))))\n"
-    "(defn repeatedly [n f] (map (fn [_] (f)) (range n)))\n"
     "(defmacro doto [x & forms]\n"
     "  (let [g (gensym \"doto\")]\n"
     "    `(let [~g ~x]\n"
@@ -15147,20 +15412,22 @@ static const char *PRELUDE =
     "              forms)\n"
     "       ~g)))\n"
     "(defmacro letfn [fnspecs & body]\n"
-    "  `(let [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
+    "  `(letfn* [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
     "                   fnspecs)]\n"
     "     ~@body))\n"
     "(defmacro condp [pred expr & clauses]\n"
-    "  (let [p (gensym \"p\") e (gensym \"e\")]\n"
-    "    (list 'let [p pred e expr]\n"
-    "      (cons 'cond\n"
-    "        (loop [cs clauses acc (list)]\n"
-    "          (if (empty? cs)\n"
-    "            (reverse (cons '(throw (IllegalArgumentException. \"condp: no matching clause\")) (cons :else acc)))\n"
-    "            (if (empty? (rest cs))\n"
-    "              (reverse (cons (first cs) (cons :else acc)))\n"
-    "              (recur (rest (rest cs))\n"
-    "                     (cons (first (rest cs)) (cons (list p (first cs) e) acc))))))))))\n"
+    "  (let [p (gensym \"p\") e (gensym \"e\")\n"
+    "        emit (fn emit [cs]\n"
+    "               (cond\n"
+    "                 (empty? cs) (list 'throw (list 'IllegalArgumentException.\n"
+    "                                                (list 'str \"No matching clause: \" e)))\n"
+    "                 (empty? (rest cs)) (first cs)\n"
+    "                 (= :>> (second cs))\n"
+    "                 (let [r (gensym \"r\")]\n"
+    "                   (list 'let [r (list p (first cs) e)]\n"
+    "                         (list 'if r (list (nth cs 2) r) (emit (drop 3 cs)))))\n"
+    "                 :else (list 'if (list p (first cs) e) (second cs) (emit (drop 2 cs)))))]\n"
+    "    (list 'let [p pred e expr] (emit clauses))))\n"
     /* clojure.core.match subset: match a value against vector patterns. A symbol
        binds (a bare _ is a wildcard), a keyword/number/etc. compares by =, and a
        vector pattern recurses element-wise. Enough for Emmy's arity combination. */
@@ -15229,7 +15496,7 @@ static const char *PRELUDE =
     "  ([coll] (dorun coll) coll)\n"
     "  ([n coll] (loop [k n s (seq coll)] (when (and s (pos? k)) (recur (dec k) (next s)))) coll))\n"
     "(defn flatten [coll]\n"  /* sequential?: lazy sub-seqs flatten too */
-    "  (mapcat (fn [x] (if (sequential? x) (flatten x) (list x))) coll))\n"
+    "  (filter (complement sequential?) (rest (tree-seq sequential? seq coll))))\n"
     "(defn fnil [f d] (fn [x & args] (apply f (if (nil? x) d x) args)))\n"
     "(defn ifn? [x] (or (fn? x) (keyword? x) (symbol? x) (map? x) (set? x) (vector? x)))\n"
     /* var? is a real predicate now (see CLOVE_VAR / resolve-var above) */
@@ -15449,6 +15716,12 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "clove/doc-info*",  prim_doc_info);
     clove_define_native(e, "clove/root-names*", prim_root_names);
     clove_define_native(e, "clove/set-var!", prim_set_var);
+    clove_define_native(e, "with-bindings*", prim_with_bindings);
+    clove_define_native(e, "get-thread-bindings", prim_get_thread_bindings);
+    clove_define_native(e, "push-thread-bindings", prim_push_thread_bindings);
+    clove_define_native(e, "pop-thread-bindings", prim_pop_thread_bindings);
+    env_define_root(e, intern("clove/dyn-boxes*", 16), NIL);
+    dyn_boxes_b = root_binding(e, intern("clove/dyn-boxes*", 16));
     clove_define_native(e, "clove/fn-arities", prim_fn_arities);
     clove_define_native(e, "macroexpand-1", prim_macroexpand_1);
     clove_define_native(e, "clove/eval-forms*", prim_eval_forms);
@@ -15707,7 +15980,7 @@ CloveEnv *clove_new_env(void) {
         "                   (cons (first s) (cat (rest s) zs))\n"
         "                   (when (seq zs) (cat (first zs) (rest zs))))))]\n"
         "     (cat (concat a b) more))))\n"
-        "(defn cycle [c] (lazy-seq (concat (seq c) (cycle c))))\n"
+        "(defn cycle [c] (lazy-seq (when (seq c) (concat c (cycle c)))))\n"
         "(defn map-xf [f]\n"
         "  (fn [rf] (fn ([] (rf)) ([acc] (rf acc)) ([acc x] (rf acc (f x)))\n"
         "             ([acc x & xs] (rf acc (apply f x xs))))))\n"   /* multi-coll transduce */
@@ -15751,7 +16024,21 @@ CloveEnv *clove_new_env(void) {
         "  ([xform f coll] (transduce xform f (f) coll))\n"
         "  ([xform f init coll]\n"
         "   (let [rf (xform f)] (rf (reduce rf init coll)))))\n"
-        "(defn sequence*2 [xform coll] (seq (transduce xform conj [] coll)))\n"
+        "(defn sequence*2 [xform coll]\n"
+        "  (let [buf (volatile! []) done (volatile! false)\n"
+        "        rf (xform (fn ([] nil) ([acc] acc) ([acc x] (vswap! buf conj x) acc)))\n"
+        "        step (fn step [s]\n"
+        "               (lazy-seq\n"
+        "                 (loop [s s]\n"
+        "                   (let [b @buf]\n"
+        "                     (cond\n"
+        "                       (seq b) (do (vreset! buf []) (concat b (step s)))\n"
+        "                       @done nil\n"
+        "                       :else (let [xs (seq s)]\n"
+        "                               (if (and xs (not (reduced? (rf nil (first xs)))))\n"
+        "                                 (recur (rest xs))\n"
+        "                                 (do (vreset! done true) (rf nil) (recur nil)))))))))]\n"
+        "    (step coll)))\n"
         "(defn eduction [& args]\n"
         "  (sequence*2 (apply comp (butlast args)) (last args)))\n"
         /* cheap tier */
@@ -16109,9 +16396,11 @@ CloveEnv *clove_new_env(void) {
         "  ([end] (range 0 end 1))\n"
         "  ([start end] (range start end 1))\n"
         "  ([start end step]\n"
-        "   (if (clove/range-small? start end step)\n"
+        "   (cond\n"
+        "     (zero? step) (if (= start end) () (repeat start))\n"
+        "     (clove/range-small? start end step)\n"
         "     (clove/range-eager start end step)\n"
-        "     (clove/range* start end step))))\n"
+        "     :else (clove/range* start end step))))\n"
         "(defn interleave\n"
         "  ([] (list)) ([c1] (lazy-seq c1))\n"
         "  ([c1 c2]\n"
@@ -16236,14 +16525,12 @@ CloveEnv *clove_new_env(void) {
         "(defn map-indexed ([f] (map-indexed-xf f)) ([f c] (clove/map-indexed-impl f c)))\n"
         "(def clove/keep-indexed-impl keep-indexed)\n"
         "(defn keep-indexed ([f] (keep-indexed-xf f)) ([f c] (clove/keep-indexed-impl f c)))\n"
-        "(def clove/distinct-impl distinct)\n"
-        "(defn distinct ([] (distinct-xf)) ([c] (clove/distinct-impl c)))\n"
+
         "(def clove/dedupe-impl dedupe)\n"
         "(defn dedupe ([] (dedupe-xf)) ([c] (clove/dedupe-impl c)))\n"
         "(def clove/interpose-impl interpose)\n"
         "(defn interpose ([sep] (interpose-xf sep)) ([sep c] (clove/interpose-impl sep c)))\n"
-        "(def clove/partition-all-impl partition-all)\n"
-        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (clove/partition-all-impl n c))\n"
+        "(defn partition-all ([n] (partition-all-xf n)) ([n c] (partition-all n n c))\n"
         "  ([n step c] (lazy-seq (when-let [s (seq c)]\n"
         "                          (cons (take n s) (partition-all n step (drop step s)))))))\n"
         "(def clove/partition-by-impl partition-by)\n"
@@ -16450,7 +16737,6 @@ CloveEnv *clove_new_env(void) {
         "        :else (str x)))\n"
         "(defn java.io.BufferedReader. [x]\n"
         "  {:clove/type :LineReader :lines (atom (str/split-lines (clove/reader-content* x)))})\n"
-        "(def BufferedReader. java.io.BufferedReader.)\n"
         "(clove/reg-method! 'readLine :LineReader\n"
         "  (fn [this]\n"
         "    (let [ls (deref (:lines this))]\n"
@@ -16494,13 +16780,6 @@ CloveEnv *clove_new_env(void) {
            as ordinary functions */
         "(defn Math/min [a b] (min a b)) (defn Math/max [a b] (max a b))\n"
         "(defn Math/round [x] (long (Math/floor (+ (double x) 0.5))))\n"
-        "(defn String.\n"
-        "  ([x] (if (string? x) x (apply str (map char (seq x)))))\n"
-        "  ([buf off len] (apply str (map char (take len (drop off (seq buf)))))))\n"
-        "(defn .getChars [s from end buf off]   ; String.getChars(srcBegin srcEnd dst[] dstBegin)\n"
-        "  (dotimes [i (- end from)]\n"
-        "    (aset buf (+ off i) (int (.charAt s (+ from i)))))\n"
-        "  nil)\n"
         "(defn Long/valueOf [s] (or (parse-long s) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
         "(defn Integer/toHexString [n] (format \"%x\" n))\n"
         "(defn Long/toHexString [n] (format \"%x\" n))\n"
@@ -16990,7 +17269,7 @@ CloveEnv *clove_new_env(void) {
         "  (deref [_] (clove/pending-await state \"future\"))\n"
         "  (clove/deref-timeout [_ ms tval] (clove/pending-await-tmo state ms tval)))\n"
         "(defn future-call [f]\n"
-        "  (let [state (clove/pending*)]\n"
+        "  (let [f (bound-fn* f) state (clove/pending*)]\n"
         "    (fiber/spawn!\n"
         "      (fn []\n"
         "        (if (:cancelled (deref state))\n"
@@ -17251,7 +17530,6 @@ CloveEnv *clove_new_env(void) {
      * (ffi/define [[:double cos [:double]] [:int getpid []]]
      *             {:headers ["math.h" "unistd.h"] :libs "-lm"}) */
     clove_eval_string(e,
-        "(def clove/ffi-counter (atom 0))\n"
         "(def clove/ffi-api-decl\n"
         "  (str \"typedef struct { void*(*mk_int)(long long);\"\n"
         "       \" void*(*mk_double)(double); void*(*mk_str)(const char*);\"\n"

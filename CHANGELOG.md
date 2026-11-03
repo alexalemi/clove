@@ -53,6 +53,33 @@
   newline, which `cmd.exe` cannot quote, and `clove new` creates directories
   without a shell.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
+### Fixed (evaluator, special forms, prelude)
+- A later `let` binding of a name no longer changes what an earlier closure
+  or lazy seq in the same `let` sees: `(let [x 1 f (fn [] x) x 2] (f))` is 1.
+  `letfn` is now a special form (`letfn*`) instead of relying on that leak.
+- `recur` in a variadic fn binds the rest param to the value given, as
+  Clojure does; it used to wrap it in another list, so loops over `& more`
+  nested, errored or never ended.
+- `distinct`, `partition` (every arity), `partition-all`, `sequence` with a
+  transducer, `eduction`, `replace` on a list, `drop-while` and `split-with`
+  are lazy, so they work on infinite seqs. `distinct` was also quadratic.
+  `(cycle [])` is `()` instead of hanging.
+- `str/join` with a separator is linear; it was quadratic.
+- `butlast` and `take-last` return nil, not `()`, when nothing is left.
+- `condp` supports `:>>`, and with no match it throws "No matching clause: x".
+- Namespaced map destructuring: `{:a/keys [b]}`, `{::keys [b]}`,
+  `{:a/syms [b]}`.
+- `merge-with` of only nils is nil; `merge` takes a `[k v]` entry;
+  `(flatten {:a 1})` is `()`; `(range 0 10 0)` repeats 0 instead of throwing;
+  `(drop-while odd? [1])` is `()`.
+- `binding` is per fiber. It used to overwrite the var's root, so two
+  fibers binding the same var (a future and its caller) clobbered each
+  other and could leave the root changed for good. `bound-fn`,
+  `get-thread-bindings` and `with-bindings` now see `binding`, and `future`
+  conveys the caller's bindings to its body, as on the JVM.
+- `set!` on a var that no `binding` has bound throws, as on the JVM (the
+  vars clojure.main binds, like `*warn-on-reflection*`, still work).
+  `set!` on a local throws instead of silently redefining a global.
 
 ## v0.9.0 — 2026-11-02
 
