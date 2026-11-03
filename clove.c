@@ -22957,7 +22957,7 @@ int main(int argc, char **argv) {
         if (argc < 3) { fputs("usage: clove -m <namespace> [args]\n", stderr); return 1; }
         const char *ns = argv[2];
         set_args(env, argc, argv, 3);   /* args after the ns land in *args* */
-        char prog[1024];
+        static char prog[1024];   /* static: see `fmt` below on main's frame */
         snprintf(prog, sizeof prog,
                  "(require '[%s])"
                  "(let [m (or (clove/resolve-maybe \"%s/-main\")"
@@ -23035,7 +23035,11 @@ int main(int argc, char **argv) {
         }
         int n = argc - base;
         if (n > 4090) { fputs("clove fmt: too many arguments\n", stderr); return 1; }
-        char *av[4096];
+        /* on the heap: main's frame is scanned by the GC for the whole run,
+         * and 32 KB of never-written slots there showed it whatever the C
+         * runtime left behind (on Windows, a word that later fell inside
+         * a vector and kept it alive) */
+        char **av = xmalloc(sizeof(char *) * (size_t)(n + 3));
         int k = 0;
         av[k++] = (char *)"cljfmt";
         av[k++] = (char *)verb;

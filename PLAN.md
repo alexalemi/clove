@@ -206,8 +206,9 @@ Things the history log leaves unresolved, roughly by value:
   wrote); `eval_body` and `let` zero the stack the last form dirtied
   (`stack_scrub_dirty`: eval/apply_fn/gc_drain note the deepest address,
   plus a 1 KB margin for natives), so a frame's unwritten slot no longer
-  shows the previous form's values (the `loop` vector under -O0 and
-  mingw). Compiled bodies (vm_run) don't scrub between statements, and
+  shows the previous form's values (the `loop` vector under -O0), and
+  `main` keeps no big arrays in its frame (mingw scanned 32 KB of
+  never-written slots there, CRT leftovers included). Compiled bodies (vm_run) don't scrub between statements, and
   which dead words survive there is still up to the compiler; only
   precise roots would close this for good; (2) Binding
   structs and the malloc arena (`malloc_trim` only on glibc) are not
