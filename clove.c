@@ -1469,6 +1469,18 @@ static CellBlock *cell_block_new(void) {
         if ((lo >> 32) == (hi >> 32) && (lo & 0xffffffffu) >= (1u << 20)) break;
     }
     CellBlock *b = p == MAP_FAILED ? NULL : p;
+#elif defined(_WIN32)
+    /* Same as above with VirtualAlloc: a malloc'd block could land across a
+     * 4 GB boundary and get pinned, and free() may keep it in the C heap. */
+    void *p;
+    for (;;) {
+        p = VirtualAlloc(NULL, sizeof(CellBlock), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p || sizeof(void *) < 8) break;
+        uint64_t lo = (uint64_t)(uintptr_t)p, hi = lo + sizeof(CellBlock);
+        if ((lo >> 32) == (hi >> 32) && (lo & 0xffffffffu) >= (1u << 20)) break;
+        VirtualFree(p, sizeof(CellBlock), MEM_DECOMMIT);  /* keep it reserved, as above */
+    }
+    CellBlock *b = p;
 #else
     CellBlock *b = malloc(sizeof *b);
 #endif
@@ -1479,6 +1491,8 @@ static void cell_block_free(CellBlock *b) {
     cell_nblocks--;
 #ifdef CLOVE_HAVE_MMAP
     munmap(b, sizeof(CellBlock));
+#elif defined(_WIN32)
+    VirtualFree(b, 0, MEM_RELEASE);
 #else
     free(b);
 #endif
