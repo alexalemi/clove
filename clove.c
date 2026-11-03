@@ -1524,6 +1524,8 @@ static size_t gc_freed_last;
 static bool clove_interactive;
 static bool gc_stress;             /* CLOVE_GC_STRESS=1: collect every 512 allocs */
 static bool gc_explicit;           /* this collection is a (gc) call: give memory back */
+static bool gc_released = true;    /* the last collection gave memory back */
+static bool gc_idling;             /* gc_explicit, but from gc_idle: keep the floor */
 static void *gc_stack_base;
 static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
@@ -1947,6 +1949,7 @@ static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp) {
     }
 
     gc_freed_last = freed;
+    gc_released = gc_explicit;
     if (getenv("CLOVE_GC_LOG")) {
         size_t tagn[CLOVE_TNODE + 1] = {0};
         for (CellBlock *b = cell_blocks; b; b = b->next)
@@ -1977,7 +1980,7 @@ static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp) {
      * often; when much survives (retentive), shrink it back to cap memory.
      * Bounded by GC_CHURN_CAP (peak ≈ that many cells of garbage). */
     size_t total = live + freed;
-    if (gc_explicit)
+    if (gc_explicit && !gc_idling)
         churn_floor = GC_MIN_THRESHOLD;   /* (gc): start over from the floor */
     else if (live * 8 < total && churn_floor < GC_CHURN_CAP)
         churn_floor *= 2;                 /* <12.5% live: amortize fixed cost */
@@ -2042,6 +2045,59 @@ static void maybe_gc(void) {
     if (++gc_allocs >= (gc_stress ? 512 : gc_threshold) ||
         gc_extra_bytes >= GC_BYTES_CAP)
         gc_collect();
+}
+
+/* Idle collection. A program that stops allocating never reaches the next
+ * threshold, so it would hold its last cycle's heap for as long as it sleeps
+ * or waits for input. Natives about to block call gc_idle first: it runs a
+ * releasing collection, like (gc), when a regular collection ran since memory
+ * was last given back or a fair amount was allocated since the last one.
+ * At most one a second (a loop that sleeps between bursts pays for regrowing
+ * the heap after each), and never more than 1/20 of the time. */
+static uint64_t gc_idle_next;   /* monotonic ms before which gc_idle waits */
+
+static uint64_t mono_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static bool gc_idle_due(void) {
+#ifdef __EMSCRIPTEN__
+    return false;   /* a GC there unwinds the caller (ASYNCIFY) */
+#endif
+    if (!gc_stack_base) return false;
+    if (gc_released && gc_allocs < (1u << 16) && gc_extra_bytes < (4u << 20)) return false;
+    return mono_ms() >= gc_idle_next;
+}
+
+static void gc_idle(void) {
+    if (!gc_idle_due()) return;
+    uint64_t t0 = mono_ms();
+    gc_explicit = gc_idling = true;
+    gc_collect();
+    gc_explicit = gc_idling = false;
+    uint64_t t1 = mono_ms(), wait = 20 * (t1 - t0);
+    gc_idle_next = t1 + (wait > 1000 ? wait : 1000);
+}
+
+/* Before a read on fd: collect only if the read would block. */
+static void gc_idle_fd(int fd) {
+    if (!gc_idle_due()) return;
+#ifndef _WIN32
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    if (poll(&p, 1, 0) > 0) {        /* data waiting: not idle. Probe again */
+        gc_idle_next = mono_ms() + 10;   /* later, not once per line */
+        return;
+    }
+#else
+    (void)fd;
+#endif
+    gc_idle();
 }
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
@@ -13638,6 +13694,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     si.hStdInput = hin; si.hStdOutput = hout; si.hStdError = herr;
     PROCESS_INFORMATION pi;
     if (CreateProcessA(NULL, cmd.data, NULL, NULL, 1 /* inherit handles */, 0, envb.data, cdir, &si, &pi)) {
+        gc_idle();
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD ec = 1;
         GetExitCodeProcess(pi.hProcess, &ec);
@@ -13714,6 +13771,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     if (inb.len == 0) { close(pin[1]); pin[1] = -1; }
     else fcntl(pin[1], F_SETFL, fcntl(pin[1], F_GETFL) | O_NONBLOCK);
     int open_fds = 2;
+    gc_idle();
     while (open_fds > 0 || pin[1] >= 0) {
         struct pollfd fds[3]; int nf = 0;
         int io = -1, ie = -1, ii = -1;
@@ -13850,6 +13908,7 @@ static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     char buf[4096];
     SBuf sb = {0};
+    gc_idle_fd(0);
     for (;;) {                       /* loop: a line may exceed one buffer */
         if (!fgets(buf, sizeof buf, stdin)) {
             if (sb.len == 0) { free(sb.data); return NIL; }
@@ -13868,6 +13927,7 @@ static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_stdin_slurp(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
     SBuf sb = {0};
+    gc_idle_fd(0);
     sb_read_all(&sb, stdin);
     Clove *res = mk_str(sb.data, sb.len);
     free(sb.data);
@@ -13944,6 +14004,7 @@ static Clove *prim_read_key(CloveEnv *env, Clove **argv, int nargs) {
     return NIL;
 #else
     char buf[32]; size_t n = 0;
+    gc_idle_fd(0);
     int c = raw_getc();
     if (c < 0) return NIL;
     buf[n++] = (char)c;
@@ -14082,6 +14143,10 @@ static Clove *prim_sleep_ms(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs < 1) return NIL;
     double ms = as_num(argv[0]);
     if (ms <= 0) return NIL;
+    uint64_t t0 = mono_ms();
+    gc_idle();
+    ms -= (double)(mono_ms() - t0);
+    if (ms <= 0) return NIL;
 #ifdef _WIN32
     Sleep((DWORD)ms);
 #else
@@ -14113,6 +14178,7 @@ static Clove *prim_poll_fds(CloveEnv *env, Clove **argv, int nargs) {
         pfd[i].events = (short)(((ev & 1) ? POLLIN : 0) | ((ev & 2) ? POLLOUT : 0));
         pfd[i].revents = 0;
     }
+    if (timeout != 0) gc_idle();
     poll(pfd, (nfds_t)n, timeout);
     /* revents are 0..3 — all smallints (immortal), so building the result
      * vector triggers no GC hazard for the in-flight item array. */
@@ -14209,6 +14275,7 @@ static Clove *prim_tcp_accept(CloveEnv *env, Clove **argv, int nargs) {
     int srv = (int)as_int(argv[0], "tcp/accept");
     int timeout = nargs > 1 ? (int)as_int(argv[1], "tcp/accept") : -1;
     struct pollfd p = { .fd = srv, .events = POLLIN };
+    if (timeout != 0) gc_idle_fd(srv);
     if (poll(&p, 1, timeout) <= 0) return NIL;
     int fd = accept(srv, NULL, NULL);
     if (fd >= 0) clove_no_sigpipe(fd);
@@ -14220,6 +14287,7 @@ static Clove *prim_tcp_recv(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     int fd = (int)as_int(argv[0], "tcp/recv");
     char buf[65536];
+    gc_idle_fd(fd);
     ssize_t n = recv(fd, buf, sizeof buf, 0);
     if (n <= 0) return NIL;
     return mk_str(buf, (size_t)n);
@@ -21309,6 +21377,7 @@ static bool ed_is_change(int k) {
  * end, so a proposed line can be accepted with Enter or edited first. */
 static bool rl_edit_init(const char *prompt, char *buf, size_t bufcap, const char *init) {
     RlTermState st;
+    gc_idle_fd(0);
     if (!rl_raw_enter(&st)) {   /* not a capable console: plain line input */
         fputs(prompt, stdout);
         if (init) fputs(init, stdout);
@@ -21795,6 +21864,7 @@ static bool br_skip(FILE *f, int c) {
 /* Read one top-level dict message; returns false on EOF/garbage. */
 static bool nrepl_read(FILE *f, NreplMsg *m) {
     memset(m, 0, sizeof *m);
+    gc_idle_fd(fileno(f));
     int c = fgetc(f);
     if (c != 'd') return false;
     for (;;) {
@@ -22042,6 +22112,7 @@ static int nrepl_server(CloveEnv *env, int port) {
     if (pf) { fprintf(pf, "%d", port); fclose(pf); }
     fprintf(stderr, "clove nREPL server on 127.0.0.1:%d\n", port);
     for (;;) {
+        gc_idle();
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
         clove_no_sigpipe(fd);

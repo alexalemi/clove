@@ -33,6 +33,12 @@
   16M cells. A 5M-iteration `loop` peaks at 72 MB instead of 530 MB (system
   time 0.29 s to 0.03 s); the test suite peaks at 2.7 GB instead of 5.2 GB.
 - `(clove/heap-bytes*)` reports the bytes the collector has mapped for cells.
+- An idle program gives its heap back without calling `(gc)`: before
+  blocking in `Thread/sleep`, the fiber scheduler's wait, `read-line` or
+  `slurp` of stdin, `tcp/accept`/`tcp/recv`, `sh`, or the REPL and nREPL
+  waiting for input, the collector runs a releasing collection if the
+  program allocated since memory was last given back (at most one a
+  second). A 300 MB churn followed by `(Thread/sleep 50)` ends at 60 MB.
 - A finished coroutine frees its 1 MiB stack at once rather than at the next
   collection (200,000 short coroutines peaked at 2 GB).
 - Hashing or comparing a map or set no longer builds an entry list.

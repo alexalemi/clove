@@ -4576,5 +4576,31 @@
 (assert= "#{1}" (pr-str (persistent! (conj! (transient #{1}) 1N))))
 (assert= "#{1}" (pr-str (conj #{1} 1N)))
 
+;; ── workstream I: idle collection, map/set builders ──
+;; A program that churns and then blocks gives its heap back without (gc):
+;; sleeping, and waiting on read-line from a pipe nobody has written to yet.
+(when-not (System/getenv "CLOVE_GC_STRESS")
+  (let [exe (str (clove/exe-dir*) "/clove")
+        churn (fn [wait]
+                (str "(let [deep (fn deep [n f] (if (zero? n) (f) (let [r (deep (dec n) f)] r)))"
+                     "      h0 (deep 20 (fn [] (dotimes [_ 40] (count (doall (map inc (range 300000)))))"
+                     "                    (clove/heap-bytes*)))]"
+                     wait
+                     "  (prn [h0 (clove/heap-bytes*)]))"))
+        parse (fn [r] (try (read-string (:out r)) (catch Exception _ [0 Long/MAX_VALUE])))
+        small? (and (= :linux (clove/os*)) (not (System/getenv "ASAN_OPTIONS")))
+        check (fn [[h0 h1]]
+                (assert= true (< h1 h0))
+                (when small? (assert= true (< h1 (* 100 1024 1024)))))]
+    (check (parse (sh exe "-e" (churn "(Thread/sleep 50)"))))
+    (when clove-test-unix?
+      (let [f "clove-idle-rl.clj" ready "clove-idle-rl.ready"]
+        (spit f (churn (str "(spit \"" ready "\" \"\") (read-line)")))
+        (try
+          ;; the writer holds the line back until the reader is waiting
+          (check (parse (sh "sh" "-c" (str "rm -f " ready "; (while [ ! -e " ready " ]; do sleep 0.02; done;"
+                                           " sleep 0.2; echo x) | '" exe "' " f))))
+          (finally (clove/file-op* :delete f) (clove/file-op* :delete ready)))))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
