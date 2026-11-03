@@ -18,8 +18,9 @@
 ;; Programmatic use: (require '[claude]) (claude/ask "what does juxt do?")
 ;; Tuning: (swap! claude/config assoc :effort "low")
 ;;
-;; Needs curl and ANTHROPIC_API_KEY. The key is expanded by the shell inside the
-;; curl command, so it never passes through clove values.
+;; Needs curl (7.55+) and ANTHROPIC_API_KEY. The key goes to curl in a header
+;; file (-H @file, mode 0600 from mktemp, deleted after), never on its command
+;; line, where ps would show it.
 
 (require '[json] '[process])
 
@@ -149,18 +150,21 @@ Answering: the reply streams into a terminal REPL, so be brief and concrete — 
 
 (defn- stream! [body on-text]
   (let [tmp (str/trim (:out (sh "mktemp")))
-        _   (spit tmp (json/write body))
+        hdr (str/trim (:out (sh "mktemp")))
         st  (atom {:blocks (sorted-map)})
         ex  (try
+              (spit tmp (json/write body))
+              (spit hdr (str "x-api-key: " (clove/env* "ANTHROPIC_API_KEY") "\n"))
               (clove/sh-lines*
                (str "curl -sS -N https://api.anthropic.com/v1/messages"
                     " -H 'content-type: application/json'"
-                    " -H \"x-api-key: $ANTHROPIC_API_KEY\""
+                    " -H @" (process/escape hdr)
                     " -H 'anthropic-version: 2023-06-01'"
                     " -H 'anthropic-beta: server-side-fallback-2026-07-01'"
                     " --data-binary @" (process/escape tmp))
                (fn [line] (swap! st sse-step line on-text)))
-              (finally (sh (str "rm -f " (process/escape tmp)))))
+              (finally (clove/file-op* :delete tmp)
+                       (clove/file-op* :delete hdr)))
         {:keys [raw error] :as s} @st]
     (when-let [err (or error (when raw (get (try (json/parse raw) (catch Exception _ nil)) "error")))]
       (throw (ex-info (str "claude: " (get err "type") ": " (get err "message")) {:error err})))

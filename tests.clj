@@ -4106,6 +4106,29 @@
     (assert= ["a b.txt" "c'd.txt"] (vec (fs/list-dir T)))
     (assert= true (fs/regular-file? (str T "/a b.txt")))
     (sh "rm" "-rf" T))
+;; claude.clj hands curl the API key in a 0600 header file, not in argv
+  (let [T (str (fs/temp-dir) "/clove-claude-c5")
+        curl (str T "/bin/curl")]
+    (fs/create-dir (str T "/bin"))
+    (spit curl (str "#!/bin/sh\n"
+                    "printf '%s\\n' \"$@\" > \"$CLOVE_FAKE_OUT/argv\"\n"
+                    "prev=\n"
+                    "for a in \"$@\"; do\n"
+                    "  if [ \"$prev\" = -H ]; then case \"$a\" in @*) f=\"${a#@}\"\n"
+                    "    ls -l \"$f\" | cut -c1-10 > \"$CLOVE_FAKE_OUT/mode\"\n"
+                    "    cat \"$f\" > \"$CLOVE_FAKE_OUT/hdr\"; echo \"$f\" > \"$CLOVE_FAKE_OUT/hdrpath\";; esac; fi\n"
+                    "  prev=$a\n"
+                    "done\n"))
+    (sh "chmod" "+x" curl)
+    (let [r (sh "env" (str "PATH=" T "/bin:" (System/getenv "PATH")) "ANTHROPIC_API_KEY=fake-key-c5"
+                (str "CLOVE_FAKE_OUT=" T) (str (clove/exe-dir*) "/clove")
+                "-e" "(require '[claude]) (#'claude/stream! {} identity) (println :ok)")]
+      (assert= ":ok\n" (:out r))
+      (assert= false (str/includes? (slurp (str T "/argv")) "fake-key-c5"))
+      (assert= "x-api-key: fake-key-c5\n" (slurp (str T "/hdr")))
+      (assert= "-rw-------\n" (slurp (str T "/mode")))
+      (assert= false (fs/exists? (str/trim (slurp (str T "/hdrpath"))))))
+    (sh "rm" "-rf" T))
   (assert= "true\n" (:out (sh "env" "PATH=/clove-no-such-dir" (str (clove/exe-dir*) "/clove")
                                "-e" "(require 'fs) (println (fs/directory? \"/\"))"))))
 

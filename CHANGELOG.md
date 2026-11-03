@@ -37,6 +37,9 @@
 - `http.clj` reads a request in linear time (it rebuilt the buffer on every
   chunk) and answers 413 past `http/*max-head-bytes*` (64 KB) or
   `http/*max-body-bytes*` (16 MB).
+- `claude.clj` passes the API key to curl in a 0600 header file
+  (`-H @file`, deleted afterwards) instead of on curl's command line, where
+  any local user could read it with `ps`. Needs curl 7.55 or later.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02
