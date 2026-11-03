@@ -571,7 +571,8 @@ embeddability matter; use bb or the JVM where throughput does.
 - Regex lookbehind `(?<=…)`/`(?<!…)`, `\k<name>` and `\G` throw. Named
   groups `(?<name>…)` capture by number only. `\p{L}`, `\p{Lu}`, `\p{Ll}`
   and `\p{N}` are exact for ASCII and approximate beyond it (script ranges,
-  no Unicode tables)
+  no Unicode tables). A `{` that does not start a valid `{n,m}` is a
+  literal, where Java throws "Illegal repetition"
 - `format`'s `%d` takes a BigInt (`1N`) that fits a Long, which Java
   rejects: clove has no separate `BigInteger` to accept instead. `%f`
   takes a Long
