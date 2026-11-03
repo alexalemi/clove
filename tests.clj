@@ -4077,5 +4077,26 @@
          [(merge-with + nil nil) (merge-with +) (merge {:a 1} [:b 2]) (merge nil [:b 2]) (pr-str (flatten {:a 1}))
           (take 3 (range 0 10 0)) (pr-str (range 3 3 0)) (pr-str (drop-while odd? [1]))])
 
+;; binding frames: bound-fn and get-thread-bindings see binding; push/pop share the stack
+(def ^:dynamic *clove-b3* 1)
+(assert= [2 2 10 5 1]
+         [(let [f (binding [*clove-b3* 2] (bound-fn [] *clove-b3*))] (f))
+          (binding [*clove-b3* 2] (some (fn [[k v]] (when (= (str k) "#'*clove-b3*") v)) (get-thread-bindings)))
+          (with-bindings {(var *clove-b3*) 10} *clove-b3*)
+          (do (push-thread-bindings {(var *clove-b3*) 5}) (let [v *clove-b3*] (pop-thread-bindings) v))
+          *clove-b3*])
+;; set! only on a thread-bound var; never on a local
+(assert= [3 1 :root :local] [(binding [*clove-b3* 2] (set! *clove-b3* 3) *clove-b3*) *clove-b3*
+                             (try (set! *clove-b3* 9) (catch Exception e :root))
+                             (try ((fn [] (let [x 1] (set! x 2) x))) (catch Exception e :local))])
+(when clove-test-coro?
+  ;; a future conveys the caller's bindings; fibers don't clobber each other's
+  (assert= 2 @(binding [*clove-b3* 2] (future (Thread/sleep 5) *clove-b3*)))
+  (let [p (promise)
+        f (future (binding [*clove-b3* 5] @p *clove-b3*))]
+    (Thread/sleep 5)
+    (assert= [5 7] (binding [*clove-b3* 7] (deliver p :go) [@f *clove-b3*]))
+    (assert= 1 *clove-b3*)))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

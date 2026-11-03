@@ -32,6 +32,14 @@
 - `merge-with` of only nils is nil; `merge` takes a `[k v]` entry;
   `(flatten {:a 1})` is `()`; `(range 0 10 0)` repeats 0 instead of throwing;
   `(drop-while odd? [1])` is `()`.
+- `binding` is per fiber. It used to overwrite the var's root, so two
+  fibers binding the same var (a future and its caller) clobbered each
+  other and could leave the root changed for good. `bound-fn`,
+  `get-thread-bindings` and `with-bindings` now see `binding`, and `future`
+  conveys the caller's bindings to its body, as on the JVM.
+- `set!` on a var that no `binding` has bound throws, as on the JVM (the
+  vars clojure.main binds, like `*warn-on-reflection*`, still work).
+  `set!` on a local throws instead of silently redefining a global.
 
 ## v0.9.0 — 2026-11-02
 
