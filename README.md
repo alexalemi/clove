@@ -572,8 +572,9 @@ embeddability matter; use bb or the JVM where throughput does.
   groups `(?<name>…)` capture by number only. `\p{L}`, `\p{Lu}`, `\p{Ll}`
   and `\p{N}` are exact for ASCII and approximate beyond it (script ranges,
   no Unicode tables)
-- `format`'s `%d` takes a BigInt (`1N`), which Java rejects: clove has no
-  separate `BigInteger` to accept instead. `%f` takes a Long
+- `format`'s `%d` takes a BigInt (`1N`) that fits a Long, which Java
+  rejects: clove has no separate `BigInteger` to accept instead. `%f`
+  takes a Long
 - `(char n)` takes any codepoint up to `0x10FFFF`, not just 16-bit values
 - `format` accepts flags after the width (`%10,d`), where Java throws
   `UnknownFormatConversionException`

@@ -13080,12 +13080,6 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                 }
                 if (v->tag != CLOVE_INT && v->tag != CLOVE_BIGINT)
                     clove_error_cls("IllegalFormatConversionException", "%c != %s", conv, val_type_name(v));
-                if (v->tag == CLOVE_BIGINT && conv == 'd') {   /* any size; Java's BigInteger */
-                    char *ds = big_to_decimal(v);
-                    fmt_pad_num(&out, ds, spec, true);
-                    free(ds);
-                    break;
-                }
                 snprintf(cfmt, sizeof cfmt, "%%%sll%c", spec, conv);
                 sb_printf(&out, cfmt, (long long)as_int(v, "format"));
                 break;

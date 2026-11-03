@@ -118,6 +118,13 @@ Things the history log leaves unresolved, roughly by value:
   faults) and ~1,300 top-level forms. Measure with hyperfine and put a
   warm-up run first: the first command in a hyperfine run reads ~4 ms slow.
   Prefaulting cell blocks with MAP_POPULATE saved only ~0.2 ms.
+- **Reader metadata as data**: `(meta (read-string "^:k [a]"))` is nil,
+  where the JVM gives `{:k true}`. The reader turns `^m form` into a
+  `(with-meta form m)` call, because the evaluator drops metadata on vector,
+  map and set literals and does not evaluate a symbol's meta map in `def`.
+  Attaching it at read time (tried 2026-11-02) broke `(meta ^:kw [1])` and
+  `(def ^{:test (fn [] ..)} x ..)` through `eval`. Fix eval first, then
+  read the meta onto the form.
 - **`clojure.data.priority-map`**: `conj`/`into` on one bypass its deftype
   `cons` (they treat it as a plain map), and it prints its internals.
   `assoc`/`peek`/`pop` work.
