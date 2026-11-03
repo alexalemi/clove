@@ -8467,29 +8467,63 @@ static Clove *bd_rem(Clove *a, Clove *b) {
     return arith(OP_SUB, s, 2, AR_CHECK);
 }
 
+/* quot, rem and mod ('q', 'r', 'm') over Clojure's operand categories: any
+ * double makes the op double, else any BigDecimal, else exact (ratios give a
+ * BigInt quotient, like Numbers.quotient). mod is rem shifted to the
+ * divisor's sign. */
+static Clove *num_qrm(Clove *x, Clove *y, char op, const char *what) {
+    if (x->tag == CLOVE_INT && y->tag == CLOVE_INT) {
+        int64_t a = x->as.i, b = y->as.i;
+        if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
+        if (b == -1) return mk_int(op == 'q' ? (int64_t)(0 - (uint64_t)a) : 0);   /* MIN/-1 wraps, as on the JVM */
+        if (op == 'q') return mk_int(a / b);
+        int64_t m = a % b;
+        if (op == 'm' && m != 0 && ((m < 0) != (b < 0))) m += b;
+        return mk_int(m);
+    }
+    if (!CLOVE_ISNUM(x->tag)) as_int(x, what);   /* the type error */
+    if (!CLOVE_ISNUM(y->tag)) as_int(y, what);
+    if (x->tag == CLOVE_DOUBLE || y->tag == CLOVE_DOUBLE) {
+        double n = as_num(x), d = as_num(y), t;
+        if (d == 0) clove_error_cls("ArithmeticException", "Divide by zero");
+        double q = n / d;
+        if (q > -9.2233720368547758e18 && q < 9.2233720368547758e18) t = (double)(int64_t)q;
+        else if (isfinite(q)) t = trunc(q);
+        else { clove_error_cls("NumberFormatException", "Infinite or NaN"); t = 0; }
+        if (op == 'q') return mk_double(t);
+        double m = n - t * d;
+        if (op == 'm' && m != 0 && (n > 0) != (d > 0)) m += d;   /* NaN stays NaN */
+        return mk_double(m);
+    }
+    Clove *r;
+    if (x->tag == CLOVE_BIGDEC || y->tag == CLOVE_BIGDEC) {
+        if (op == 'q') return bd_quot(x, y);
+        r = bd_rem(x, y);
+    } else if (x->tag == CLOVE_RATIO || y->tag == CLOVE_RATIO) {
+        Clove *q, *den = big_mul(rat_den(x), rat_num(y));
+        big_divmod(big_mul(rat_num(x), rat_den(y)), den, &q, NULL);
+        q = to_bigint(q);
+        if (op == 'q') return q;
+        Clove *m[2] = { q, y };
+        Clove *s[2] = { x, arith(OP_MUL, m, 2, AR_CHECK) };
+        r = arith(OP_SUB, s, 2, AR_CHECK);
+    } else {
+        Clove *q; big_divmod(x, y, &q, &r);
+        if (op == 'q') return to_bigint(q);
+        r = to_bigint(r);
+    }
+    if (op == 'm' && num_cmp(r, mk_int(0)) != 0 &&
+        (num_cmp(x, mk_int(0)) > 0) != (num_cmp(y, mk_int(0)) > 0)) {
+        Clove *two[2] = { r, y };
+        r = arith(OP_ADD, two, 2, AR_CHECK);
+    }
+    return r;
+}
+
 static Clove *prim_mod(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "mod");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) {
-        Clove *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
-        if (num_cmp(r, mk_int(0)) != 0 && (num_cmp(argv[0], mk_int(0)) > 0) != (num_cmp(argv[1], mk_int(0)) > 0)) {
-            Clove *two[2] = { r, argv[1] };
-            r = arith(OP_ADD, two, 2, AR_CHECK);
-        }
-        return r;
-    }
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
-        if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
-            r = big_addsub(r, argv[1], 0);
-        return to_bigint(r);
-    }
-    int64_t a = as_int(argv[0], "mod");
-    int64_t b = as_int(argv[1], "mod");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    int64_t m = a % b;
-    if (m != 0 && ((m < 0) != (b < 0))) m += b;  /* Clojure mod follows divisor's sign */
-    return mk_int(m);
+    return num_qrm(argv[0], argv[1], 'm', "mod");
 }
 
 /* ── Map primitives (HAMT engine — see the HAMT section above) ── */
@@ -8794,14 +8828,7 @@ static Clove *prim_merge(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_rem(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "rem");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_rem(argv[0], argv[1]);
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *r; big_divmod(argv[0], argv[1], NULL, &r); return to_bigint(r);
-    }
-    int64_t a = as_int(argv[0], "rem");
-    int64_t b = as_int(argv[1], "rem");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    return mk_int(a % b);
+    return num_qrm(argv[0], argv[1], 'r', "rem");
 }
 
 static Clove *prim_list(CloveEnv *env, Clove **argv, int nargs) {
@@ -11392,14 +11419,7 @@ static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "quot");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_quot(argv[0], argv[1]);
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *q; big_divmod(argv[0], argv[1], &q, NULL); return to_bigint(q);
-    }
-    int64_t a = as_int(argv[0], "quot");
-    int64_t b = as_int(argv[1], "quot");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    return mk_int(a / b);
+    return num_qrm(argv[0], argv[1], 'q', "quot");
 }
 
 /* ── strings ── */
@@ -17332,7 +17352,7 @@ CloveEnv *clove_new_env(void) {
         "(defn infinite? [x] (and (double? x) (or (= x ##Inf) (= x ##-Inf))))\n"
         "(defn NaN? [x] (and (double? x) (clove/nan?* x)))\n"
         "(defn Math/floorDiv [a b] (let [q (quot a b)] (if (and (not= (rem a b) 0) (not= (neg? a) (neg? b))) (dec q) q)))\n"
-        "(defn Math/floorMod [a b] (- a (* b (Math/floorDiv a b))))\n"
+        "(defn Math/floorMod [a b] (mod a b))\n"
         "(defn Math/addExact [a b] (+ a b)) (defn Math/multiplyExact [a b] (* a b))\n"
         "(defn Math/subtractExact [a b] (- a b)) (defn Math/negateExact [a] (- a))\n"
         "(defn Math/toIntExact [a] (if (and (<= a 2147483647) (>= a -2147483648)) a (throw (ArithmeticException. \"integer overflow\"))))\n"

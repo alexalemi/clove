@@ -4041,5 +4041,14 @@
 (assert= [true "dflt"] [(string? (System/getProperty "user.dir")) (System/getProperty "nope.prop" "dflt")])
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
+;; ── workstream A: numbers, reader, regex, printer, format ──
+;; quot/rem/mod: MIN/-1 wrapped through SIGFPE; doubles and ratios were truncated to longs
+(assert= "[-9223372036854775808 0 0 0]" (pr-str [(quot Long/MIN_VALUE -1) (rem Long/MIN_VALUE -1) (mod Long/MIN_VALUE -1) (Math/floorMod Long/MIN_VALUE -1)]))
+(assert= "[3.0 0.0 1.5 0.5 0.5 -1.5 -3.0 1/2 1/2 1/6 3N 10N -1/3 -0.0]"
+         (pr-str [(quot 7.5 2) (rem 10 2.5) (mod 7.5 2) (mod 0.5 1) (mod -7.5 2) (rem -7.5 2) (quot -7.5 2)
+                  (rem 7/2 1) (mod -7/2 2) (mod 1/2 1/3) (quot 7/2 1) (quot 7/2 1/3) (mod 7 -2/3) (rem -0.0 2)]))
+(assert= [:div :div :nan] (mapv #(try (%) (catch ArithmeticException _ :div) (catch Exception _ :nan))
+                                [#(mod 5 0.0) #(quot 1/2 0) #(quot ##Inf 2)]))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
