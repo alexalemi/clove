@@ -4343,5 +4343,18 @@
     (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
     (assert= [0 1 2 3 4] @order)))
 
+;; ── argv spawning round-trips awkward arguments on every platform ──
+;; On Windows clove/proc* builds a CreateProcess command line, so quotes,
+;; trailing backslashes, % and & must survive MSVCRT parsing, and nothing
+;; may reach cmd.exe.
+(let [f "clove-argv-roundtrip.clj"
+      args ["a b" "c\"d" "e\\" "f\\\"g" "%PATH%" "x & y" "" "tab\there" "^caret|pipe<>"]]
+  (spit f "(prn (vec *command-line-args*))")
+  (try
+    (let [r (apply sh (str (clove/exe-dir*) "/clove") f args)]
+      (assert= [0 (pr-str args)]
+               [(:exit r) (clojure.string/trim-newline (clojure.string/replace (:out r) "\r" ""))]))
+    (finally (clove/file-op* :delete f))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
