@@ -4388,7 +4388,10 @@
       ;; the churn peak itself varies run to run (130-500 MB here, with GC
       ;; timing), so assert that it shrank and where it settled, not a ratio
       (assert= true (< h1 h0))
-      (assert= true (< h1 (* 100 1024 1024)))
+      ;; where it settles depends on stale stack words the conservative scan
+      ;; sees: ASan's bigger frames and the Windows build (no mmap'd blocks)
+      ;; keep more, so the absolute bound is checked on plain Linux only
+      (when rss? (assert= true (< h1 (* 100 1024 1024))))
       (when rss? (assert= true (< r1 (* 200 1024)))))
     ;; a loop with a tiny live set keeps a small heap (it grew to ~500 MB)
     (let [[r h] (run (str "(let [r (loop [i 0 acc 0] (if (< i 5000000) (recur (inc i) (+ acc i)) acc))]"
