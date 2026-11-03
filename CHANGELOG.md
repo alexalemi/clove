@@ -40,6 +40,9 @@
 - `claude.clj` passes the API key to curl in a 0600 header file
   (`-H @file`, deleted afterwards) instead of on curl's command line, where
   any local user could read it with `ps`. Needs curl 7.55 or later.
+- `clove bundle` runs the compiler with an argument vector, so an output
+  path with spaces or quotes works, and it deletes the generated `.gen.c`
+  even when the compile fails.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02

@@ -4129,6 +4129,23 @@
       (assert= "-rw-------\n" (slurp (str T "/mode")))
       (assert= false (fs/exists? (str/trim (slurp (str T "/hdrpath"))))))
     (sh "rm" "-rf" T))
+;; clove bundle runs cc with an argument vector (paths with spaces) and
+  ;; removes the generated .c whether or not cc succeeds
+  (let [T (str (fs/temp-dir) "/clove-bundle-c10")
+        exe (str (clove/exe-dir*) "/clove")]
+    (fs/create-dir T)
+    (spit (str T "/h.clj") "(println 1)")
+    ;; a fake cc that records its arguments one per line
+    (spit (str T "/cc") "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\n")
+    (sh "chmod" "+x" (str T "/cc"))
+    (let [r (sh "env" "-u" "CLOVE_GC_STRESS" exe "bundle" (str "--cc=" T "/cc") (str T "/h.clj") (str T "/my app"))]
+      (assert= 0 (:exit r))
+      (assert= true (contains? (set (str/split-lines (slurp (str T "/args")))) (str T "/my app")))
+      (assert= false (fs/exists? (str T "/my app.gen.c"))))
+    (let [r (sh "env" "-u" "CLOVE_GC_STRESS" exe "bundle" "--cc=false" (str T "/h.clj") (str T "/my app"))]
+      (assert= 1 (:exit r))
+      (assert= false (fs/exists? (str T "/my app.gen.c"))))
+    (sh "rm" "-rf" T))
   (assert= "true\n" (:out (sh "env" "PATH=/clove-no-such-dir" (str (clove/exe-dir*) "/clove")
                                "-e" "(require 'fs) (println (fs/directory? \"/\"))"))))
 
