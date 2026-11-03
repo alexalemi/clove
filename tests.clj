@@ -4090,7 +4090,8 @@
   (let [T (str (System/getProperty "java.io.tmpdir") "/clove-nrepl-c1")
         exe (str (clove/exe-dir*) "/clove")
         _ (clove/file-op* :mkdirs T)
-        pid (str/trim (:out (sh (str "cd '" T "' && env -u CLOVE_GC_STRESS timeout 60 " exe
+        ;; no `timeout` wrapper: macOS doesn't ship one; the finally kills it
+        pid (str/trim (:out (sh (str "cd '" T "' && env -u CLOVE_GC_STRESS " exe
                                      " nrepl 8095 >/dev/null 2>&1 & echo $!"))))
         conn (fn [] (loop [i 0]
                       (or (try (tcp/connect "127.0.0.1" 8095) (catch Exception e nil))
@@ -4099,12 +4100,16 @@
                         (when fd
                           (tcp/send fd msg)
                           (let [r (tcp/recv fd)] (tcp/close fd) r))))]
-    (assert= nil (ask "d18446744073709551615:abcd"))
-    (assert= nil (ask "d2:op4000000000:xyz"))
-    (assert= nil (ask "d2:op1x:y"))
-    (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
-    (sh (str "kill " pid))
-    (sh (str "rm -rf '" T "'")))
+    (try
+      ;; the server must be up first, or the nil answers below prove nothing
+      (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
+      (assert= nil (ask "d18446744073709551615:abcd"))
+      (assert= nil (ask "d2:op4000000000:xyz"))
+      (assert= nil (ask "d2:op1x:y"))
+      (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
+      (finally
+        (sh (str "kill " pid))
+        (sh (str "rm -rf '" T "'")))))
   ;; fs.clj passes paths as data, never through sh -c, and loads without cc
   (load-file "fs.clj")
   (let [T (str (fs/temp-dir) "/clove-fs-c2")
