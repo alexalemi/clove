@@ -4087,26 +4087,26 @@
   ;; C nREPL server: a bencode length past 2^64 or 64 MB closes the session
   ;; (it wrapped to malloc(0) and overflowed, or tried to read 4 GB); the
   ;; server keeps serving the next client
+  ;; The client runs in its own clove under a perl alarm, so a server that
+  ;; never answers fails the test instead of hanging the suite.
   (let [T (str (System/getProperty "java.io.tmpdir") "/clove-nrepl-c1")
         exe (str (clove/exe-dir*) "/clove")
         _ (clove/file-op* :mkdirs T)
+        client (str T "/client.clj")
         ;; no `timeout` wrapper: macOS doesn't ship one; the finally kills it
         pid (str/trim (:out (sh (str "cd '" T "' && env -u CLOVE_GC_STRESS " exe
-                                     " nrepl 8095 >/dev/null 2>&1 & echo $!"))))
-        conn (fn [] (loop [i 0]
-                      (or (try (tcp/connect "127.0.0.1" 8095) (catch Exception e nil))
-                          (when (< i 100) (Thread/sleep 50) (recur (inc i))))))
-        ask (fn [msg] (let [fd (conn)]
-                        (when fd
-                          (tcp/send fd msg)
-                          (let [r (tcp/recv fd)] (tcp/close fd) r))))]
+                                     " nrepl 8095 >/dev/null 2>&1 & echo $!"))))]
+    (spit client (str "(defn conn [] (loop [i 0] (or (try (tcp/connect \"127.0.0.1\" 8095) (catch Exception e nil))"
+                      "  (when (< i 100) (Thread/sleep 50) (recur (inc i))))))\n"
+                      "(defn ask [msg] (when-let [fd (conn)] (tcp/send fd msg) (let [r (tcp/recv fd)] (tcp/close fd) r)))\n"
+                      "(defn new-session? [r] (clojure.string/includes? (str r) \"new-session\"))\n"
+                      ;; the server must be up first, or the nil answers prove nothing
+                      "(prn [(new-session? (ask \"d2:op5:clonee\"))\n"
+                      "      (ask \"d18446744073709551615:abcd\") (ask \"d2:op4000000000:xyz\") (ask \"d2:op1x:y\")\n"
+                      "      (new-session? (ask \"d2:op5:clonee\"))])\n"))
     (try
-      ;; the server must be up first, or the nil answers below prove nothing
-      (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
-      (assert= nil (ask "d18446744073709551615:abcd"))
-      (assert= nil (ask "d2:op4000000000:xyz"))
-      (assert= nil (ask "d2:op1x:y"))
-      (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
+      (assert= "[true nil nil nil true]"
+               (str/trim (:out (sh "perl" "-e" "alarm 30; exec @ARGV" exe client))))
       (finally
         (sh (str "kill " pid))
         (sh (str "rm -rf '" T "'")))))
