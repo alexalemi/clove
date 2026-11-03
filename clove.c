@@ -329,7 +329,8 @@ struct Clove {
          * wider recurs spill to a heap array stored in iv[0]. */
         struct { Clove *iv[3]; uint8_t n; bool spill; } recur;
         struct { uint32_t *code; Clove **consts;
-                 uint32_t ncode; uint16_t nconst; } chunk;
+                 uint32_t ncode; uint16_t nconst;
+                 bool leaf; } chunk;   /* leaf: see vm_chunk_leaf */
         struct Coro *coro;   /* CLOVE_CORO: heap-allocated coroutine state */
         /* CLOVE_IARRAY: cell-owned flat buffer (freed on sweep); no GC children.
          * dbl=true marks a double-array: the same 8-byte slots hold IEEE bit
@@ -361,6 +362,8 @@ struct CloveEnv {
     uint8_t nslots;
     uint8_t captured;   /* a closure holds (a descendant of) this frame:
                          * VOP_REBIND must not mutate its slots in place */
+    uint8_t onstack;    /* a leaf call's frame, in apply's C frame: not in an
+                         * env block, never referenced once the call returns */
     const char *sname[ENV_SLOTS];
     Clove *sval[ENV_SLOTS];
 };
@@ -1220,6 +1223,7 @@ static CloveEnv *env_new(CloveEnv *parent) {
     e->parent = parent;
     e->nslots = 0;
     e->captured = 0;
+    e->onstack = 0;
     return e;
 }
 
@@ -5455,6 +5459,21 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
     }
 }
 
+/* A leaf body never lets its call frame escape: no closure or lazy-seq
+ * captures it, no tree-walked subform sees it, and it opens no let/loop frame
+ * (whose env would point back at it). apply then gives the call a frame on
+ * the C stack instead of a heap env. A call that turns out to be a macro
+ * only at runtime evaluates the source form; the VM moves the frame to the
+ * heap first (vm_frame_to_heap). */
+static bool vm_chunk_leaf(const uint32_t *code, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t op = code[i] & 0xff;
+        if (op == VOP_CLOSURE || op == VOP_LAZY || op == VOP_EVAL || op == VOP_NEWENV)
+            return false;
+    }
+    return true;
+}
+
 /* Compile one arity body. Returns a chunk cell, or NULL (caller falls
  * back to the tree-walker permanently). */
 static Clove *vm_compile(CloveEnv *cenv, Clove *params, Clove *body) {
@@ -5497,8 +5516,20 @@ static Clove *vm_compile(CloveEnv *cenv, Clove *params, Clove *body) {
     chunk->as.chunk.consts = c.consts;
     chunk->as.chunk.ncode = c.ncode;
     chunk->as.chunk.nconst = (uint16_t)c.nconst;
+    chunk->as.chunk.leaf = vm_chunk_leaf(c.code, c.ncode);
     vsp = base;
     return chunk;
+}
+
+/* A heap copy of a leaf call's stack frame, for code that may capture it. */
+static __attribute__((noinline)) CloveEnv *vm_frame_to_heap(CloveEnv *se) {
+    CloveEnv *e = env_new(se->parent);
+    for (int i = 0; i < se->nslots; i++) {
+        e->sname[i] = se->sname[i];
+        e->sval[i] = se->sval[i];
+    }
+    e->nslots = se->nslots;
+    return e;
 }
 
 static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
@@ -5584,6 +5615,7 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                         free(sb.data);
                     }
                     vsp -= n + 1;
+                    if (env->onstack) env_keep = env = vm_frame_to_heap(env);
                     r = eval(env, K[a >> 8]);
                 } else {
                     if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
@@ -5672,6 +5704,7 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                 Clove *f = vstack[vsp - n - 1];
                 if (IS_MACRO_HEAD(env, f)) {
                     vsp -= n + 1;                    /* late macro: deopt, no TCO */
+                    if (env->onstack) env_keep = env = vm_frame_to_heap(env);
                     vpush(eval(env, K[a >> 8]));
                     VM_NEXT();
                 }
@@ -5998,6 +6031,23 @@ static __attribute__((noinline)) void bind_recur_rest(CloveEnv *call, Clove *par
 
 static Clove *apply_other(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
 
+/* The call frame for an arity whose params fill the slots: on the C stack
+ * (se) when its compiled body is a leaf, else a heap env. */
+static inline CloveEnv *arity_frame(Clove *arity, CloveEnv *parent, CloveEnv *se) {
+    Clove *ch = arity->meta;
+    if (ch && ch->tag == CLOVE_CHUNK && ch->as.chunk.leaf) {
+        se->bindings = NULL;
+        se->parent = parent;
+        se->gcmark = 0;
+        se->gcfree = 0;
+        se->nslots = 0;
+        se->captured = 0;
+        se->onstack = 1;
+        return se;
+    }
+    return env_new(parent);
+}
+
 static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
     clove_check_stack();   /* raise a catchable error before the C stack overflows */
     /* NATIVE/FN are the overwhelmingly common cases; everything else (Vars,
@@ -6013,6 +6063,7 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
     (void)recur_keep;
     int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
     Clove *recur_arity = NULL;   /* variadic arity a self-recur re-enters */
+    CloveEnv senv;               /* a leaf arity's call frame (vm_chunk_leaf) */
     for (;;) {
         Clove *chosen = NULL;
         uint32_t cb = 0;
@@ -6021,8 +6072,8 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
             chosen = recur_arity;
             cb = arity_bits(chosen);
             recur_arity = NULL;
-            call = env_new(fn->as.fn.env);
             if ((cb & AR_SLOTS) && (size_t)nargs == (cb >> 8) + 1) {
+                call = arity_frame(chosen, fn->as.fn.env, &senv);
                 Clove *p = chosen->as.arity.params;
                 for (int i = 0; i < nargs - 1; i++, p = p->as.cons.tail) {
                     call->sname[i] = p->as.cons.head->as.sym;
@@ -6032,6 +6083,7 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
                 call->sval[nargs - 1] = argv[nargs - 1];
                 call->nslots = (uint8_t)nargs;
             } else {
+                call = env_new(fn->as.fn.env);
                 bind_recur_rest(call, chosen->as.arity.params, argv, nargs);
             }
         } else {
@@ -6049,8 +6101,8 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
             }
             if (!chosen) { chosen = fallback; cb = fbb; }
             if (!chosen) arity_error(fn, nargs);
-            call = env_new(fn->as.fn.env);
             if (cb & AR_SLOTS) {
+                call = arity_frame(chosen, fn->as.fn.env, &senv);
                 /* fill the frame's slots straight from argv: no
                  * bind_params/destructure walk */
                 int fx = (int)(cb >> 8);
@@ -6068,6 +6120,7 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
                     call->nslots = (uint8_t)(fx + 1);
                 }
             } else {
+                call = env_new(fn->as.fn.env);
                 bind_params(call, chosen->as.arity.params, argv, nargs);
             }
         }
