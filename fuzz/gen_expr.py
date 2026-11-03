@@ -172,9 +172,11 @@ class Gen:
         if d >= MAXD or random.random() < 0.25:
             return pick([small(), "0.5", "1.5", "2.0", "1/3", "-7/2", "0.1"])
         d += 1
-        r = random.randrange(6)
+        r = random.randrange(7)
         if r == 0:
             return f"(/ {self.int(d)} {self.int(d)})"
+        if r == 5:
+            return f"({pick(['quot', 'rem', 'mod'])} {self.num(d)} {self.num(d)})"
         if r == 1:
             return f"({pick(['+', '-', '*'])} {self.num(d)} {self.num(d)})"
         if r == 2:

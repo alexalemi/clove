@@ -367,6 +367,8 @@ static bool int_value(Clove *v, int64_t *out);
 static char *big_to_decimal(Clove *v);
 static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R);
 static bool big_is_zero(Clove *A);
+static Clove *big_addsub(Clove *A, Clove *B, int sub);
+static Clove *big_mul(Clove *A, Clove *B);
 static Clove *bd_parse(const char *t, size_t n);
 static Clove *make_ratio(Clove *num, Clove *den);
 static Clove *to_seq(Clove *v);
@@ -2872,7 +2874,7 @@ static int64_t as_int(Clove *v, const char *what) {
          * that gets past int_value is out of int64 range: the error below. */
         if (v->tag == CLOVE_DOUBLE || v->tag == CLOVE_RATIO || v->tag == CLOVE_BIGDEC) {
             double d = as_num(v);
-            if (!(d >= -9.2233720368547758e18 && d <= 9.2233720368547758e18))
+            if (!(d >= -9.2233720368547758e18 && d < 9.2233720368547758e18))   /* 2^63 does not fit */
                 clove_error("%s: value out of integer range: %g", what, d);
             return (int64_t)d;
         }
@@ -2899,6 +2901,11 @@ static void sb_grow(SBuf *sb, size_t need) {
     if (!sb->data) clove_error("out of memory");
 }
 static void sb_putc(SBuf *sb, char c) { sb_grow(sb, 1); sb->data[sb->len++] = c; sb->data[sb->len] = '\0'; }
+static void sb_putn(SBuf *sb, const char *s, size_t n) {
+    sb_grow(sb, n);
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n; sb->data[sb->len] = '\0';
+}
 static void sb_puts(SBuf *sb, const char *s) {
     size_t n = strlen(s);
     sb_grow(sb, n);
@@ -3080,6 +3087,7 @@ static Clove *mk_typed2(const char *type, const char *k, Clove *v) {
  * this is nonzero an unknown (or malformed) tag reads as a quoted
  * tagged-literal value instead of raising. Reset at each top-level read. */
 static int rd_suppress_tags;
+static void sb_put_utf8(SBuf *sb, int32_t cp);
 
 static Clove *read_tagged(Clove *tag, Clove *form) {
     const char *t = tag->as.sym;
@@ -3102,6 +3110,82 @@ static Clove *read_tagged(Clove *tag, Clove *form) {
     return mk_cons(mk_sym(intern("quote", 5)), mk_cons(tl, NIL));
 }
 
+/* Digits in a radix as a magnitude (INT, or BIGINT past int64); NULL when
+ * a character is not a digit of that radix or there are none. */
+static Clove *radix_digits(const char *s, size_t len, int radix) {
+    if (len == 0) return NULL;
+    uint64_t u = 0; Clove *acc = NULL;
+    for (size_t i = 0; i < len; i++) {
+        int c = (unsigned char)s[i];
+        int dv = c >= '0' && c <= '9' ? c - '0' : isalpha(c) ? tolower(c) - 'a' + 10 : 99;
+        if (dv >= radix) return NULL;
+        if (!acc && u <= ((uint64_t)INT64_MAX - (uint64_t)dv) / (uint64_t)radix) { u = u * (uint64_t)radix + (uint64_t)dv; continue; }
+        if (!acc) acc = mk_int((int64_t)u);
+        acc = big_addsub(big_mul(acc, mk_int(radix)), mk_int(dv), 0);
+    }
+    return acc ? acc : mk_int((int64_t)u);
+}
+
+/* A number token, by Clojure's LispReader patterns: the whole token must
+ * match or it is an error ([12abc 3] is not [12 3]). Integers: decimal
+ * (leading zeros stay decimal, a clove choice: 017 is 17), 0x hex, NNrDDD
+ * radix, optional N; hex and radix past a Long become BigInts. Ratios
+ * d/d, floats d(.d*)?(e[+-]?d)?, and a trailing M for BigDecimal. */
+static Clove *read_number(const char *start, size_t n) {
+    const char *q = start, *e = start + n;
+    bool neg = false;
+    if (*q == '+' || *q == '-') neg = *q++ == '-';
+    size_t m = (size_t)(e - q);
+#define BADNUM() rd_error("Invalid number: %.*s", (int)(n > 80 ? 80 : n), start)
+    size_t dn = 0; while (dn < m && isdigit((unsigned char)q[dn])) dn++;
+    Clove *mag = NULL; bool hasN = false;
+    if (dn == m || (dn + 1 == m && q[dn] == 'N')) {            /* decimal integer */
+        hasN = dn < m;
+        if (!hasN && dn < 19) {
+            int64_t v = 0; for (size_t i = 0; i < dn; i++) v = v * 10 + (q[i] - '0');
+            return mk_int(neg ? -v : v);
+        }
+        mag = big_from_decimal(q);                               /* stops at N */
+    } else if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {   /* hex */
+        hasN = e[-1] == 'N';
+        mag = radix_digits(q + 2, m - 2 - hasN, 16);
+    } else if (dn >= 1 && dn <= 2 && q[0] != '0' && (q[dn] == 'r' || q[dn] == 'R')) {
+        int radix = atoi(q);
+        if (radix < 2 || radix > 36) rd_error("Radix out of range: %.*s", (int)(n > 80 ? 80 : n), start);
+        mag = radix_digits(q + dn + 1, m - dn - 1, radix);
+    } else if (dn > 0 && q[dn] == '/') {                        /* ratio */
+        const char *d = q + dn + 1;
+        if (d == e) BADNUM();
+        for (const char *t = d; t < e; t++) if (!isdigit((unsigned char)*t)) BADNUM();
+        Clove *num = big_from_decimal(q);                        /* stops at / */
+        return make_ratio(neg ? big_addsub(mk_int(0), num, 1) : num, big_from_decimal(d));
+    } else if (e[-1] == 'M') {
+        Clove *d = bd_parse(start, n - 1);
+        if (!d || !isdigit((unsigned char)q[0])) BADNUM();
+        return d;
+    } else {                                                     /* float */
+        size_t i = dn;
+        if (i < m && q[i] == '.') { i++; while (i < m && isdigit((unsigned char)q[i])) i++; }
+        if (i < m && (q[i] == 'e' || q[i] == 'E')) {
+            i++;
+            if (i < m && (q[i] == '+' || q[i] == '-')) i++;
+            size_t j = i; while (i < m && isdigit((unsigned char)q[i])) i++;
+            if (i == j) BADNUM();
+        }
+        if (i != m) BADNUM();
+        char sbuf[64];
+        char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
+        memcpy(buf, start, n); buf[n] = '\0';
+        double dv = strtod(buf, NULL);
+        if (buf != sbuf) free(buf);
+        return mk_double(dv);
+    }
+    if (!mag) BADNUM();
+#undef BADNUM
+    if (neg) mag = big_addsub(mk_int(0), mag, 1);
+    return hasN ? to_bigint(mag) : mag;
+}
+
 static Clove *read_atom(const char **p) {
     const char *start = *p;
     while (is_sym_char((unsigned char)**p)) (*p)++;
@@ -3112,88 +3196,7 @@ static Clove *read_atom(const char **p) {
     bool is_num = (isdigit((unsigned char)start[0]) ||
                    ((start[0] == '+' || start[0] == '-') && n > 1 &&
                     isdigit((unsigned char)start[1])));
-    if (is_num) {
-        /* Plain decimal integer (optional sign, digits, optional trailing N):
-         * may exceed int64 -> bigint. Detected first, before the 64-char buf cap,
-         * so arbitrarily long literals parse. An N suffix is a BigInt at any
-         * size (1N); without one, a value that fits is a Long. */
-        {
-            const char *q = start; size_t m = n;
-            if (m && (*q == '+' || *q == '-')) { q++; m--; }
-            bool hasN = m > 0 && q[m - 1] == 'N';
-            size_t dn = hasN ? m - 1 : m;
-            bool alldig = dn > 0;
-            for (size_t i = 0; i < dn && alldig; i++) if (q[i] < '0' || q[i] > '9') alldig = false;
-            if (alldig && (hasN || dn >= 19)) {
-                char *tmp = xmalloc(n + 1); memcpy(tmp, start, n); tmp[n] = '\0';
-                Clove *r = big_from_decimal(tmp);   /* stops at the trailing N */
-                free(tmp);
-                return hasN ? to_bigint(r) : r;
-            }
-        }
-        /* BigDecimal literal: 1.5M, 1M, 1E+3M -- the decimal text before M */
-        if (start[n - 1] == 'M') {
-            Clove *d = bd_parse(start, n - 1);
-            if (!d) rd_error("invalid number: %.*s", (int)n, start);
-            return d;
-        }
-        /* ratio literal: [+-]?digits/digits -> exact rational */
-        {
-            const char *slash = memchr(start, '/', n);
-            const char *ns = start; if (*ns == '+' || *ns == '-') ns++;
-            if (slash && slash > ns && slash + 1 < start + n) {
-                bool ok = true;
-                for (const char *q = ns; q < slash && ok; q++) if (*q < '0' || *q > '9') ok = false;
-                for (const char *q = slash + 1; q < start + n && ok; q++) if (*q < '0' || *q > '9') ok = false;
-                if (ok) {
-                    char *nb = xmalloc(n + 1), *db = xmalloc(n + 1);
-                    size_t nl = (size_t)(slash - start), dl = (size_t)(start + n - slash - 1);
-                    memcpy(nb, start, nl); nb[nl] = '\0';
-                    memcpy(db, slash + 1, dl); db[dl] = '\0';
-                    Clove *num = big_from_decimal(nb), *den = big_from_decimal(db);
-                    free(nb); free(db);
-                    return make_ratio(num, den);
-                }
-            }
-        }
-        /* stack copy for the common case; a long literal (a 70-digit
-         * double) gets a heap copy instead of a "number too long" error.
-         * Only the double path below can return after a heap copy. */
-        char sbuf[64];
-        char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
-        memcpy(buf, start, n); buf[n] = '\0';
-        if (buf != sbuf) {
-            double dv = strtod(buf, NULL);
-            bool flt = memchr(buf, '.', n) || memchr(buf, 'e', n) || memchr(buf, 'E', n);
-            free(buf);
-            if (!flt) rd_error("invalid number: %.*s", (int)(n > 80 ? 80 : n), start);
-            return mk_double(dv);
-        }
-        int64_t sign = 1;
-        char *d = buf;
-        if (*d == '+' || *d == '-') { if (*d == '-') sign = -1; d++; }
-        /* hex: 0x1F / 0XFF — parse UNSIGNED then cast, so a full-width literal
-         * like 0xbf58476d1ce4e5b9 wraps to its signed long value (Java-like)
-         * instead of clamping to LLONG_MAX. */
-        if (d[0] == '0' && (d[1] == 'x' || d[1] == 'X') && d[2])
-            return mk_int(sign * (int64_t)strtoull(d + 2, NULL, 16));
-        /* radix: 2r1010, 16rFF, 36rZ (Clojure's <radix>r<digits>) */
-        char *rp = strchr(d, 'r'); if (!rp) rp = strchr(d, 'R');
-        if (rp && rp != d && rp[1]) {
-            *rp = '\0';
-            long radix = strtol(d, NULL, 10);
-            if (radix >= 2 && radix <= 36)
-                return mk_int(sign * (int64_t)strtoull(rp + 1, NULL, (int)radix));
-            *rp = 'r';
-        }
-        bool is_float = false;
-        for (size_t i = 0; i < n; i++)
-            if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E') is_float = true;
-        if (is_float) return mk_double(strtod(buf, NULL));
-        /* NB: leading-zero stays DECIMAL (017 => 17), not octal — a deliberate
-         * clove choice to avoid the octal footgun (see tests.clj). */
-        return mk_int(strtoll(buf, NULL, 10));
-    }
+    if (is_num) return read_number(start, n);
 
     /* Keyword? */
     if (start[0] == ':') {
@@ -3226,6 +3229,20 @@ static Clove *read_atom(const char **p) {
     return mk_sym(intern(start, n));
 }
 
+/* Four hex digits after a \u, as a codepoint. */
+static int32_t rd_hex4(const char *s) {
+    int32_t cp = 0;
+    for (int k = 0; k < 4; k++) {
+        char h = s[k];
+        int d = (h >= '0' && h <= '9') ? h - '0'
+              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+        if (d < 0) rd_error("Invalid unicode escape: \\u%.*s", k + (h != '\0'), s);
+        cp = cp * 16 + d;
+    }
+    return cp;
+}
+
 static Clove *read_string(const char **p) {
     (*p)++; /* consume opening " */
     SBuf sb = {0};
@@ -3239,30 +3256,32 @@ static Clove *read_string(const char **p) {
                 case 'r':  sb_putc(&sb, '\r'); break;
                 case 'b':  sb_putc(&sb, '\b'); break;
                 case 'f':  sb_putc(&sb, '\f'); break;
-                case '0':  sb_putc(&sb, '\0'); break;
                 case '\\': sb_putc(&sb, '\\'); break;
                 case '"':  sb_putc(&sb, '"');  break;
-                case 'u': {  /* \uXXXX — UTF-8 encode into the byte string */
-                    int cp = 0, k = 0;
-                    for (; k < 4; k++) {
-                        char h = (*p)[1 + k];
-                        int d = (h >= '0' && h <= '9') ? h - '0'
-                              : (h >= 'a' && h <= 'f') ? h - 'a' + 10
-                              : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
-                        if (d < 0) break;
-                        cp = cp * 16 + d;
+                case 'u': {  /* \uXXXX, exactly four hex digits; a surrogate pair is one char */
+                    int32_t cp = rd_hex4(*p + 1);
+                    *p += 4;  /* outer (*p)++ eats the last digit */
+                    if (cp >= 0xD800 && cp <= 0xDBFF && (*p)[1] == '\\' && (*p)[2] == 'u') {
+                        int32_t lo = rd_hex4(*p + 3);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            *p += 6;
+                        }
                     }
-                    if (k == 0) clove_error("invalid \\u escape");
-                    if (cp < 0x80) sb_putc(&sb, (char)cp);
-                    else if (cp < 0x800) {
-                        sb_putc(&sb, (char)(0xC0 | (cp >> 6)));
-                        sb_putc(&sb, (char)(0x80 | (cp & 0x3F)));
-                    } else {
-                        sb_putc(&sb, (char)(0xE0 | (cp >> 12)));
-                        sb_putc(&sb, (char)(0x80 | ((cp >> 6) & 0x3F)));
-                        sb_putc(&sb, (char)(0x80 | (cp & 0x3F)));
+                    sb_put_utf8(&sb, cp);
+                    break;
+                }
+                case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                    int32_t cp = 0; int k = 0;   /* octal \0 .. \377, up to three digits */
+                    for (; k < 3; k++) {   /* Clojure stops at whitespace or a macro char */
+                        char o = (*p)[k];
+                        if (!o || isspace((unsigned char)o) || strchr("\";'@^`~()[]{}\\%#", o)) break;
+                        if (o < '0' || o > '7') rd_error("Invalid digit %c in unicode character.", o);
+                        cp = cp * 8 + (o - '0');
                     }
-                    *p += k;  /* past hex digits; outer (*p)++ eats the last */
+                    if (cp > 0377) rd_error("Octal escape sequence must be in range [0, 377].");
+                    sb_put_utf8(&sb, cp);
+                    *p += k - 1;
                     break;
                 }
                 case '\0': rd_error("unterminated string");
@@ -3319,7 +3338,49 @@ static Clove *read_list(const char **p, char close) {
     }
 }
 
+/* Find the %-params a #() body uses: an iterative worklist over nested
+ * collections. Its own frame, so read_form's recursion stays small. */
+static __attribute__((noinline)) void fnlit_scan(Clove *body, int *maxnp, bool *pctp, bool *variadicp) {
+    int maxn = 0;
+    bool pct = false, variadic = false;
+    /* everything pushed is reachable from body, so the heap worklist needs no rooting */
+    size_t cap = 64, wn = 0;
+    Clove **work = xmalloc(cap * sizeof *work);
+#define FNLIT_PUSH(x) do { if (wn == cap) work = xrealloc(work, (cap *= 2) * sizeof *work); work[wn++] = (x); } while (0)
+    FNLIT_PUSH(body);
+    while (wn > 0) {
+        Clove *f = work[--wn];
+        if (!f || f == NIL) continue;
+        if (f->tag == CLOVE_SYMBOL && f->as.sym[0] == '%') {
+            const char *s = f->as.sym;
+            if (s[1] == '\0') { pct = true; if (maxn < 1) maxn = 1; }
+            else if (s[1] == '&' && s[2] == '\0') variadic = true;
+            else if (s[1] >= '1' && s[1] <= '9' && s[2] == '\0') {
+                if (s[1] - '0' > maxn) maxn = s[1] - '0';
+            }
+        } else if (f->tag == CLOVE_LIST) {
+            for (Clove *l = f; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
+                FNLIT_PUSH(l->as.cons.head);
+        } else if (f->tag == CLOVE_VECTOR) {
+            for (size_t i = 0; i < vec_len(f); i++)
+                FNLIT_PUSH(vec_nth(f, i));
+        } else if (f->tag == CLOVE_MAP) {
+            for (Clove *e = map_entry_list(f); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
+                FNLIT_PUSH(e->as.cons.head->as.cons.head);
+                FNLIT_PUSH(e->as.cons.head->as.cons.tail);
+            }
+        } else if (f->tag == CLOVE_SET) {
+            for (Clove *e = set_element_list(f); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+                FNLIT_PUSH(e->as.cons.head);
+        }
+    }
+#undef FNLIT_PUSH
+    free(work);
+    *maxnp = maxn; *pctp = pct; *variadicp = variadic;
+}
+
 static Clove *read_form(const char **p) {
+    clove_check_stack();
     skip_ws(p);
     char c = **p;
     if (c == '\0') return NULL;
@@ -3372,20 +3433,17 @@ static Clove *read_form(const char **p) {
         if (n == 8 && !memcmp(start, "formfeed", 8)) return mk_char('\f');
         if (n == 9 && !memcmp(start, "backspace", 9)) return mk_char('\b');
         if (start[0] == 'u' && n == 5) {             /* \uXXXX hex codepoint */
-            int32_t cp = 0;
-            for (size_t i = 1; i < n; i++) {
-                char d = start[i]; int hv;
-                if (d >= '0' && d <= '9') hv = d - '0';
-                else if (d >= 'a' && d <= 'f') hv = d - 'a' + 10;
-                else if (d >= 'A' && d <= 'F') hv = d - 'A' + 10;
-                else clove_error("bad \\u char literal");
-                cp = cp * 16 + hv;
-            }
+            int32_t cp = rd_hex4(start + 1);
+            if (cp >= 0xD800 && cp <= 0xDFFF) rd_error("Invalid character constant: \\u%.4s", start + 1);
             return mk_char(cp);
         }
-        if (start[0] == 'o' && n >= 2 && n <= 4) {   /* \oNNN octal */
+        if (start[0] == 'o' && n >= 2 && n <= 4) {   /* \oNNN octal, at most \o377 */
             int32_t cp = 0;
-            for (size_t i = 1; i < n; i++) cp = cp * 8 + (start[i] - '0');
+            for (size_t i = 1; i < n; i++) {
+                if (start[i] < '0' || start[i] > '7') rd_error("Invalid digit: %c", start[i]);
+                cp = cp * 8 + (start[i] - '0');
+            }
+            if (cp > 0377) rd_error("Octal escape sequence must be in range [0, 377].");
             return mk_char(cp);
         }
         if ((unsigned char)start[0] >= 0x80) {   /* a literal multi-byte UTF-8 char, e.g. \⁹ */
@@ -3399,7 +3457,7 @@ static Clove *read_form(const char **p) {
                 return mk_char(cp);
             }
         }
-        rd_error("unsupported char literal");
+        rd_error("Unsupported character: \\%.*s", (int)(n > 40 ? 40 : n), start);
     }
     if (c == '#' && (*p)[1] == '_') {
         *p += 2;
@@ -3409,7 +3467,8 @@ static Clove *read_form(const char **p) {
          * #_ at a call/collection position yields the next element). At a
          * closing delimiter or EOF there is none → splice zero elements. */
         char d = **p;
-        if (d == '\0' || d == ')' || d == ']' || d == '}')
+        if (d == '\0') return NULL;   /* nothing follows: as at EOF */
+        if (d == ')' || d == ']' || d == '}')
             return mk_cons(mk_sym(intern("**reader-splice**", 17)),
                            mk_cons(NIL, NIL));
         return read_form(p);
@@ -3503,36 +3562,7 @@ static Clove *read_form(const char **p) {
         Clove *body = read_form(p);
         int maxn = 0;
         bool pct = false, variadic = false;
-        /* scan for %-symbols (iterative worklist over nested collections) */
-        Clove *work[256]; int wn = 0;
-        bool overflow = false;
-        work[wn++] = body;
-        while (wn > 0) {
-            Clove *f = work[--wn];
-            if (!f || f == NIL) continue;
-            if (f->tag == CLOVE_SYMBOL && f->as.sym[0] == '%') {
-                const char *s = f->as.sym;
-                if (s[1] == '\0') { pct = true; if (maxn < 1) maxn = 1; }
-                else if (s[1] == '&' && s[2] == '\0') variadic = true;
-                else if (s[1] >= '1' && s[1] <= '9' && s[2] == '\0') {
-                    if (s[1] - '0' > maxn) maxn = s[1] - '0';
-                }
-            } else if (f->tag == CLOVE_LIST) {
-                for (Clove *l = f; l && l->tag == CLOVE_LIST && wn < 254; l = l->as.cons.tail)
-                    work[wn++] = l->as.cons.head;
-            } else if (f->tag == CLOVE_VECTOR) {
-                for (size_t i = 0; i < vec_len(f) && wn < 254; i++)
-                    work[wn++] = vec_nth(f, i);
-            } else if (f->tag == CLOVE_MAP) {
-                for (Clove *e = map_entry_list(f); e && e->tag == CLOVE_LIST && wn < 253;
-                     e = e->as.cons.tail) {
-                    work[wn++] = e->as.cons.head->as.cons.head;
-                    work[wn++] = e->as.cons.head->as.cons.tail;
-                }
-            }
-        }
-        if (wn >= 253) overflow = true;
-        if (overflow) clove_error("#(): body too complex to scan for %% params");
+        fnlit_scan(body, &maxn, &pct, &variadic);
         Clove *items[11];
         size_t ni = 0;
         /* params are always %1..%maxn; bare % is an alias for %1 (Clojure), so a
@@ -6821,6 +6851,7 @@ static void sb_put_utf8(SBuf *sb, int32_t cp) {
  * toString -- and lives in str_to below. */
 static void print_to(SBuf *sb, Clove *v, bool readably) {
     if (v == NULL || v == NIL) { sb_puts(sb, "nil"); return; }
+    clove_check_stack();
     switch (v->tag) {
         case CLOVE_NIL: sb_puts(sb, "nil"); break;
         case CLOVE_EMPTY: sb_puts(sb, "()"); break;
@@ -6842,25 +6873,28 @@ static void print_to(SBuf *sb, Clove *v, bool readably) {
                 Clove *rg;
                 if (map_find(v->meta, mk_kw(intern("regex", 5)), &rg) && is_truthy(rg)) {
                     sb_putc(sb, '#'); sb_putc(sb, '"');
-                    sb_puts(sb, v->as.str);
+                    sb_putn(sb, v->as.str, v->as.strx.nbytes);
                     sb_putc(sb, '"');
                     break;
                 }
             }
             if (readably) {
                 sb_putc(sb, '"');
-                for (const char *c = v->as.str; *c; c++) {
+                const char *c = v->as.str, *end = c + v->as.strx.nbytes;
+                for (; c < end; c++) {
                     switch (*c) {
                         case '\n': sb_puts(sb, "\\n");  break;
                         case '\t': sb_puts(sb, "\\t");  break;
                         case '\r': sb_puts(sb, "\\r");  break;
+                        case '\b': sb_puts(sb, "\\b");  break;
+                        case '\f': sb_puts(sb, "\\f");  break;
                         case '\\': sb_puts(sb, "\\\\"); break;
                         case '"':  sb_puts(sb, "\\\""); break;
                         default:   sb_putc(sb, *c);
                     }
                 }
                 sb_putc(sb, '"');
-            } else sb_puts(sb, v->as.str);
+            } else sb_putn(sb, v->as.str, v->as.strx.nbytes);
             break;
         case CLOVE_CHAR: {
             int32_t cp = v->as.chr;
@@ -7107,7 +7141,7 @@ static void str_to(SBuf *sb, Clove *v) {
             print_to(sb, v, true); break;
         case CLOVE_STRING:   /* a regex's str is its source; an exception's its toString */
             if (v->meta && exc_printable(v)) exc_to_string(sb, v);
-            else sb_puts(sb, v->as.str);
+            else sb_putn(sb, v->as.str, v->as.strx.nbytes);
             break;
         case CLOVE_MAP: {
             Clove *ty, *sv;
@@ -7548,8 +7582,53 @@ static int big_cmp(Clove *A, Clove *B) {
     return a.sign < 0 ? -c : c;
 }
 
-/* Truncating divmod (quot toward zero, rem takes the dividend's sign). Bit-by-
- * bit long division on magnitudes — simple and correct; fine at our scale. */
+static uint32_t udiv_small_inplace(uint32_t *d, uint32_t n, uint32_t div);
+/* Magnitude division, Knuth's algorithm D (TAOCP 4.3.1, as in Hacker's
+ * Delight divmnu): a / b into q (na-nb+1 limbs) and r (nb limbs). Needs
+ * na >= nb >= 1 and a nonzero top limb in b. */
+static void umag_divmod(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb,
+                        uint32_t *q, uint32_t *r) {
+    if (nb == 1) {
+        memcpy(q, a, na * 4);
+        r[0] = udiv_small_inplace(q, na, b[0]);
+        return;
+    }
+    int s = __builtin_clz(b[nb - 1]);          /* normalize: top bit of b set */
+    uint32_t *bn = umalloc(nb), *un = umalloc(na + 1);
+    for (uint32_t i = nb - 1; i > 0; i--) bn[i] = (b[i] << s) | (uint32_t)((uint64_t)b[i - 1] >> (32 - s));
+    bn[0] = b[0] << s;
+    un[na] = (uint32_t)((uint64_t)a[na - 1] >> (32 - s));
+    for (uint32_t i = na - 1; i > 0; i--) un[i] = (a[i] << s) | (uint32_t)((uint64_t)a[i - 1] >> (32 - s));
+    un[0] = a[0] << s;
+    for (uint32_t j = na - nb + 1; j-- > 0; ) {
+        uint64_t num = ((uint64_t)un[j + nb] << 32) | un[j + nb - 1];
+        uint64_t qhat = num / bn[nb - 1], rhat = num % bn[nb - 1];
+        while (qhat >> 32 || qhat * bn[nb - 2] > ((rhat << 32) | un[j + nb - 2])) {
+            qhat--; rhat += bn[nb - 1];
+            if (rhat >> 32) break;
+        }
+        int64_t k = 0, t;                       /* un[j..j+nb] -= qhat * bn */
+        for (uint32_t i = 0; i < nb; i++) {
+            uint64_t p = qhat * bn[i];
+            t = (int64_t)un[i + j] - k - (int64_t)(p & 0xFFFFFFFFu);
+            un[i + j] = (uint32_t)t;
+            k = (int64_t)(p >> 32) - (t >> 32);
+        }
+        t = (int64_t)un[j + nb] - k; un[j + nb] = (uint32_t)t;
+        q[j] = (uint32_t)qhat;
+        if (t < 0) {                            /* qhat was one too big: add back */
+            q[j]--;
+            uint64_t c = 0;
+            for (uint32_t i = 0; i < nb; i++) { c += (uint64_t)un[i + j] + bn[i]; un[i + j] = (uint32_t)c; c >>= 32; }
+            un[j + nb] += (uint32_t)c;
+        }
+    }
+    for (uint32_t i = 0; i + 1 < nb; i++) r[i] = (un[i] >> s) | (uint32_t)((uint64_t)un[i + 1] << (32 - s));
+    r[nb - 1] = un[nb - 1] >> s;
+    free(bn); free(un);
+}
+
+/* Truncating divmod (quot toward zero, rem takes the dividend's sign). */
 static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
     if (b.sign == 0) clove_error_cls("ArithmeticException", "Divide by zero");
@@ -7558,18 +7637,11 @@ static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R) {
         if (R) { uint32_t *m = umalloc(a.n ? a.n : 1); memcpy(m, a.mag, a.n * 4); *R = big_norm(a.sign, m, a.n); }
         return;
     }
-    uint32_t qn = a.n, rn = a.n + 1;
-    uint32_t *q = umalloc(qn); for (uint32_t i = 0; i < qn; i++) q[i] = 0;
-    uint32_t *r = umalloc(rn); for (uint32_t i = 0; i < rn; i++) r[i] = 0;
-    for (uint32_t bit = a.n * 32; bit-- > 0; ) {
-        uint32_t carry = 0;                                   /* r <<= 1 */
-        for (uint32_t i = 0; i < rn; i++) { uint32_t nx = r[i] >> 31; r[i] = (r[i] << 1) | carry; carry = nx; }
-        if ((a.mag[bit / 32] >> (bit % 32)) & 1) r[0] |= 1;   /* bring down next bit */
-        uint32_t rl = rn; while (rl > 0 && r[rl - 1] == 0) rl--;
-        if (umag_cmp(r, rl, b.mag, b.n) >= 0) { umag_sub(r, rl, b.mag, b.n, r); q[bit / 32] |= 1u << (bit % 32); }
-    }
+    uint32_t qn = a.n - b.n + 1;
+    uint32_t *q = umalloc(qn), *r = umalloc(b.n);
+    umag_divmod(a.mag, a.n, b.mag, b.n, q, r);
     if (Q) *Q = big_norm(a.sign * b.sign, q, qn); else free(q);
-    if (R) *R = big_norm(a.sign, r, rn); else free(r);
+    if (R) *R = big_norm(a.sign, r, b.n); else free(r);
 }
 static Clove *big_abs(Clove *A) {
     if (A->tag == CLOVE_INT) return A->as.i < 0 ? big_addsub(mk_int(0), A, 1) : A;
@@ -7609,12 +7681,21 @@ static char *big_to_decimal(Clove *v) {
     for (size_t i = nc - 1; i-- > 0; ) p += (size_t)snprintf(buf + p, cap - p, "%09u", chunks[i]);
     buf[p] = 0; free(chunks); return buf;
 }
-/* Parse a decimal integer (optional sign, all digits) into INT or BIGINT. */
+/* Parse a decimal integer (optional sign, then digits) into INT or BIGINT.
+ * Stops at the first non-digit; callers check the token is all digits. Nine
+ * digits per multiply-add step. */
 static Clove *big_from_decimal(const char *s) {
     int sign = 1; if (*s == '+') s++; else if (*s == '-') { sign = -1; s++; }
-    Clove *acc = mk_int(0), *ten = mk_int(10);
-    for (; *s; s++) { if (*s < '0' || *s > '9') break; acc = big_addsub(big_mul(acc, ten), mk_int(*s - '0'), 0); }
-    return sign < 0 ? big_addsub(mk_int(0), acc, 1) : acc;
+    size_t nd = 0; while (s[nd] >= '0' && s[nd] <= '9') nd++;
+    uint32_t *m = umalloc((uint32_t)(nd / 9 + 2)), n = 0;
+    for (size_t i = 0, len = nd % 9 ? nd % 9 : 9; i < nd; i += len, len = 9) {
+        uint32_t mul = 1, add = 0;
+        for (size_t k = 0; k < len; k++) { mul *= 10; add = add * 10 + (uint32_t)(s[i + k] - '0'); }
+        uint64_t c = add;
+        for (uint32_t j = 0; j < n; j++) { c += (uint64_t)m[j] * mul; m[j] = (uint32_t)c; c >>= 32; }
+        if (c) m[n++] = (uint32_t)c;
+    }
+    return big_norm(sign, m, n);
 }
 
 /* ───── Exact rationals ──────────────────────────────────────────────── */
@@ -8700,29 +8781,63 @@ static Clove *bd_rem(Clove *a, Clove *b) {
     return arith(OP_SUB, s, 2, AR_CHECK);
 }
 
+/* quot, rem and mod ('q', 'r', 'm') over Clojure's operand categories: any
+ * double makes the op double, else any BigDecimal, else exact (ratios give a
+ * BigInt quotient, like Numbers.quotient). mod is rem shifted to the
+ * divisor's sign. */
+static Clove *num_qrm(Clove *x, Clove *y, char op, const char *what) {
+    if (x->tag == CLOVE_INT && y->tag == CLOVE_INT) {
+        int64_t a = x->as.i, b = y->as.i;
+        if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
+        if (b == -1) return mk_int(op == 'q' ? (int64_t)(0 - (uint64_t)a) : 0);   /* MIN/-1 wraps, as on the JVM */
+        if (op == 'q') return mk_int(a / b);
+        int64_t m = a % b;
+        if (op == 'm' && m != 0 && ((m < 0) != (b < 0))) m += b;
+        return mk_int(m);
+    }
+    if (!CLOVE_ISNUM(x->tag)) as_int(x, what);   /* the type error */
+    if (!CLOVE_ISNUM(y->tag)) as_int(y, what);
+    if (x->tag == CLOVE_DOUBLE || y->tag == CLOVE_DOUBLE) {
+        double n = as_num(x), d = as_num(y), t;
+        if (d == 0) clove_error_cls("ArithmeticException", "Divide by zero");
+        double q = n / d;
+        if (q > -9.2233720368547758e18 && q < 9.2233720368547758e18) t = (double)(int64_t)q;
+        else if (isfinite(q)) t = trunc(q);
+        else { clove_error_cls("NumberFormatException", "Infinite or NaN"); t = 0; }
+        if (op == 'q') return mk_double(t);
+        double m = n - t * d;
+        if (op == 'm' && m != 0 && (n > 0) != (d > 0)) m += d;   /* NaN stays NaN */
+        return mk_double(m);
+    }
+    Clove *r;
+    if (x->tag == CLOVE_BIGDEC || y->tag == CLOVE_BIGDEC) {
+        if (op == 'q') return bd_quot(x, y);
+        r = bd_rem(x, y);
+    } else if (x->tag == CLOVE_RATIO || y->tag == CLOVE_RATIO) {
+        Clove *q, *den = big_mul(rat_den(x), rat_num(y));
+        big_divmod(big_mul(rat_num(x), rat_den(y)), den, &q, NULL);
+        q = to_bigint(q);
+        if (op == 'q') return q;
+        Clove *m[2] = { q, y };
+        Clove *s[2] = { x, arith(OP_MUL, m, 2, AR_CHECK) };
+        r = arith(OP_SUB, s, 2, AR_CHECK);
+    } else {
+        Clove *q; big_divmod(x, y, &q, &r);
+        if (op == 'q') return to_bigint(q);
+        r = to_bigint(r);
+    }
+    if (op == 'm' && num_cmp(r, mk_int(0)) != 0 &&
+        (num_cmp(x, mk_int(0)) > 0) != (num_cmp(y, mk_int(0)) > 0)) {
+        Clove *two[2] = { r, y };
+        r = arith(OP_ADD, two, 2, AR_CHECK);
+    }
+    return r;
+}
+
 static Clove *prim_mod(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "mod");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) {
-        Clove *r = bd_rem(argv[0], argv[1]);   /* Clojure: rem, shifted to the divisor's sign */
-        if (num_cmp(r, mk_int(0)) != 0 && (num_cmp(argv[0], mk_int(0)) > 0) != (num_cmp(argv[1], mk_int(0)) > 0)) {
-            Clove *two[2] = { r, argv[1] };
-            r = arith(OP_ADD, two, 2, AR_CHECK);
-        }
-        return r;
-    }
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *r; big_divmod(argv[0], argv[1], NULL, &r);   /* mod follows divisor sign */
-        if (!big_is_zero(r) && (num_cmp(r, mk_int(0)) < 0) != (num_cmp(argv[1], mk_int(0)) < 0))
-            r = big_addsub(r, argv[1], 0);
-        return to_bigint(r);
-    }
-    int64_t a = as_int(argv[0], "mod");
-    int64_t b = as_int(argv[1], "mod");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    int64_t m = a % b;
-    if (m != 0 && ((m < 0) != (b < 0))) m += b;  /* Clojure mod follows divisor's sign */
-    return mk_int(m);
+    return num_qrm(argv[0], argv[1], 'm', "mod");
 }
 
 /* ── Map primitives (HAMT engine — see the HAMT section above) ── */
@@ -9034,14 +9149,7 @@ static Clove *prim_merge(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_rem(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "rem");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_rem(argv[0], argv[1]);
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *r; big_divmod(argv[0], argv[1], NULL, &r); return to_bigint(r);
-    }
-    int64_t a = as_int(argv[0], "rem");
-    int64_t b = as_int(argv[1], "rem");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    return mk_int(a % b);
+    return num_qrm(argv[0], argv[1], 'r', "rem");
 }
 
 static Clove *prim_list(CloveEnv *env, Clove **argv, int nargs) {
@@ -9500,32 +9608,51 @@ static Clove *prim_seq_p(CloveEnv *env, Clove **argv, int nargs) {
 
 /* ───── Regex engine ─────────────────────────────────────────────────── */
 
-/* Tiny backtracking matcher. Supported: literals . ^ $ [abc] [a-z] [^...]
- * \d \D \w \W \s \S \n \t \r, ( ) capture groups, (?: ) non-capturing,
- * (?=X) (?!X) lookahead, | alternation, * + ? quantifiers with lazy
- * variants (*? +? ??), X{n} X{n,} X{n,m} bounded repeats (n,m ≤ 64,
- * desugared to copies).
- * Not supported: lookbehind / named groups — any (?<...) is a loud error
- * rather than a silent non-match. Patterns are plain
- * strings; the #"..." reader literal passes backslashes through raw.
- * Parse-time desugaring: X+ => X X* (atom re-parsed), X? => ALT(X, empty);
- * only star is a real loop, guarded against empty-match cycles. */
+/* Backtracking matcher with Java's syntax for the common constructs:
+ * literals, . ^ $ \A \z \Z \b \B, classes [abc] [a-z] [^...] with nested
+ * classes and && intersection, \d \w \s \h \v and their negations,
+ * \p{..}/\P{..} (POSIX names ASCII-only like Java; L Lu Ll N approximate
+ * Unicode by script ranges), escapes \t \n \r \f \a \e \cX \0ooo \xHH
+ * \x{h..} \uHHHH, \Q..\E, groups ( ) (?: ) (?<name> ) (?> ), lookahead
+ * (?= ) (?! ), backrefs \1..\9, inline flags (?imsx-imsx) and scoped
+ * (?i:X), quantifiers * + ? {n} {n,} {n,m} with lazy and possessive forms.
+ * Unsupported constructs (lookbehind, \k<name>, \G, \R, ...) are a loud
+ * error rather than a silent non-match.
+ *
+ * A quantified single-character atom becomes one RX_REP node that scans
+ * forward in a loop and backs off one char at a time, so x*, \w+ and .*
+ * neither recurse per character nor spend the backtracking budget per
+ * character. Other quantified atoms desugar: X+ => X X*, X? => ALT(X,
+ * empty), X{n,m} => copies; only star is a real loop, guarded against
+ * empty-match cycles. */
 
 enum { RX_CHAR, RX_ANY, RX_CLASS, RX_BOL, RX_EOL, RX_STAR, RX_LOOP,
-       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF, RX_WB };
+       RX_ALT, RX_JOIN, RX_GS, RX_GE, RX_LA, RX_BACKREF, RX_WB, RX_REP, RX_ATOMIC };
+
+/* flags, per node: RXF_DOTALL (?s) . matches line ends, RXF_ICASE (?i)
+ * ASCII case-insensitive, RXF_MULTI (?m) ^/$ at line breaks */
+#define RXF_DOTALL 1
+#define RXF_ICASE  2
+#define RXF_MULTI  4
 
 typedef struct Rx Rx;
-#define RX_MAX_URANGES 4
+#define RX_MAX_URANGES 6
+#define RX_MAX_PROPS 4
 struct Rx {
     uint8_t type;
     bool lazy;
-    bool neg;
-    int32_t cp;                /* RX_CHAR: the literal codepoint */
+    bool neg;                  /* class: complement; LA: negative; WB: \B */
+    bool possessive;           /* RX_REP: never back off */
+    uint8_t flags;             /* RXF_* in force where the node was parsed */
+    uint8_t nur, nprop;
+    uint8_t props[RX_MAX_PROPS];  /* class: property ids, | 0x80 when negated */
+    int32_t cp;                /* RX_CHAR: the codepoint; BOL/EOL: anchor kind */
     int group;
+    int min, max;              /* RX_REP bounds; max < 0: unbounded */
     uint8_t bits[32];          /* class member set for codepoints < 256 */
-    int32_t ur[RX_MAX_URANGES * 2];  /* class: unicode [lo,hi] pairs */
-    uint8_t nur;
-    Rx *next, *child, *alt, *owner;
+    int32_t ur[RX_MAX_URANGES * 2];  /* class: [lo,hi] pairs past 255 */
+    Rx *next, *child, *alt, *owner;  /* class: child = nested classes (linked
+                                      * by alt), owner = && operand */
     const char *last;          /* star: last entry position (cycle guard) */
 };
 
@@ -9537,6 +9664,7 @@ typedef struct {
     Rx *pool;
     int npool;
     int ngroups;
+    int flags;                 /* RXF_* in force at the cursor */
 } RxC;
 
 typedef struct { Rx *h, *t; } RxChain;
@@ -9546,34 +9674,262 @@ static Rx *rx_node(RxC *c, int type) {
     Rx *r = &c->pool[c->npool++];
     memset(r, 0, sizeof *r);
     r->type = (uint8_t)type;
+    r->flags = (uint8_t)c->flags;
     return r;
 }
 
 static void rx_bit(Rx *r, unsigned char ch) { r->bits[ch >> 3] |= (uint8_t)(1u << (ch & 7)); }
-static void rx_urange(Rx *r, int32_t lo, int32_t hi) {
-    if (r->nur >= RX_MAX_URANGES) clove_error("regex: too many non-ASCII chars in one class");
+/* a nested class unioned into r */
+static Rx *rx_subclass(RxC *c, Rx *r, bool neg) {
+    Rx *u = rx_node(c, RX_CLASS);
+    u->neg = neg;
+    u->alt = r->child; r->child = u;
+    return u;
+}
+static void rx_range(RxC *c, Rx *r, int32_t lo, int32_t hi) {
+    if (hi < lo) clove_error("regex: illegal character range");
+    for (; lo <= hi && lo < 256; lo++) rx_bit(r, (unsigned char)lo);
+    if (lo > hi) return;
+    while (r->nur >= RX_MAX_URANGES) {          /* full: spill into a nested class */
+        Rx *u = r->child;
+        r = (u && !u->neg && u->nur < RX_MAX_URANGES) ? u : rx_subclass(c, r, false);
+    }
     r->ur[r->nur * 2] = lo;
     r->ur[r->nur * 2 + 1] = hi;
     r->nur++;
 }
-static bool rx_class_match(const Rx *r, int32_t cp) {
+
+/* Unicode-ish properties for \p{..}: ASCII exact, beyond that by script
+ * blocks (there are no Unicode tables in clove). */
+enum { RXP_L = 1, RXP_LU, RXP_LL, RXP_N };
+static bool rx_prop(int prop, int32_t cp) {
+    bool up, lo;
+    if (cp < 0x80) {
+        switch (prop) {
+            case RXP_L:  return isalpha(cp);
+            case RXP_LU: return isupper(cp);
+            case RXP_LL: return islower(cp);
+            default:     return isdigit(cp);
+        }
+    }
+    if (prop == RXP_N)
+        return cp == 0xB2 || cp == 0xB3 || cp == 0xB9 || (cp >= 0xBC && cp <= 0xBE) ||
+               (cp >= 0x660 && cp <= 0x669) || (cp >= 0x6F0 && cp <= 0x6F9) ||
+               (cp >= 0x966 && cp <= 0x96F) || (cp >= 0x2070 && cp <= 0x2079) ||
+               (cp >= 0x2080 && cp <= 0x2089) || (cp >= 0x2150 && cp <= 0x2189) ||
+               (cp >= 0x2460 && cp <= 0x249B) || (cp >= 0xFF10 && cp <= 0xFF19);
+    /* cased letters: Latin-1, Latin Extended-A/B (even = upper, mostly), Greek, Cyrillic */
+    if (cp >= 0xC0 && cp <= 0xFF && cp != 0xD7 && cp != 0xF7) { up = cp < 0xDF; lo = !up; }
+    else if (cp >= 0x100 && cp <= 0x24F) { up = !(cp & 1); lo = cp & 1; if (cp >= 0x139 && cp <= 0x148) { up = cp & 1; lo = !up; } }
+    else if ((cp >= 0x391 && cp <= 0x3AB) || cp == 0x386 || (cp >= 0x388 && cp <= 0x38F)) { up = true; lo = false; }
+    else if (cp >= 0x3AC && cp <= 0x3CE) { up = false; lo = true; }
+    else if (cp >= 0x400 && cp <= 0x42F) { up = true; lo = false; }
+    else if (cp >= 0x430 && cp <= 0x45F) { up = false; lo = true; }
+    else if (cp >= 0x460 && cp <= 0x52F) { up = !(cp & 1); lo = cp & 1; }
+    else if (cp >= 0x1E00 && cp <= 0x1EFF) { up = !(cp & 1); lo = cp & 1; }
+    else if (cp >= 0xFF21 && cp <= 0xFF3A) { up = true; lo = false; }
+    else if (cp >= 0xFF41 && cp <= 0xFF5A) { up = false; lo = true; }
+    else {
+        up = lo = false;
+        if (prop == RXP_L)   /* uncased scripts */
+            return cp == 0xAA || cp == 0xB5 || cp == 0xBA || (cp >= 0x250 && cp <= 0x2AF) ||
+                   (cp >= 0x3D0 && cp <= 0x3FF) || (cp >= 0x531 && cp <= 0x587) ||
+                   (cp >= 0x5D0 && cp <= 0x5EA) || (cp >= 0x620 && cp <= 0x64A) ||
+                   (cp >= 0x904 && cp <= 0x939) || (cp >= 0xE01 && cp <= 0xE30) ||
+                   (cp >= 0x10A0 && cp <= 0x10FF) || (cp >= 0x1100 && cp <= 0x11FF) ||
+                   (cp >= 0x1F00 && cp <= 0x1FFF) || (cp >= 0x3041 && cp <= 0x3096) ||
+                   (cp >= 0x30A1 && cp <= 0x30FA) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+                   (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+                   (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x20000 && cp <= 0x2FA1F);
+    }
+    return prop == RXP_L ? (up || lo) : prop == RXP_LU ? up : lo;
+}
+
+static bool rx_class_test(const Rx *r, int32_t cp, int flags);
+/* class membership before r's own complement is applied */
+static bool rx_class_raw(const Rx *r, int32_t cp) {
     bool in = cp < 256 && ((r->bits[cp >> 3] >> (cp & 7)) & 1);
     for (int i = 0; !in && i < r->nur; i++)
         in = cp >= r->ur[i * 2] && cp <= r->ur[i * 2 + 1];
-    return r->neg ? !in : in;
+    for (int i = 0; !in && i < r->nprop; i++)
+        in = rx_prop(r->props[i] & 0x7F, cp) != ((r->props[i] & 0x80) != 0);
+    for (const Rx *u = r->child; !in && u; u = u->alt)
+        in = rx_class_test(u, cp, 0);
+    if (in && r->owner) in = rx_class_test(r->owner, cp, 0);
+    return in;
+}
+static bool rx_class_test(const Rx *r, int32_t cp, int flags) {
+    bool in = rx_class_raw(r, cp);
+    if (!in && (flags & RXF_ICASE) && cp < 0x80 && isalpha(cp))
+        in = rx_class_raw(r, islower(cp) ? toupper(cp) : tolower(cp));
+    return in != r->neg;
 }
 
-static void rx_class_shorthand(Rx *r, char c) {
-    switch (c) {
-        case 'd': for (int i = '0'; i <= '9'; i++) rx_bit(r, (unsigned char)i); break;
-        case 'w': for (int i = '0'; i <= '9'; i++) rx_bit(r, (unsigned char)i);
-                  for (int i = 'a'; i <= 'z'; i++) rx_bit(r, (unsigned char)i);
-                  for (int i = 'A'; i <= 'Z'; i++) rx_bit(r, (unsigned char)i);
-                  rx_bit(r, '_'); break;
-        case 's': rx_bit(r, ' '); rx_bit(r, '\t'); rx_bit(r, '\n');
-                  rx_bit(r, '\r'); rx_bit(r, '\f'); rx_bit(r, '\v'); break;
-        default: clove_error("regex: unknown class \\%c", c);
+/* \d \w \s \h \v (lower case) into r; upper case is the complement, as a
+ * nested class. */
+static void rx_shorthand(RxC *c, Rx *r, char e) {
+    if (isupper((unsigned char)e)) { r = rx_subclass(c, r, true); e = (char)tolower(e); }
+    switch (e) {
+        case 'd': rx_range(c, r, '0', '9'); break;
+        case 'w': rx_range(c, r, '0', '9'); rx_range(c, r, 'a', 'z');
+                  rx_range(c, r, 'A', 'Z'); rx_bit(r, '_'); break;
+        case 's': rx_range(c, r, '\t', '\r'); rx_bit(r, ' '); break;
+        case 'h': rx_bit(r, ' '); rx_bit(r, '\t'); rx_bit(r, 0xA0); rx_range(c, r, 0x1680, 0x1680);
+                  rx_range(c, r, 0x180E, 0x180E); rx_range(c, r, 0x2000, 0x200A);
+                  rx_range(c, r, 0x202F, 0x202F); rx_range(c, r, 0x205F, 0x205F);
+                  rx_range(c, r, 0x3000, 0x3000); break;
+        case 'v': rx_range(c, r, '\n', '\r'); rx_bit(r, 0x85); rx_range(c, r, 0x2028, 0x2029); break;
     }
+}
+
+/* \p{Name} / \P{Name} / \pL into r */
+static void rx_property(RxC *c, Rx *r, bool neg) {
+    char name[32]; size_t n = 0;
+    if (*c->p == '{') {
+        c->p++;
+        while (*c->p && *c->p != '}' && n < sizeof name - 1) name[n++] = *c->p++;
+        if (*c->p != '}') clove_error("regex: bad \\p{...} property");
+        c->p++;
+    } else if (*c->p) name[n++] = *c->p++;
+    name[n] = '\0';
+    const char *nm = name;
+    if (!strncmp(nm, "Is", 2)) nm += 2;
+    int prop = 0;
+    if (!strcmp(nm, "L") || !strcmp(nm, "Letter") || !strcmp(nm, "Alphabetic")) prop = RXP_L;
+    else if (!strcmp(nm, "Lu") || !strcmp(nm, "Uppercase")) prop = RXP_LU;
+    else if (!strcmp(nm, "Ll") || !strcmp(nm, "Lowercase")) prop = RXP_LL;
+    else if (!strcmp(nm, "N") || !strcmp(nm, "Nd") || (!strcmp(nm, "Digit") && nm != name)) prop = RXP_N;
+    if (prop) {
+        if (r->nprop >= RX_MAX_PROPS) r = rx_subclass(c, r, false);
+        r->props[r->nprop++] = (uint8_t)(prop | (neg ? 0x80 : 0));
+        return;
+    }
+    /* POSIX classes: ASCII only, as in Java */
+    Rx *t = neg ? rx_subclass(c, r, true) : r;
+    if (!strcmp(nm, "Lower")) rx_range(c, t, 'a', 'z');
+    else if (!strcmp(nm, "Upper")) rx_range(c, t, 'A', 'Z');
+    else if (!strcmp(nm, "ASCII")) rx_range(c, t, 0, 0x7F);
+    else if (!strcmp(nm, "Alpha")) { rx_range(c, t, 'a', 'z'); rx_range(c, t, 'A', 'Z'); }
+    else if (!strcmp(nm, "Digit")) rx_range(c, t, '0', '9');
+    else if (!strcmp(nm, "Alnum")) { rx_range(c, t, 'a', 'z'); rx_range(c, t, 'A', 'Z'); rx_range(c, t, '0', '9'); }
+    else if (!strcmp(nm, "Punct")) { for (int i = 0x21; i < 0x7F; i++) if (ispunct(i)) rx_bit(t, (unsigned char)i); }
+    else if (!strcmp(nm, "Graph")) rx_range(c, t, 0x21, 0x7E);
+    else if (!strcmp(nm, "Print")) rx_range(c, t, 0x20, 0x7E);
+    else if (!strcmp(nm, "Blank")) { rx_bit(t, ' '); rx_bit(t, '\t'); }
+    else if (!strcmp(nm, "Cntrl")) { rx_range(c, t, 0, 0x1F); rx_bit(t, 0x7F); }
+    else if (!strcmp(nm, "XDigit")) { rx_range(c, t, '0', '9'); rx_range(c, t, 'a', 'f'); rx_range(c, t, 'A', 'F'); }
+    else if (!strcmp(nm, "Space")) { rx_range(c, t, '\t', '\r'); rx_bit(t, ' '); }
+    else clove_error("regex: unsupported property \\p{%s}", name);
+}
+
+static int rx_hexval(char h) {
+    return (h >= '0' && h <= '9') ? h - '0' : (h >= 'a' && h <= 'f') ? h - 'a' + 10
+         : (h >= 'A' && h <= 'F') ? h - 'A' + 10 : -1;
+}
+static int32_t rx_hex(RxC *c, int ndig) {
+    int32_t v = 0;
+    for (int k = 0; k < ndig; k++) {
+        int d = rx_hexval(*c->p);
+        if (d < 0) clove_error("regex: illegal hexadecimal escape sequence");
+        v = v * 16 + d; c->p++;
+    }
+    return v;
+}
+
+/* The escape after a backslash (c->p is past it): a single character
+ * returns its codepoint; a class escape (\d \W \p{L} ...) goes into `set`
+ * and returns -1. Anchors and backrefs are handled by the caller. */
+static int32_t rx_escape(RxC *c, Rx *set) {
+    char e = *c->p;
+    if (!e) clove_error("regex: trailing backslash");
+    c->p++;
+    switch (e) {
+        case 'd': case 'w': case 's': case 'h': case 'v':
+        case 'D': case 'W': case 'S': case 'H': case 'V':
+            rx_shorthand(c, set, e); return -1;
+        case 'p': case 'P': rx_property(c, set, e == 'P'); return -1;
+        case 't': return '\t';
+        case 'n': return '\n';
+        case 'r': return '\r';
+        case 'f': return '\f';
+        case 'a': return 7;
+        case 'e': return 27;
+        case 'c': if (!*c->p) clove_error("regex: \\c needs a character"); return *c->p++ ^ 64;
+        case '0': {
+            int32_t v = 0; int k = 0;
+            while (k < 3 && *c->p >= '0' && *c->p <= '7' && v * 8 + (*c->p - '0') <= 0377) { v = v * 8 + (*c->p++ - '0'); k++; }
+            if (!k) clove_error("regex: illegal octal escape sequence");
+            return v;
+        }
+        case 'x':
+            if (*c->p == '{') {
+                c->p++;
+                int32_t v = 0; int k = 0;
+                while (rx_hexval(*c->p) >= 0 && k < 8) { v = v * 16 + rx_hexval(*c->p++); k++; }
+                if (!k || *c->p != '}' || v > 0x10FFFF) clove_error("regex: illegal hexadecimal escape sequence");
+                c->p++;
+                return v;
+            }
+            return rx_hex(c, 2);
+        case 'u': {
+            int32_t v = rx_hex(c, 4);
+            if (v >= 0xD800 && v <= 0xDBFF && c->p[0] == '\\' && c->p[1] == 'u') {
+                const char *save = c->p;
+                c->p += 2;
+                int32_t lo = rx_hex(c, 4);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) return 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                c->p = save;
+            }
+            return v;
+        }
+    }
+    if ((unsigned char)e >= 0x80) { c->p--; return utf8_next(&c->p); }
+    if (isalnum((unsigned char)e)) clove_error("regex: unsupported escape \\%c", e);
+    return (unsigned char)e;                     /* \. \* \\ \- ... */
+}
+
+/* A [...] class; c->p is at the '['. */
+static Rx *rx_parse_class(RxC *c);
+static void rx_class_items(RxC *c, Rx *r) {
+    bool first = true;
+    while (*c->p && (*c->p != ']' || first)) {
+        first = false;
+        if (c->p[0] == '&' && c->p[1] == '&') {  /* intersect with the rest */
+            c->p += 2;
+            Rx *rhs = rx_node(c, RX_CLASS);
+            rx_class_items(c, rhs);
+            r->owner = rhs;
+            return;
+        }
+        if (*c->p == '[') {
+            Rx *u = rx_parse_class(c);
+            u->alt = r->child; r->child = u;
+            continue;
+        }
+        int32_t lo;
+        if (*c->p == '\\') {
+            c->p++;
+            if (*c->p == 'b' || *c->p == 'B') clove_error("regex: \\%c is not allowed in a class", *c->p);
+            lo = rx_escape(c, r);
+            if (lo < 0) continue;
+        } else lo = utf8_next(&c->p);
+        if (*c->p == '-' && c->p[1] && c->p[1] != ']' && c->p[1] != '[') {
+            c->p++;                                   /* consume '-' */
+            int32_t hi;
+            if (*c->p == '\\') { c->p++; hi = rx_escape(c, r); if (hi < 0) clove_error("regex: illegal character range"); }
+            else hi = utf8_next(&c->p);
+            rx_range(c, r, lo, hi);
+        } else rx_range(c, r, lo, lo);
+    }
+}
+static Rx *rx_parse_class(RxC *c) {
+    c->p++;
+    Rx *r = rx_node(c, RX_CLASS);
+    if (*c->p == '^') { r->neg = true; c->p++; }
+    rx_class_items(c, r);
+    if (*c->p != ']') clove_error("regex: missing ]");
+    c->p++;
+    return r;
 }
 
 static RxChain rx_parse_alt(RxC *c);
@@ -9584,34 +9940,58 @@ static RxChain rx_parse_atom(RxC *c) {
     char c0 = *c->p;
     if (c0 == '(') {
         c->p++;
-        bool capture = true;
-        if (c->p[0] == '?' && (c->p[1] == '=' || c->p[1] == '!')) {
-            /* lookahead (?=X) / (?!X): zero-width assertion */
-            bool neg = c->p[1] == '!';
-            c->p += 2;
-            RxChain inner = rx_parse_alt(c);
-            if (*c->p != ')') clove_error("regex: missing )");
-            c->p++;
-            Rx *la = rx_node(c, RX_LA);
-            la->neg = neg;
-            la->child = inner.h;   /* tail's next stays NULL: bare sub-match */
-            ch.h = ch.t = la;
-            return ch;
+        int saved_flags = c->flags;
+        if (c->p[0] == '?') {
+            char k = c->p[1];
+            if (k == '=' || k == '!' || k == '>') {
+                /* lookahead (?=X) (?!X), atomic (?>X): a sub-match */
+                c->p += 2;
+                RxChain inner = rx_parse_alt(c);
+                c->flags = saved_flags;
+                if (*c->p != ')') clove_error("regex: missing )");
+                c->p++;
+                Rx *la = rx_node(c, k == '>' ? RX_ATOMIC : RX_LA);
+                la->neg = k == '!';
+                la->child = inner.h;   /* tail's next stays NULL: bare sub-match */
+                ch.h = ch.t = la;
+                return ch;
+            }
+            if (k == '<' && isalpha((unsigned char)c->p[2])) {   /* (?<name>X): numbered group */
+                c->p += 2;
+                while (isalnum((unsigned char)*c->p)) c->p++;
+                if (*c->p != '>') clove_error("regex: bad named group");
+                c->p++;
+            } else if (k == '<') {
+                clove_error("regex: lookbehind (?<= (?<! is not supported; use the "
+                            "peg battery for lookbehind-style matching");
+            } else {
+                /* inline flags: (?imsx-imsx) for the rest of the group, (?i:X) scoped */
+                const char *q = c->p + 1;
+                bool off = false; int on_f = 0, off_f = 0;
+                for (; *q && *q != ')' && *q != ':'; q++) {
+                    int f = *q == 'i' ? RXF_ICASE : *q == 's' ? RXF_DOTALL : *q == 'm' ? RXF_MULTI : 0;
+                    if (*q == '-') off = true;
+                    else if (f) { if (off) off_f |= f; else on_f |= f; }
+                    else if (!strchr("xuUd", *q))
+                        clove_error("regex: unsupported construct (?%c", *q);
+                }
+                if (!*q) clove_error("regex: missing )");
+                c->flags = (c->flags | on_f) & ~off_f;
+                c->p = q + 1;
+                if (*q == ')') return ch;   /* (?i): the flags stay for the rest of the group */
+                RxChain inner = rx_parse_alt(c);
+                c->flags = saved_flags;
+                if (*c->p != ')') clove_error("regex: missing )");
+                c->p++;
+                return inner;
+            }
         }
-        if (c->p[0] == '?' && c->p[1] == '<')
-            clove_error("regex: (?<...) is not supported (no lookbehind or "
-                       "named groups); use the peg battery for lookbehind-style "
-                       "matching");
-        if (c->p[0] == '?' && c->p[1] == ':') { capture = false; c->p += 2; }
-        int idx = 0;
-        if (capture) {
-            if (c->ngroups >= RX_MAX_GROUPS) clove_error("regex: too many groups");
-            idx = c->ngroups++;
-        }
+        if (c->ngroups >= RX_MAX_GROUPS) clove_error("regex: too many groups");
+        int idx = c->ngroups++;
         RxChain inner = rx_parse_alt(c);
+        c->flags = saved_flags;
         if (*c->p != ')') clove_error("regex: missing )");
         c->p++;
-        if (!capture) return inner;
         Rx *gs = rx_node(c, RX_GS); gs->group = idx;
         Rx *ge = rx_node(c, RX_GE); ge->group = idx;
         gs->next = inner.h ? inner.h : ge;
@@ -9620,63 +10000,36 @@ static RxChain rx_parse_atom(RxC *c) {
         return ch;
     }
     if (c0 == '[') {
-        c->p++;
-        Rx *r = rx_node(c, RX_CLASS);
-        if (*c->p == '^') { r->neg = true; c->p++; }
-        while (*c->p && *c->p != ']') {
-            if (*c->p == '\\' && c->p[1]) {
-                char e = c->p[1]; c->p += 2;
-                if (e == 'd' || e == 'w' || e == 's') rx_class_shorthand(r, e);
-                else if (e == 'n') rx_bit(r, '\n');
-                else if (e == 't') rx_bit(r, '\t');
-                else if (e == 'r') rx_bit(r, '\r');
-                else rx_bit(r, (unsigned char)e);
-                continue;
-            }
-            int32_t lo = utf8_next(&c->p);
-            if (*c->p == '-' && c->p[1] && c->p[1] != ']') {
-                c->p++;                              /* consume '-' */
-                int32_t hi = utf8_next(&c->p);
-                if (hi < 256) {
-                    for (int32_t i = lo; i <= hi; i++) rx_bit(r, (unsigned char)i);
-                } else rx_urange(r, lo, hi);
-            } else if (lo < 256) rx_bit(r, (unsigned char)lo);
-            else rx_urange(r, lo, lo);
-        }
-        if (*c->p != ']') clove_error("regex: missing ]");
-        c->p++;
-        ch.h = ch.t = r;
-        return ch;
-    }
-    if (c0 == '\\') {
-        char e = c->p[1];
-        if (!e) clove_error("regex: trailing backslash");
-        c->p += 2;
-        Rx *r;
-        if (e == 'd' || e == 'w' || e == 's') {
-            r = rx_node(c, RX_CLASS); rx_class_shorthand(r, e);
-        } else if (e == 'D' || e == 'W' || e == 'S') {
-            r = rx_node(c, RX_CLASS); rx_class_shorthand(r, (char)tolower(e)); r->neg = true;
-        } else if (e >= '1' && e <= '9') {        /* \1..\9 backreference */
-            r = rx_node(c, RX_BACKREF); r->group = e - '0';
-        } else if (e == 'b' || e == 'B') {        /* \b / \B word boundary */
-            r = rx_node(c, RX_WB); r->neg = (e == 'B');
-        } else {
-            r = rx_node(c, RX_CHAR);
-            if ((unsigned char)e >= 0x80) {          /* \é etc: whole codepoint */
-                c->p -= 1;
-                r->cp = utf8_next(&c->p);
-            } else {
-                r->cp = e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
-            }
-        }
+        Rx *r = rx_parse_class(c);
         ch.h = ch.t = r;
         return ch;
     }
     Rx *r;
+    if (c0 == '\\') {
+        char e = c->p[1];
+        if (e >= '1' && e <= '9') {                   /* \1..\9 backreference */
+            c->p += 2;
+            r = rx_node(c, RX_BACKREF); r->group = e - '0';
+        } else if (e == 'b' || e == 'B') {            /* \b / \B word boundary */
+            c->p += 2;
+            r = rx_node(c, RX_WB); r->neg = (e == 'B');
+        } else if (e == 'A') { c->p += 2; r = rx_node(c, RX_BOL); r->cp = 1; }
+        else if (e == 'z') { c->p += 2; r = rx_node(c, RX_EOL); r->cp = 2; }
+        else if (e == 'Z') { c->p += 2; r = rx_node(c, RX_EOL); r->cp = 1; }
+        else {
+            c->p++;
+            Rx *set = rx_node(c, RX_CLASS);
+            int32_t cp = rx_escape(c, set);
+            if (cp >= 0) { set->type = RX_CHAR; set->cp = cp; }
+            r = set;
+        }
+        ch.h = ch.t = r;
+        return ch;
+    }
     if (c0 == '.') { c->p++; r = rx_node(c, RX_ANY); }
     else if (c0 == '^') { c->p++; r = rx_node(c, RX_BOL); }
     else if (c0 == '$') { c->p++; r = rx_node(c, RX_EOL); }
+    else if (c0 == '*' || c0 == '+' || c0 == '?') clove_error("regex: dangling meta character '%c'", c0);
     else { r = rx_node(c, RX_CHAR); r->cp = utf8_next(&c->p); }
     ch.h = ch.t = r;
     return ch;
@@ -9694,106 +10047,98 @@ static RxChain rx_star(RxC *c, RxChain atom, bool lazy) {
     return ch;
 }
 
+/* A chain run as one unit that is never backtracked into: (?>X), X*+ */
+static RxChain rx_atomic(RxC *c, RxChain unit) {
+    if (!unit.h) return unit;
+    Rx *a = rx_node(c, RX_ATOMIC);
+    a->child = unit.h;
+    RxChain ch = {a, a};
+    return ch;
+}
+
+static bool rx_single(RxChain a) {
+    return a.h && a.h == a.t && !a.h->next &&
+           (a.h->type == RX_CHAR || a.h->type == RX_ANY || a.h->type == RX_CLASS);
+}
+
 static RxChain rx_parse_cat(RxC *c) {
     RxChain out = {NULL, NULL};
     while (*c->p && *c->p != '|' && *c->p != ')') {
         const char *atom_src = c->p;
         int groups_before = c->ngroups;          /* group # at the atom's start */
+        int flags_before = c->flags;
         RxChain atom = rx_parse_atom(c);
         int groups_after = c->ngroups;           /* ... and just after it */
+        int flags_after = c->flags;
         char q = *c->p;
         RxChain unit = atom;
+        int lo = -1, hi = -1;                    /* quantifier bounds; hi -1: open */
         if (q == '{' && c->p[1] >= '0' && c->p[1] <= '9') {
-            /* X{n} / X{n,} / X{n,m}: desugar by re-parsing the atom —
-             * n required copies, then a star ({n,}) or m-n optionals. */
             c->p++;
-            int lo = 0, hi = -1;             /* -1: exactly lo; -2: open */
-            while (*c->p >= '0' && *c->p <= '9') lo = lo * 10 + (*c->p++ - '0');
+            lo = 0;
+            while (*c->p >= '0' && *c->p <= '9') { lo = lo * 10 + (*c->p++ - '0'); if (lo > 100000) clove_error("regex: {n,m} out of range"); }
+            hi = lo;
             if (*c->p == ',') {
                 c->p++;
-                if (*c->p == '}') hi = -2;
+                if (*c->p == '}') hi = -1;
                 else {
                     hi = 0;
-                    while (*c->p >= '0' && *c->p <= '9') hi = hi * 10 + (*c->p++ - '0');
+                    while (*c->p >= '0' && *c->p <= '9') { hi = hi * 10 + (*c->p++ - '0'); if (hi > 100000) clove_error("regex: {n,m} out of range"); }
                 }
             }
             if (*c->p != '}') clove_error("regex: bad {n,m} quantifier");
             c->p++;
-            bool qlazy = false;
-            if (*c->p == '?') { qlazy = true; c->p++; }   /* {n,m}? lazy */
-            else if (*c->p == '+') c->p++;                /* {n,m}+ possessive → greedy */
-            if (hi == -1) hi = lo;
-            if (lo > 64 || (hi != -2 && (hi > 64 || hi < lo)))
-                clove_error("regex: {n,m} out of range");
+            if (hi >= 0 && hi < lo) clove_error("regex: {n,m} out of range");
+        } else if (q == '*' || q == '+' || q == '?') {
+            c->p++;
+            lo = q == '+' ? 1 : 0;
+            hi = q == '?' ? 1 : -1;
+        }
+        if (lo >= 0) {
+            bool lazy = *c->p == '?', poss = *c->p == '+';
+            if (lazy || poss) c->p++;
             const char *after = c->p;
-            RxChain seq = lo > 0 ? atom : (RxChain){NULL, NULL};
-            for (int k = 1; k < lo; k++) {       /* required copies 2..n */
-                c->p = atom_src;
-                c->ngroups = groups_before;      /* copies REUSE the atom's group #s */
-                RxChain copy = rx_parse_atom(c);
-                c->ngroups = groups_after;       /* (last iteration wins, like Java) */
-                if (!seq.h) seq = copy;
-                else if (copy.h) { seq.t->next = copy.h; seq.t = copy.t; }
-            }
-            if (hi == -2) {                      /* {n,}: append X* */
-                c->p = atom_src;
-                c->ngroups = groups_before;
-                RxChain copy = rx_parse_atom(c);
-                c->ngroups = groups_after;
-                RxChain star = rx_star(c, copy, qlazy);
-                if (!seq.h) seq = star;
-                else { seq.t->next = star.h; seq.t = star.t; }
+            if (!atom.h) {
+                /* (?i)* and friends: nothing to repeat */
+            } else if (rx_single(atom)) {
+                Rx *rep = rx_node(c, RX_REP);
+                rep->child = atom.h; rep->min = lo; rep->max = hi;
+                rep->lazy = lazy; rep->possessive = poss;
+                unit.h = unit.t = rep;
             } else {
-                for (int k = lo; k < hi; k++) {  /* optional copies */
-                    c->p = atom_src;
-                    c->ngroups = groups_before;
-                    RxChain copy = rx_parse_atom(c);
-                    c->ngroups = groups_after;
-                    Rx *a = rx_node(c, RX_ALT);
-                    Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
-                    Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
-                    if (copy.t) copy.t->next = j1;
-                    Rx *xbranch = copy.h ? copy.h : j1;
-                    a->child = qlazy ? j2 : xbranch;   /* lazy prefers the empty branch */
-                    a->alt   = qlazy ? xbranch : j2;
-                    if (!seq.h) { seq.h = seq.t = a; }
-                    else { seq.t->next = a; seq.t = a; }
+                /* X{lo,hi} => lo copies of X, then X* (open) or hi-lo optional
+                 * copies. Copies re-parse the atom and REUSE its group numbers
+                 * (the last iteration wins, like Java). */
+                if (lo > 1000 || hi > 1000) clove_error("regex too complex: {n,m} on a group");
+                RxChain seq = {NULL, NULL};
+                int ncopies = hi < 0 ? lo + 1 : hi;
+                for (int k = 0; k < ncopies; k++) {
+                    RxChain copy;
+                    if (k == 0) copy = atom;
+                    else {
+                        c->p = atom_src; c->ngroups = groups_before; c->flags = flags_before;
+                        copy = rx_parse_atom(c);
+                        c->ngroups = groups_after; c->flags = flags_after;
+                    }
+                    if (k >= lo && hi < 0) copy = rx_star(c, copy, lazy);
+                    else if (k >= lo) {                   /* optional copy */
+                        Rx *a = rx_node(c, RX_ALT);
+                        Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
+                        Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
+                        if (copy.t) copy.t->next = j1;
+                        Rx *xbranch = copy.h ? copy.h : j1;
+                        a->child = lazy ? j2 : xbranch;   /* lazy prefers the empty branch */
+                        a->alt   = lazy ? xbranch : j2;
+                        copy.h = copy.t = a;
+                    }
+                    if (!seq.h) seq = copy;
+                    else if (copy.h) { seq.t->next = copy.h; seq.t = copy.t; }
                 }
+                unit = poss ? rx_atomic(c, seq) : seq;
             }
             c->p = after;
-            if (!out.h) out = seq;
-            else if (seq.h) { out.t->next = seq.h; out.t = seq.t; }
-            continue;
         }
-        if (q == '*' || q == '+' || q == '?') {
-            c->p++;
-            bool lazy = *c->p == '?';
-            if (lazy) c->p++;
-            else if (*c->p == '+') c->p++;   /* possessive (a++, a*+) → treat greedy */
-            if (q == '*') {
-                unit = rx_star(c, atom, lazy);
-            } else if (q == '+') {
-                /* X+ => X X*: re-parse the atom for the star's copy. */
-                const char *save = c->p;
-                c->p = atom_src;
-                c->ngroups = groups_before;  /* copy REUSES the atom's group #s */
-                RxChain atom2 = rx_parse_atom(c);
-                c->ngroups = groups_after;
-                c->p = save;
-                RxChain star = rx_star(c, atom2, lazy);
-                atom.t->next = star.h;
-                unit.h = atom.h; unit.t = star.t;
-            } else {  /* ? => ALT(X, empty); lazy ?? prefers empty */
-                Rx *a = rx_node(c, RX_ALT);
-                Rx *j1 = rx_node(c, RX_JOIN); j1->owner = a;
-                Rx *j2 = rx_node(c, RX_JOIN); j2->owner = a;
-                if (atom.t) atom.t->next = j1;
-                Rx *xbranch = atom.h ? atom.h : j1;
-                a->child = lazy ? j2 : xbranch;
-                a->alt   = lazy ? xbranch : j2;
-                unit.h = unit.t = a;
-            }
-        }
+        if (!unit.h) continue;
         if (!out.h) out = unit;
         else { out.t->next = unit.h; out.t = unit.t; }
     }
@@ -9819,56 +10164,107 @@ static RxChain rx_parse_alt(RxC *c) {
 /* ── matcher ── */
 
 static const char *rx_str_begin;
-/* inline flags, set by rx_compile: RXF_DOTALL (?s) . matches newline,
- * RXF_ICASE (?i) ASCII case-insensitive, RXF_MULTI (?m) ^/$ at line breaks */
-#define RXF_DOTALL 1
-#define RXF_ICASE  2
-#define RXF_MULTI  4
-static int rx_dotall;
 static const char *rx_match_end;
 static const char *rx_cap_s[RX_MAX_GROUPS], *rx_cap_e[RX_MAX_GROUPS];
 static long rx_steps;          /* backtracking budget per match attempt */
 #define RX_MAX_STEPS 2000000L
+static void rx_step(void) {
+    if (++rx_steps > RX_MAX_STEPS) clove_error("regex: too much backtracking");
+}
 
-static bool rx_m(Rx *r, const char *s) {
-    if (++rx_steps > RX_MAX_STEPS)
-        clove_error("regex: too much backtracking");
-    if (!r) { rx_match_end = s; return true; }
+/* Length of the line terminator at s (\n, \r\n, \r, U+0085, U+2028/9), or 0. */
+static int rx_term_len(const char *s) {
+    unsigned char a = (unsigned char)s[0];
+    if (a == '\n') return 1;
+    if (a == '\r') return s[1] == '\n' ? 2 : 1;
+    if (a == 0xC2 && (unsigned char)s[1] == 0x85) return 2;
+    if (a == 0xE2 && (unsigned char)s[1] == 0x80 && ((unsigned char)s[2] == 0xA8 || (unsigned char)s[2] == 0xA9)) return 3;
+    return 0;
+}
+
+/* One character against a CHAR/ANY/CLASS node; advances *pp on a match. */
+static bool rx_one(const Rx *r, const char **pp) {
+    const char *s = *pp;
+    if (!*s) return false;
     switch (r->type) {
         case RX_CHAR:
             if (r->cp < 0x80) {
-                if (rx_dotall & RXF_ICASE)
-                    return *s && tolower((unsigned char)*s) == tolower(r->cp) && rx_m(r->next, s + 1);
-                return *s == (char)r->cp && rx_m(r->next, s + 1);
+                bool hit = (r->flags & RXF_ICASE) ? tolower((unsigned char)*s) == tolower(r->cp)
+                                                  : *s == (char)r->cp;
+                if (hit) *pp = s + 1;
+                return hit;
             }
-            { const char *p = s; return *s && utf8_next(&p) == r->cp && rx_m(r->next, p); }
-        case RX_ANY: {
-            if (!*s || (!(rx_dotall & RXF_DOTALL) && *s == '\n')) return false;
+            { const char *p = s; if (utf8_next(&p) != r->cp) return false; *pp = p; return true; }
+        case RX_ANY:
+            if (!(r->flags & RXF_DOTALL) && rx_term_len(s)) return false;
+            utf8_next(pp);                 /* one CODEPOINT, not one byte */
+            return true;
+        default: {
             const char *p = s;
-            utf8_next(&p);                 /* one CODEPOINT, not one byte */
-            return rx_m(r->next, p);
+            if (!rx_class_test(r, utf8_next(&p), r->flags)) return false;
+            *pp = p;
+            return true;
         }
-        case RX_CLASS: {
-            if (!*s) return false;
+    }
+}
+
+/* Start of the codepoint before p (never before floor), matching how
+ * utf8_next steps forward over valid and invalid bytes alike. */
+static const char *rx_back1(const char *p, const char *floor) {
+    for (int k = 2; k <= 4 && p - k >= floor; k++) {
+        const char *q = p - k;
+        if (((unsigned char)*q & 0xC0) == 0x80) continue;
+        const char *t = q;
+        utf8_next(&t);
+        if (t == p) return q;
+        break;
+    }
+    return p - 1;
+}
+
+static bool rx_m(Rx *r, const char *s) {
+    clove_check_stack();      /* deep nested groups or a long complex star: an error, not a crash */
+    if (!r) { rx_match_end = s; return true; }
+    switch (r->type) {
+        case RX_CHAR: case RX_ANY: case RX_CLASS: {
             const char *p = s;
-            int32_t cp = utf8_next(&p);
-            bool hit = rx_class_match(r, cp);
-            if (!hit && (rx_dotall & RXF_ICASE) && cp < 0x80 && isalpha(cp)) {
-                int32_t other = islower(cp) ? toupper(cp) : tolower(cp);
-                /* a negated class must exclude both cases: [^a] rejects A too */
-                hit = r->neg ? (rx_class_match(r, cp) && rx_class_match(r, other))
-                             : rx_class_match(r, other);
-            } else if (hit && r->neg && (rx_dotall & RXF_ICASE) && cp < 0x80 && isalpha(cp)) {
-                int32_t other = islower(cp) ? toupper(cp) : tolower(cp);
-                hit = rx_class_match(r, other);
+            return rx_one(r, &p) && rx_m(r->next, p);
+        }
+        case RX_REP: {
+            const char *p = s;
+            int n = 0;
+            for (; n < r->min; n++) if (!rx_one(r->child, &p)) return false;
+            if (r->lazy) {
+                for (;;) {
+                    rx_step();
+                    if (rx_m(r->next, p)) return true;
+                    if ((r->max >= 0 && n >= r->max) || !rx_one(r->child, &p)) return false;
+                    n++;
+                }
             }
-            return hit && rx_m(r->next, p);
+            const char *floor = p;
+            while ((r->max < 0 || n < r->max) && rx_one(r->child, &p)) n++;
+            if (r->possessive) return rx_m(r->next, p);
+            for (;;) {
+                rx_step();
+                if (rx_m(r->next, p)) return true;
+                if (p == floor) return false;
+                p = rx_back1(p, floor);
+            }
         }
-        case RX_BOL:   return (s == rx_str_begin || ((rx_dotall & RXF_MULTI) && s[-1] == '\n'))
-                              && rx_m(r->next, s);
-        case RX_EOL:   /* neg marks rx_compile_full's absolute end anchor */
-            return (*s == '\0' || (!r->neg && (rx_dotall & RXF_MULTI) && *s == '\n'))
-                   && rx_m(r->next, s);
+        case RX_BOL:
+            if (r->cp == 1 || !(r->flags & RXF_MULTI)) { if (s != rx_str_begin) return false; }
+            else if (s != rx_str_begin && !(*s && (s[-1] == '\n' || (s[-1] == '\r' && *s != '\n'))))
+                return false;
+            return rx_m(r->next, s);
+        case RX_EOL: {   /* cp: 0 '$', 1 \Z (end or before a final line end), 2 \z */
+            int t = 0;
+            bool at = *s == '\0' ||
+                (r->cp != 2 && (t = rx_term_len(s)) > 0 &&
+                 ((r->cp == 0 && (r->flags & RXF_MULTI)) || s[t] == '\0') &&
+                 !(*s == '\n' && s > rx_str_begin && s[-1] == '\r'));
+            return at && rx_m(r->next, s);
+        }
         case RX_WB: {  /* \b boundary / \B non-boundary (\w = [A-Za-z0-9_]) */
             int wprev = (s != rx_str_begin) && (isalnum((unsigned char)s[-1]) || s[-1] == '_');
             int wcur  = (*s != '\0') && (isalnum((unsigned char)*s) || *s == '_');
@@ -9891,9 +10287,9 @@ static bool rx_m(Rx *r, const char *s) {
         case RX_BACKREF: {
             /* match the exact text captured by group N (empty if it never matched) */
             const char *cs = rx_cap_s[r->group], *ce = rx_cap_e[r->group];
-            if (!cs || !ce || ce < cs) return rx_m(r->next, s);
+            if (!cs || !ce || ce < cs) return false;   /* group did not take part: fail, as Java */
             size_t len = (size_t)(ce - cs);
-            if (rx_dotall & RXF_ICASE) {
+            if (r->flags & RXF_ICASE) {
                 for (size_t i = 0; i < len; i++)
                     if (!s[i] || tolower((unsigned char)s[i]) != tolower((unsigned char)cs[i])) return false;
             } else if (strncmp(s, cs, len) != 0) return false;
@@ -9907,10 +10303,19 @@ static bool rx_m(Rx *r, const char *s) {
             if (m == r->neg) return false;
             return rx_m(r->next, s);
         }
-        case RX_ALT:  return rx_m(r->child, s) || rx_m(r->alt, s);
+        case RX_ATOMIC: {
+            /* the child's first match is final: no backtracking into it */
+            const char *save_end = rx_match_end;
+            bool m = rx_m(r->child, s);
+            const char *end = rx_match_end;
+            rx_match_end = save_end;
+            return m && rx_m(r->next, end);
+        }
+        case RX_ALT:  rx_step(); return rx_m(r->child, s) || rx_m(r->alt, s);
         case RX_JOIN: return rx_m(r->owner->next, s);
         case RX_LOOP: return rx_m(r->owner, s);
         case RX_STAR: {
+            rx_step();
             if (r->lazy && rx_m(r->next, s)) return true;
             if (s != r->last) {           /* empty-iteration cycle guard */
                 const char *save = r->last;
@@ -9925,38 +10330,46 @@ static bool rx_m(Rx *r, const char *s) {
     return false;
 }
 
-/* Compile into a malloc'd pool; caller frees pool. */
-/* Handle inline flag groups (?x)(?s)(?i)(?m): extract the flags, drop the
- * (?flags) tokens, and in extended mode (x) strip unescaped whitespace and
- * #-to-end-of-line comments. Char classes and escaped pairs are copied raw.
- * Returns a malloc'd cleaned pattern; *dotall reports the (?s) flag. */
-static char *rx_preprocess(const char *p, int *dotall) {
-    *dotall = 0;
-    char *out = xmalloc(strlen(p) + 1);
-    size_t o = 0;
+/* Rewrite before parsing: \Q...\E becomes escaped literals, and when an
+ * (?x) flag appears anywhere, unescaped whitespace and #-comments go.
+ * Classes and escaped pairs are copied raw. Returns a malloc'd pattern. */
+static char *rx_preprocess(const char *p) {
+    static const char lb[] = "(?>\\r\\n|[\\n\\x0B\\f\\r\\x{85}\\x{2028}\\x{2029}])";
     bool extended = false, in_class = false;
+    size_t nR = 0;
+    for (size_t i = 0; p[i]; i++) {
+        if (p[i] == '\\' && p[i + 1]) { nR += p[i + 1] == 'R'; i++; continue; }
+        if (p[i] == '(' && p[i + 1] == '?') {
+            size_t j = i + 2;
+            while (p[j] && strchr("imsxuUd-", p[j])) { if (p[j] == 'x') extended = true; j++; }
+        }
+    }
+    char *out = xmalloc(2 * strlen(p) + nR * sizeof lb + 1);
+    size_t o = 0;
     for (size_t i = 0; p[i]; ) {
         char ch = p[i];
+        if (ch == '\\' && p[i + 1] == 'Q') {
+            for (i += 2; p[i] && !(p[i] == '\\' && p[i + 1] == 'E'); i++) {
+                if ((unsigned char)p[i] < 0x80 && !isalnum((unsigned char)p[i])) out[o++] = '\\';
+                out[o++] = p[i];
+            }
+            if (p[i]) i += 2;
+            continue;
+        }
+        if (ch == '\\' && p[i + 1] == 'R' && !in_class) {   /* \R: any line break */
+            memcpy(out + o, lb, sizeof lb - 1); o += sizeof lb - 1; i += 2;
+            continue;
+        }
         if (ch == '\\' && p[i + 1]) { out[o++] = p[i++]; out[o++] = p[i++]; continue; }
         if (in_class) { if (ch == ']') in_class = false; out[o++] = p[i++]; continue; }
-        if (ch == '[') { in_class = true; out[o++] = p[i++]; continue; }
-        if (ch == '(' && p[i + 1] == '?') {           /* maybe a flag-only group */
-            size_t j = i + 2;
-            while (p[j] && strchr("ixsmu", p[j])) j++;
-            if (p[j] == ')' && j > i + 2) {           /* (?flags) — apply and drop */
-                for (size_t k = i + 2; k < j; k++) {
-                    if (p[k] == 's') *dotall |= RXF_DOTALL;
-                    else if (p[k] == 'x') extended = true;
-                    else if (p[k] == 'i') *dotall |= RXF_ICASE;
-                    else if (p[k] == 'm') *dotall |= RXF_MULTI;
-                    /* u: Unicode case folding — clove folds ASCII only */
-                }
-                i = j + 1;
-                continue;
-            }
+        if (ch == '[') {
+            in_class = true; out[o++] = p[i++];
+            if (p[i] == '^') out[o++] = p[i++];
+            if (p[i] == ']') out[o++] = p[i++];     /* []a] : a literal ] */
+            continue;
         }
         if (extended) {
-            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') { i++; continue; }
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f') { i++; continue; }
             if (ch == '#') { while (p[i] && p[i] != '\n') i++; continue; }
         }
         out[o++] = p[i++];
@@ -9965,46 +10378,37 @@ static char *rx_preprocess(const char *p, int *dotall) {
     return out;
 }
 
-static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
+/* Compile into a malloc'd pool; caller frees pool. `full` chains an
+ * absolute end anchor INSIDE the program, so a failed full match
+ * backtracks into alternations/quantifiers: (step|steps) must retry the
+ * longer branch when "step" leaves input unconsumed. (Wrapping textually as
+ * (...)$ would shift group numbers.) */
+static Rx *rx_compile_mode(const char *pattern, Rx **pool_out, int *ngroups_out, bool full) {
     RxC c;
-    int dotall;
-    char *clean = rx_preprocess(pattern, &dotall);
-    rx_dotall = dotall;
+    char *clean = rx_preprocess(pattern);
     c.p = clean;
     c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
     c.npool = 0;
     c.ngroups = 1;  /* group 0 = whole match */
+    c.flags = 0;
     RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); free(clean); clove_error("regex: unexpected )"); }
+    if (*c.p) { free(c.pool); free(clean); clove_error("regex: unmatched )"); }
     free(clean);  /* nodes copied what they need; chars no longer referenced */
+    if (full) {
+        Rx *eol = rx_node(&c, RX_EOL);
+        eol->cp = 2;
+        if (top.t) top.t->next = eol;
+        if (!top.h) top.h = eol;
+    }
     *pool_out = c.pool;
     *ngroups_out = c.ngroups;
     return top.h;  /* may be NULL: empty pattern matches everywhere */
 }
-
-/* Compile with an end-of-string anchor INSIDE the program, so a failed
- * full match backtracks into alternations/quantifiers — (step|steps)
- * must retry the longer branch when "step" leaves input unconsumed.
- * Wrapping textually as (...)$ would shift group numbers; instead the
- * whole parse is treated as one alternation and EOL is chained after. */
+static Rx *rx_compile(const char *pattern, Rx **pool_out, int *ngroups_out) {
+    return rx_compile_mode(pattern, pool_out, ngroups_out, false);
+}
 static Rx *rx_compile_full(const char *pattern, Rx **pool_out, int *ngroups_out) {
-    RxC c;
-    int dotall;
-    char *clean = rx_preprocess(pattern, &dotall);
-    rx_dotall = dotall;
-    c.p = clean;
-    c.pool = xmalloc(sizeof(Rx) * RX_MAX_NODES);
-    c.npool = 0;
-    c.ngroups = 1;
-    RxChain top = rx_parse_alt(&c);
-    if (*c.p) { free(c.pool); free(clean); clove_error("regex: unexpected )"); }
-    free(clean);
-    Rx *eol = rx_node(&c, RX_EOL);
-    eol->neg = true;               /* absolute end, even under (?m) */
-    if (top.t) top.t->next = eol;
-    *pool_out = c.pool;
-    *ngroups_out = c.ngroups;
-    return top.h ? top.h : eol;
+    return rx_compile_mode(pattern, pool_out, ngroups_out, true);
 }
 
 /* Build the Clojure-style result: string when no groups, else
@@ -11717,14 +12121,7 @@ static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
 static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     need_nargs(nargs, 2, "quot");
-    if (argv[0]->tag == CLOVE_BIGDEC || argv[1]->tag == CLOVE_BIGDEC) return bd_quot(argv[0], argv[1]);
-    if (argv[0]->tag == CLOVE_BIGINT || argv[1]->tag == CLOVE_BIGINT) {
-        Clove *q; big_divmod(argv[0], argv[1], &q, NULL); return to_bigint(q);
-    }
-    int64_t a = as_int(argv[0], "quot");
-    int64_t b = as_int(argv[1], "quot");
-    if (b == 0) clove_error_cls("ArithmeticException", "Divide by zero");
-    return mk_int(a / b);
+    return num_qrm(argv[0], argv[1], 'q', "quot");
 }
 
 /* ── strings ── */
@@ -11800,8 +12197,8 @@ static Clove *prim_subs(CloveEnv *env, Clove **argv, int nargs) {
     static Clove *prim_##NAME(CloveEnv *env, Clove **argv, int nargs) { \
         (void)env; \
         char *s = as_str(argv[0], #NAME); \
-        Clove *r = mk_str(s, strlen(s)); \
-        for (char *c = r->as.str; *c; c++) *c = (char)XFORM((unsigned char)*c); \
+        Clove *r = mk_str(s, argv[0]->tag == CLOVE_STRING ? argv[0]->as.strx.nbytes : strlen(s)); \
+        for (char *c = r->as.str, *e = c + r->as.strx.nbytes; c < e; c++) *c = (char)XFORM((unsigned char)*c); \
         return r; \
     }
 
@@ -12966,7 +13363,8 @@ static void fmt_pad_num(SBuf *out, const char *num, const char *spec, bool numer
     if (*num == '-') { sign = "-"; num++; }
     else if (numeric && plus) sign = "+";
     else if (numeric && space) sign = " ";
-    size_t len = strlen(sign) + strlen(num);
+    size_t len = strlen(sign);
+    for (const char *q = num; *q; q++) len += ((unsigned char)*q & 0xC0) != 0x80;   /* codepoints */
     size_t pad = width > len ? width - len : 0;
     if (!left && !(zero && numeric)) for (size_t i = 0; i < pad; i++) sb_putc(out, ' ');
     sb_puts(out, sign);
@@ -13022,6 +13420,14 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
             v = argv[ai++];
         }
         char cfmt[32];
+        if (v == NIL && conv != 'b' && conv != 'B' && conv != 'n') {   /* Java: null */
+            bool up = isupper((unsigned char)conv) != 0;
+            const char *dot = strchr(spec, '.');
+            char pspec[20]; size_t pl = dot ? (size_t)(dot - spec) : strlen(spec);
+            memcpy(pspec, spec, pl); pspec[pl] = '\0';
+            fmt_pad_num(&out, up ? "NULL" : "null", pspec, false);
+            continue;
+        }
         if (group && (conv == 'd' || conv == 'f') && v != NIL &&
             (v->tag == CLOVE_INT || v->tag == CLOVE_DOUBLE || v->tag == CLOVE_BIGDEC || v->tag == CLOVE_BIGINT)) {
             /* format bare (precision only), group, then pad to the width */
@@ -13054,29 +13460,32 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                 free(t.data);
                 break;
             }
-            case 'S': {
+            case 's': case 'S': {
                 SBuf t = {0};
                 str_to(&t, v);
-                for (size_t k = 0; k < t.len; k++) t.data[k] = (char)toupper((unsigned char)t.data[k]);
-                fmt_pad_num(&out, t.data ? t.data : "", spec, false);
+                if (conv == 'S')
+                    for (size_t k = 0; k < t.len; k++) t.data[k] = (char)toupper((unsigned char)t.data[k]);
+                if (si == 0) {  /* no width/precision: append directly, any length */
+                    sb_putn(&out, t.data ? t.data : "", t.len);
+                    free(t.data);
+                    break;
+                }
+                const char *dot = strchr(spec, '.');
+                if (dot && t.data) {   /* precision: at most that many codepoints */
+                    size_t keep = (size_t)atoi(dot + 1), b = 0;
+                    for (size_t n = 0; b < t.len && n < keep; n++)
+                        do b++; while (b < t.len && ((unsigned char)t.data[b] & 0xC0) == 0x80);
+                    t.len = b; t.data[b] = '\0';
+                }
+                char pspec[20]; size_t pl = dot ? (size_t)(dot - spec) : strlen(spec);
+                memcpy(pspec, spec, pl); pspec[pl] = '\0';
+                fmt_pad_num(&out, t.data ? t.data : "", pspec, false);
                 free(t.data);
                 break;
             }
             case 'h': case 'H': {
                 char hb[16]; snprintf(hb, sizeof hb, conv == 'h' ? "%x" : "%X", (unsigned)clove_hash(v));
                 fmt_pad_num(&out, v == NIL ? "null" : hb, spec, false);
-                break;
-            }
-            case 's': {
-                SBuf t = {0};
-                str_to(&t, v);
-                if (si == 0) {  /* no width/precision: append directly, any length */
-                    if (t.data) sb_puts(&out, t.data);
-                } else {
-                    snprintf(cfmt, sizeof cfmt, "%%%ss", spec);
-                    sb_printf(&out, cfmt, t.data ? t.data : "");
-                }
-                free(t.data);
                 break;
             }
             case 'd': case 'x': case 'X': case 'o':
@@ -13088,6 +13497,8 @@ static Clove *prim_format(CloveEnv *env, Clove **argv, int nargs) {
                     sb_puts(&out, v->as.str);
                     break;
                 }
+                if (v->tag != CLOVE_INT && v->tag != CLOVE_BIGINT)
+                    clove_error_cls("IllegalFormatConversionException", "%c != %s", conv, val_type_name(v));
                 snprintf(cfmt, sizeof cfmt, "%%%sll%c", spec, conv);
                 sb_printf(&out, cfmt, (long long)as_int(v, "format"));
                 break;
@@ -13268,7 +13679,6 @@ static Clove *prim_re_replace(CloveEnv *env, Clove **argv, int nargs) {
     char *repl = is_fn ? NULL : as_str(argv[2], "re-replace");
     Rx *pool; int ngroups;
     Rx *prog = rx_compile(pat, &pool, &ngroups);
-    int dotall_save = rx_dotall;
     rx_str_begin = s;
     SBuf out = {0};
     sb_grow(&out, 1); out.data[0] = '\0';
@@ -13283,7 +13693,6 @@ static Clove *prim_re_replace(CloveEnv *env, Clove **argv, int nargs) {
                 Clove *mv = rx_match_value(ngroups);
                 sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
                 rx_str_begin = s;                     /* restore after the call */
-                rx_dotall = dotall_save;              /* a nested regex in the fn clobbers it */
             } else rx_subst(&out, repl);
             if (mend > p) { p = mend; continue; }
             /* empty match: emit one codepoint and advance to avoid looping */
@@ -13421,9 +13830,18 @@ MATH2(hypot, hypot)     /* sqrt(x*x + y*y) without overflow */
 
 static Clove *prim_round(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
-    /* Java's Math.round: floor(x + 0.5) — round half toward +infinity
-     * (so -2.5 → -2), not C llround's round-half-away-from-zero. */
-    return mk_int((int64_t)floor(as_num(argv[0]) + 0.5));
+    /* Java's Math.round: half toward +infinity (-2.5 → -2), NaN → 0, and
+     * saturating at the long range. Not floor(x + 0.5): that sum rounds
+     * 0.49999999999999994 up to 1. */
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_INT) return v;
+    double d = as_num(v);
+    if (isnan(d)) return mk_int(0);
+    double r = floor(d);
+    if (d - r >= 0.5) r += 1;
+    if (r >= 9.2233720368547758e18) return mk_int(INT64_MAX);
+    if (r <= -9.2233720368547758e18) return mk_int(INT64_MIN);
+    return mk_int((int64_t)r);
 }
 
 static Clove *prim_math_abs(CloveEnv *env, Clove **argv, int nargs) {
@@ -13522,7 +13940,10 @@ static Clove *prim_char(CloveEnv *env, Clove **argv, int nargs) {
     if (v != NIL && v->tag == CLOVE_CHAR) return v;
     if (v != NIL && v->tag == CLOVE_STRING && v->as.str[0])
         return mk_char((unsigned char)v->as.str[0]);
-    return mk_char((int32_t)as_int(v, "char"));
+    int64_t cp = as_int(v, "char");
+    if (cp < 0 || cp > 0x10FFFF)   /* codepoints: astral chars are fine here, unlike the JVM's 16-bit char */
+        clove_error_cls("IllegalArgumentException", "Value out of range for char: %lld", (long long)cp);
+    return mk_char((int32_t)cp);
 }
 
 /* (str/replace-first s match repl) — first occurrence only. A #"..."/re-pattern
@@ -13537,7 +13958,6 @@ static Clove *prim_replace_first(CloveEnv *env, Clove **argv, int nargs) {
         char *repl = is_fn ? NULL : as_str(argv[2], "str/replace-first");
         Rx *pool; int ngroups;
         Rx *prog = rx_compile(pat, &pool, &ngroups);
-        int dotall_save = rx_dotall;
         rx_str_begin = s;
         SBuf out = {0};
         sb_grow(&out, 1); out.data[0] = '\0';
@@ -13553,7 +13973,6 @@ static Clove *prim_replace_first(CloveEnv *env, Clove **argv, int nargs) {
                     Clove *mv = rx_match_value(ngroups);
                     sb_puts(&out, as_str(apply(env, replv, &mv, 1), "replace fn"));
                     rx_str_begin = s;
-                    rx_dotall = dotall_save;
                 } else rx_subst(&out, repl);
                 if (mend > p) p = mend;
                 else if (*p) { sb_putc(&out, *p); p++; }  /* empty match mid-string */
@@ -13599,18 +14018,63 @@ static Clove *prim_parse_long(CloveEnv *env, Clove **argv, int nargs) {
     return mk_int((int64_t)v);
 }
 
+/* Java's Double.parseDouble, which parse-double wraps: surrounding
+ * whitespace is trimmed; NaN, Infinity, hex floats (0x1p3) and an f/d
+ * suffix are accepted; C-only spellings (inf, nan, 0x10) are not. */
 static Clove *prim_parse_double(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *s = as_str(argv[0], "parse-double");
-    char *end;
-    double v = strtod(s, &end);
-    if (end == s || *end != '\0') return NIL;
+    const char *b = s, *e = s + strlen(s);
+    while (b < e && (unsigned char)*b <= ' ') b++;
+    while (e > b && (unsigned char)e[-1] <= ' ') e--;
+    const char *q = b;
+    bool neg = false;
+    if (q < e && (*q == '+' || *q == '-')) neg = *q++ == '-';
+    size_t rest = (size_t)(e - q);
+    if (rest == 3 && !memcmp(q, "NaN", 3)) return mk_double(NAN);
+    if (rest == 8 && !memcmp(q, "Infinity", 8)) return mk_double(neg ? -INFINITY : INFINITY);
+    if (rest > 0 && strchr("fFdD", e[-1])) e--;
+    bool ok = false;
+    if (e - q > 2 && q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {
+        const char *t = q + 2; int nd = 0;
+        while (t < e && isxdigit((unsigned char)*t)) { t++; nd++; }
+        if (t < e && *t == '.') { t++; while (t < e && isxdigit((unsigned char)*t)) { t++; nd++; } }
+        if (nd && t < e && (*t == 'p' || *t == 'P')) {
+            t++;
+            if (t < e && (*t == '+' || *t == '-')) t++;
+            const char *d0 = t;
+            while (t < e && isdigit((unsigned char)*t)) t++;
+            ok = t > d0 && t == e;
+        }
+    } else {
+        const char *t = q; int nd = 0;
+        while (t < e && isdigit((unsigned char)*t)) { t++; nd++; }
+        if (t < e && *t == '.') { t++; while (t < e && isdigit((unsigned char)*t)) { t++; nd++; } }
+        if (nd && t < e && (*t == 'e' || *t == 'E')) {
+            t++;
+            if (t < e && (*t == '+' || *t == '-')) t++;
+            const char *d0 = t;
+            while (t < e && isdigit((unsigned char)*t)) t++;
+            if (t == d0) nd = 0;
+        }
+        ok = nd && t == e;
+    }
+    if (!ok) return NIL;
+    char sbuf[64];
+    size_t n = (size_t)(e - b);
+    char *buf = n < sizeof sbuf ? sbuf : xmalloc(n + 1);
+    memcpy(buf, b, n); buf[n] = '\0';
+    double v = strtod(buf, NULL);
+    if (buf != sbuf) free(buf);
     return mk_double(v);
 }
 
+/* (read-string s) or (read-string opts s); of opts only :eof is used
+ * (reader conditionals are always allowed). */
 static Clove *prim_read_string(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    const char *p = as_str(argv[0], "read-string");
+    Clove *opts = nargs > 1 ? argv[0] : NIL;
+    const char *p = as_str(argv[nargs > 1 ? 1 : 0], "read-string");
     /* Nested reads (load-file, require shims) must not disturb the host
      * file's line tracking — else later top-level forms inherit bogus
      * line meta and error carets point at the wrong line. */
@@ -13625,6 +14089,9 @@ static Clove *prim_read_string(CloveEnv *env, Clove **argv, int nargs) {
     rd_line = save_line;
     rd_line_start = save_start;
     rd_file_cell = save_file;
+    Clove *eof;
+    if (!form && opts != NIL && opts->tag == CLOVE_MAP && map_find(opts, mk_kw(intern("eof", 3)), &eof))
+        return eof;
     return form ? form : NIL;
 }
 
@@ -14066,8 +14533,9 @@ static const char *PRELUDE =
     "(defn odd? [n] (not (even? n)))\n"
     /* (abs Long/MIN_VALUE) is Long/MIN_VALUE (Math.abs), not an overflow */
     "(defn abs [x] (if (neg? x) (if (int? x) (unchecked-subtract x) (- x)) x))\n"
-    "(defn max [x & xs] (reduce (fn [a b] (if (> a b) a b)) x xs))\n"
-    "(defn min [x & xs] (reduce (fn [a b] (if (< a b) a b)) x xs))\n"
+    /* a NaN argument wins, as in Numbers.max/min */
+    "(defn max [x & xs] (reduce (fn [a b] (cond (> a b) a (< a b) b (and (double? a) (clove/nan?* a)) a :else b)) x xs))\n"
+    "(defn min [x & xs] (reduce (fn [a b] (cond (< a b) a (> a b) b (and (double? a) (clove/nan?* a)) a :else b)) x xs))\n"
     "(defn complement [f] (fn [& args] (not (apply f args))))\n"
     "(defn constantly [x] (fn [& args] x))\n"
     "(defn comp [& fs]\n"
@@ -16779,7 +17247,6 @@ CloveEnv *clove_new_env(void) {
            dot-fns — plain doubles/ints aren't tagged maps, so these dispatch
            as ordinary functions */
         "(defn Math/min [a b] (min a b)) (defn Math/max [a b] (max a b))\n"
-        "(defn Math/round [x] (long (Math/floor (+ (double x) 0.5))))\n"
         "(defn Long/valueOf [s] (or (parse-long s) (throw (NumberFormatException. (str \"For input string: \\\"\" s \"\\\"\")))))\n"
         "(defn Integer/toHexString [n] (format \"%x\" n))\n"
         "(defn Long/toHexString [n] (format \"%x\" n))\n"
@@ -17691,7 +18158,7 @@ CloveEnv *clove_new_env(void) {
         "(defn infinite? [x] (and (double? x) (or (= x ##Inf) (= x ##-Inf))))\n"
         "(defn NaN? [x] (and (double? x) (clove/nan?* x)))\n"
         "(defn Math/floorDiv [a b] (let [q (quot a b)] (if (and (not= (rem a b) 0) (not= (neg? a) (neg? b))) (dec q) q)))\n"
-        "(defn Math/floorMod [a b] (- a (* b (Math/floorDiv a b))))\n"
+        "(defn Math/floorMod [a b] (mod a b))\n"
         "(defn Math/addExact [a b] (+ a b)) (defn Math/multiplyExact [a b] (* a b))\n"
         "(defn Math/subtractExact [a b] (- a b)) (defn Math/negateExact [a] (- a))\n"
         "(defn Math/toIntExact [a] (if (and (<= a 2147483647) (>= a -2147483648)) a (throw (ArithmeticException. \"integer overflow\"))))\n"

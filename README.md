@@ -214,7 +214,7 @@ same `tests.clj` runs everywhere.
 | **Polymorphism** | `defmulti`/`defmethod`, `defprotocol`/`extend-type`/`extend-protocol`/`satisfies?`, **`deftype`/`defrecord`** with real method dispatch (this is what lets Emmy/DataScript/instaparse run), `binding` |
 | **Errors** | `throw` any value, `try`/`catch`/`finally` with **typed `catch`** (first clause the exception is-a; `class`/`instance?` agree), `ex-info`/`ex-message`/`ex-data`; interpreter errors are catchable. Friendly messages: arity errors name the fn + accepted arities, type errors name the offending value's type, unresolved symbols get typo/require suggestions; uncaught errors render the source line + caret and a `file:line` trace that reaches inside compiled fn bodies (`*e`/`(pst)` for the post-mortem) |
 | **I/O streams** | `print`/`println`/`pr`/`prn` route through the **`*out*`** var; bind it to capture (`with-out-str`) or to `*err*` for stderr; `slurp`/`spit` (`:append`), string readers/writers, `*in*` is stdin (`slurp`, `line-seq`, `read`), `with-in-str`, `printf` |
-| **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, flags `(?i)`/`(?m)`/`(?s)`, `{n,m}` quantifiers, lazy quantifiers, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-matcher`/`re-groups` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
+| **Regex** | self-contained backtracking engine, **codepoint-aware** (`.`/classes/quantifiers match whole UTF-8 chars; `[α-ω]` unicode ranges work; `\w`/`\d`/`\s` stay ASCII like Java's default): classes, groups, `(?:…)`, lookahead `(?=)`, alternation, flags `(?i)`/`(?m)`/`(?s)` and scoped `(?i:…)`, `{n,m}` quantifiers, lazy and possessive quantifiers, atomic groups `(?>…)`, `\p{…}` properties, `\Q…\E`, class intersection `[a-z&&[^aeiou]]`, **backreferences `\1`…`\9`**; `#"…"` literals; `re-find` `re-matches` `re-seq` `re-matcher`/`re-groups` `re-replace` (`$1` refs) `re-split`; guarded against catastrophic backtracking |
 | **PEGs** | `peg.clj` battery: [Janet's](https://janet-lang.org/docs/peg.html) parsing-expression grammars as plain data — `(peg/match '(* (<- :w+) "=" (number :d+)) "k=7")` ⇒ `["k" 7]`; grammars as maps with `:main`, ordered choice, `any`/`some`/`between`, `if`/`if-not`/`look` (arbitrary lookahead *and* lookbehind), `to`/`thru`, `sub`/`split`, captures with tags (`<-` `group` `replace` `cmt` `accumulate` `number` `backmatch` `->` `unref` …), `find`/`find-all`/`replace`/`replace-all`; codepoint-indexed; verified case-for-case against the Janet binary |
 | **Transducers** | `map`/`filter`/`take`/`mapcat`/… as transducers, `transduce`, `eduction`, `into` with an xform — compose over infinite seqs with `reduced` early-exit |
 | **Concurrency** | stackful **coroutines** (`coro/new`/`resume`/`yield`) under a shared cooperative **fiber scheduler** (Janet `ev/`-style: ready queue, timer wheel, `poll(2)` fd parking). Real **`future`/`promise`** with blocking `deref` (parks in a fiber, drives the loop on main, `(deref x ms tval)` timeouts, failed futures rethrow at deref), fiber-aware `Thread/sleep`, a genuine `clojure.core.async` (`go`/`<!`/`>!`/`alts!`, channels, timeouts), **agents** (`send`/`await`/error modes/`restart-agent`, serial actions on a drain fiber), and **STM refs** (`dosync`/`alter`/`commute`/`ensure` with real conflict-detect-and-retry across fiber yields; in-tx `send`s held until commit; watches on agents/refs) — all on one thread, one scheduler |
@@ -516,6 +516,8 @@ embeddability matter; use bb or the JVM where throughput does.
 - There is no separate `java.math.BigInteger`: `biginteger` returns a BigInt
   (same arithmetic as the JVM's, but it prints `3N` where Java prints `3`),
   and `numerator`/`denominator` of a ratio return longs when they fit
+- An integer literal with a leading zero is decimal: `017` reads as 17 and
+  `08` as 8. Clojure reads `017` as octal 15 and rejects `08`
 - Float division by zero is `##Inf`/`##NaN` whatever the operand types, as in
   compiled Clojure with primitive doubles; boxed JVM math (and babashka) throws
 - Hash maps iterate in **insertion order at every size**. The JVM agrees up
@@ -566,6 +568,15 @@ embeddability matter; use bb or the JVM where throughput does.
   them for a background thread). `.printStackTrace` prints the exception and
   its causes, but there are no stack frames to print
 - Regex `(?i)` folds ASCII case only, and so does `(?iu)`
+- Regex lookbehind `(?<=…)`/`(?<!…)`, `\k<name>` and `\G` throw. Named
+  groups `(?<name>…)` capture by number only. `\p{L}`, `\p{Lu}`, `\p{Ll}`
+  and `\p{N}` are exact for ASCII and approximate beyond it (script ranges,
+  no Unicode tables). A `{` that does not start a valid `{n,m}` is a
+  literal, where Java throws "Illegal repetition"
+- `format`'s `%d` takes a BigInt (`1N`) that fits a Long, which Java
+  rejects: clove has no separate `BigInteger` to accept instead. `%f`
+  takes a Long
+- `(char n)` takes any codepoint up to `0x10FFFF`, not just 16-bit values
 - `format` accepts flags after the width (`%10,d`), where Java throws
   `UnknownFormatConversionException`
 - Dereferencing a future whose body threw rethrows that exception itself.
