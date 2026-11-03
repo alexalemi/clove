@@ -96,7 +96,8 @@
   element before the match (1.1 GB at 3M elements, now 26 MB). Realizing a
   long chain of lazy seqs forwards each step instead of keeping it. Natives
   are called without an `apply` frame in between, so clang builds (macOS)
-  release the `iterate` case too.
+  release the `iterate` case too, and between top-level forms and `let`
+  bindings the stack the last form dirtied is zeroed.
 
 ### Fixed (host IO, processes, batteries)
 - `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`

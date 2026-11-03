@@ -904,16 +904,49 @@ static void stack_floor_init(const char *base) {
     main_stack_floor = (const char *)((uintptr_t)base - budget + STACK_SAFETY_MARGIN);
 }
 
+static const char *stack_floor(void) {
+#ifdef CLOVE_HAVE_CORO
+    if (coro_current)                       /* coro: stack is [stack, stack_top) */
+        return coro_current->stack + STACK_SAFETY_MARGIN;
+#endif
+    return main_stack_floor;
+}
+
+/* The deepest stack address the evaluator has reached since the last
+ * stack_scrub_dirty: everything between it and a caller's frame is what
+ * calls that returned left behind. */
+static uintptr_t stack_low;   /* an address, not a pointer: never a root */
+
+static inline void stack_note(const char *sp) {
+    uintptr_t a = (uintptr_t)sp;
+    if (a < stack_low || !stack_low) stack_low = a;
+}
+
+/* Zero the stack below the caller down to stack_low. A later frame that
+ * reserves a slot and never writes it would show the conservative scan
+ * whatever an earlier call left there (a vector built in a `loop` and
+ * since dropped) for as long as that frame lives. Only the part dirtied
+ * since the last scrub is cleared, so a cheap form costs little. */
+static __attribute__((noinline)) void stack_scrub_dirty(void) {
+    char probe;
+    uintptr_t here = (uintptr_t)&probe, low = stack_low, floor = (uintptr_t)stack_floor();
+    stack_low = here;   /* the frames above us are left behind next */
+    if (!low || low > here) low = here;
+    if (floor && low < floor) low = floor;
+    /* the notes come from evaluator frames; the natives they called ran a
+     * little deeper, so clear a margin past the mark */
+    size_t n = (size_t)(here - low) + 1024;
+    if (n > 65536) n = 65536;
+    char *buf = __builtin_alloca(n);
+    memset(buf, 0, n);
+    __asm__ __volatile__("" : : "r"(buf) : "memory");   /* keep the stores */
+}
+
 static void clove_check_stack(void) {
     char probe;
     const char *sp = &probe;               /* approximate current stack pointer */
-    const char *floor;
-#ifdef CLOVE_HAVE_CORO
-    if (coro_current)                       /* coro: stack is [stack, stack_top) */
-        floor = coro_current->stack + STACK_SAFETY_MARGIN;
-    else
-#endif
-        floor = main_stack_floor;
+    const char *floor = stack_floor();
+    stack_note(sp);
     if (floor && sp < floor)
         clove_error_cls("StackOverflowError", "stack overflow — usually deep non-tail recursion: "
                    "use loop/recur (or reduce) instead of self-calls that grow the stack");
@@ -1566,6 +1599,8 @@ static void mark_env_chain(CloveEnv *e) {
 }
 
 static void gc_drain(void) {
+    char probe;
+    stack_note(&probe);   /* marking leaves live-then pointers down here */
     while (mark_sp) {
         Clove *v = mark_stack[--mark_sp];
         if (v->meta) mark_push(v->meta);
@@ -4697,10 +4732,15 @@ static Clove *read_form(const char **p) {
 
 /* Evaluate each form in sequence, return the last result (nil if empty).
  * The shape of fn bodies, do, let, when, and loop. */
+/* Between forms, the stack below holds whatever the last one left: frames
+ * of the next form that skip a slot would show it to the conservative scan
+ * for as long as they run, so the part the last form dirtied is cleared. */
 static Clove *eval_body(CloveEnv *env, Clove *body) {
     Clove *r = NIL;
-    for (; body && body->tag == CLOVE_LIST; body = body->as.cons.tail)
+    for (Clove *first = body; body && body->tag == CLOVE_LIST; body = body->as.cons.tail) {
+        if (body != first) stack_scrub_dirty();
         r = eval(env, body->as.cons.head);
+    }
     return r;
 }
 
@@ -6972,6 +7012,8 @@ static Clove *eval(CloveEnv *env, Clove *form) {
     if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
     if (form == NULL || form == NIL) return NIL;
     if (form->tag != CLOVE_LIST) return eval_inner(env, form);
+    char probe;
+    stack_note(&probe);
     if (eval_sp < EVAL_STACK_MAX) {
         eval_stack[eval_sp++] = form;
         Clove *r = eval_inner(env, form);
@@ -7796,6 +7838,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                          * a later same-name binding doesn't leak into it */
                         if (scope->captured) scope = env_new(scope);
                         destructure(scope, vec_nth(binds_vec, i), val);
+                        stack_scrub_dirty();
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }

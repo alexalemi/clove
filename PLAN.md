@@ -203,9 +203,12 @@ Things the history log leaves unresolved, roughly by value:
   stale word on an early lazy cell no longer pins the whole tail; `apply`
   calls natives with no frame of its own in between (clang's `apply` frame
   held the iterate head under `(first (filter ..))` in a slot it never
-  wrote). Which dead words survive is still up to the compiler: an
-  unoptimized (-O0) build keeps the `loop` vector in an unwritten
-  `eval_inner` slot. The regression tests run on every CI platform; only
+  wrote); `eval_body` and `let` zero the stack the last form dirtied
+  (`stack_scrub_dirty`: eval/apply_fn/gc_drain note the deepest address,
+  plus a 1 KB margin for natives), so a frame's unwritten slot no longer
+  shows the previous form's values (the `loop` vector under -O0 and
+  mingw). Compiled bodies (vm_run) don't scrub between statements, and
+  which dead words survive there is still up to the compiler; only
   precise roots would close this for good; (2) Binding
   structs and the malloc arena (`malloc_trim` only on glibc) are not
   returned. `clove/heap-bytes*` measures (1) without RSS
