@@ -7315,8 +7315,53 @@ static int big_cmp(Clove *A, Clove *B) {
     return a.sign < 0 ? -c : c;
 }
 
-/* Truncating divmod (quot toward zero, rem takes the dividend's sign). Bit-by-
- * bit long division on magnitudes — simple and correct; fine at our scale. */
+static uint32_t udiv_small_inplace(uint32_t *d, uint32_t n, uint32_t div);
+/* Magnitude division, Knuth's algorithm D (TAOCP 4.3.1, as in Hacker's
+ * Delight divmnu): a / b into q (na-nb+1 limbs) and r (nb limbs). Needs
+ * na >= nb >= 1 and a nonzero top limb in b. */
+static void umag_divmod(const uint32_t *a, uint32_t na, const uint32_t *b, uint32_t nb,
+                        uint32_t *q, uint32_t *r) {
+    if (nb == 1) {
+        memcpy(q, a, na * 4);
+        r[0] = udiv_small_inplace(q, na, b[0]);
+        return;
+    }
+    int s = __builtin_clz(b[nb - 1]);          /* normalize: top bit of b set */
+    uint32_t *bn = umalloc(nb), *un = umalloc(na + 1);
+    for (uint32_t i = nb - 1; i > 0; i--) bn[i] = (b[i] << s) | (uint32_t)((uint64_t)b[i - 1] >> (32 - s));
+    bn[0] = b[0] << s;
+    un[na] = (uint32_t)((uint64_t)a[na - 1] >> (32 - s));
+    for (uint32_t i = na - 1; i > 0; i--) un[i] = (a[i] << s) | (uint32_t)((uint64_t)a[i - 1] >> (32 - s));
+    un[0] = a[0] << s;
+    for (uint32_t j = na - nb + 1; j-- > 0; ) {
+        uint64_t num = ((uint64_t)un[j + nb] << 32) | un[j + nb - 1];
+        uint64_t qhat = num / bn[nb - 1], rhat = num % bn[nb - 1];
+        while (qhat >> 32 || qhat * bn[nb - 2] > ((rhat << 32) | un[j + nb - 2])) {
+            qhat--; rhat += bn[nb - 1];
+            if (rhat >> 32) break;
+        }
+        int64_t k = 0, t;                       /* un[j..j+nb] -= qhat * bn */
+        for (uint32_t i = 0; i < nb; i++) {
+            uint64_t p = qhat * bn[i];
+            t = (int64_t)un[i + j] - k - (int64_t)(p & 0xFFFFFFFFu);
+            un[i + j] = (uint32_t)t;
+            k = (int64_t)(p >> 32) - (t >> 32);
+        }
+        t = (int64_t)un[j + nb] - k; un[j + nb] = (uint32_t)t;
+        q[j] = (uint32_t)qhat;
+        if (t < 0) {                            /* qhat was one too big: add back */
+            q[j]--;
+            uint64_t c = 0;
+            for (uint32_t i = 0; i < nb; i++) { c += (uint64_t)un[i + j] + bn[i]; un[i + j] = (uint32_t)c; c >>= 32; }
+            un[j + nb] += (uint32_t)c;
+        }
+    }
+    for (uint32_t i = 0; i + 1 < nb; i++) r[i] = (un[i] >> s) | (uint32_t)((uint64_t)un[i + 1] << (32 - s));
+    r[nb - 1] = un[nb - 1] >> s;
+    free(bn); free(un);
+}
+
+/* Truncating divmod (quot toward zero, rem takes the dividend's sign). */
 static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R) {
     uint32_t sa[2], sb[2]; BigView a, b; big_view(A, &a, sa); big_view(B, &b, sb);
     if (b.sign == 0) clove_error_cls("ArithmeticException", "Divide by zero");
@@ -7325,18 +7370,11 @@ static void big_divmod(Clove *A, Clove *B, Clove **Q, Clove **R) {
         if (R) { uint32_t *m = umalloc(a.n ? a.n : 1); memcpy(m, a.mag, a.n * 4); *R = big_norm(a.sign, m, a.n); }
         return;
     }
-    uint32_t qn = a.n, rn = a.n + 1;
-    uint32_t *q = umalloc(qn); for (uint32_t i = 0; i < qn; i++) q[i] = 0;
-    uint32_t *r = umalloc(rn); for (uint32_t i = 0; i < rn; i++) r[i] = 0;
-    for (uint32_t bit = a.n * 32; bit-- > 0; ) {
-        uint32_t carry = 0;                                   /* r <<= 1 */
-        for (uint32_t i = 0; i < rn; i++) { uint32_t nx = r[i] >> 31; r[i] = (r[i] << 1) | carry; carry = nx; }
-        if ((a.mag[bit / 32] >> (bit % 32)) & 1) r[0] |= 1;   /* bring down next bit */
-        uint32_t rl = rn; while (rl > 0 && r[rl - 1] == 0) rl--;
-        if (umag_cmp(r, rl, b.mag, b.n) >= 0) { umag_sub(r, rl, b.mag, b.n, r); q[bit / 32] |= 1u << (bit % 32); }
-    }
+    uint32_t qn = a.n - b.n + 1;
+    uint32_t *q = umalloc(qn), *r = umalloc(b.n);
+    umag_divmod(a.mag, a.n, b.mag, b.n, q, r);
     if (Q) *Q = big_norm(a.sign * b.sign, q, qn); else free(q);
-    if (R) *R = big_norm(a.sign, r, rn); else free(r);
+    if (R) *R = big_norm(a.sign, r, b.n); else free(r);
 }
 static Clove *big_abs(Clove *A) {
     if (A->tag == CLOVE_INT) return A->as.i < 0 ? big_addsub(mk_int(0), A, 1) : A;
@@ -7376,12 +7414,21 @@ static char *big_to_decimal(Clove *v) {
     for (size_t i = nc - 1; i-- > 0; ) p += (size_t)snprintf(buf + p, cap - p, "%09u", chunks[i]);
     buf[p] = 0; free(chunks); return buf;
 }
-/* Parse a decimal integer (optional sign, all digits) into INT or BIGINT. */
+/* Parse a decimal integer (optional sign, then digits) into INT or BIGINT.
+ * Stops at the first non-digit; callers check the token is all digits. Nine
+ * digits per multiply-add step. */
 static Clove *big_from_decimal(const char *s) {
     int sign = 1; if (*s == '+') s++; else if (*s == '-') { sign = -1; s++; }
-    Clove *acc = mk_int(0), *ten = mk_int(10);
-    for (; *s; s++) { if (*s < '0' || *s > '9') break; acc = big_addsub(big_mul(acc, ten), mk_int(*s - '0'), 0); }
-    return sign < 0 ? big_addsub(mk_int(0), acc, 1) : acc;
+    size_t nd = 0; while (s[nd] >= '0' && s[nd] <= '9') nd++;
+    uint32_t *m = umalloc((uint32_t)(nd / 9 + 2)), n = 0;
+    for (size_t i = 0, len = nd % 9 ? nd % 9 : 9; i < nd; i += len, len = 9) {
+        uint32_t mul = 1, add = 0;
+        for (size_t k = 0; k < len; k++) { mul *= 10; add = add * 10 + (uint32_t)(s[i + k] - '0'); }
+        uint64_t c = add;
+        for (uint32_t j = 0; j < n; j++) { c += (uint64_t)m[j] * mul; m[j] = (uint32_t)c; c >>= 32; }
+        if (c) m[n++] = (uint32_t)c;
+    }
+    return big_norm(sign, m, n);
 }
 
 /* ───── Exact rationals ──────────────────────────────────────────────── */
