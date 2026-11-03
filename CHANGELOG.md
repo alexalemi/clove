@@ -52,6 +52,16 @@
 - Replacing a value in a big map copies only the trie path, not the
   insertion-order index too: persistent `update`/`assoc-in` loops are about
   1.6x faster.
+- Dense levels of a big hash map or set are array nodes (32 child slots,
+  as in Clojure's `PersistentHashMap`), so an update copies half the bytes
+  along its path; removing a key no longer looks it up twice; and a map that
+  keeps dropping its oldest key compacts its insertion order a quarter as
+  often. A dissoc/assoc loop on a 100k-entry map went from 2.7 s to 1.8 s.
+- `frequencies` and `group-by` are natives: each element is one lookup and
+  an in-place update, group-by's groups grow as transient vectors, and a
+  lazy input is consumed as they go instead of being held whole. On a
+  million elements `frequencies` went from 0.43 s to 0.22 s and `group-by`
+  from 0.57 s to 0.25 s.
 - `update` takes up to three args before the rest, and `fnil` takes two or
   three defaults, as in Clojure. `(update-in m [] f)` updates the `nil` key
   as on the JVM (it applied `f` to the whole map).

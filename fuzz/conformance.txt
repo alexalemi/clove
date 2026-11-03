@@ -622,3 +622,7 @@
 [(= (frequencies (map #(mod % 37) (range 5000))) (reduce (fn [m x] (assoc m x (inc (get m x 0)))) {} (map #(mod % 37) (range 5000)))) (count (into #{} (range 50000))) (sort (keys (group-by #(mod % 5) (range 100)))) (= (set (range 3000)) (into #{} (map identity) (range 3000)))]
 ;; workstream G: heap retention
 (System/gc)
+;; workstream I: map/set builders, array-node HAMT levels
+[(pr-str (frequencies [1 1N 2])) (frequencies "abracadabra") (group-by count ["a" "bb" "c" nil]) (group-by identity nil) (frequencies nil) (frequencies [[1 2] (list 1 2) nil nil])]
+(let [m (reduce (fn [m i] (assoc (dissoc m i) (+ i 1000) i)) (zipmap (range 1000) (range 1000)) (range 5000))] [(count m) (apply min (keys m)) (reduce + (vals m)) (= m (zipmap (range 5000 6000) (range 4000 5000)))])
+(let [s (reduce disj (set (range 2000)) (range 0 2000 3)) t (persistent! (reduce disj! (transient (set (range 2000))) (range 0 2000 3)))] [(count s) (contains? s 3) (contains? s 4) (reduce + s) (= s t) (count (apply disj s (range 2000)))])

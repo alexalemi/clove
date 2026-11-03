@@ -175,10 +175,14 @@ Things the history log leaves unresolved, roughly by value:
   (synchronous, likely faster, and would lift the depth cap). Tested only
   against Debian's emcc 3.1.6, in node and Chrome.
 - **Persistent map update loops are ~4x bb** (`(reduce #(update %1 k f) {} ..)`,
-  `assoc-in`/`update-in` at 1M steps; 2026-11-02). Builders that use
-  transients (`frequencies`, `group-by`, `into`, `set`) are within ~2.5x.
+  `assoc-in`/`update-in` at 1M steps; 2026-11-02). Builders are within 2x
+  (2026-11-03, CPU time vs bb: `frequencies` 1.4x, `group-by` 1.1x,
+  `(into #{} ..)` 1.0x, `(into {} ..)` 1.5x, a dissoc/assoc loop on a 100k
+  map 1.7x). `frequencies`/`group-by` are natives; `into` is still a defn,
+  so its `from` local pins a lazy input whole while it builds.
   Big maps keep an insertion stamp in each HAMT entry cell (iteration sorts
-  by stamp), so a value update copies only the trie path. What is left per
+  by stamp), so a value update copies only the trie path; dense levels are
+  32-slot array nodes. What is left per
   persistent assoc: ~3 cells plus ~2.6 kid arrays of up to 64 slots copied,
   and the GC/page-fault cost of that churn; the interpreter's call overhead
   is most of the rest. Levers: the fast-call path in `apply` handles only
