@@ -4324,9 +4324,9 @@
   (assert= "true\n"
            (:out (sh (str (clove/exe-dir*) "/clove") "-e"
                      (str "(let [rss (fn [] (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))))"
-                          "      big (atom (vec (range 5000000))) before (rss)]"
+                          "      big (atom (vec (range 5000000))) before (rss) hb (clove/heap-bytes*)]"
                           "  (reset! big nil) (dotimes [_ 4] (gc) (count (vec (range 1000))))"
-                          "  (prn (< (rss) (quot before 2))))")))))
+                          "  (prn (and (< (clove/heap-bytes*) (quot hb 4)) (< (rss) (quot (* 3 before) 4)))))")))))
 (when clove-test-coro?
   ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
   (let [v (reduce (fn [a _] [a]) [] (range 100000))
@@ -4348,7 +4348,8 @@
 ;; clove/heap-bytes* is what the collector has mapped; RSS bounds are looser
 ;; (Linux only, not under ASan, whose quarantine holds freed memory).
 (when-not (System/getenv "CLOVE_GC_STRESS")
-  (let [run (fn [src] (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src))))
+  (let [run (fn [src] (try (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src)))
+                           (catch Exception _ (vec (repeat 4 Long/MAX_VALUE)))))  ; fails every check
         rss? (and (= :linux (clove/os*)) (not (System/getenv "ASAN_OPTIONS")))
         rss "(fn [] (if (= :linux (clove/os*)) (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))) 0))"]
     ;; one (gc) after dropping a 5M-element vector gives its blocks back
