@@ -399,7 +399,7 @@ static Clove *seq1(Clove *v);
 static Clove *sorted_iter_chunk(Clove *it, Clove *stack);
 static Clove *sorted_seq(Clove *coll, bool rev);
 static Clove *seq1_slot(Clove **slot);
-static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
+static inline Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
 static Clove *sorted_entry_list(Clove *coll);
 static bool sorted_get(CloveEnv *env, Clove *coll, Clove *key, Clove **out);
 static Clove *sorted_put(CloveEnv *env, Clove *coll, Clove *key, Clove *val);
@@ -6349,13 +6349,24 @@ static inline CloveEnv *arity_frame(Clove *arity, CloveEnv *parent, CloveEnv *se
     return env_new(parent);
 }
 
-static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
+static Clove *apply_fn(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
+
+/* A native is called straight from here, with no apply frame in between:
+ * a frame that only forwarded would still reserve apply_fn's locals, and
+ * whatever an earlier call left in them stays visible to the conservative
+ * scan for as long as the native runs ((first (filter p (iterate ..)))
+ * kept the whole walk live that way under clang). */
+static inline Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
+    if (fn->tag == CLOVE_NATIVE) return fn->as.native(env, argv, nargs);
+    return apply_fn(env, fn, argv, nargs);
+}
+
+static __attribute__((noinline)) Clove *apply_fn(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
     clove_check_stack();   /* raise a catchable error before the C stack overflows */
-    /* NATIVE/FN are the overwhelmingly common cases; everything else (Vars,
+    /* FN is the overwhelmingly common case; everything else (Vars,
      * keywords, maps as fns ...) is out of line, keeping this frame small:
      * every interpreted call level carries it, and stale words in a big frame
      * pin dead data for the conservative scan. */
-    if (fn->tag == CLOVE_NATIVE) return fn->as.native(env, argv, nargs);
     if (fn->tag != CLOVE_FN) return apply_other(env, fn, argv, nargs);
     /* volatile: when recur swaps argv to the sentinel's (possibly heap-
      * spilled) value array, this slot is the cell's only GC root — the

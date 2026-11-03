@@ -94,7 +94,9 @@
   more cases: a vector built in a `loop` and dropped stays live no more,
   and `(first (filter pred (iterate inc 0)))` no longer retains every
   element before the match (1.1 GB at 3M elements, now 26 MB). Realizing a
-  long chain of lazy seqs forwards each step instead of keeping it.
+  long chain of lazy seqs forwards each step instead of keeping it. Natives
+  are called without an `apply` frame in between, so clang builds (macOS)
+  release the `iterate` case too.
 
 ### Fixed (host IO, processes, batteries)
 - `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`

@@ -200,12 +200,13 @@ Things the history log leaves unresolved, roughly by value:
   `eval_inner`'s frame is ~150 bytes and holds no arrays; `apply` zeroes its
   stack env; `vm_compile` and `lazy_force` scrub the stack below them;
   `lazy_force` forwards each realized step to the end of the chain, so one
-  stale word on an early lazy cell no longer pins the whole tail. Which dead
-  words survive is up to the compiler, so the regression tests for this run
-  on Linux/gcc only: at -O0, and with clang (a spill slot in `apply`'s frame
-  still held the iterate head under `(first (filter ..))`) or mingw (the
-  `loop`/`persistent!` vector), the scan still finds them. Only precise
-  roots would close this for good; (2) Binding
+  stale word on an early lazy cell no longer pins the whole tail; `apply`
+  calls natives with no frame of its own in between (clang's `apply` frame
+  held the iterate head under `(first (filter ..))` in a slot it never
+  wrote). Which dead words survive is still up to the compiler: an
+  unoptimized (-O0) build keeps the `loop` vector in an unwritten
+  `eval_inner` slot. The regression tests run on every CI platform; only
+  precise roots would close this for good; (2) Binding
   structs and the malloc arena (`malloc_trim` only on glibc) are not
   returned. `clove/heap-bytes*` measures (1) without RSS
   noise.
