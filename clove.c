@@ -138,6 +138,7 @@ static int clove_wsa_init(void) {   /* idempotent winsock startup */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
 #ifndef __EMSCRIPTEN__      /* no ucontext in wasm: notebooks run without coroutines */
 #include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
+#include <sys/mman.h>       /* mmap — coroutine stacks with a guard page */
 #define CLOVE_HAVE_CORO 1
 #endif
 #define sock_close close
@@ -227,7 +228,7 @@ typedef enum {
     CLOVE_TNODE,     /* internal: a node of a sorted collection's weight-balanced
                      * tree (Adams' tree). Holds key, val (set: val==key; map: the
                      * value), left/right subtrees, and subtree size. Not user-
-                     * visible. */
+                     * visible. Keep last: the GC log sizes its histogram by it. */
 } CloveTag;
 
 typedef struct Clove Clove;
@@ -650,8 +651,10 @@ typedef struct Coro {
     Clove *xfer;            /* value handed across resume/yield (GC root) */
     Clove *error;           /* value of an uncaught throw, else NULL (GC root) */
     ucontext_t ctx;        /* machine context saved while suspended */
-    char *stack;           /* malloc'd stack (low address) */
+    char *stack;           /* usable stack (low address); NULL once freed */
     size_t stack_size;
+    char *stack_map;       /* mmap base (guard page below stack), or NULL
+                            * when the stack came from malloc */
     char *stack_top;       /* stack + stack_size (high address) */
     void *saved_sp;        /* approx SP at last switch-away — GC scan low bound */
     CoroStatus status;
@@ -682,6 +685,7 @@ static Clove **main_s_vstack;
 static size_t main_s_vsp;
 static size_t main_s_vstack_cap;
 static void coro_mark_scan(Coro *c);   /* GC: scan a coro's roots + stack */
+static void coro_free_stacks(Coro *co);
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -927,20 +931,42 @@ static Clove *mk_sym(const char *s) {
  * name, allocated outside the GC pools — so (identical? :a :a) holds and
  * keyword-heavy code allocates nothing per read. */
 typedef struct KwNode { const char *name; Clove *cell; struct KwNode *next; } KwNode;
-static KwNode *kw_table[256];
+static KwNode **kw_table;               /* kw_cap buckets, doubled at load 1 */
+static size_t kw_cap, kw_n;
+
+static size_t kw_slot(const char *s, size_t cap) {
+    uint64_t x = (uint64_t)(uintptr_t)s;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t)x & (cap - 1);
+}
 
 static Clove *mk_kw(const char *s) {   /* s is already interned */
-    uint32_t h = (uint32_t)((uintptr_t)s >> 4) & 255u;
-    for (KwNode *n = kw_table[h]; n; n = n->next)
-        if (n->name == s) return n->cell;
+    if (kw_table)
+        for (KwNode *n = kw_table[kw_slot(s, kw_cap)]; n; n = n->next)
+            if (n->name == s) return n->cell;
+    if (kw_n >= kw_cap) {               /* grow (or create) and rehash */
+        size_t ncap = kw_cap ? kw_cap * 2 : 1024;
+        KwNode **nt = calloc(ncap, sizeof *nt);
+        if (!nt) clove_error("out of memory");
+        for (size_t i = 0; i < kw_cap; i++)
+            for (KwNode *n = kw_table[i], *next; n; n = next) {
+                next = n->next;
+                size_t h = kw_slot(n->name, ncap);
+                n->next = nt[h]; nt[h] = n;
+            }
+        free(kw_table);
+        kw_table = nt; kw_cap = ncap;
+    }
     Clove *v = xmalloc(sizeof *v);     /* immortal: never in a pool, never swept */
     memset(v, 0, sizeof *v);
     v->tag = CLOVE_KEYWORD;
     v->gcmark = 1;
     v->as.kw = s;
     KwNode *n = xmalloc(sizeof *n);
+    size_t h = kw_slot(s, kw_cap);
     n->name = s; n->cell = v; n->next = kw_table[h];
     kw_table[h] = n;
+    kw_n++;
     return v;
 }
 static size_t gc_extra_bytes;   /* string buffer bytes since last GC —
@@ -1097,7 +1123,22 @@ typedef struct InternNode {
     uint32_t hash;
     uint32_t len;
 } InternNode;
-static InternNode *intern_table[INTERN_BUCKETS];
+static InternNode **intern_table;     /* intern_cap buckets, doubled at load 1 */
+static size_t intern_cap, intern_n;
+
+static void intern_grow(void) {
+    size_t ncap = intern_cap ? intern_cap * 2 : INTERN_BUCKETS;
+    InternNode **nt = calloc(ncap, sizeof *nt);
+    if (!nt) { fputs("out of memory\n", stderr); exit(1); }
+    for (size_t i = 0; i < intern_cap; i++)
+        for (InternNode *n = intern_table[i], *next; n; n = next) {
+            next = n->next;
+            n->next = nt[n->hash & (ncap - 1)];
+            nt[n->hash & (ncap - 1)] = n;
+        }
+    free(intern_table);
+    intern_table = nt; intern_cap = ncap;
+}
 
 static uint32_t fnv1a(const char *s, size_t n) {
     uint32_t h = 2166136261u;
@@ -1106,10 +1147,13 @@ static uint32_t fnv1a(const char *s, size_t n) {
 }
 
 static const char *intern(const char *s, size_t n) {
-    uint32_t full = fnv1a(s, n), h = full & (INTERN_BUCKETS - 1);
+    if (!intern_table) intern_grow();
+    uint32_t full = fnv1a(s, n), h = full & (intern_cap - 1);
     for (InternNode *node = intern_table[h]; node; node = node->next)
         if (node->hash == full && node->len == n && memcmp(node->str, s, n) == 0)
             return node->str;
+    if (intern_n >= intern_cap) { intern_grow(); h = full & (intern_cap - 1); }
+    intern_n++;
     char *copy = xmalloc(n + 1);
     memcpy(copy, s, n);
     copy[n] = '\0';
@@ -1680,8 +1724,7 @@ static void gc_collect(void) {
 #ifdef CLOVE_HAVE_CORO
                     case CLOVE_CORO:
                         if (c->as.coro) {
-                            free(c->as.coro->stack);
-                            free(c->as.coro->s_vstack);
+                            coro_free_stacks(c->as.coro);
                             free(c->as.coro);
                         }
                         break;
@@ -1721,13 +1764,13 @@ static void gc_collect(void) {
 
     gc_freed_last = freed;
     if (getenv("CLOVE_GC_LOG")) {
-        size_t tagn[24] = {0};
+        size_t tagn[CLOVE_TNODE + 1] = {0};
         for (CellBlock *b = cell_blocks; b; b = b->next)
             for (size_t i = 0; i < b->used; i++)
-                if (b->cells[i].tag != CLOVE_FREE && b->cells[i].tag < 24)
+                if (b->cells[i].tag != CLOVE_FREE && b->cells[i].tag <= CLOVE_TNODE)
                     tagn[b->cells[i].tag]++;
         fprintf(stderr, "[gc] live=%zu freed=%zu", live, freed);
-        for (int t = 0; t < 24; t++)
+        for (int t = 0; t <= CLOVE_TNODE; t++)
             if (tagn[t] > 100000) fprintf(stderr, " tag%d=%zu", t, tagn[t]);
         fprintf(stderr, "\n");
     }
@@ -1761,8 +1804,9 @@ static void maybe_gc(void) {
 
 /* ───── Hashing ──────────────────────────────────────────────────────── */
 
-/* Must agree with clove_eq: (= 1 1.0) → same hash; (= [1 2] '(1 2)) → lists
- * and vectors hash identically (ordered); maps hash order-independently. */
+/* Must agree with clove_eq: (= 1 1N) → same hash; (= [1 2] '(1 2)) → lists
+ * and vectors hash identically (ordered); maps hash order-independently.
+ * Doubles never = an integer, so they hash by bits alone. */
 
 static uint32_t mix64(uint64_t x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
@@ -1772,9 +1816,17 @@ static uint32_t mix64(uint64_t x) {
 }
 
 static Clove *map_entry_list(Clove *m);
+typedef bool (*EntryFn)(Clove *k, Clove *v, void *ctx);
+static bool map_each(Clove *m, EntryFn f, void *ctx);
+static uint32_t clove_hash(Clove *v);
+static bool hash_entry_sum(Clove *k, Clove *v, void *ctx) {
+    *(uint32_t *)ctx += clove_hash(k) * 31 + clove_hash(v);
+    return true;
+}
 
 static uint32_t clove_hash(Clove *v) {
     if (v == NULL || v == NIL) return 0x9e3779b9u;
+    if (v->tag >= CLOVE_LIST) clove_check_stack();   /* collections recurse */
     switch (v->tag) {
         case CLOVE_NIL:  return 0x9e3779b9u;
         case CLOVE_BOOL: return v->as.b ? 1231u : 1237u;
@@ -1792,13 +1844,12 @@ static uint32_t clove_hash(Clove *v) {
             return mix64(clove_hash(u) * 31 + (uint64_t)sc + 0x9e3779b97f4a7c15ull);
         }
         case CLOVE_DOUBLE: {
-            double d = v->as.d;
-            if (d == (double)(int64_t)d) return mix64((uint64_t)(int64_t)d);  /* = int cross-equality */
+            double d = v->as.d == 0.0 ? 0.0 : v->as.d;   /* (= 0.0 -0.0) */
             uint64_t bits;
             memcpy(&bits, &d, sizeof bits);
             return mix64(bits);
         }
-        case CLOVE_STRING:  return fnv1a(v->as.str, strlen(v->as.str));
+        case CLOVE_STRING:  return fnv1a(v->as.str, v->as.strx.nbytes);
         case CLOVE_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
         case CLOVE_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
         case CLOVE_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
@@ -1819,9 +1870,7 @@ static uint32_t clove_hash(Clove *v) {
         }
         case CLOVE_MAP: case CLOVE_SET: {
             uint32_t h = v->tag == CLOVE_SET ? 0xa5e3u : 0;  /* order-independent sum */
-            for (Clove *e = map_entry_list(v); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                h += clove_hash(e->as.cons.head->as.cons.head) * 31
-                   + clove_hash(e->as.cons.head->as.cons.tail);
+            map_each(v, hash_entry_sum, &h);
             return h;
         }
         case CLOVE_SORTED: {  /* must match the hash of an equal hash set/map */
@@ -2261,6 +2310,35 @@ static void hamt_entries(Clove *node, Clove ***t) {
             *t = &(**t)->as.cons.tail;
         }
     }
+}
+
+/* Visit every entry without allocating: maps in insertion order (k, v), sets
+ * in HAMT order (x, x). Stops early when f returns false; returns false then. */
+static bool hamt_each(Clove *node, EntryFn f, void *ctx) {
+    if (!node) return true;
+    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
+        Clove *k = node->as.hnode.kids[i];
+        if (k == NULL && !node->as.hnode.collision) {
+            if (!hamt_each(node->as.hnode.kids[i + 1], f, ctx)) return false;
+        } else if (!f(k, node->as.hnode.kids[i + 1], ctx)) return false;
+    }
+    return true;
+}
+static bool map_each(Clove *m, EntryFn f, void *ctx) {
+    if (m->tag == CLOVE_SET) return hamt_each(m->as.map.root, f, ctx);
+    Clove *order = m->as.map.order;
+    if (!order || !m->as.map.count) return true;
+    uint32_t n = order->as.vec.count;
+    if (!m->as.map.root) {
+        for (uint32_t i = 0; i < n; i += 2)
+            if (!f(order->as.vec.tail[i], order->as.vec.tail[i + 1], ctx)) return false;
+        return true;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        Clove *e = vec_nth(order, i);
+        if (e && !f(e->as.tnode.key, e->as.tnode.val, ctx)) return false;
+    }
+    return true;
 }
 
 /* Maps iterate in insertion order (the order vector); sets in HAMT order. */
@@ -7907,6 +7985,7 @@ static Clove *prim_denominator(CloveEnv *env, Clove **argv, int nargs) {
  * (= [1 2 3] '(1 2 3)) is true. Seqs are forced one cell at a time, so a
  * finite side ends the walk: (= [0 1 2] (range)) is false, not a hang. */
 static bool seq_eq(Clove *a, Clove *b) {
+    clove_check_stack();   /* nested colls recurse: a coro has only 1 MiB */
     bool va = a->tag == CLOVE_VECTOR, vb = b->tag == CLOVE_VECTOR;
     Clove *la = va ? NULL : seq1(a), *lb = vb ? NULL : seq1(b);
     size_t ia = 0, ib = 0;
@@ -7952,6 +8031,15 @@ static bool maplike_eq_(Clove *a, Clove *b) {
     return true;
 }
 
+static bool map_entry_in(Clove *k, Clove *v, void *b) {
+    Clove *bv;
+    return map_find(b, k, &bv) && clove_eq(v, bv);
+}
+static bool set_elem_in(Clove *k, Clove *v, void *b) {
+    (void)v;
+    return set_contains(b, k, NULL);
+}
+
 static bool is_jcoll(Clove *v);
 static bool clove_eq(Clove *a, Clove *b) {
     if (a == b) return true;
@@ -7964,6 +8052,7 @@ static bool clove_eq(Clove *a, Clove *b) {
         return seq_eq(a, b);
     /* sorted collections compare as their set/map category, across tags */
     if (a->tag == CLOVE_SORTED || b->tag == CLOVE_SORTED) {
+        clove_check_stack();
         bool a_set = a->tag == CLOVE_SET || (a->tag == CLOVE_SORTED && !a->as.sorted.is_map);
         bool b_set = b->tag == CLOVE_SET || (b->tag == CLOVE_SORTED && !b->as.sorted.is_map);
         if (a_set && b_set) return setlike_eq_(a, b);
@@ -7994,7 +8083,8 @@ static bool clove_eq(Clove *a, Clove *b) {
         case CLOVE_BIGDEC: return num_cmp(a, b) == 0;   /* (= 1.0M 1.00M), as Clojure */
         case CLOVE_SYMBOL: return a->as.sym == b->as.sym;
         case CLOVE_KEYWORD: return a->as.kw == b->as.kw;
-        case CLOVE_STRING: return strcmp(a->as.str, b->as.str) == 0;
+        case CLOVE_STRING: return a->as.strx.nbytes == b->as.strx.nbytes &&
+                                  memcmp(a->as.str, b->as.str, a->as.strx.nbytes) == 0;
         case CLOVE_CHAR: return a->as.chr == b->as.chr;
         case CLOVE_MAP: {
             /* a deftype with a custom equiv/equals (e.g. DataScript's Datom
@@ -8011,19 +8101,13 @@ static bool clove_eq(Clove *a, Clove *b) {
               }
             }
             if (a->as.map.count != b->as.map.count) return false;
-            for (Clove *e = map_entry_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-                Clove *bv;
-                if (!map_find(b, e->as.cons.head->as.cons.head, &bv)) return false;
-                if (!clove_eq(e->as.cons.head->as.cons.tail, bv)) return false;
-            }
-            return true;
+            clove_check_stack();
+            return map_each(a, map_entry_in, b);
         }
-        case CLOVE_SET: {
+        case CLOVE_SET:
             if (a->as.map.count != b->as.map.count) return false;
-            for (Clove *e = set_element_list(a); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                if (!set_contains(b, e->as.cons.head, NULL)) return false;
-            return true;
-        }
+            clove_check_stack();
+            return map_each(a, set_elem_in, b);
         default: return false;
     }
 }
@@ -10399,7 +10483,7 @@ static Clove *prim_with_meta(CloveEnv *env, Clove **argv, int nargs) {
         memcpy(c->as.vec.tail, v->as.vec.tail, sizeof(Clove *) * v->as.vec.taillen);
     }
     if (v->tag == CLOVE_STRING) {        /* string buffers are owned: copy */
-        size_t n = strlen(v->as.str);
+        size_t n = v->as.strx.nbytes;
         c->as.str = xmalloc(n + 1);
         memcpy(c->as.str, v->as.str, n + 1);
         c->as.strx.nbytes = (uint32_t)n;
@@ -10981,8 +11065,8 @@ static Clove *prim_swap(CloveEnv *env, Clove **argv, int nargs) {
  * UTF-8 preserves codepoint order the sign is right for any input. The
  * magnitude of a multi-byte mismatch is a byte difference rather than the
  * JVM's UTF-16 char difference; callers may only rely on the sign there. */
-static int str_compare(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b), lim = la < lb ? la : lb;
+static int str_compare_n(const char *a, size_t la, const char *b, size_t lb) {
+    size_t lim = la < lb ? la : lb;
     for (size_t i = 0; i < lim; i++) {
         int ca = (unsigned char)a[i], cb = (unsigned char)b[i];
         if (ca != cb) return ca - cb;
@@ -10991,6 +11075,9 @@ static int str_compare(const char *a, const char *b) {
     size_t d = la < lb ? lb - la : la - lb;
     int dd = d > (size_t)INT_MAX ? INT_MAX : (int)d;
     return la < lb ? -dd : dd;
+}
+static int str_compare(const char *a, const char *b) {
+    return str_compare_n(a, strlen(a), b, strlen(b));
 }
 
 static int cmp_values(Clove *a, Clove *b) {
@@ -11001,7 +11088,8 @@ static int cmp_values(Clove *a, Clove *b) {
     if (a_num && b_num) return num_cmp(a, b);   /* exact for bigints/ratios */
     if (a->tag != b->tag) clove_error("compare: %s and %s are not comparable", val_desc(a), val_desc(b));
     switch (a->tag) {
-        case CLOVE_STRING:  return str_compare(a->as.str, b->as.str);
+        case CLOVE_STRING:  return str_compare_n(a->as.str, a->as.strx.nbytes,
+                                                 b->as.str, b->as.strx.nbytes);
         case CLOVE_CHAR:    return a->as.chr - b->as.chr;
         case CLOVE_KEYWORD: return str_compare(a->as.kw, b->as.kw);
         case CLOVE_SYMBOL:  return str_compare(a->as.sym, b->as.sym);
@@ -11342,15 +11430,21 @@ static Clove *prim_name(CloveEnv *env, Clove **argv, int nargs) {
     return mk_str(n, strlen(n));
 }
 
+/* Byte length of a name from as_named: a string's own length (it may hold
+ * NUL bytes), else the C string's. */
+static size_t named_len(Clove *x, const char *n) {
+    return x != NIL && x->tag == CLOVE_STRING ? x->as.strx.nbytes : strlen(n);
+}
+
 static Clove *prim_keyword(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     /* (keyword \a) => nil, like Clojure — keyword rejects chars. */
     if (argv[0] != NIL && argv[0]->tag == CLOVE_CHAR) return NIL;
     if (nargs >= 2) {                       /* (keyword ns name) => :ns/name */
         const char *nm = as_named(argv[1], "keyword");
-        if (argv[0] == NIL) return mk_kw(intern(nm, strlen(nm)));  /* nil ns: bare kw */
+        if (argv[0] == NIL) return mk_kw(intern(nm, named_len(argv[1], nm)));  /* nil ns: bare kw */
         const char *ns = as_named(argv[0], "keyword");
-        size_t ln = strlen(ns), lm = strlen(nm);
+        size_t ln = named_len(argv[0], ns), lm = named_len(argv[1], nm);
         char *buf = xmalloc(ln + lm + 2);
         memcpy(buf, ns, ln); buf[ln] = '/';
         memcpy(buf + ln + 1, nm, lm); buf[ln + lm + 1] = '\0';
@@ -11359,7 +11453,7 @@ static Clove *prim_keyword(CloveEnv *env, Clove **argv, int nargs) {
         return r;
     }
     const char *n = as_named(argv[0], "keyword");
-    return mk_kw(intern(n, strlen(n)));
+    return mk_kw(intern(n, named_len(argv[0], n)));
 }
 
 /* string/symbol/keyword -> its name; a non-named, non-nil value (e.g. what
@@ -11385,8 +11479,9 @@ static Clove *prim_symbol(CloveEnv *env, Clove **argv, int nargs) {
         const char *nm = symbol_name_of(argv[1]);
         return mk_sym(intern_qual(ns, nm));
     }
-    const char *n = symbol_name_of(nargs >= 2 ? argv[1] : argv[0]);
-    return mk_sym(intern(n, strlen(n)));
+    Clove *x = nargs >= 2 ? argv[1] : argv[0];
+    const char *n = symbol_name_of(x);
+    return mk_sym(intern(n, x->tag == CLOVE_STRING ? named_len(x, n) : strlen(n)));
 }
 
 static Clove *prim_quot(CloveEnv *env, Clove **argv, int nargs) {
@@ -13343,6 +13438,7 @@ static Clove *coro_resume(Coro *target, Clove *val) {
     state_load(target);                  /* install target's vstack + scalars */
     swapcontext(resumer ? &resumer->ctx : &coro_main_ctx, &target->ctx);
     /* ← target yielded or died back to us; it already restored our state. */
+    if (target->status == CORO_DEAD) coro_free_stacks(target);
     return target->xfer;
 }
 
@@ -13390,6 +13486,50 @@ static void coro_trampoline(void) {
     /* unreachable */
 }
 
+/* The stack is mmap'd with a PROT_NONE page below it, so recursion that
+ * gets past clove_check_stack faults instead of overwriting the heap. If the
+ * mapping fails (e.g. vm.max_map_count), fall back to malloc, unguarded. */
+#define CORO_STACK_CACHE 16          /* recently freed mappings kept for reuse */
+static char *coro_stack_cache[CORO_STACK_CACHE];
+static int coro_stack_ncached;
+
+static void coro_stack_alloc(Coro *co) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (coro_stack_ncached) {           /* skip the mmap/mprotect/munmap round */
+        co->stack_map = coro_stack_cache[--coro_stack_ncached];
+        co->stack = co->stack_map + page;
+        return;
+    }
+    char *base = mmap(NULL, CORO_STACK_SIZE + page, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base != MAP_FAILED) {
+        if (mprotect(base, page, PROT_NONE) == 0) {
+            co->stack_map = base;
+            co->stack = base + page;
+            return;
+        }
+        munmap(base, CORO_STACK_SIZE + page);
+    }
+    co->stack_map = NULL;
+    co->stack = xmalloc(CORO_STACK_SIZE);
+}
+
+/* Release a coro's stacks. Only ever called when it is not running: from
+ * coro_resume once it has died (we are back on the resumer's stack), or
+ * from the sweep. */
+static void coro_free_stacks(Coro *co) {
+    if (co->stack_map && coro_stack_ncached < CORO_STACK_CACHE)
+        coro_stack_cache[coro_stack_ncached++] = co->stack_map;
+    else if (co->stack_map)
+        munmap(co->stack_map, CORO_STACK_SIZE + (size_t)(co->stack - co->stack_map));
+    else
+        free(co->stack);
+    free(co->s_vstack);
+    co->stack = co->stack_map = co->stack_top = NULL;
+    co->s_vstack = NULL;
+    co->s_vsp = 0;
+}
+
 static Clove *coro_new(Clove *thunk) {
     Clove *cell = alloc(CLOVE_CORO);     /* as.coro zeroed → GC-safe before attach */
     Coro *co = xmalloc(sizeof(Coro));
@@ -13399,7 +13539,10 @@ static Clove *coro_new(Clove *thunk) {
     co->s_vstack = xmalloc(sizeof(Clove *) * CORO_VSTACK_CAP);   /* this coro's own vstack */
     co->s_vsp = 0;
     co->s_vstack_cap = CORO_VSTACK_CAP;
-    co->stack = xmalloc(CORO_STACK_SIZE);
+    coro_stack_alloc(co);
+    /* the stacks live outside the cell pools: count them toward GC pressure,
+     * or a loop making coroutines grows by ~1 MiB each between collections */
+    gc_extra_bytes += CORO_STACK_SIZE + sizeof(Clove *) * CORO_VSTACK_CAP;
     co->stack_size = CORO_STACK_SIZE;
     co->stack_top = co->stack + CORO_STACK_SIZE;
     getcontext(&co->ctx);

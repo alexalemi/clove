@@ -4041,5 +4041,30 @@
 (assert= [true "dflt"] [(string? (System/getProperty "user.dir")) (System/getProperty "nope.prop" "dflt")])
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
+;; ── workstream D: GC, coroutines, equality/hash/interning, vectors, sorted colls ──
+;; strings compare, hash and intern by their full length, NUL bytes included
+(assert= [false 2 -1] (let [a (str "a" (char 0) "b") b (str "a" (char 0) "c")] [(= a b) (count #{a b}) (compare a b)]))
+(assert= false (= "" (str (char 0))))
+(assert= [false false] [(= (keyword (str "a" (char 0) "b")) (keyword (str "a" (char 0) "c")))
+                        (= (symbol (str "a" (char 0) "b")) (symbol (str "a" (char 0) "c")))])
+;; doubles hash by bits (no UB cast for NaN/Inf/huge); 0.0 and -0.0 are = so hash alike
+(assert= [5 true true] [(count (hash-set 1e300 ##NaN ##Inf 0.0 -0.0 1.0)) (= (hash 0.0) (hash -0.0)) (= (hash 1) (hash 1N))])
+;; intern tables grow: many distinct keywords stay distinct and identical to themselves
+(assert= 50000 (count (set (map #(keyword (str "kw-d-" %)) (range 50000)))))
+(assert= true (identical? (keyword "kw-d-49999") :kw-d-49999))
+;; map/set hash and = walk entries without building lists
+(assert= [true true false] [(= (hash (zipmap (range 100) (range 100))) (hash (into {} (map vector (range 100) (range 100)))))
+                            (= (set (range 100)) (set (reverse (range 100))))
+                            (= (zipmap (range 100) (range 100)) (assoc (zipmap (range 100) (range 100)) 5 6))])
+(when clove-test-coro?
+  ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
+  (let [v (reduce (fn [a _] [a]) [] (range 100000))
+        c (coro/new (fn [] (let [w (reduce (fn [a _] [a]) [] (range 100000))]
+                             (try (= w v) (catch StackOverflowError e :so)))))]
+    (assert= :so (coro/resume c)))
+  ;; finished coroutines release their stacks right away
+  (dotimes [i 3000] (coro/resume (coro/new (fn [] i))))
+  (assert= 6 (coro/resume (coro/new (fn [] (* 2 3))))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
