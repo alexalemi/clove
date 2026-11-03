@@ -4041,5 +4041,20 @@
 (assert= [true "dflt"] [(string? (System/getProperty "user.dir")) (System/getProperty "nope.prop" "dflt")])
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
+;; ── workstream C: host IO, processes, batteries ──
+(when clove-test-unix?
+  ;; IO errors throw (spit to a full disk returned nil; slurp of a dir gave "")
+  (assert= "/tmp (Is a directory)"
+           (try (slurp "/tmp") (catch java.io.FileNotFoundException e (ex-message e))))
+  (assert= "/clove-no-such-dir/x (No such file or directory)"
+           (try (spit "/clove-no-such-dir/x" "a") (catch java.io.FileNotFoundException e (ex-message e))))
+  (when (clove/file-op* :exists "/dev/full")
+    (assert= "No space left on device"
+             (try (spit "/dev/full" "hello") (catch java.io.IOException e (ex-message e)))))
+  ;; a child killed by a signal exits 128+sig, not 0
+  (assert= 137 (:exit (sh "kill -9 $$")))
+  (assert= 143 (clove/sh-lines* "kill -TERM $$" identity))
+  (assert= 137 (:exit (sh "sh" "-c" "kill -9 $$"))))
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

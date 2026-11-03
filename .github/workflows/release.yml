@@ -81,8 +81,7 @@ jobs:
           D=clove-${GITHUB_REF_NAME}-windows-x86_64
           mkdir "$D"
           cp clove.exe clove.c README.md CHANGELOG.md "$D/"
-          cp docs.clj libc.clj json.clj fs.clj process.clj test.clj jit.clj \
-             bundle.clj clerk.clj judge.cljc csp.clj http.clj nrepl.clj "$D/"
+          cp $(make -s print-batteries) "$D/"
           cp -r vendor "$D/vendor"
           zip -qr "$D.zip" "$D"
       - uses: actions/upload-artifact@v4

@@ -13,6 +13,17 @@
 - The esoteric-language interpreter example is now `examples/tape.clj`
   ("Tape Machine").
 
+### Fixed (host IO, processes, batteries)
+- `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`
+  throws `IOException` "No space left on device" (it returned nil), and
+  `(slurp "/tmp")` throws `FileNotFoundException` "/tmp (Is a directory)" (it
+  returned ""). Open failures are `FileNotFoundException` with the OS reason.
+- `sh` and `clove/sh-lines*` report a child killed by a signal as 128+signal
+  (`(sh "kill -9 $$")` gave exit 0).
+- `~/.clove_history` is created with mode 0600, and an existing one is
+  tightened to it.
+- `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
+
 ## v0.9.0 — 2026-11-02
 
 ### Changed

@@ -2781,9 +2781,6 @@ static Clove *peel_meta_sym_doc(Clove *v, bool *priv, Clove **doc_out) {
     }
     return v;
 }
-static Clove *peel_meta_sym_priv(Clove *v, bool *priv) {
-    return peel_meta_sym_doc(v, priv, NULL);
-}
 static Clove *peel_meta_sym(Clove *v) { return peel_meta_sym_doc(v, NULL, NULL); }
 
 /* ── Var metadata ──
@@ -8516,7 +8513,6 @@ static Clove *mk_iarray_of(uint32_t n, bool dbl) {
     gc_extra_bytes += sizeof(int64_t) * (n ? n : 1);
     return a;
 }
-static Clove *mk_iarray(uint32_t n) { return mk_iarray_of(n, false); }
 
 /* Element access. memcpy rather than a cast through int64_t*: type-punning a
  * double through an integer pointer is undefined, and every compiler folds
@@ -11618,25 +11614,35 @@ static const char *embedded_lookup(const char *path) {
     return NULL;
 }
 
+/* Append the rest of f to sb; sb->data is non-NULL and NUL-terminated after. */
+static void sb_read_all(SBuf *sb, FILE *f) {
+    size_t n;
+    do {
+        sb_grow(sb, 4096);
+        n = fread(sb->data + sb->len, 1, 4096, f);
+        sb->len += n;
+    } while (n > 0);
+    sb->data[sb->len] = '\0';
+}
+
+/* "path (strerror)", the JVM's FileNotFoundException message. */
+static void io_fail(const char *cls, const char *path, int e) {
+    clove_error_cls(cls, "%s (%s)", path, strerror(e));
+}
+
 static Clove *prim_slurp(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
     char *path = as_str(argv[0], "slurp");
     const char *emb = embedded_lookup(path);
     if (emb) return mk_str(emb, strlen(emb));   /* bundled dependency */
     FILE *f = fopen(path, "rb");
-    if (!f) clove_error("slurp: cannot open %s", path);
+    if (!f) io_fail("FileNotFoundException", path, errno);
     SBuf sb = {0};
-    sb_grow(&sb, 4096);
-    size_t n;
-    char buf[4096];
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
-        sb_grow(&sb, n);
-        memcpy(sb.data + sb.len, buf, n);
-        sb.len += n;
-        sb.data[sb.len] = '\0';
-    }
+    sb_read_all(&sb, f);
+    int e = ferror(f) ? errno : 0;   /* a directory opens fine, then fails with EISDIR */
     fclose(f);
-    Clove *r = mk_str(sb.data ? sb.data : "", sb.len);
+    if (e) { free(sb.data); io_fail("FileNotFoundException", path, e); }
+    Clove *r = mk_str(sb.data, sb.len);
     free(sb.data);
     return r;
 }
@@ -11650,13 +11656,15 @@ static Clove *prim_spit(CloveEnv *env, Clove **argv, int nargs) {
     for (int i = 2; i + 1 < nargs; i += 2)
         if (argv[i] == mk_kw(intern("append", 6)) && argv[i + 1] != NIL && argv[i + 1] != FALSE)
             append = true;
-    FILE *f = fopen(path, append ? "ab" : "wb");
-    if (!f) clove_error("spit: cannot open %s", path);
     SBuf sb = {0};
     str_to(&sb, content);
-    if (sb.data) fwrite(sb.data, 1, sb.len, f);
+    FILE *f = fopen(path, append ? "ab" : "wb");
+    if (!f) { free(sb.data); io_fail("FileNotFoundException", path, errno); }
+    int e = 0;
+    if (sb.len && fwrite(sb.data, 1, sb.len, f) != sb.len) e = errno;
     free(sb.data);
-    fclose(f);
+    if (fclose(f) != 0 && !e) e = errno;   /* buffered data hits the disk here */
+    if (e) clove_error_cls("IOException", "%s", strerror(e));
     return NIL;
 }
 
@@ -11799,6 +11807,17 @@ static void clove_child_limits(void) {
 #endif
 }
 
+/* Exit code from a wait/pclose status: 128+signal when the child was killed,
+ * as a shell reports it. -1 when pclose itself failed. */
+static int wait_code(int status) {
+    if (status == -1) return -1;
+#ifdef _WIN32
+    return status;        /* _pclose already returns the exit code */
+#else
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
+}
+
 static void sb_child_limits(SBuf *b) {
 #ifndef _WIN32
     if (clove_orig_stack_limit) {
@@ -11893,11 +11912,19 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     const char *cdir = dir != NIL ? as_str(dir, "sh") : NULL;
     SBuf inb = {0};
     if (in != NIL) str_to(&inb, in);
-    int pin[2], pout[2], perr[2];
-    if (pipe(pin) || pipe(pout) || pipe(perr)) clove_error_cls("IOException", "sh: pipe failed");
-    fflush(stdout); fflush(stderr);
-    pid_t pid = fork();
-    if (pid < 0) clove_error_cls("IOException", "sh: fork failed");
+    int pfd[6] = {-1, -1, -1, -1, -1, -1};
+    int *pin = pfd, *pout = pfd + 2, *perr = pfd + 4;
+    bool piped = pipe(pin) == 0 && pipe(pout) == 0 && pipe(perr) == 0;
+    pid_t pid = -1;
+    if (piped) { fflush(stdout); fflush(stderr); pid = fork(); }
+    if (pid < 0) {
+        int e = errno;
+        for (int i = 0; i < 6; i++) if (pfd[i] >= 0) close(pfd[i]);
+        for (size_t i = 0; i < n; i++) free(parts[i].data);
+        free(parts); free(cargv); free(inb.data); free(out.data); free(err.data);
+        if (cenv) { for (size_t i = 0; i < nenv; i++) free(cenv[i]); free(cenv); }
+        clove_error_cls("IOException", "sh: %s failed: %s", piped ? "fork" : "pipe", strerror(e));
+    }
     if (pid == 0) {
         dup2(pin[0], 0); dup2(pout[1], 1); dup2(perr[1], 2);
         close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); close(perr[0]); close(perr[1]);
@@ -11943,7 +11970,7 @@ static Clove *prim_proc(CloveEnv *env, Clove **argv, int nargs) {
     }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
-    code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+    code = wait_code(status);
     for (size_t i = 0; i < n; i++) free(parts[i].data);
     free(parts); free(cargv); free(inb.data);
     if (cenv) { for (size_t i = 0; i < nenv; i++) free(cenv[i]); free(cenv); }
@@ -12066,11 +12093,9 @@ static Clove *prim_read_line(CloveEnv *env, Clove **argv, int nargs) {
 /* (clove/stdin-slurp*) → the rest of stdin as a string ("" at EOF): `(slurp *in*)`. */
 static Clove *prim_stdin_slurp(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
-    char buf[4096];
     SBuf sb = {0};
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, stdin)) > 0) { sb_grow(&sb, n); memcpy(sb.data + sb.len, buf, n); sb.len += n; sb.data[sb.len] = '\0'; }
-    Clove *res = mk_str(sb.data ? sb.data : "", sb.len);
+    sb_read_all(&sb, stdin);
+    Clove *res = mk_str(sb.data, sb.len);
     free(sb.data);
     return res;
 }
@@ -12509,16 +12534,6 @@ static Clove *print_args(CloveEnv *env, Clove **argv, int nargs, bool readably, 
     if (newline) sb_putc(&sb, '\n');
     emit_out(env, sb.data ? sb.data : "", sb.len);
     free(sb.data);
-    return NIL;
-}
-
-/* (clove/eprintln* ..) — like println but always to stderr (diagnostics). */
-static Clove *prim_eprintln(CloveEnv *env, Clove **argv, int nargs) {
-    (void)env;
-    SBuf sb = {0};
-    for (int i = 0; i < nargs; i++) { if (i) sb_putc(&sb, ' '); print_to(&sb, argv[i], false); }
-    sb_putc(&sb, '\n');
-    if (sb.data) { fwrite(sb.data, 1, sb.len, CERR); free(sb.data); }
     return NIL;
 }
 
@@ -13479,17 +13494,10 @@ static Clove *prim_sh(CloveEnv *env, Clove **argv, int nargs) {
     free(full.data);
     if (!p) clove_error("sh: popen failed");
     SBuf out = {0};
-    sb_grow(&out, 1); out.data[0] = '\0';
-    char buf[4096];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, p)) > 0) {
-        sb_grow(&out, n);
-        memcpy(out.data + out.len, buf, n);
-        out.len += n; out.data[out.len] = '\0';
-    }
+    sb_read_all(&out, p);
     int status = pclose(p);
     Clove *m = mk_map();
-    m = map_assoc(m, mk_kw(intern("exit", 4)), mk_int(status == -1 ? -1 : WEXITSTATUS(status)));
+    m = map_assoc(m, mk_kw(intern("exit", 4)), mk_int(wait_code(status)));
     Clove *s = mk_str(out.data, out.len);
     free(out.data);
     m = map_assoc(m, mk_kw(intern("out", 3)), s);
@@ -13543,8 +13551,7 @@ static Clove *prim_sh_lines(CloveEnv *env, Clove **argv, int nargs) {
     }
     free(line.data);
     err_top = fr.prev;
-    int status = pclose(p);
-    return mk_int(status == -1 ? -1 : WEXITSTATUS(status));
+    return mk_int(wait_code(pclose(p)));
 }
 
 /* Vtable handed to FFI modules — generated glue marshals exclusively
@@ -15286,7 +15293,6 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, ">=",      prim_ge);
     clove_define_native(e, "==",      prim_num_eq);
     clove_define_native(e, "println", prim_println);
-    clove_define_native(e, "clove/eprintln*", prim_eprintln);
     clove_define_native(e, "str",     prim_str);
     clove_define_native(e, "pr-str",  prim_pr_str);
     clove_define_native(e, "print-str",   prim_print_str);
@@ -18151,22 +18157,8 @@ EMSCRIPTEN_KEEPALIVE const char *clove_wasm_eval(const char *src) {
 /* Script mode: read entire stream, eval every form, print nothing but what
  * the script prints itself (babashka-style). Errors abort with status 1. */
 static int run_stream(CloveEnv *env, FILE *f, const char *name) {
-    /* Slurp — scripts are small; streams (stdin) can't be sized up front. */
-    size_t cap = 1 << 16, len = 0;
     /* volatile: src must survive the longjmp from clove_error intact. */
-    char * volatile src = malloc(cap);
-    if (!src) { fputs("out of memory\n", stderr); return 1; }
-    size_t n;
-    while ((n = fread(src + len, 1, cap - len - 1, f)) > 0) {
-        len += n;
-        if (len + 1 >= cap) {
-            cap *= 2;
-            char *p = realloc(src, cap);
-            if (!p) { free(src); fputs("out of memory\n", stderr); return 1; }
-            src = p;
-        }
-    }
-    src[len] = '\0';
+    char * volatile src = NULL;
     if (setjmp(err_jmp) != 0) {
         print_error();
         vsp = 0;
@@ -18175,6 +18167,9 @@ static int run_stream(CloveEnv *env, FILE *f, const char *name) {
         free(src);
         return 1;
     }
+    SBuf sb = {0};   /* an out-of-memory error here leaks sb; the process exits */
+    sb_read_all(&sb, f);
+    src = sb.data;
     rd_line = 1;   /* track source lines for error traces */
     rd_file_cell = mk_str(name, strlen(name));
     err_src_text = src;            /* retained for error display */
@@ -18235,6 +18230,20 @@ static void hist_push(char *s) {
     rl_hist[rl_hist_n++] = s;
 }
 
+/* History is private: create it 0600 (and tighten a file made before that). */
+static FILE *hist_open(const char *path, bool append) {
+#ifdef _WIN32
+    return fopen(path, append ? "a" : "w");
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0600);
+    if (fd < 0) return NULL;
+    fchmod(fd, 0600);
+    FILE *f = fdopen(fd, append ? "a" : "w");
+    if (!f) close(fd);
+    return f;
+#endif
+}
+
 static void hist_load(void) {
     char path[1024];
     if (!hist_path(path, sizeof path)) return;
@@ -18272,7 +18281,7 @@ static void hist_load(void) {
     free(line.data);
     fclose(f);
     if (!v2 && rl_hist_n) {   /* upgrade the file in place */
-        FILE *w = fopen(path, "w");
+        FILE *w = hist_open(path, false);
         if (w) {
             fputs(HIST_V2 "\n", w);
             for (int i = 0; i < rl_hist_n; i++) hist_write_entry(w, rl_hist[i]);
@@ -18287,7 +18296,7 @@ static void hist_add(const char *line) {
     hist_push(strdup(line));
     char path[1024];
     if (!hist_path(path, sizeof path)) return;
-    FILE *f = fopen(path, "a");
+    FILE *f = hist_open(path, true);
     if (!f) return;
     fseek(f, 0, SEEK_END);
     if (ftell(f) == 0) fputs(HIST_V2 "\n", f);
@@ -20216,32 +20225,16 @@ static void set_args(CloveEnv *env, int argc, char **argv, int from) {
 /* Run an internal clj program string. Errors render and exit 1; with
  * truthy_exit, a falsy final value also exits 1 (e.g. run-tests). */
 static int run_subprogram(CloveEnv *env, const char *src, bool truthy_exit) {
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
-    const char *p = src;
-    Clove *volatile last = TRUE;
-    while (*p) {
-        skip_ws(&p);
-        if (!*p) break;
-        Clove *form = read_form(&p);
-        if (!form) break;
-        last = eval(env, form);
-    }
+    Clove *last = clove_eval_string(env, src);
+    if (clove_eval_errored) return 1;
     return (truthy_exit && (last == NIL || last == FALSE)) ? 1 : 0;
 }
 
 /* Like run_subprogram, but an integer final value becomes the exit status
  * (-main returning an int, bb-style). Shared rule with bundled binaries. */
 static int run_subprogram_int_exit(CloveEnv *env, const char *src) {
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; return 1; }
-    const char *p = src;
-    Clove *volatile last = NIL;
-    while (*p) {
-        skip_ws(&p);
-        if (!*p) break;
-        Clove *form = read_form(&p);
-        if (!form) break;
-        last = eval(env, form);
-    }
+    Clove *last = clove_eval_string(env, src);
+    if (clove_eval_errored) return 1;
     return (last != NIL && last->tag == CLOVE_INT) ? (int)last->as.i : 0;
 }
 
@@ -20250,21 +20243,15 @@ static int lint_file(CloveEnv *env, const char *path) {
     (void)env;
     FILE *f = fopen(path, "r");
     if (!f) { fprintf(stderr, "lint: cannot open %s\n", path); return 1; }
-    size_t cap = 1 << 16, len = 0, n;
-    char *src = malloc(cap);
-    if (!src) { fclose(f); return 1; }
-    while ((n = fread(src + len, 1, cap - len - 1, f)) > 0) {
-        len += n;
-        if (len + 1 >= cap) { cap *= 2; src = realloc(src, cap); if (!src) { fclose(f); return 1; } }
-    }
-    src[len] = '\0';
+    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; rd_line = 0; return 1; }
+    SBuf sb = {0};
+    sb_read_all(&sb, f);
     fclose(f);
     err_src_name = path;
-    err_src_text = src;             /* retained: error rendering may use it */
+    err_src_text = sb.data;         /* retained: error rendering may use it */
     rd_line = 1;
     rd_file_cell = mk_str(path, strlen(path));
-    if (setjmp(err_jmp) != 0) { print_error(); vsp = 0; eval_sp = 0; vm_tsp = 0; rd_line = 0; return 1; }
-    const char *p = src;
+    const char *p = sb.data;
     while (*p) {
         skip_ws(&p);
         if (!*p) break;

@@ -87,7 +87,11 @@ def main():
     if not hist.startswith("#clove-history-v2\n") or "(let [a 2]\\n  (* a 21))" not in hist:
         fails += 1
         print("FAIL history file:", repr(hist))
-    total = len(cases) + 2
+    mode = os.stat(os.path.join(home, ".clove_history")).st_mode & 0o777
+    if mode != 0o600:   # history holds whatever was typed, secrets included
+        fails += 1
+        print("FAIL history file mode:", oct(mode))
+    total = len(cases) + 3
     print(f"pty tests: {total - fails} passed, {fails} failed")
     sys.exit(1 if fails else 0)
 

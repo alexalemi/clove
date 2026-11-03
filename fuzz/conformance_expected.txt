@@ -542,3 +542,6 @@ true
 ["one thousand, two hundred thirty-four|twenty-second|MCMXCIV|minus seven" "1.2345678E+4|1.000E+1|-1.234E-3|1000000000000000000000.0|0.00001" "-1234.50|0001.50|+2.00|      1.50|"]
 ["Space|\\a|Big-World Foo|Hello world|hello" "ab   |abcdefghijkl |3 4 55"]
 [[true true 1]]
+"/tmp (Is a directory)"
+"/clove-no-such-dir/x (No such file or directory)"
+137

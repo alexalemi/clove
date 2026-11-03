@@ -84,8 +84,11 @@ clean:
 	rm -f examples/host
 	rm -f clove
 
+print-batteries:
+	@echo $(BATTERIES)
+
 lint:
 	clj-kondo --lint json.clj libc.clj test.clj examples 2>/dev/null || true
 	@echo "(name files .cljc if they use #?(:clove ...) reader conditionals)"
 
-.PHONY: run test test-full test-pty conformance fuzz clean example lint install uninstall
+.PHONY: run test test-full test-pty conformance fuzz clean example lint install uninstall print-batteries

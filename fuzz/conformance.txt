@@ -568,3 +568,7 @@
 [(clojure.pprint/cl-format nil "~r|~:r|~@r|~r" 1234 22 1994 -7) (clojure.pprint/cl-format nil "~e|~,3e|~e|~f|~f" 12345.678 9.9996 -0.001234 1e21 1e-5) (clojure.pprint/cl-format nil "~$|~,4$|~@$|~,,10$|" -1234.5 1.5 2 1.5)]
 [(clojure.pprint/cl-format nil "~:c|~@c|~:(~a~)|~@(~a~)|~(~a~)" \space \a "big-world foo" "hello WORLD" "HeLLo") (clojure.pprint/cl-format nil "ab~5,4t|abcdefghijkl~10t|~2*~a ~a ~a~:*~a" 1 2 3 4 5)]
 [(do (defrecord CvMR [a b]) [(contains? (map->CvMR {:a 5}) :b) (= (map->CvMR {:a 5}) (->CvMR 5 nil)) (:z (map->CvMR {:z 1}))])]
+;; workstream C: host IO errors and signal exit codes
+(try (slurp "/tmp") (catch java.io.FileNotFoundException e (ex-message e)))
+(try (spit "/clove-no-such-dir/x" "a") (catch java.io.FileNotFoundException e (ex-message e)))
+(:exit (clojure.java.shell/sh "sh" "-c" "kill -9 $$"))
