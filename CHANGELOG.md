@@ -49,6 +49,13 @@
 - `update` takes up to three args before the rest, and `fnil` takes two or
   three defaults, as in Clojure. `(update-in m [] f)` updates the `nil` key
   as on the JVM (it applied `f` to the whole map).
+- Faster calls into interpreted fns: arity selection and parameter binding
+  are cached per arity, a leaf fn (no closures or lazy seqs in its body)
+  gets its frame on the C stack, and tail calls to natives skip the
+  trampoline. `update`, `update-in`, `assoc-in` and `next` are native.
+  1M-step `update-in` and `assoc-in` loops are about 2x faster.
+- Deeper recursion before StackOverflowError: about 19,000 compiled frames
+  (was 3,000) and 6,000 through `try` (was 670) on an 8 MB stack.
 
 ### Fixed
 - The collector no longer keeps dead data alive through its own stack
@@ -67,6 +74,11 @@
   like the equal vector.
 - `subseq` and `rsubseq` return `()` rather than nil where Clojure does.
 - `CLOVE_GC_LOG` counts every cell type in its histogram.
+- Dead data reachable only from stale words on the C stack is collected in
+  more cases: a vector built in a `loop` and dropped stays live no more,
+  and `(first (filter pred (iterate inc 0)))` no longer retains every
+  element before the match (1.1 GB at 3M elements, now 26 MB). Realizing a
+  long chain of lazy seqs forwards each step instead of keeping it.
 
 ### Fixed (host IO, processes, batteries)
 - `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`

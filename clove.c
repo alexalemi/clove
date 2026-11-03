@@ -270,6 +270,9 @@ struct Clove {
                   * what makes stepping the cursor BACKWARD exact. */
                  uint32_t cur_cp, cur_byte; bool clean; } strx;
         struct { Clove *head; Clove *tail; } cons;
+        /* An fn arity is a cons (params . body); info caches its dispatch
+         * facts on first call (see arity_bits). Zero = not computed yet. */
+        struct { Clove *params; Clove *body; uint32_t info; } arity;
         /* Persistent vector: 32-way position trie + tail of the last ≤32
          * elements. tail is owned by THIS cell (copied per derived vector);
          * tree nodes are shared CLOVE_HNODE cells. root NULL → all in tail. */
@@ -307,13 +310,8 @@ struct Clove {
          * subnode. Collision nodes hold same-hash entries linearly. */
         struct { Clove **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
                  bool collision; uint32_t edit_id; } hnode;
-        /* arities: list of (params-list . body-list) pairs; dispatch by argc.
-         * fast-call cache (lazy, filled on first apply): fc_arity is the lone
-         * fixed arity whose params are all simple symbols, count fc_n <=
-         * ENV_SLOTS — lets apply skip arity_info + bind_params/destructure and
-         * fill the call frame's slots directly. NULL => always use slow path. */
-        struct { Clove *arities; CloveEnv *env; bool is_macro;
-                 bool fc_ready; uint8_t fc_n; Clove *fc_arity; } fn;
+        /* arities: list of (params-list . body-list) pairs; dispatch by argc */
+        struct { Clove *arities; CloveEnv *env; bool is_macro; } fn;
         CloveNativeFn native;
         struct { Clove *value; Clove *watches; Clove *validator; } atom;  /* watches: {key fn} or NIL; validator: fn or NIL */
         /* CLOVE_BIGINT: mag is n little-endian base-2^32 limbs, mag[n-1] != 0;
@@ -331,7 +329,8 @@ struct Clove {
          * wider recurs spill to a heap array stored in iv[0]. */
         struct { Clove *iv[3]; uint8_t n; bool spill; } recur;
         struct { uint32_t *code; Clove **consts;
-                 uint32_t ncode; uint16_t nconst; } chunk;
+                 uint32_t ncode; uint16_t nconst;
+                 bool leaf; } chunk;   /* leaf: see vm_chunk_leaf */
         struct Coro *coro;   /* CLOVE_CORO: heap-allocated coroutine state */
         /* CLOVE_IARRAY: cell-owned flat buffer (freed on sweep); no GC children.
          * dbl=true marks a double-array: the same 8-byte slots hold IEEE bit
@@ -363,6 +362,8 @@ struct CloveEnv {
     uint8_t nslots;
     uint8_t captured;   /* a closure holds (a descendant of) this frame:
                          * VOP_REBIND must not mutate its slots in place */
+    uint8_t onstack;    /* a leaf call's frame, in apply's C frame: not in an
+                         * env block, never referenced once the call returns */
     const char *sname[ENV_SLOTS];
     Clove *sval[ENV_SLOTS];
 };
@@ -1222,6 +1223,7 @@ static CloveEnv *env_new(CloveEnv *parent) {
     e->parent = parent;
     e->nslots = 0;
     e->captured = 0;
+    e->onstack = 0;
     return e;
 }
 
@@ -5457,6 +5459,21 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
     }
 }
 
+/* A leaf body never lets its call frame escape: no closure or lazy-seq
+ * captures it, no tree-walked subform sees it, and it opens no let/loop frame
+ * (whose env would point back at it). apply then gives the call a frame on
+ * the C stack instead of a heap env. A call that turns out to be a macro
+ * only at runtime evaluates the source form; the VM moves the frame to the
+ * heap first (vm_frame_to_heap). */
+static bool vm_chunk_leaf(const uint32_t *code, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t op = code[i] & 0xff;
+        if (op == VOP_CLOSURE || op == VOP_LAZY || op == VOP_EVAL || op == VOP_NEWENV)
+            return false;
+    }
+    return true;
+}
+
 /* Compile one arity body. Returns a chunk cell, or NULL (caller falls
  * back to the tree-walker permanently). */
 static Clove *vm_compile(CloveEnv *cenv, Clove *params, Clove *body) {
@@ -5499,8 +5516,20 @@ static Clove *vm_compile(CloveEnv *cenv, Clove *params, Clove *body) {
     chunk->as.chunk.consts = c.consts;
     chunk->as.chunk.ncode = c.ncode;
     chunk->as.chunk.nconst = (uint16_t)c.nconst;
+    chunk->as.chunk.leaf = vm_chunk_leaf(c.code, c.ncode);
     vsp = base;
     return chunk;
+}
+
+/* A heap copy of a leaf call's stack frame, for code that may capture it. */
+static __attribute__((noinline)) CloveEnv *vm_frame_to_heap(CloveEnv *se) {
+    CloveEnv *e = env_new(se->parent);
+    for (int i = 0; i < se->nslots; i++) {
+        e->sname[i] = se->sname[i];
+        e->sval[i] = se->sval[i];
+    }
+    e->nslots = se->nslots;
+    return e;
 }
 
 static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
@@ -5586,6 +5615,7 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                         free(sb.data);
                     }
                     vsp -= n + 1;
+                    if (env->onstack) env_keep = env = vm_frame_to_heap(env);
                     r = eval(env, K[a >> 8]);
                 } else {
                     if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
@@ -5614,7 +5644,10 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                 VM_NEXT();
             }
             VM_CASE(VOP_VEC) {
-                Clove *v = mk_vector(&vstack[vsp - a], a);
+                /* up to 32 elements fit the tail: one cell, no conj chain */
+                Clove *v = a == 0 ? mk_empty_vec()
+                         : a <= 32 ? vec_cell(NULL, 0, a, &vstack[vsp - a], (uint8_t)a, NULL)
+                         : mk_vector(&vstack[vsp - a], a);
                 vsp -= a;
                 vpush(v);
                 VM_NEXT();
@@ -5671,7 +5704,19 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                 Clove *f = vstack[vsp - n - 1];
                 if (IS_MACRO_HEAD(env, f)) {
                     vsp -= n + 1;                    /* late macro: deopt, no TCO */
+                    if (env->onstack) env_keep = env = vm_frame_to_heap(env);
                     vpush(eval(env, K[a >> 8]));
+                    VM_NEXT();
+                }
+                if (f->tag != CLOVE_FN && f->tag != CLOVE_VAR) {
+                    /* a native (or keyword, map ...) adds no interpreted
+                     * frame to elide: call it as VOP_CALL does, without
+                     * allocating a sentinel */
+                    if (g_interrupt) { g_interrupt = 0; clove_error("interrupted"); }
+                    if (tslot >= 0) vm_trace[tslot].pc = pc;
+                    Clove *r = apply(env, f, &vstack[vsp - n], (int)n);
+                    vsp -= n + 1;
+                    vpush(r);
                     VM_NEXT();
                 }
                 g_tc_form = K[a >> 8];               /* trace frame for the trampoline */
@@ -5704,27 +5749,35 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
     #undef VM_NEXT
 }
 
-/* Decide once whether `fn` qualifies for the direct-slot fast call path:
- * exactly one arity, fixed (no &), every param a plain symbol, count within
- * the inline slots. Result cached on the cell (arities are immutable). */
-static void fastcall_init(Clove *fn) {
-    fn->as.fn.fc_ready = true;
-    fn->as.fn.fc_arity = NULL;
-    fn->as.fn.fc_n = 0;
-    Clove *arities = fn->as.fn.arities;
-    if (!arities || arities->tag != CLOVE_LIST) return;
-    if (arities->as.cons.tail != NIL) return;          /* multi-arity */
-    Clove *arity = arities->as.cons.head;
-    int n = 0;
-    for (Clove *p = arity->as.cons.head; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+/* An arity's dispatch facts, computed on its first call and cached in the
+ * arity cell (arities are immutable and shared by every closure of one fn
+ * form): fixed param count (bits 8+), whether it takes & rest, and whether
+ * apply may fill the call frame's slots straight from argv -- every param,
+ * the rest param included, a plain symbol, all within ENV_SLOTS. */
+#define AR_READY    1u
+#define AR_VARIADIC 2u
+#define AR_SLOTS    4u
+static uint32_t arity_bits(Clove *arity) {
+    uint32_t b = arity->as.arity.info;
+    if (b) return b;
+    uint32_t fixed = 0;
+    bool va = false, simple = true;
+    for (Clove *p = arity->as.arity.params; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
         Clove *pe = p->as.cons.head;
-        if (pe == NIL || pe->tag != CLOVE_SYMBOL) return;   /* destructuring */
-        if (pe->as.sym == sym_amp()) return;               /* variadic     */
-        n++;
+        if (pe->tag == CLOVE_SYMBOL && pe->as.sym == sym_amp()) {
+            va = true;
+            Clove *r = p->as.cons.tail;
+            if (r == NIL || r->tag != CLOVE_LIST || r->as.cons.head->tag != CLOVE_SYMBOL)
+                simple = false;
+            break;
+        }
+        if (pe->tag != CLOVE_SYMBOL) simple = false;
+        fixed++;
     }
-    if (n > ENV_SLOTS) return;
-    fn->as.fn.fc_arity = arity;
-    fn->as.fn.fc_n = (uint8_t)n;
+    if (fixed + va > ENV_SLOTS) simple = false;
+    b = AR_READY | (va ? AR_VARIADIC : 0) | (simple ? AR_SLOTS : 0) | (fixed << 8);
+    arity->as.arity.info = b;
+    return b;
 }
 
 /* If `inst` is a deftype instance (:clove/type-tagged map) whose type has a
@@ -5782,6 +5835,17 @@ static bool method_maybe(const char *mname) {
     return method_noted(d);
 }
 
+/* (method self args...): out of line, so its argument buffer is not part of
+ * every frame that might dispatch (prim_assoc, apply on a map ...) */
+static __attribute__((noinline)) Clove *apply_with_self(CloveEnv *env, Clove *method, Clove *self,
+                                                       Clove **argv, int nargs, const char *mname) {
+    Clove *iargv[256];
+    if (nargs + 1 > 256) clove_error("too many args to %s", mname);
+    iargv[0] = self;
+    for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
+    return apply(env, method, iargv, nargs + 1);
+}
+
 static bool dispatch_deftype_method(CloveEnv *env, Clove *inst, const char *mname,
                                     Clove **argv, int nargs, Clove **out) {
     if (inst == NIL || inst->tag != CLOVE_MAP) return false;
@@ -5808,11 +5872,7 @@ static bool dispatch_deftype_method(CloveEnv *env, Clove *inst, const char *mnam
         if (tab == NIL || tab->tag != CLOVE_MAP) return false;
         if (!map_find(tab, tykw, &method)) return false;
     }
-    Clove *iargv[256];
-    if (nargs + 1 > 256) clove_error("too many args to %s", mname);
-    iargv[0] = inst;
-    for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
-    *out = apply(env, method, iargv, nargs + 1);
+    *out = apply_with_self(env, method, inst, argv, nargs, mname);
     return true;
 }
 
@@ -5931,154 +5991,226 @@ static bool dyn_bound(Binding *b) {
 
 /* ───── apply + tree-walking evaluator (special forms) ─────────────────── */
 
+/* No arity of fn takes nargs: name the fn and list the arities it does
+ * take, so the caller knows which call is wrong (not just the count). Out of
+ * line so its buffer is not part of every apply frame. */
+static __attribute__((noinline, noreturn)) void arity_error(Clove *fn, int nargs) {
+    char ab[160]; int al = 0; ab[0] = '\0';
+    for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
+        uint32_t b = arity_bits(ar->as.cons.head);
+        int n = snprintf(ab + al, sizeof(ab) - al, "%s%u%s",
+                         al ? " " : "", (unsigned)(b >> 8), (b & AR_VARIADIC) ? "+" : "");
+        if (n > 0 && al + n < (int)sizeof(ab)) al += n; else break;
+    }
+    const char *nm = NULL;
+    if (fn->meta && fn->meta->tag == CLOVE_MAP) {
+        Clove *o;
+        if (map_find(fn->meta, mk_kw(intern("name", 4)), &o) &&
+            o != NIL && o->tag == CLOVE_SYMBOL) nm = o->as.sym;
+    }
+    clove_error("no matching arity: %s called with %d arg%s (takes %s)",
+               nm ? nm : "fn", nargs, nargs == 1 ? "" : "s", ab);
+}
+
+/* recur in a variadic arity passes the rest param as one value, already a
+ * seq: bind it as-is, same arity. */
+static __attribute__((noinline)) void bind_recur_rest(CloveEnv *call, Clove *params, Clove **argv, int nargs) {
+    int i = 0;
+    for (Clove *p = params; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+        Clove *pat = p->as.cons.head;
+        if (pat->tag == CLOVE_SYMBOL && pat->as.sym == sym_amp()) {
+            if (nargs != i + 1)
+                clove_error("recur: expected %d args, got %d", i + 1, nargs);
+            destructure(call, p->as.cons.tail->as.cons.head, argv[i]);
+            return;
+        }
+        if (i >= nargs) clove_error("recur: too few args (%d)", nargs);
+        destructure(call, pat, argv[i++]);
+    }
+}
+
+static Clove *apply_other(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
+
+/* Zero the stack just below the caller. The compiler's deep recursion
+ * leaves the first call's env and arguments in words that later frames at
+ * that depth may never overwrite; the conservative scan would keep them
+ * (a lazy seq's head, and with it everything realized since) alive. */
+static __attribute__((noinline)) void stack_scrub(void) {
+    char buf[8192];
+    memset(buf, 0, sizeof buf);
+    __asm__ __volatile__("" : : "r"(buf) : "memory");   /* keep the stores */
+}
+/* The same for the few frames a thunk call uses (see lazy_force). */
+static __attribute__((noinline)) void stack_scrub_small(void) {
+    char buf[1024];
+    memset(buf, 0, sizeof buf);
+    __asm__ __volatile__("" : : "r"(buf) : "memory");
+}
+
+/* The call frame for an arity whose params fill the slots: on the C stack
+ * (se) when its compiled body is a leaf, else a heap env. */
+static inline CloveEnv *arity_frame(Clove *arity, CloveEnv *parent, CloveEnv *se) {
+    Clove *ch = arity->meta;
+    if (ch && ch->tag == CLOVE_CHUNK && ch->as.chunk.leaf) {
+        se->bindings = NULL;
+        se->parent = parent;
+        se->gcmark = 0;
+        se->gcfree = 0;
+        se->nslots = 0;
+        se->captured = 0;
+        se->onstack = 1;
+        return se;
+    }
+    return env_new(parent);
+}
+
 static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
     clove_check_stack();   /* raise a catchable error before the C stack overflows */
-    /* NATIVE/FN are the overwhelmingly common cases — check them before VAR so
-     * the hot path (every +, <, fn call) doesn't pay an extra branch. */
+    /* NATIVE/FN are the overwhelmingly common cases; everything else (Vars,
+     * keywords, maps as fns ...) is out of line, keeping this frame small:
+     * every interpreted call level carries it, and stale words in a big frame
+     * pin dead data for the conservative scan. */
     if (fn->tag == CLOVE_NATIVE) return fn->as.native(env, argv, nargs);
+    if (fn->tag != CLOVE_FN) return apply_other(env, fn, argv, nargs);
+    /* volatile: when recur swaps argv to the sentinel's (possibly heap-
+     * spilled) value array, this slot is the cell's only GC root — the
+     * optimizer must not elide it. */
+    Clove * volatile recur_keep = NIL;
+    (void)recur_keep;
+    int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
+    Clove *recur_arity = NULL;   /* variadic arity a self-recur re-enters */
+    CloveEnv senv;               /* a leaf arity's call frame (vm_chunk_leaf) */
+    /* zeroed: an unused senv would otherwise hold whatever an earlier call
+     * left at this depth, and the GC scans it */
+    memset(&senv, 0, sizeof senv);
+    for (;;) {
+        Clove *chosen = NULL;
+        uint32_t cb = 0;
+        CloveEnv *call;
+        if (recur_arity) {
+            chosen = recur_arity;
+            cb = arity_bits(chosen);
+            recur_arity = NULL;
+            if ((cb & AR_SLOTS) && (size_t)nargs == (cb >> 8) + 1) {
+                call = arity_frame(chosen, fn->as.fn.env, &senv);
+                Clove *p = chosen->as.arity.params;
+                for (int i = 0; i < nargs - 1; i++, p = p->as.cons.tail) {
+                    call->sname[i] = p->as.cons.head->as.sym;
+                    call->sval[i] = argv[i];
+                }
+                call->sname[nargs - 1] = p->as.cons.tail->as.cons.head->as.sym;
+                call->sval[nargs - 1] = argv[nargs - 1];
+                call->nslots = (uint8_t)nargs;
+            } else {
+                call = env_new(fn->as.fn.env);
+                bind_recur_rest(call, chosen->as.arity.params, argv, nargs);
+            }
+        } else {
+            /* exact param-count match wins; variadic is the fallback */
+            Clove *fallback = NULL;
+            uint32_t fbb = 0;
+            for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
+                Clove *arity = ar->as.cons.head;
+                uint32_t b = arity_bits(arity);
+                if (!(b & AR_VARIADIC)) {
+                    if ((size_t)nargs == (b >> 8)) { chosen = arity; cb = b; break; }
+                } else if ((size_t)nargs >= (b >> 8) && !fallback) {
+                    fallback = arity; fbb = b;
+                }
+            }
+            if (!chosen) { chosen = fallback; cb = fbb; }
+            if (!chosen) arity_error(fn, nargs);
+            if (cb & AR_SLOTS) {
+                call = arity_frame(chosen, fn->as.fn.env, &senv);
+                /* fill the frame's slots straight from argv: no
+                 * bind_params/destructure walk */
+                int fx = (int)(cb >> 8);
+                Clove *p = chosen->as.arity.params;
+                for (int i = 0; i < fx; i++, p = p->as.cons.tail) {
+                    call->sname[i] = p->as.cons.head->as.sym;
+                    call->sval[i] = argv[i];
+                }
+                call->nslots = (uint8_t)fx;
+                if (cb & AR_VARIADIC) {
+                    Clove *restl = NIL;   /* nil when no extra args */
+                    for (int j = nargs - 1; j >= fx; j--) restl = mk_cons(argv[j], restl);
+                    call->sname[fx] = p->as.cons.tail->as.cons.head->as.sym;
+                    call->sval[fx] = restl;
+                    call->nslots = (uint8_t)(fx + 1);
+                }
+            } else {
+                call = env_new(fn->as.fn.env);
+                bind_params(call, chosen->as.arity.params, argv, nargs);
+            }
+        }
+        /* first call compiles the body; failures pin TRUE = tree-walk.
+         * TRUE is pinned BEFORE compiling: a throw mid-compilation
+         * (macro expander erroring) must not retry-and-leak the
+         * compiler's buffers on every subsequent call. */
+        if (chosen->meta == NULL) {
+            chosen->meta = TRUE;
+            Clove *ch = vm_compile(call, chosen->as.arity.params,
+                                  chosen->as.arity.body);
+            if (ch) chosen->meta = ch;
+            stack_scrub();
+        }
+        Clove *result = chosen->meta->tag == CLOVE_CHUNK
+            ? vm_run(call, chosen->meta)
+            : eval_body(call, chosen->as.arity.body);
+        if (!(result && result->tag == CLOVE_RECUR)) {
+            if (tc_frame >= 0) eval_sp = tc_frame;
+            return result;
+        }
+        /* recur/tailcall: the sentinel's value array IS the next argv. */
+        recur_keep = result;   /* root the cell across the next iteration */
+        /* a tail call REPLACES this fn's trace frame (mirrors real frame
+         * elision; recur loops stay at one slot) */
+        int native_frame = -1;   /* extra trace slot for a native tail call */
+        if (g_tc_form) {
+            if (result->meta && result->meta->tag != CLOVE_FN) {
+                /* a native does not reuse this frame, so its form goes
+                 * ABOVE the current one: (defn f [x] (+ x 1)) failing in
+                 * + must still show `(f ...)` in the trace */
+                if (eval_sp < EVAL_STACK_MAX) {
+                    native_frame = eval_sp;
+                    eval_stack[eval_sp++] = g_tc_form;
+                }
+            } else {
+                if (tc_frame < 0 && eval_sp < EVAL_STACK_MAX) tc_frame = eval_sp++;
+                if (tc_frame >= 0) eval_stack[tc_frame] = g_tc_form;
+            }
+            g_tc_form = NULL;
+        }
+        argv = result->as.recur.spill
+            ? (Clove **)result->as.recur.iv[0] : result->as.recur.iv;
+        nargs = (int)result->as.recur.n;
+        if (!result->meta && (cb & AR_VARIADIC)) recur_arity = chosen;
+        if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
+            Clove *newfn = result->meta;
+            if (newfn->tag == CLOVE_FN) fn = newfn;         /* loop, replacing this frame */
+            else {
+                /* native/keyword/map: dispatch here. NOT `return apply(...)`
+                 * — that C tail call lets -O2 free this frame (and the
+                 * volatile recur_keep rooting the sentinel that owns argv),
+                 * so the GC could reclaim the args mid-call. Reading
+                 * recur_keep after the call pins the sentinel live. */
+                Clove *rv = apply(env, newfn, argv, nargs);
+                recur_keep = result;
+                if (native_frame >= 0) eval_sp = native_frame;
+                if (tc_frame >= 0) eval_sp = tc_frame;
+                return rv;
+            }
+        }
+    }
+}
+
+/* apply for everything but natives and interpreted fns: Vars, keywords,
+ * maps, sets, vectors ... as functions. */
+static __attribute__((noinline)) Clove *apply_other(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
     if (fn->tag == CLOVE_VAR) {     /* a Var is IFn: call its current value */
         Binding *b = root_find(env_root(env), fn->as.var.name, NULL, false);
         if (b && b->value != fn) return apply(env, b->value, argv, nargs);
         clove_error("var is unbound or not callable");
-    }
-    if (fn->tag == CLOVE_FN) {
-        /* volatile: when recur swaps argv to the sentinel's (possibly heap-
-         * spilled) value array, this slot is the cell's only GC root — the
-         * optimizer must not elide it. */
-        Clove * volatile recur_keep = NIL;
-        (void)recur_keep;
-        int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
-        Clove *recur_arity = NULL;   /* variadic arity a self-recur re-enters */
-        for (;;) {
-            if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
-            Clove *chosen;
-            CloveEnv *call;
-            if (recur_arity) {
-                /* recur in a variadic arity passes the rest param as one
-                 * value, already a seq: bind it as-is, same arity */
-                chosen = recur_arity;
-                recur_arity = NULL;
-                call = env_new(fn->as.fn.env);
-                int i = 0;
-                for (Clove *p = chosen->as.cons.head; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
-                    Clove *pat = p->as.cons.head;
-                    if (pat->tag == CLOVE_SYMBOL && pat->as.sym == sym_amp()) {
-                        if (nargs != i + 1)
-                            clove_error("recur: expected %d args, got %d", i + 1, nargs);
-                        destructure(call, p->as.cons.tail->as.cons.head, argv[i]);
-                        break;
-                    }
-                    if (i >= nargs) clove_error("recur: too few args (%d)", nargs);
-                    destructure(call, pat, argv[i++]);
-                }
-            } else if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
-                /* fast path: fill the frame's slots straight from argv, no
-                 * arity_info walk and no bind_params/destructure calls. */
-                chosen = fn->as.fn.fc_arity;
-                call = env_new(fn->as.fn.env);
-                Clove *p = chosen->as.cons.head;
-                for (int i = 0; i < nargs; i++) {
-                    call->sname[i] = p->as.cons.head->as.sym;
-                    call->sval[i] = argv[i];
-                    p = p->as.cons.tail;
-                }
-                call->nslots = (uint8_t)nargs;
-            } else {
-                /* slow dispatch: exact param-count match wins; variadic is fallback. */
-                Clove *fallback = NULL;
-                chosen = NULL;
-                for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
-                    Clove *arity = ar->as.cons.head;
-                    size_t fixed; bool variadic;
-                    arity_info(arity->as.cons.head, &fixed, &variadic);
-                    if (!variadic && (size_t)nargs == fixed) { chosen = arity; break; }
-                    if (variadic && (size_t)nargs >= fixed && !fallback) fallback = arity;
-                }
-                if (!chosen) chosen = fallback;
-                if (!chosen) {
-                    /* name the fn and list the arities it DOES take, so the
-                     * caller knows which call is wrong (not just the count). */
-                    char ab[160]; int al = 0; ab[0] = '\0';
-                    for (Clove *ar = fn->as.fn.arities; ar && ar->tag == CLOVE_LIST; ar = ar->as.cons.tail) {
-                        size_t fx; bool va; arity_info(ar->as.cons.head->as.cons.head, &fx, &va);
-                        int n = snprintf(ab + al, sizeof(ab) - al, "%s%zu%s",
-                                         al ? " " : "", fx, va ? "+" : "");
-                        if (n > 0 && al + n < (int)sizeof(ab)) al += n; else break;
-                    }
-                    const char *nm = NULL;
-                    if (fn->meta && fn->meta->tag == CLOVE_MAP) {
-                        Clove *o;
-                        if (map_find(fn->meta, mk_kw(intern("name", 4)), &o) &&
-                            o != NIL && o->tag == CLOVE_SYMBOL) nm = o->as.sym;
-                    }
-                    clove_error("no matching arity: %s called with %d arg%s (takes %s)",
-                               nm ? nm : "fn", nargs, nargs == 1 ? "" : "s", ab);
-                }
-                call = env_new(fn->as.fn.env);
-                bind_params(call, chosen->as.cons.head, argv, nargs);
-            }
-            /* first call compiles the body; failures pin TRUE = tree-walk.
-             * TRUE is pinned BEFORE compiling: a throw mid-compilation
-             * (macro expander erroring) must not retry-and-leak the
-             * compiler's buffers on every subsequent call. */
-            if (chosen->meta == NULL) {
-                chosen->meta = TRUE;
-                Clove *ch = vm_compile(call, chosen->as.cons.head,
-                                      chosen->as.cons.tail);
-                if (ch) chosen->meta = ch;
-            }
-            Clove *result = chosen->meta->tag == CLOVE_CHUNK
-                ? vm_run(call, chosen->meta)
-                : eval_body(call, chosen->as.cons.tail);
-            if (!(result && result->tag == CLOVE_RECUR)) {
-                if (tc_frame >= 0) eval_sp = tc_frame;
-                return result;
-            }
-            /* recur/tailcall: the sentinel's value array IS the next argv. */
-            recur_keep = result;   /* root the cell across the next iteration */
-            /* a tail call REPLACES this fn's trace frame (mirrors real frame
-             * elision; recur loops stay at one slot) */
-            int native_frame = -1;   /* extra trace slot for a native tail call */
-            if (g_tc_form) {
-                if (result->meta && result->meta->tag != CLOVE_FN) {
-                    /* a native does not reuse this frame, so its form goes
-                     * ABOVE the current one: (defn f [x] (+ x 1)) failing in
-                     * + must still show `(f ...)` in the trace */
-                    if (eval_sp < EVAL_STACK_MAX) {
-                        native_frame = eval_sp;
-                        eval_stack[eval_sp++] = g_tc_form;
-                    }
-                } else {
-                    if (tc_frame < 0 && eval_sp < EVAL_STACK_MAX) tc_frame = eval_sp++;
-                    if (tc_frame >= 0) eval_stack[tc_frame] = g_tc_form;
-                }
-                g_tc_form = NULL;
-            }
-            argv = result->as.recur.spill
-                ? (Clove **)result->as.recur.iv[0] : result->as.recur.iv;
-            nargs = (int)result->as.recur.n;
-            if (!result->meta && chosen != fn->as.fn.fc_arity) {
-                size_t fx; bool va;
-                arity_info(chosen->as.cons.head, &fx, &va);
-                if (va) recur_arity = chosen;
-            }
-            if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
-                Clove *newfn = result->meta;
-                if (newfn->tag == CLOVE_FN) fn = newfn;         /* loop, replacing this frame */
-                else {
-                    /* native/keyword/map: dispatch here. NOT `return apply(...)`
-                     * — that C tail call lets -O2 free this frame (and the
-                     * volatile recur_keep rooting the sentinel that owns argv),
-                     * so the GC could reclaim the args mid-call. Reading
-                     * recur_keep after the call pins the sentinel live. */
-                    Clove *rv = apply(env, newfn, argv, nargs);
-                    recur_keep = result;
-                    if (native_frame >= 0) eval_sp = native_frame;
-                    if (tc_frame >= 0) eval_sp = tc_frame;
-                    return rv;
-                }
-            }
-        }
     }
     Clove *a0 = nargs > 0 ? argv[0] : NIL;
     Clove *a1 = nargs > 1 ? argv[1] : NIL;
@@ -6105,10 +6237,7 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
         if (map_find(fn, KW_IMPLS, &impls) &&
             impls != NIL && impls->tag == CLOVE_MAP &&
             map_find(impls, mk_sym(intern("invoke", 6)), &inv)) {
-            Clove *iargv[256]; iargv[0] = fn;
-            if (nargs + 1 > 256) clove_error("too many args to invoke");
-            for (int i = 0; i < nargs; i++) iargv[i + 1] = argv[i];
-            return apply(env, inv, iargv, nargs + 1);
+            return apply_with_self(env, inv, fn, argv, nargs, "invoke");
         }
         if (nargs < 1 || nargs > 2) clove_error("map lookup takes 1 or 2 args, got %d", nargs);
         if (map_find(fn, a0, &out)) return out;
@@ -6556,6 +6685,639 @@ static Clove *eval(CloveEnv *env, Clove *form) {
     return eval_inner(env, form);
 }
 
+/* The special forms below run out of line: their locals (arg buffers,
+ * error frames, binding arrays) would otherwise sit in every eval_inner
+ * frame, costing stack depth and leaving stale words that pin dead data
+ * for the conservative scan. */
+static __attribute__((noinline)) Clove *eval_try(CloveEnv *env, Clove *rest) {
+    static const char *SYM_CATCH, *SYM_FINALLY;
+    if (!SYM_CATCH) { SYM_CATCH = intern("catch", 5); SYM_FINALLY = intern("finally", 7); }
+    /* (try body... (catch ExClass e handler...)... (finally fin...))
+     * The first catch clause whose class matches handles the
+     * exception (catch_matches; see "Exception classes"); none
+     * matching rethrows it. finally runs on every exit: normal,
+     * body throw, handler throw, or no clause matching. */
+    Clove *body = NIL, **bt = &body;
+    Clove *catch_clause = NULL, *finally_clause = NULL;
+    for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+        Clove *f = c->as.cons.head;
+        const char *fh = (f != NIL && f->tag == CLOVE_LIST &&
+                          f->as.cons.head->tag == CLOVE_SYMBOL)
+                         ? f->as.cons.head->as.sym : NULL;
+        if (fh == SYM_CATCH) {
+            if (finally_clause) clove_error("try: catch must precede finally");
+            need_args(f->as.cons.tail, 2, "catch");
+            sym_name(f->as.cons.tail->as.cons.head, "catch class");
+            sym_name(f->as.cons.tail->as.cons.tail->as.cons.head,
+                     "catch binding");
+            if (!catch_clause) catch_clause = f;
+        } else if (fh == SYM_FINALLY) {
+            if (finally_clause) clove_error("try: only one finally clause is allowed");
+            finally_clause = f;
+        } else {
+            if (catch_clause || finally_clause)
+                clove_error("try: body form after catch/finally");
+            *bt = mk_cons(f, NIL);
+            bt = &(*bt)->as.cons.tail;
+        }
+    }
+
+    /* volatile: read after a longjmp back into this frame. */
+    Clove * volatile body_v = body;
+    Clove * volatile catch_v = catch_clause;   /* first catch, or NULL */
+    Clove * volatile clauses_v = rest;
+    Clove * volatile finally_v = finally_clause;
+    Clove * volatile result = NIL;
+    volatile bool pending = false;  /* unhandled exception to rethrow */
+
+    ErrFrame frame;
+    frame.prev = err_top;
+    frame.vsp_save = vsp;
+    frame.esp_save = eval_sp;
+    frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
+    frame.rd_line_save = rd_line;
+    frame.rd_start_save = rd_line_start;
+    frame.rd_file_save = rd_file_cell;
+    err_top = &frame;
+    if (setjmp(frame.jb) == 0) {
+        result = eval_body(env, body_v);
+        err_top = frame.prev;
+    } else {
+        err_top = frame.prev;
+        vsp = frame.vsp_save;
+        eval_sp = frame.esp_save;
+        vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
+        rd_line = frame.rd_line_save;
+        rd_line_start = frame.rd_start_save;
+        rd_file_cell = frame.rd_file_save;
+        /* first clause whose class the exception is-a */
+        Clove *exc = NULL, *hit = NULL;
+        if (catch_v) {
+            exc = err_as_value();
+            for (Clove *c = clauses_v; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+                Clove *f = c->as.cons.head;
+                if (f != NIL && f->tag == CLOVE_LIST &&
+                    f->as.cons.head->tag == CLOVE_SYMBOL &&
+                    f->as.cons.head->as.sym == SYM_CATCH &&
+                    catch_matches(f->as.cons.tail->as.cons.head->as.sym, exc)) {
+                    hit = f;
+                    break;
+                }
+            }
+        }
+        if (hit) {
+            /* Bind the exception value; run the handler under
+             * its own frame so finally still runs if it throws. */
+            cur_exc = NULL;
+            CloveEnv *scope = env_new(env);
+            Clove *cc = hit->as.cons.tail;           /* (Class e body...) */
+            env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
+            ErrFrame hframe;
+            hframe.prev = err_top;
+            hframe.vsp_save = vsp;
+            hframe.esp_save = eval_sp;
+            hframe.vm_tsp_save = vm_tsp; hframe.ns_save = cur_reader_ns; hframe.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
+            hframe.rd_line_save = rd_line;
+            hframe.rd_start_save = rd_line_start;
+            hframe.rd_file_save = rd_file_cell;
+            err_top = &hframe;
+            if (setjmp(hframe.jb) == 0) {
+                result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
+                err_top = hframe.prev;
+            } else {
+                err_top = hframe.prev;
+                vsp = hframe.vsp_save;
+                eval_sp = hframe.esp_save;
+                vm_tsp = hframe.vm_tsp_save; cur_reader_ns = hframe.ns_save; if (g_ns_binding && hframe.nsvar_save) g_ns_binding->value = hframe.nsvar_save;
+                rd_line = hframe.rd_line_save;
+                rd_line_start = hframe.rd_start_save;
+                rd_file_cell = hframe.rd_file_save;
+                pending = true;     /* handler threw */
+            }
+        } else {
+            pending = true;   /* no clause took it: rethrow after finally */
+        }
+    }
+    if (finally_v) {  /* a throwing finally replaces any pending exception */
+        /* The pending exception lives in globals (cur_exc, or
+         * err_msg + err_class), and the finally body is free to
+         * throw and catch errors of its own -- park it across. */
+        Clove *pend_exc = NULL, *pend_val = NULL;
+        const char *pend_cls = NULL;
+        if (pending) {
+            pend_exc = cur_exc;
+            pend_val = err_as_value();
+            pend_cls = err_class;
+        }
+        eval_body(env, finally_v->as.cons.tail);
+        if (pending) {
+            cur_exc = pend_exc;
+            err_class = pend_cls;
+            if (!pend_exc)
+                err_msg_set("%s", pend_val->as.str);
+        }
+    }
+    if (pending) clove_raise();
+    return result;
+}
+
+static __attribute__((noinline)) Clove *eval_ns(CloveEnv *env, Clove *rest) {
+    /* (ns name (:require [a.b :as x] ...)) — load the
+     * :require clauses; everything else is tolerated. */
+    static const char *KW_REQ, *KW_IMPORT, *KW_USE;
+    if (!KW_REQ) { KW_REQ = intern("require", 7);
+                   KW_IMPORT = intern("import", 6);
+                   KW_USE = intern("use", 3); }
+    /* Enter the namespace FIRST: the clauses' :as/:refer
+     * registrations key their owner off cur_reader_ns, so
+     * processing them before entering attributed them to
+     * the PREVIOUS ns (invisible when require-one had
+     * already entered it around load-file; wrong for a
+     * top-level script's own ns form). Subsequent reads
+     * stamp home_ns and defs land under name/ as before
+     * (run_stream alternates read/eval, so the rest of
+     * the file is read with the ns active). */
+    {
+        Clove *nsn = rest != NIL && rest->tag == CLOVE_LIST
+                    ? rest->as.cons.head : NIL;
+        if (nsn != NIL && nsn->tag == CLOVE_SYMBOL)
+            set_cur_ns(env_root(env), nsn->as.symc.name);
+    }
+    for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
+        Clove *cl = c->as.cons.head;
+        /* clause head keyword -> which per-spec handler */
+        const char *kw = NULL;
+        if (cl != NIL && cl->tag == CLOVE_LIST &&
+            cl->as.cons.head->tag == CLOVE_KEYWORD)
+            kw = cl->as.cons.head->as.kw;
+        else if (cl != NIL && cl->tag == CLOVE_VECTOR && vec_len(cl) > 0 &&
+                 vec_nth(cl, 0)->tag == CLOVE_KEYWORD)
+            kw = vec_nth(cl, 0)->as.kw;
+        const char *callee_name =
+            kw == KW_REQ    ? "clove/require-one" :
+            kw == KW_USE    ? "clove/use-one"     :
+            kw == KW_IMPORT ? "clove/import-one"  : NULL;
+        if (!callee_name) continue;
+        Clove *callee = env_lookup_maybe(env, callee_name);
+        if (!callee) continue;
+        if (cl->tag == CLOVE_LIST) {
+            for (Clove *sp = cl->as.cons.tail; sp && sp->tag == CLOVE_LIST;
+                 sp = sp->as.cons.tail) {
+                Clove *one[1] = {sp->as.cons.head};
+                apply(env, callee, one, 1);
+            }
+        } else {
+            for (uint32_t vi = 1; vi < vec_len(cl); vi++) {
+                Clove *one[1] = {vec_nth(cl, vi)};
+                apply(env, callee, one, 1);
+            }
+        }
+    }
+    return NIL;
+}
+
+static __attribute__((noinline)) Clove *eval_binding(CloveEnv *env, bool is_binding, Clove *rest) {
+    /* (binding [*v* val ...] body) pushes a DynFrame (see
+     * dyn_run). with-redefs mutates the roots in place,
+     * restored on every exit path via a handler frame. */
+    Clove *bv = rest->as.cons.head;
+    if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
+        clove_error("binding needs an even-sized vector");
+    size_t n = vec_len(bv) / 2;
+    if (n > 16) clove_error("binding: too many vars");
+    Binding *slots[16];
+    Clove *saved[16];
+    CloveEnv *root = env_root(env);
+    for (size_t i = 0; i < n; i++) {
+        Clove *symc = vec_nth(bv, i * 2);
+        const char *nm = sym_name(symc, "binding");
+        Binding *b = NULL;
+        /* home-ns first, like symbol resolution: a
+         * (def ^:dynamic *v*) inside (ns foo) lands
+         * under foo/, and binding must find it there */
+        if (symc->as.symc.home_ns && !strchr(nm, '/')) {
+            const char *qual = intern_qual(symc->as.symc.home_ns, nm);
+            b = root_binding(root, qual);
+            /* binding a referred var rebinds the shared
+             * source global, so other ns's reads see it */
+            if (!b)
+                for (int ri = 0; ri < n_refers; ri++)
+                    if (refer_from[ri] == qual) {
+                        b = root_binding(root, refer_to[ri]);
+                        if (b) break;
+                    }
+        }
+        if (!b)
+            b = root_binding(root, nm);
+        /* aliased dynamic var like cfg/-star-v-star-: resolve
+         * the alias to its full ns, else the bare var name */
+        if (!b) {
+            const char *slash = strchr(nm, '/');
+            if (slash && slash != nm) {
+                const char *pre = intern(nm, (size_t)(slash - nm));
+                const char *base = slash + 1;
+                const char *full = alias_lookup(pre, symc->as.symc.home_ns);
+                if (full) {
+                    const char *q = intern_qual(full, base);
+                    b = root_binding(root, q);
+                }
+                if (!b) {
+                    const char *bb = intern(base, strlen(base));
+                    b = root_binding(root, bb);
+                }
+            }
+        }
+        if (!b) clove_error("binding: unable to resolve %s", nm);
+        slots[i] = b;
+    }
+    /* parallel semantics, like Clojure: evaluate every
+     * init before mutating any var — a throw mid-inits
+     * then unwinds with nothing to restore */
+    Clove *newv[16];
+    for (size_t i = 0; i < n; i++)
+        newv[i] = eval(env, vec_nth(bv, i * 2 + 1));
+    if (is_binding) {
+        DynFrame fr = { NULL, (int)n, slots, newv, NULL };
+        return dyn_run(env, &fr, rest->as.cons.tail, NULL, NULL, 0);
+    }
+    for (size_t i = 0; i < n; i++) {
+        saved[i] = slots[i]->value;
+        slots[i]->value = newv[i];
+    }
+    ErrFrame frame;
+    frame.prev = err_top;
+    frame.vsp_save = vsp;
+    frame.esp_save = eval_sp;
+    frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
+    frame.rd_line_save = rd_line;
+    frame.rd_start_save = rd_line_start;
+    frame.rd_file_save = rd_file_cell;
+    err_top = &frame;
+    Clove * volatile result = NIL;
+    volatile bool threw = false;
+    if (setjmp(frame.jb) == 0) {
+        result = eval_body(env, rest->as.cons.tail);
+        err_top = frame.prev;
+    } else {
+        err_top = frame.prev;
+        vsp = frame.vsp_save;
+        eval_sp = frame.esp_save;
+        vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
+        rd_line = frame.rd_line_save;
+        rd_line_start = frame.rd_start_save;
+        rd_file_cell = frame.rd_file_save;
+        threw = true;
+    }
+    for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
+    if (threw) clove_raise();
+    return result;
+}
+
+static __attribute__((noinline)) Clove *eval_defmacro(CloveEnv *env, Clove *rest) {
+    /* (defmacro name [params] body...) — a fn flagged so that
+     * eval calls it on unevaluated forms and re-evals the result. */
+    need_args(rest, 2, "defmacro");
+    bool mac_private = false;
+    Clove *mac_doc = NIL;
+    Clove *mac_name = rest->as.cons.head;
+    const char *name = sym_name(mac_name, "defmacro");
+    if (mac_name->meta && mac_name->meta->tag == CLOVE_MAP) {
+        Clove *pv;      /* ^:private / ^{:doc ".."} written as literals */
+        mac_private = map_find(mac_name->meta, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
+        if (map_find(mac_name->meta, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
+            mac_doc = pv;
+    }
+    Clove *mbody = rest->as.cons.tail;
+    if (mbody->as.cons.head->tag == CLOVE_STRING &&
+        mbody->as.cons.tail != NIL) {
+        mac_doc = mbody->as.cons.head;   /* docstring → doc registry */
+        mbody = mbody->as.cons.tail;
+    }
+    if (mbody->as.cons.head->tag == CLOVE_MAP &&
+        mbody->as.cons.tail != NIL) {
+        Clove *dv;                        /* attr-map may carry :doc */
+        if (mac_doc == NIL &&
+            map_find(mbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
+            dv != NIL && dv->tag == CLOVE_STRING)
+            mac_doc = dv;
+        mbody = mbody->as.cons.tail;
+    }
+    Clove *m = make_fn(env, mbody, true);
+    {
+        const char *st = env_define_root(env_root(env), name, m);
+        if (strchr(st, '/')) mark_private_def(st, mac_private);
+        if (mac_doc != NIL) doc_put(st, mac_doc->as.str, NULL);
+    }
+    return m;
+}
+
+static __attribute__((noinline)) Clove *eval_defn(CloveEnv *env, Clove *rest) {
+    const char *SYM_FN = intern("fn", 2), *SYM_DEF = intern("def", 3);
+    /* (defn name [params] body...) ≡ (def name (fn [params] body...));
+     * a docstring rides along in the def rewrite so the DEF
+     * branch records it in the doc registry. */
+    need_args(rest, 2, "defn");
+    Clove *name = rest->as.cons.head;
+    Clove *fbody = rest->as.cons.tail;
+    Clove *fdoc = NIL;
+    if (fbody->as.cons.head->tag == CLOVE_STRING &&
+        fbody->as.cons.tail != NIL) {
+        fdoc = fbody->as.cons.head;
+        fbody = fbody->as.cons.tail;
+    }
+    if (fbody->as.cons.head->tag == CLOVE_MAP &&
+        fbody->as.cons.tail != NIL) {
+        Clove *dv;                     /* attr-map may carry :doc */
+        if (fdoc == NIL &&
+            map_find(fbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
+            dv != NIL && dv->tag == CLOVE_STRING)
+            fdoc = dv;
+        /* the rest of it is var metadata, merged over the name's */
+        if (name != NIL && name->tag == CLOVE_SYMBOL) {
+            Clove *nm = name->meta && name->meta->tag == CLOVE_MAP ? name->meta : mk_map();
+            for (Clove *e = map_entry_list(fbody->as.cons.head); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+                nm = map_assoc(nm, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
+            Clove *ns = alloc(CLOVE_SYMBOL);
+            ns->as = name->as;
+            ns->meta = nm;
+            name = ns;
+        }
+        fbody = fbody->as.cons.tail;
+    }
+    Clove *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
+    Clove *fn_tail = mk_cons(fn_form, NIL);
+    Clove *def_form = mk_cons(mk_sym(SYM_DEF),
+                       mk_cons(name, fdoc == NIL ? fn_tail
+                                     : mk_cons(fdoc, fn_tail)));
+    return eval(env, def_form);
+}
+
+static __attribute__((noinline)) Clove *eval_def(CloveEnv *env, Clove *rest) {
+    need_args(rest, 1, "def");
+    Clove *namef = rest->as.cons.head;
+    /* a #?(:cljs ..)-only def name elides to nil here — skip it */
+    if (namef == NIL) return NIL;
+    const char *name = sym_name(namef, "def");
+    /* The name's metadata is evaluated, as Clojure's def does, so
+     * ^{:test (fn [] ..)} stores a fn. :private also goes to the
+     * private-defs table, :doc to the doc registry. */
+    Clove *dm = eval_form_meta(env, namef);
+    bool def_private = false;
+    Clove *def_doc = NIL;
+    if (dm) {
+        Clove *pv;
+        def_private = map_find(dm, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
+        if (map_find(dm, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
+            def_doc = pv;
+    } else dm = NIL;
+    Clove *valf = rest->as.cons.tail;
+    /* (def name): no value — an unbound-var declaration => nil */
+    if (valf == NIL) {
+        const char *st = env_define_root(env_root(env), name, NIL);
+        if (strchr(st, '/')) mark_private_def(st, def_private);
+        var_meta_on_def(st, dm);
+        return NIL;
+    }
+    /* (def name "docstring" value): docstring → doc registry */
+    if (valf->as.cons.tail != NIL &&
+        valf->as.cons.tail->tag == CLOVE_LIST &&
+        valf->as.cons.head != NIL &&
+        valf->as.cons.head->tag == CLOVE_STRING) {
+        def_doc = valf->as.cons.head;
+        valf = valf->as.cons.tail;
+    }
+    Clove *val = eval(env, valf->as.cons.head);
+    /* def is always global; a redef without ^:private clears
+     * the mark (Clojure resets var meta on redef) */
+    {
+        const char *st = env_define_root(env_root(env), name, val);
+        if (strchr(st, '/')) mark_private_def(st, def_private);
+        if (def_doc != NIL) doc_put(st, def_doc->as.str, NULL);
+        var_meta_on_def(st, dm);
+    }
+    /* Attach :name metadata to a def'd function (fresh per defn, so
+     * no shared-cell hazard) the first time it's named, so
+     * (:name (meta (resolve sym))) works for potemkin-style
+     * import-def without clove having real vars. */
+    if (val != NIL && val->tag == CLOVE_FN) {
+        bool has_name = false;
+        if (val->meta && val->meta->tag == CLOVE_MAP) {
+            Clove *tmp; has_name = map_find(val->meta, mk_kw(intern("name", 4)), &tmp);
+        }
+        if (!has_name) {
+            const char *slash = strrchr(name, '/');
+            const char *bare = slash ? slash + 1 : name;
+            Clove *m = (val->meta && val->meta->tag == CLOVE_MAP) ? val->meta : mk_map();
+            val->meta = map_assoc(m, mk_kw(intern("name", 4)),
+                                  mk_sym(intern(bare, strlen(bare))));
+        }
+    }
+    return val;
+}
+
+static __attribute__((noinline)) Clove *eval_set(CloveEnv *env, Clove *rest) {
+    /* (set! var val) — only a var bound by binding, or one of
+     * the vars clojure.main binds for every REPL/script. Any
+     * other target (a field access) just evaluates val. */
+    if (rest == NIL || rest->as.cons.tail == NIL || rest->as.cons.tail->tag != CLOVE_LIST)
+        clove_error("set! needs a target and a value");
+    Clove *place = rest->as.cons.head;
+    Clove *val = eval(env, rest->as.cons.tail->as.cons.head);
+    if (place == NIL || place->tag != CLOVE_SYMBOL) return val;
+    for (CloveEnv *e = env; e && e->parent; e = e->parent)
+        if (env_local_find(e, place->as.sym))
+            clove_error("Can't set! local %s", place->as.symc.name);
+    Binding *b = root_find(env_root(env), place->as.sym, place->as.symc.home_ns, false);
+    if (!b) clove_error("set!: unable to resolve %s", place->as.symc.name);
+    static const char *repl_bound[] = {
+        "*warn-on-reflection*", "*unchecked-math*", "*print-length*",
+        "*print-level*", "*print-meta*", "*print-namespace-maps*",
+        "*math-context*", "*assert*", "*data-readers*",
+        "*default-data-reader-fn*", "*compile-path*",
+        "*command-line-args*", "*ns*", "*1", "*2", "*3", "*e", NULL };
+    bool ok = dyn_bound(b);
+    for (int i = 0; !ok && repl_bound[i]; i++) ok = !strcmp(b->name, repl_bound[i]);
+    if (!ok) clove_error("Can't change/establish root binding of #'%s with set", b->name);
+    b->value = val;
+    return val;
+}
+
+static __attribute__((noinline)) Clove *eval_recur(CloveEnv *env, Clove *rest) {
+    /* Evaluate each arg eagerly, then package into a sentinel
+     * that the enclosing loop will catch. If nothing catches
+     * it, a non-loop consumer (e.g. +) will hit the default
+     * arm of its tag-switch and error out — that's our
+     * runtime tail-position check. */
+    size_t n = list_len(rest);
+    if (n > 255) clove_error("recur: too many arguments");
+    Clove *r = alloc(CLOVE_RECUR);
+    Clove **vals = r->as.recur.iv;
+    if (n > 3) {  /* spill flag set before any slot fills */
+        vals = xmalloc(sizeof(Clove *) * n);
+        r->as.recur.iv[0] = (Clove *)vals;
+        r->as.recur.spill = true;
+    }
+    size_t i = 0;  /* n grows as slots fill — GC safety */
+    for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
+        vals[i++] = eval(env, a->as.cons.head);
+        r->as.recur.n = (uint8_t)i;
+    }
+    return r;
+}
+
+/* (loop [[a b] x] ..) => (loop [g x] (let [[a b] g] ..)) with fresh gensyms,
+ * spliced into the source so it is rewritten once per site */
+static __attribute__((noinline)) Clove *loop_desugar(CloveEnv *env, Clove *form, Clove *rest,
+                                                    Clove *binds_vec, size_t nparams) {
+    const char *SYM_LET = intern("let", 3), *SYM_LOOP = intern("loop", 4);
+    static int loopg;
+    Clove *gb[64], *lb[64];   /* new loop binds / let binds */
+    if (nparams > 32) clove_error("loop: too many bindings");
+    for (size_t i = 0; i < nparams; i++) {
+        char nm[24];
+        snprintf(nm, sizeof nm, "loop__%d", ++loopg);
+        Clove *g = mk_sym(intern(nm, strlen(nm)));
+        gb[i * 2] = g;
+        gb[i * 2 + 1] = vec_nth(binds_vec, i * 2 + 1);
+        lb[i * 2] = vec_nth(binds_vec, i * 2);
+        lb[i * 2 + 1] = g;
+    }
+    Clove *letform = mk_cons(mk_sym(SYM_LET),
+        mk_cons(mk_vector(lb, nparams * 2), rest->as.cons.tail));
+    Clove *newform = mk_cons(mk_sym(SYM_LOOP),
+        mk_cons(mk_vector(gb, nparams * 2), mk_cons(letform, NIL)));
+    /* splice: desugar once per site, not per entry */
+    form->as.cons.head = newform->as.cons.head;
+    form->as.cons.tail = newform->as.cons.tail;
+    return eval(env, newform);
+}
+
+static __attribute__((noinline)) Clove *eval_loop(CloveEnv *env, Clove *form, Clove *rest) {
+    /* (loop [name1 init1 name2 init2 ...] body...) — like let,
+     * but body re-runs whenever it produces a (recur ...) value. */
+    Clove *binds_vec = rest->as.cons.head;
+    if (binds_vec == NIL || binds_vec->tag != CLOVE_VECTOR ||
+        vec_len(binds_vec) % 2 != 0)
+        clove_error("loop needs an even-sized binding vector");
+    size_t nparams = vec_len(binds_vec) / 2;
+    /* Destructuring patterns: rewrite to gensym bindings with
+     * an inner let, so recur rebinds the gensyms and the
+     * patterns re-destructure each iteration (Clojure does
+     * the same rewrite). */
+    bool plain = true;
+    for (size_t i = 0; i < nparams; i++)
+        if (vec_nth(binds_vec, i * 2)->tag != CLOVE_SYMBOL) plain = false;
+    if (!plain) return loop_desugar(env, form, rest, binds_vec, nparams);
+    const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
+    CloveEnv *scope = env_new(env);
+    for (size_t i = 0; i < nparams; i++) {
+        names[i] = sym_name(vec_nth(binds_vec, i * 2), "loop binding");
+        Clove *val = eval(scope, vec_nth(binds_vec, i * 2 + 1));
+        env_define(scope, names[i], val);
+    }
+    Clove *body = rest->as.cons.tail;
+    /* volatile: the recur sentinel owns the (possibly heap-spilled)
+     * arg array read below, and env_new/env_define can collect —
+     * an optimizer keeping only `rvals` (a malloc interior pointer
+     * the conservative scan can't see) let the sweep free it
+     * under us (ASan -O1 heap-use-after-free). Same as apply's. */
+    Clove * volatile recur_keep = NIL;
+    for (;;) {
+        Clove *r = eval_body(scope, body);
+        if (!(r && r->tag == CLOVE_RECUR)) {
+            recur_keep = NIL;   /* a dead sentinel would pin its last values */
+            free(names);
+            return r;
+        }
+        recur_keep = r;
+
+        if (r->as.recur.n != nparams)
+            clove_error("recur arity mismatch: expected %zu, got %d",
+                       nparams, (int)r->as.recur.n);
+        Clove **rvals = r->as.recur.spill
+            ? (Clove **)r->as.recur.iv[0] : r->as.recur.iv;
+        /* Fresh binding frame each pass — a body that closes over a
+         * loop var (e.g. (loop [x ..] (recur (conj acc (fn [] x))))
+         * must capture THIS iteration's value, not see it mutated by
+         * later passes. Old frames stay intact for their closures. */
+        scope = env_new(env);
+        for (size_t i = 0; i < nparams; i++)
+            env_define(scope, names[i], rvals[i]);
+        (void)recur_keep;
+    }
+}
+
+/* (.-field obj), (.method obj args..): NULL when s names no such form */
+static __attribute__((noinline)) Clove *eval_dot_form(CloveEnv *env, const char *s, Clove *rest) {
+    /* (.-field obj): deftype field access -> field of the instance
+     * map (clove represents a deftype instance as a tagged map) */
+    if (s[0] == '.' && s[1] == '-' && s[2] &&
+        rest != NIL && rest->tag == CLOVE_LIST) {
+        Clove *obj = eval(env, rest->as.cons.head);
+        Clove *out;
+        if (obj != NIL && obj->tag == CLOVE_MAP &&
+            map_find(obj, mk_kw(intern(s + 2, strlen(s + 2))), &out))
+            return out;
+        return NIL;
+    }
+    /* (.foo obj args..) where a global .foo shim exists (host
+     * interop like .write/.get): an instance that implements foo
+     * itself -- reify, proxy, deftype -- wins, as a Java override
+     * would; anything else gets the shim. Args are evaluated once,
+     * here, either way. */
+    if (s[0] == '.' && s[1] && s[1] != '-' &&
+        rest != NIL && rest->tag == CLOVE_LIST) {
+        Binding *gb = method_noted(s) ? root_find(env_root(env), s, NULL, false) : NULL;
+        Clove *gf = gb ? gb->value : NULL;
+        if (gf && gf != NIL &&
+            ((gf->tag == CLOVE_FN && !gf->as.fn.is_macro) || gf->tag == CLOVE_NATIVE) &&
+            list_len(rest) <= 64) {
+            Clove *dargv[64]; int dn = 0;
+            for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
+                dargv[dn++] = eval(env, a->as.cons.head);
+            Clove *out;
+            if (dargv[0] != NIL && dargv[0]->tag == CLOVE_MAP &&
+                dispatch_deftype_method(env, dargv[0], s + 1, dargv + 1, dn - 1, &out))
+                return out;
+            return apply(env, gf, dargv, dn);
+        }
+    }
+    /* (.foo x): if .foo is not a defined method, treat as a deftype
+     * field access (Java's field-access syntax === method syntax) */
+    if (s[0] == '.' && s[1] && s[1] != '-' &&
+        rest != NIL && rest->tag == CLOVE_LIST &&
+        !root_find(env_root(env), s, NULL, false)) {
+        Clove *obj = eval(env, rest->as.cons.head);
+        Clove *out;
+        /* (.method obj args..): route to the deftype's method (sans
+         * dot) — a reify/deftype's own methods, e.g. a Comparator's
+         * .compare, aren't predefined global .fns. */
+        Clove *margv[64]; int mn = 0;
+        for (Clove *a = rest->as.cons.tail; a && a->tag == CLOVE_LIST && mn < 64;
+             a = a->as.cons.tail)
+            margv[mn++] = eval(env, a->as.cons.head);
+        if (dispatch_deftype_method(env, obj, s + 1, margv, mn, &out)) return out;
+        /* a reify keeps its methods per-instance in :clove/impls */
+        if (obj != NIL && obj->tag == CLOVE_MAP) {
+            Clove *impls, *m;
+            if (map_find(obj, mk_kw(intern("clove/impls", 11)), &impls) &&
+                impls != NIL && impls->tag == CLOVE_MAP &&
+                map_find(impls, mk_sym(intern(s + 1, strlen(s + 1))), &m)) {
+                Clove *iargv[65]; iargv[0] = obj;
+                for (int i = 0; i < mn; i++) iargv[i + 1] = margv[i];
+                return apply(env, m, iargv, mn + 1);
+            }
+        }
+        /* one arg, no such method -> field access on the instance map */
+        if (rest->as.cons.tail == NIL && obj != NIL && obj->tag == CLOVE_MAP &&
+            map_find(obj, mk_kw(intern(s + 1, strlen(s + 1))), &out))
+            return out;
+        err_token = s;
+        clove_error("I don't know what `%s` refers to.", s);
+    }
+    return NULL;
+}
+
 static Clove *eval_inner(CloveEnv *env, Clove *form) {
     if (form == NULL || form == NIL) return NIL;
     switch (form->tag) {
@@ -6653,75 +7415,13 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
              * skip the strip + dot + special-form cascade on every repeat. */
             if (head->tag == CLOVE_SYMBOL && !head->as.symc.plain) {
                 const char *s = strip_core_qualifier(head->as.sym);
-                /* (.-field obj): deftype field access -> field of the instance
-                 * map (clove represents a deftype instance as a tagged map) */
-                if (s[0] == '.' && s[1] == '-' && s[2] &&
-                    rest != NIL && rest->tag == CLOVE_LIST) {
-                    Clove *obj = eval(env, rest->as.cons.head);
-                    Clove *out;
-                    if (obj != NIL && obj->tag == CLOVE_MAP &&
-                        map_find(obj, mk_kw(intern(s + 2, strlen(s + 2))), &out))
-                        return out;
-                    return NIL;
-                }
-                /* (.foo obj args..) where a global .foo shim exists (host
-                 * interop like .write/.get): an instance that implements foo
-                 * itself -- reify, proxy, deftype -- wins, as a Java override
-                 * would; anything else gets the shim. Args are evaluated once,
-                 * here, either way. */
-                if (s[0] == '.' && s[1] && s[1] != '-' &&
-                    rest != NIL && rest->tag == CLOVE_LIST) {
-                    Binding *gb = method_noted(s) ? root_find(env_root(env), s, NULL, false) : NULL;
-                    Clove *gf = gb ? gb->value : NULL;
-                    if (gf && gf != NIL &&
-                        ((gf->tag == CLOVE_FN && !gf->as.fn.is_macro) || gf->tag == CLOVE_NATIVE) &&
-                        list_len(rest) <= 64) {
-                        Clove *dargv[64]; int dn = 0;
-                        for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail)
-                            dargv[dn++] = eval(env, a->as.cons.head);
-                        Clove *out;
-                        if (dargv[0] != NIL && dargv[0]->tag == CLOVE_MAP &&
-                            dispatch_deftype_method(env, dargv[0], s + 1, dargv + 1, dn - 1, &out))
-                            return out;
-                        return apply(env, gf, dargv, dn);
-                    }
-                }
-                /* (.foo x): if .foo is not a defined method, treat as a deftype
-                 * field access (Java's field-access syntax === method syntax) */
-                if (s[0] == '.' && s[1] && s[1] != '-' &&
-                    rest != NIL && rest->tag == CLOVE_LIST &&
-                    !root_find(env_root(env), s, NULL, false)) {
-                    Clove *obj = eval(env, rest->as.cons.head);
-                    Clove *out;
-                    /* (.method obj args..): route to the deftype's method (sans
-                     * dot) — a reify/deftype's own methods, e.g. a Comparator's
-                     * .compare, aren't predefined global .fns. */
-                    Clove *margv[64]; int mn = 0;
-                    for (Clove *a = rest->as.cons.tail; a && a->tag == CLOVE_LIST && mn < 64;
-                         a = a->as.cons.tail)
-                        margv[mn++] = eval(env, a->as.cons.head);
-                    if (dispatch_deftype_method(env, obj, s + 1, margv, mn, &out)) return out;
-                    /* a reify keeps its methods per-instance in :clove/impls */
-                    if (obj != NIL && obj->tag == CLOVE_MAP) {
-                        Clove *impls, *m;
-                        if (map_find(obj, mk_kw(intern("clove/impls", 11)), &impls) &&
-                            impls != NIL && impls->tag == CLOVE_MAP &&
-                            map_find(impls, mk_sym(intern(s + 1, strlen(s + 1))), &m)) {
-                            Clove *iargv[65]; iargv[0] = obj;
-                            for (int i = 0; i < mn; i++) iargv[i + 1] = margv[i];
-                            return apply(env, m, iargv, mn + 1);
-                        }
-                    }
-                    /* one arg, no such method -> field access on the instance map */
-                    if (rest->as.cons.tail == NIL && obj != NIL && obj->tag == CLOVE_MAP &&
-                        map_find(obj, mk_kw(intern(s + 1, strlen(s + 1))), &out))
-                        return out;
-                    err_token = s;
-                    clove_error("I don't know what `%s` refers to.", s);
+                if (s[0] == '.') {
+                    Clove *r = eval_dot_form(env, s, rest);
+                    if (r) return r;
                 }
                 static const char *SYM_QUOTE, *SYM_IF, *SYM_DO, *SYM_DEF, *SYM_LET, *SYM_FN, *SYM_LOOP, *SYM_RECUR,
                                   *SYM_AND, *SYM_OR, *SYM_WHEN, *SYM_COND, *SYM_DEFN,
-                                  *SYM_DEFMACRO, *SYM_QUASIQUOTE, *SYM_TRY, *SYM_CATCH, *SYM_FINALLY;
+                                  *SYM_DEFMACRO, *SYM_QUASIQUOTE, *SYM_TRY;
                 if (!SYM_QUOTE) {
                     SYM_QUOTE = intern("quote", 5); SYM_IF = intern("if", 2);
                     SYM_DO = intern("do", 2);       SYM_DEF = intern("def", 3);
@@ -6733,8 +7433,6 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     SYM_DEFMACRO = intern("defmacro", 8);
                     SYM_QUASIQUOTE = intern("quasiquote", 10);
                     SYM_TRY = intern("try", 3);
-                    SYM_CATCH = intern("catch", 5);
-                    SYM_FINALLY = intern("finally", 7);
                 }
                 {
                     /* A top-level #_form (or #?@ branch) arrives as the
@@ -6750,135 +7448,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         return r;
                     }
                 }
-                if (s == SYM_TRY) {
-                    /* (try body... (catch ExClass e handler...)... (finally fin...))
-                     * The first catch clause whose class matches handles the
-                     * exception (catch_matches; see "Exception classes"); none
-                     * matching rethrows it. finally runs on every exit: normal,
-                     * body throw, handler throw, or no clause matching. */
-                    Clove *body = NIL, **bt = &body;
-                    Clove *catch_clause = NULL, *finally_clause = NULL;
-                    for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
-                        Clove *f = c->as.cons.head;
-                        const char *fh = (f != NIL && f->tag == CLOVE_LIST &&
-                                          f->as.cons.head->tag == CLOVE_SYMBOL)
-                                         ? f->as.cons.head->as.sym : NULL;
-                        if (fh == SYM_CATCH) {
-                            if (finally_clause) clove_error("try: catch must precede finally");
-                            need_args(f->as.cons.tail, 2, "catch");
-                            sym_name(f->as.cons.tail->as.cons.head, "catch class");
-                            sym_name(f->as.cons.tail->as.cons.tail->as.cons.head,
-                                     "catch binding");
-                            if (!catch_clause) catch_clause = f;
-                        } else if (fh == SYM_FINALLY) {
-                            if (finally_clause) clove_error("try: only one finally clause is allowed");
-                            finally_clause = f;
-                        } else {
-                            if (catch_clause || finally_clause)
-                                clove_error("try: body form after catch/finally");
-                            *bt = mk_cons(f, NIL);
-                            bt = &(*bt)->as.cons.tail;
-                        }
-                    }
-
-                    /* volatile: read after a longjmp back into this frame. */
-                    Clove * volatile body_v = body;
-                    Clove * volatile catch_v = catch_clause;   /* first catch, or NULL */
-                    Clove * volatile clauses_v = rest;
-                    Clove * volatile finally_v = finally_clause;
-                    Clove * volatile result = NIL;
-                    volatile bool pending = false;  /* unhandled exception to rethrow */
-
-                    ErrFrame frame;
-                    frame.prev = err_top;
-                    frame.vsp_save = vsp;
-                    frame.esp_save = eval_sp;
-                    frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
-                    frame.rd_line_save = rd_line;
-                    frame.rd_start_save = rd_line_start;
-                    frame.rd_file_save = rd_file_cell;
-                    err_top = &frame;
-                    if (setjmp(frame.jb) == 0) {
-                        result = eval_body(env, body_v);
-                        err_top = frame.prev;
-                    } else {
-                        err_top = frame.prev;
-                        vsp = frame.vsp_save;
-                        eval_sp = frame.esp_save;
-                        vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
-                        rd_line = frame.rd_line_save;
-                        rd_line_start = frame.rd_start_save;
-                        rd_file_cell = frame.rd_file_save;
-                        /* first clause whose class the exception is-a */
-                        Clove *exc = NULL, *hit = NULL;
-                        if (catch_v) {
-                            exc = err_as_value();
-                            for (Clove *c = clauses_v; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
-                                Clove *f = c->as.cons.head;
-                                if (f != NIL && f->tag == CLOVE_LIST &&
-                                    f->as.cons.head->tag == CLOVE_SYMBOL &&
-                                    f->as.cons.head->as.sym == SYM_CATCH &&
-                                    catch_matches(f->as.cons.tail->as.cons.head->as.sym, exc)) {
-                                    hit = f;
-                                    break;
-                                }
-                            }
-                        }
-                        if (hit) {
-                            /* Bind the exception value; run the handler under
-                             * its own frame so finally still runs if it throws. */
-                            cur_exc = NULL;
-                            CloveEnv *scope = env_new(env);
-                            Clove *cc = hit->as.cons.tail;           /* (Class e body...) */
-                            env_define(scope, cc->as.cons.tail->as.cons.head->as.sym, exc);
-                            ErrFrame hframe;
-                            hframe.prev = err_top;
-                            hframe.vsp_save = vsp;
-                            hframe.esp_save = eval_sp;
-                            hframe.vm_tsp_save = vm_tsp; hframe.ns_save = cur_reader_ns; hframe.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
-                            hframe.rd_line_save = rd_line;
-                            hframe.rd_start_save = rd_line_start;
-                            hframe.rd_file_save = rd_file_cell;
-                            err_top = &hframe;
-                            if (setjmp(hframe.jb) == 0) {
-                                result = eval_body(scope, cc->as.cons.tail->as.cons.tail);
-                                err_top = hframe.prev;
-                            } else {
-                                err_top = hframe.prev;
-                                vsp = hframe.vsp_save;
-                                eval_sp = hframe.esp_save;
-                                vm_tsp = hframe.vm_tsp_save; cur_reader_ns = hframe.ns_save; if (g_ns_binding && hframe.nsvar_save) g_ns_binding->value = hframe.nsvar_save;
-                                rd_line = hframe.rd_line_save;
-                                rd_line_start = hframe.rd_start_save;
-                                rd_file_cell = hframe.rd_file_save;
-                                pending = true;     /* handler threw */
-                            }
-                        } else {
-                            pending = true;   /* no clause took it: rethrow after finally */
-                        }
-                    }
-                    if (finally_v) {  /* a throwing finally replaces any pending exception */
-                        /* The pending exception lives in globals (cur_exc, or
-                         * err_msg + err_class), and the finally body is free to
-                         * throw and catch errors of its own -- park it across. */
-                        Clove *pend_exc = NULL, *pend_val = NULL;
-                        const char *pend_cls = NULL;
-                        if (pending) {
-                            pend_exc = cur_exc;
-                            pend_val = err_as_value();
-                            pend_cls = err_class;
-                        }
-                        eval_body(env, finally_v->as.cons.tail);
-                        if (pending) {
-                            cur_exc = pend_exc;
-                            err_class = pend_cls;
-                            if (!pend_exc)
-                                err_msg_set("%s", pend_val->as.str);
-                        }
-                    }
-                    if (pending) clove_raise();
-                    return result;
-                }
+                if (s == SYM_TRY) return eval_try(env, rest);
                 {
                     static const char *SYM_NS, *SYM_REQUIRE, *SYM_USE, *SYM_IMPORT;
                     if (!SYM_NS) {
@@ -6892,60 +7462,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                      * (require + refer-all) defined in the preamble, so it must
                      * fall through to macro resolution rather than short-circuit. */
                     if (s == SYM_IMPORT) return NIL;
-                    if (s == SYM_NS) {
-                        /* (ns name (:require [a.b :as x] ...)) — load the
-                         * :require clauses; everything else is tolerated. */
-                        static const char *KW_REQ, *KW_IMPORT, *KW_USE;
-                        if (!KW_REQ) { KW_REQ = intern("require", 7);
-                                       KW_IMPORT = intern("import", 6);
-                                       KW_USE = intern("use", 3); }
-                        /* Enter the namespace FIRST: the clauses' :as/:refer
-                         * registrations key their owner off cur_reader_ns, so
-                         * processing them before entering attributed them to
-                         * the PREVIOUS ns (invisible when require-one had
-                         * already entered it around load-file; wrong for a
-                         * top-level script's own ns form). Subsequent reads
-                         * stamp home_ns and defs land under name/ as before
-                         * (run_stream alternates read/eval, so the rest of
-                         * the file is read with the ns active). */
-                        {
-                            Clove *nsn = rest != NIL && rest->tag == CLOVE_LIST
-                                        ? rest->as.cons.head : NIL;
-                            if (nsn != NIL && nsn->tag == CLOVE_SYMBOL)
-                                set_cur_ns(env_root(env), nsn->as.symc.name);
-                        }
-                        for (Clove *c = rest; c && c->tag == CLOVE_LIST; c = c->as.cons.tail) {
-                            Clove *cl = c->as.cons.head;
-                            /* clause head keyword -> which per-spec handler */
-                            const char *kw = NULL;
-                            if (cl != NIL && cl->tag == CLOVE_LIST &&
-                                cl->as.cons.head->tag == CLOVE_KEYWORD)
-                                kw = cl->as.cons.head->as.kw;
-                            else if (cl != NIL && cl->tag == CLOVE_VECTOR && vec_len(cl) > 0 &&
-                                     vec_nth(cl, 0)->tag == CLOVE_KEYWORD)
-                                kw = vec_nth(cl, 0)->as.kw;
-                            const char *callee_name =
-                                kw == KW_REQ    ? "clove/require-one" :
-                                kw == KW_USE    ? "clove/use-one"     :
-                                kw == KW_IMPORT ? "clove/import-one"  : NULL;
-                            if (!callee_name) continue;
-                            Clove *callee = env_lookup_maybe(env, callee_name);
-                            if (!callee) continue;
-                            if (cl->tag == CLOVE_LIST) {
-                                for (Clove *sp = cl->as.cons.tail; sp && sp->tag == CLOVE_LIST;
-                                     sp = sp->as.cons.tail) {
-                                    Clove *one[1] = {sp->as.cons.head};
-                                    apply(env, callee, one, 1);
-                                }
-                            } else {
-                                for (uint32_t vi = 1; vi < vec_len(cl); vi++) {
-                                    Clove *one[1] = {vec_nth(cl, vi)};
-                                    apply(env, callee, one, 1);
-                                }
-                            }
-                        }
-                        return NIL;
-                    }
+                    if (s == SYM_NS) return eval_ns(env, rest);
                     (void)SYM_REQUIRE; (void)SYM_USE;
                 }
                 {
@@ -6954,180 +7471,11 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                         SYM_BINDING = intern("binding", 7);
                         SYM_WITH_REDEFS = intern("with-redefs", 11);
                     }
-                    if (s == SYM_BINDING || s == SYM_WITH_REDEFS) {
-                        /* (binding [*v* val ...] body) pushes a DynFrame (see
-                         * dyn_run). with-redefs mutates the roots in place,
-                         * restored on every exit path via a handler frame. */
-                        Clove *bv = rest->as.cons.head;
-                        if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
-                            clove_error("binding needs an even-sized vector");
-                        size_t n = vec_len(bv) / 2;
-                        if (n > 16) clove_error("binding: too many vars");
-                        Binding *slots[16];
-                        Clove *saved[16];
-                        CloveEnv *root = env_root(env);
-                        for (size_t i = 0; i < n; i++) {
-                            Clove *symc = vec_nth(bv, i * 2);
-                            const char *nm = sym_name(symc, "binding");
-                            Binding *b = NULL;
-                            /* home-ns first, like symbol resolution: a
-                             * (def ^:dynamic *v*) inside (ns foo) lands
-                             * under foo/, and binding must find it there */
-                            if (symc->as.symc.home_ns && !strchr(nm, '/')) {
-                                const char *qual = intern_qual(symc->as.symc.home_ns, nm);
-                                b = root_binding(root, qual);
-                                /* binding a referred var rebinds the shared
-                                 * source global, so other ns's reads see it */
-                                if (!b)
-                                    for (int ri = 0; ri < n_refers; ri++)
-                                        if (refer_from[ri] == qual) {
-                                            b = root_binding(root, refer_to[ri]);
-                                            if (b) break;
-                                        }
-                            }
-                            if (!b)
-                                b = root_binding(root, nm);
-                            /* aliased dynamic var like cfg/-star-v-star-: resolve
-                             * the alias to its full ns, else the bare var name */
-                            if (!b) {
-                                const char *slash = strchr(nm, '/');
-                                if (slash && slash != nm) {
-                                    const char *pre = intern(nm, (size_t)(slash - nm));
-                                    const char *base = slash + 1;
-                                    const char *full = alias_lookup(pre, symc->as.symc.home_ns);
-                                    if (full) {
-                                        const char *q = intern_qual(full, base);
-                                        b = root_binding(root, q);
-                                    }
-                                    if (!b) {
-                                        const char *bb = intern(base, strlen(base));
-                                        b = root_binding(root, bb);
-                                    }
-                                }
-                            }
-                            if (!b) clove_error("binding: unable to resolve %s", nm);
-                            slots[i] = b;
-                        }
-                        /* parallel semantics, like Clojure: evaluate every
-                         * init before mutating any var — a throw mid-inits
-                         * then unwinds with nothing to restore */
-                        Clove *newv[16];
-                        for (size_t i = 0; i < n; i++)
-                            newv[i] = eval(env, vec_nth(bv, i * 2 + 1));
-                        if (s == SYM_BINDING) {
-                            DynFrame fr = { NULL, (int)n, slots, newv, NULL };
-                            return dyn_run(env, &fr, rest->as.cons.tail, NULL, NULL, 0);
-                        }
-                        for (size_t i = 0; i < n; i++) {
-                            saved[i] = slots[i]->value;
-                            slots[i]->value = newv[i];
-                        }
-                        ErrFrame frame;
-                        frame.prev = err_top;
-                        frame.vsp_save = vsp;
-                        frame.esp_save = eval_sp;
-                        frame.vm_tsp_save = vm_tsp; frame.ns_save = cur_reader_ns; frame.nsvar_save = g_ns_binding ? g_ns_binding->value : NULL;
-                        frame.rd_line_save = rd_line;
-                        frame.rd_start_save = rd_line_start;
-                        frame.rd_file_save = rd_file_cell;
-                        err_top = &frame;
-                        Clove * volatile result = NIL;
-                        volatile bool threw = false;
-                        if (setjmp(frame.jb) == 0) {
-                            result = eval_body(env, rest->as.cons.tail);
-                            err_top = frame.prev;
-                        } else {
-                            err_top = frame.prev;
-                            vsp = frame.vsp_save;
-                            eval_sp = frame.esp_save;
-                            vm_tsp = frame.vm_tsp_save; cur_reader_ns = frame.ns_save; if (g_ns_binding && frame.nsvar_save) g_ns_binding->value = frame.nsvar_save;
-                            rd_line = frame.rd_line_save;
-                            rd_line_start = frame.rd_start_save;
-                            rd_file_cell = frame.rd_file_save;
-                            threw = true;
-                        }
-                        for (size_t i = 0; i < n; i++) slots[i]->value = saved[i];
-                        if (threw) clove_raise();
-                        return result;
-                    }
+                    if (s == SYM_BINDING || s == SYM_WITH_REDEFS) return eval_binding(env, s == SYM_BINDING, rest);
                 }
                 if (s == SYM_QUASIQUOTE) return qq_expand(env, rest->as.cons.head);
-                if (s == SYM_DEFMACRO) {
-                    /* (defmacro name [params] body...) — a fn flagged so that
-                     * eval calls it on unevaluated forms and re-evals the result. */
-                    need_args(rest, 2, "defmacro");
-                    bool mac_private = false;
-                    Clove *mac_doc = NIL;
-                    Clove *mac_name = rest->as.cons.head;
-                    const char *name = sym_name(mac_name, "defmacro");
-                    if (mac_name->meta && mac_name->meta->tag == CLOVE_MAP) {
-                        Clove *pv;      /* ^:private / ^{:doc ".."} written as literals */
-                        mac_private = map_find(mac_name->meta, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
-                        if (map_find(mac_name->meta, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
-                            mac_doc = pv;
-                    }
-                    Clove *mbody = rest->as.cons.tail;
-                    if (mbody->as.cons.head->tag == CLOVE_STRING &&
-                        mbody->as.cons.tail != NIL) {
-                        mac_doc = mbody->as.cons.head;   /* docstring → doc registry */
-                        mbody = mbody->as.cons.tail;
-                    }
-                    if (mbody->as.cons.head->tag == CLOVE_MAP &&
-                        mbody->as.cons.tail != NIL) {
-                        Clove *dv;                        /* attr-map may carry :doc */
-                        if (mac_doc == NIL &&
-                            map_find(mbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
-                            dv != NIL && dv->tag == CLOVE_STRING)
-                            mac_doc = dv;
-                        mbody = mbody->as.cons.tail;
-                    }
-                    Clove *m = make_fn(env, mbody, true);
-                    {
-                        const char *st = env_define_root(env_root(env), name, m);
-                        if (strchr(st, '/')) mark_private_def(st, mac_private);
-                        if (mac_doc != NIL) doc_put(st, mac_doc->as.str, NULL);
-                    }
-                    return m;
-                }
-                if (s == SYM_DEFN) {
-                    /* (defn name [params] body...) ≡ (def name (fn [params] body...));
-                     * a docstring rides along in the def rewrite so the DEF
-                     * branch records it in the doc registry. */
-                    need_args(rest, 2, "defn");
-                    Clove *name = rest->as.cons.head;
-                    Clove *fbody = rest->as.cons.tail;
-                    Clove *fdoc = NIL;
-                    if (fbody->as.cons.head->tag == CLOVE_STRING &&
-                        fbody->as.cons.tail != NIL) {
-                        fdoc = fbody->as.cons.head;
-                        fbody = fbody->as.cons.tail;
-                    }
-                    if (fbody->as.cons.head->tag == CLOVE_MAP &&
-                        fbody->as.cons.tail != NIL) {
-                        Clove *dv;                     /* attr-map may carry :doc */
-                        if (fdoc == NIL &&
-                            map_find(fbody->as.cons.head, mk_kw(intern("doc", 3)), &dv) &&
-                            dv != NIL && dv->tag == CLOVE_STRING)
-                            fdoc = dv;
-                        /* the rest of it is var metadata, merged over the name's */
-                        if (name != NIL && name->tag == CLOVE_SYMBOL) {
-                            Clove *nm = name->meta && name->meta->tag == CLOVE_MAP ? name->meta : mk_map();
-                            for (Clove *e = map_entry_list(fbody->as.cons.head); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                                nm = map_assoc(nm, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
-                            Clove *ns = alloc(CLOVE_SYMBOL);
-                            ns->as = name->as;
-                            ns->meta = nm;
-                            name = ns;
-                        }
-                        fbody = fbody->as.cons.tail;
-                    }
-                    Clove *fn_form = mk_cons(mk_sym(SYM_FN), fbody);
-                    Clove *fn_tail = mk_cons(fn_form, NIL);
-                    Clove *def_form = mk_cons(mk_sym(SYM_DEF),
-                                       mk_cons(name, fdoc == NIL ? fn_tail
-                                                     : mk_cons(fdoc, fn_tail)));
-                    return eval(env, def_form);
-                }
+                if (s == SYM_DEFMACRO) return eval_defmacro(env, rest);
+                if (s == SYM_DEFN) return eval_defn(env, rest);
                 if (s == SYM_QUOTE) return rest->as.cons.head;
                 if (s == SYM_IF) {
                     need_args(rest, 2, "if");
@@ -7138,68 +7486,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     return els == NIL ? NIL : eval(env, els->as.cons.head);
                 }
                 if (s == SYM_DO) return eval_body(env, rest);
-                if (s == SYM_DEF) {
-                    need_args(rest, 1, "def");
-                    Clove *namef = rest->as.cons.head;
-                    /* a #?(:cljs ..)-only def name elides to nil here — skip it */
-                    if (namef == NIL) return NIL;
-                    const char *name = sym_name(namef, "def");
-                    /* The name's metadata is evaluated, as Clojure's def does, so
-                     * ^{:test (fn [] ..)} stores a fn. :private also goes to the
-                     * private-defs table, :doc to the doc registry. */
-                    Clove *dm = eval_form_meta(env, namef);
-                    bool def_private = false;
-                    Clove *def_doc = NIL;
-                    if (dm) {
-                        Clove *pv;
-                        def_private = map_find(dm, mk_kw(intern("private", 7)), &pv) && is_truthy(pv);
-                        if (map_find(dm, mk_kw(intern("doc", 3)), &pv) && pv != NIL && pv->tag == CLOVE_STRING)
-                            def_doc = pv;
-                    } else dm = NIL;
-                    Clove *valf = rest->as.cons.tail;
-                    /* (def name): no value — an unbound-var declaration => nil */
-                    if (valf == NIL) {
-                        const char *st = env_define_root(env_root(env), name, NIL);
-                        if (strchr(st, '/')) mark_private_def(st, def_private);
-                        var_meta_on_def(st, dm);
-                        return NIL;
-                    }
-                    /* (def name "docstring" value): docstring → doc registry */
-                    if (valf->as.cons.tail != NIL &&
-                        valf->as.cons.tail->tag == CLOVE_LIST &&
-                        valf->as.cons.head != NIL &&
-                        valf->as.cons.head->tag == CLOVE_STRING) {
-                        def_doc = valf->as.cons.head;
-                        valf = valf->as.cons.tail;
-                    }
-                    Clove *val = eval(env, valf->as.cons.head);
-                    /* def is always global; a redef without ^:private clears
-                     * the mark (Clojure resets var meta on redef) */
-                    {
-                        const char *st = env_define_root(env_root(env), name, val);
-                        if (strchr(st, '/')) mark_private_def(st, def_private);
-                        if (def_doc != NIL) doc_put(st, def_doc->as.str, NULL);
-                        var_meta_on_def(st, dm);
-                    }
-                    /* Attach :name metadata to a def'd function (fresh per defn, so
-                     * no shared-cell hazard) the first time it's named, so
-                     * (:name (meta (resolve sym))) works for potemkin-style
-                     * import-def without clove having real vars. */
-                    if (val != NIL && val->tag == CLOVE_FN) {
-                        bool has_name = false;
-                        if (val->meta && val->meta->tag == CLOVE_MAP) {
-                            Clove *tmp; has_name = map_find(val->meta, mk_kw(intern("name", 4)), &tmp);
-                        }
-                        if (!has_name) {
-                            const char *slash = strrchr(name, '/');
-                            const char *bare = slash ? slash + 1 : name;
-                            Clove *m = (val->meta && val->meta->tag == CLOVE_MAP) ? val->meta : mk_map();
-                            val->meta = map_assoc(m, mk_kw(intern("name", 4)),
-                                                  mk_sym(intern(bare, strlen(bare))));
-                        }
-                    }
-                    return val;
-                }
+                if (s == SYM_DEF) return eval_def(env, rest);
                 if (s == SYM_LET && !head_shadowed(env, head->as.sym)) {
                     /* (let [a 1 b 2] body...) — bindings live in a vector. */
                     Clove *binds_vec = rest->as.cons.head;
@@ -7218,32 +7505,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                 }
                 static const char *SYM_LETFN, *SYM_SET;
                 if (!SYM_LETFN) { SYM_LETFN = intern("letfn*", 6); SYM_SET = intern("set!", 4); }
-                if (s == SYM_SET && !head_shadowed(env, head->as.sym)) {
-                    /* (set! var val) — only a var bound by binding, or one of
-                     * the vars clojure.main binds for every REPL/script. Any
-                     * other target (a field access) just evaluates val. */
-                    if (rest == NIL || rest->as.cons.tail == NIL || rest->as.cons.tail->tag != CLOVE_LIST)
-                        clove_error("set! needs a target and a value");
-                    Clove *place = rest->as.cons.head;
-                    Clove *val = eval(env, rest->as.cons.tail->as.cons.head);
-                    if (place == NIL || place->tag != CLOVE_SYMBOL) return val;
-                    for (CloveEnv *e = env; e && e->parent; e = e->parent)
-                        if (env_local_find(e, place->as.sym))
-                            clove_error("Can't set! local %s", place->as.symc.name);
-                    Binding *b = root_find(env_root(env), place->as.sym, place->as.symc.home_ns, false);
-                    if (!b) clove_error("set!: unable to resolve %s", place->as.symc.name);
-                    static const char *repl_bound[] = {
-                        "*warn-on-reflection*", "*unchecked-math*", "*print-length*",
-                        "*print-level*", "*print-meta*", "*print-namespace-maps*",
-                        "*math-context*", "*assert*", "*data-readers*",
-                        "*default-data-reader-fn*", "*compile-path*",
-                        "*command-line-args*", "*ns*", "*1", "*2", "*3", "*e", NULL };
-                    bool ok = dyn_bound(b);
-                    for (int i = 0; !ok && repl_bound[i]; i++) ok = !strcmp(b->name, repl_bound[i]);
-                    if (!ok) clove_error("Can't change/establish root binding of #'%s with set", b->name);
-                    b->value = val;
-                    return val;
-                }
+                if (s == SYM_SET && !head_shadowed(env, head->as.sym)) return eval_set(env, rest);
                 if (s == SYM_LETFN && !head_shadowed(env, head->as.sym)) {
                     /* (letfn* [f (fn ..) g (fn ..)] body) — every fn closes
                      * over one frame holding all the names */
@@ -7294,99 +7556,8 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     }
                     return NIL;
                 }
-                if (s == SYM_RECUR) {
-                    /* Evaluate each arg eagerly, then package into a sentinel
-                     * that the enclosing loop will catch. If nothing catches
-                     * it, a non-loop consumer (e.g. +) will hit the default
-                     * arm of its tag-switch and error out — that's our
-                     * runtime tail-position check. */
-                    size_t n = list_len(rest);
-                    if (n > 255) clove_error("recur: too many arguments");
-                    Clove *r = alloc(CLOVE_RECUR);
-                    Clove **vals = r->as.recur.iv;
-                    if (n > 3) {  /* spill flag set before any slot fills */
-                        vals = xmalloc(sizeof(Clove *) * n);
-                        r->as.recur.iv[0] = (Clove *)vals;
-                        r->as.recur.spill = true;
-                    }
-                    size_t i = 0;  /* n grows as slots fill — GC safety */
-                    for (Clove *a = rest; a && a->tag == CLOVE_LIST; a = a->as.cons.tail) {
-                        vals[i++] = eval(env, a->as.cons.head);
-                        r->as.recur.n = (uint8_t)i;
-                    }
-                    return r;
-                }
-                if (s == SYM_LOOP && !head_shadowed(env, head->as.sym)) {
-                    /* (loop [name1 init1 name2 init2 ...] body...) — like let,
-                     * but body re-runs whenever it produces a (recur ...) value. */
-                    Clove *binds_vec = rest->as.cons.head;
-                    if (binds_vec == NIL || binds_vec->tag != CLOVE_VECTOR ||
-                        vec_len(binds_vec) % 2 != 0)
-                        clove_error("loop needs an even-sized binding vector");
-                    size_t nparams = vec_len(binds_vec) / 2;
-                    /* Destructuring patterns: rewrite to gensym bindings with
-                     * an inner let, so recur rebinds the gensyms and the
-                     * patterns re-destructure each iteration (Clojure does
-                     * the same rewrite). */
-                    bool plain = true;
-                    for (size_t i = 0; i < nparams; i++)
-                        if (vec_nth(binds_vec, i * 2)->tag != CLOVE_SYMBOL) plain = false;
-                    if (!plain) {
-                        static int loopg;
-                        Clove *gb[64], *lb[64];   /* new loop binds / let binds */
-                        if (nparams > 32) clove_error("loop: too many bindings");
-                        for (size_t i = 0; i < nparams; i++) {
-                            char nm[24];
-                            snprintf(nm, sizeof nm, "loop__%d", ++loopg);
-                            Clove *g = mk_sym(intern(nm, strlen(nm)));
-                            gb[i * 2] = g;
-                            gb[i * 2 + 1] = vec_nth(binds_vec, i * 2 + 1);
-                            lb[i * 2] = vec_nth(binds_vec, i * 2);
-                            lb[i * 2 + 1] = g;
-                        }
-                        Clove *letform = mk_cons(mk_sym(SYM_LET),
-                            mk_cons(mk_vector(lb, nparams * 2), rest->as.cons.tail));
-                        Clove *newform = mk_cons(mk_sym(SYM_LOOP),
-                            mk_cons(mk_vector(gb, nparams * 2), mk_cons(letform, NIL)));
-                        /* splice: desugar once per site, not per entry */
-                        form->as.cons.head = newform->as.cons.head;
-                        form->as.cons.tail = newform->as.cons.tail;
-                        return eval(env, newform);
-                    }
-                    const char **names = xmalloc(sizeof(char *) * (nparams ? nparams : 1));
-                    CloveEnv *scope = env_new(env);
-                    for (size_t i = 0; i < nparams; i++) {
-                        names[i] = sym_name(vec_nth(binds_vec, i * 2), "loop binding");
-                        Clove *val = eval(scope, vec_nth(binds_vec, i * 2 + 1));
-                        env_define(scope, names[i], val);
-                    }
-                    Clove *body = rest->as.cons.tail;
-                    /* volatile: the recur sentinel owns the (possibly heap-spilled)
-                     * arg array read below, and env_new/env_define can collect —
-                     * an optimizer keeping only `rvals` (a malloc interior pointer
-                     * the conservative scan can't see) let the sweep free it
-                     * under us (ASan -O1 heap-use-after-free). Same as apply's. */
-                    Clove * volatile recur_keep = NIL;
-                    for (;;) {
-                        Clove *r = eval_body(scope, body);
-                        if (!(r && r->tag == CLOVE_RECUR)) { free(names); return r; }
-                        recur_keep = r;
-
-                        if (r->as.recur.n != nparams)
-                            clove_error("recur arity mismatch: expected %zu, got %d",
-                                       nparams, (int)r->as.recur.n);
-                        Clove **rvals = r->as.recur.spill
-                            ? (Clove **)r->as.recur.iv[0] : r->as.recur.iv;
-                        /* Fresh binding frame each pass — a body that closes over a
-                         * loop var (e.g. (loop [x ..] (recur (conj acc (fn [] x))))
-                         * must capture THIS iteration's value, not see it mutated by
-                         * later passes. Old frames stay intact for their closures. */
-                        scope = env_new(env);
-                        for (size_t i = 0; i < nparams; i++)
-                            env_define(scope, names[i], rvals[i]);
-                        (void)recur_keep;
-                    }
-                }
+                if (s == SYM_RECUR) return eval_recur(env, rest);
+                if (s == SYM_LOOP && !head_shadowed(env, head->as.sym)) return eval_loop(env, form, rest);
                 {
                     static const char *SYM_LAZY_SEQ;
                     if (!SYM_LAZY_SEQ) SYM_LAZY_SEQ = intern("lazy-seq", 8);
@@ -9967,6 +10138,7 @@ static Clove *prim_first(CloveEnv *env, Clove **argv, int nargs) {
         }
         return node->as.tnode.key;
     }
+    if (v != NIL && v->tag == CLOVE_VECTOR) return vec_len(v) ? vec_nth(v, 0) : NIL;
     Clove *s = seq1_slot(&argv[0]);  /* advances the root: skipping into a long
                                        lazy chain (e.g. filter) stays O(1) live */
     return s == NIL ? NIL : s->as.cons.head;
@@ -9978,6 +10150,83 @@ static Clove *prim_rest(CloveEnv *env, Clove **argv, int nargs) {
     if (s == NIL) return EMPTY;                 /* (rest ()) / (rest nil) => () */
     Clove *t = s->as.cons.tail;                  /* tail may be lazy */
     return (t == NIL) ? EMPTY : t;              /* a finished list rests to () */
+}
+
+static Clove *vec_seq_from(Clove *v, size_t start);
+/* (next coll) is (seq (rest coll)); a vector starts its seq at index 1
+ * instead of building one from 0 and dropping the head */
+static Clove *prim_next(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 1, "next");
+    Clove *v = argv[0];
+    if (v != NIL && v->tag == CLOVE_VECTOR) return vec_seq_from(v, 1);
+    return seq1(prim_rest(env, argv, 1));
+}
+
+/* update, update-in and assoc-in compose get, f and assoc exactly as the
+ * Clojure definitions do, but walk the key path in C: no interpreted call
+ * (and call frame) per level. */
+static Clove *prim_update(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 3, "update");
+    size_t base = vsp;
+    vpush(prim_get(env, argv, 2));
+    for (int i = 3; i < nargs; i++) vpush(argv[i]);
+    Clove *nv = apply(env, argv[2], &vstack[base], nargs - 2);
+    vsp = base;
+    Clove *a[3] = { argv[0], argv[1], nv };
+    return prim_assoc(env, a, 3);
+}
+
+/* Along the path ks: f NULL puts v (assoc-in), else applies f to the old
+ * value and args (update-in). An empty path is the single key nil, as
+ * Clojure's [k & ks] destructuring makes it. */
+static Clove *path_update(CloveEnv *env, Clove *m, Clove *ks, Clove *f, Clove *v,
+                          Clove **args, int nargs) {
+    size_t base = vsp;
+    bool isvec = ks != NIL && ks->tag == CLOVE_VECTOR;
+    size_t n = isvec ? vec_len(ks) : 0, i = 0;
+    Clove *s = isvec ? NIL : seq1(ks);
+    for (;;) {       /* push each level's map and key; rooted on the vstack */
+        Clove *k;
+        bool last;
+        if (isvec) {
+            k = i < n ? vec_nth(ks, i) : NIL;
+            last = ++i >= n;
+        } else {
+            k = s == NIL ? NIL : s->as.cons.head;
+            s = s == NIL ? NIL : seq1(s->as.cons.tail);
+            last = s == NIL;
+        }
+        vpush(m);
+        vpush(k);
+        if (last) break;
+        Clove *g[2] = { m, k };
+        m = prim_get(env, g, 2);
+    }
+    Clove *val = v;
+    if (f) {
+        Clove *g[2] = { vstack[vsp - 2], vstack[vsp - 1] };
+        size_t ab = vsp;
+        vpush(prim_get(env, g, 2));
+        for (int j = 0; j < nargs; j++) vpush(args[j]);
+        val = apply(env, f, &vstack[ab], nargs + 1);
+        vsp = ab;
+    }
+    while (vsp > base) {
+        Clove *a[3] = { vstack[vsp - 2], vstack[vsp - 1], val };
+        val = prim_assoc(env, a, 3);
+        vsp -= 2;
+    }
+    return val;
+}
+
+static Clove *prim_update_in(CloveEnv *env, Clove **argv, int nargs) {
+    need_nargs(nargs, 3, "update-in");
+    return path_update(env, argv[0], argv[1], argv[2], NULL, argv + 3, nargs - 3);
+}
+
+static Clove *prim_assoc_in(CloveEnv *env, Clove **argv, int nargs) {
+    if (nargs != 3) clove_error("wrong number of args (%d) passed to assoc-in", nargs);
+    return path_update(env, argv[0], argv[1], NULL, argv[2], NULL, 0);
 }
 
 static Clove *prim_second(CloveEnv *env, Clove **argv, int nargs) {
@@ -10024,41 +10273,78 @@ static Clove *vec_seq_from(Clove *v, size_t start) {
  * `done` stays false during this, so a self-referential seq that re-enters its
  * own force (chunk-map* walking the tail) still sees this cell as unrealized
  * and stops there instead of looping forever. */
+static Clove *lazy_force(Clove *l);
+
+/* A forced cell whose thunk returned another lazy cell is "forwarded": done,
+ * with that cell in `cached`. Follow the chain to its realized value and
+ * point every cell on it straight there. */
+static Clove *lazy_resolve(Clove *l) {
+    Clove *x = l;
+    while (x != NULL && x != NIL && x->tag == CLOVE_LAZY && x->as.lazy.done)
+        x = x->as.lazy.cached;
+    Clove *r = (x != NULL && x != NIL && x->tag == CLOVE_LAZY) ? lazy_force(x) : x;
+    for (Clove *p = l; p != x; ) {
+        Clove *next = p->as.lazy.cached;
+        p->as.lazy.cached = r;
+        p = next;
+    }
+    return r;
+}
+
+/* Is l (after any forwarding) a lazy cell nobody has forced yet? */
+static bool lazy_unrealized(Clove *l) {
+    while (l->as.lazy.done) {
+        l = l->as.lazy.cached;
+        if (l == NULL || l == NIL || l->tag != CLOVE_LAZY) return false;
+    }
+    return true;
+}
+
 static Clove *lazy_force(Clove *l) {
-    if (l->as.lazy.done) return l->as.lazy.cached;
+    if (l->as.lazy.done) {
+        Clove *c = l->as.lazy.cached;
+        return (c != NULL && c != NIL && c->tag == CLOVE_LAZY) ? lazy_resolve(l) : c;
+    }
+    /* re-entered while its own force is under way (thunk already called):
+     * continue from where that walk has got to */
+    if (l->as.lazy.thunk == NIL) return lazy_force(l->as.lazy.cached);
     /* ITERATIVE chain walk — one C frame total, not one per cell. A filter
      * whose predicate rejects a long stretch yields lazy-of-lazy chains
      * 100K+ deep ((first (filter #(= % 3000000) (iterate inc 0)))); the old
      * per-cell recursion needed ~90 bytes of C stack per link and died on
      * the 8 MB default stacks of macOS/Windows (Linux's raised rlimit hid it).
-     * Phase 1: run thunks down the chain, linking each cell's `cached` to
-     * the next unforced cell — gc_mark follows `cached` unconditionally, so
-     * the provisional link keeps the whole chain reachable from l across the
-     * GCs a thunk call can trigger. `done` stays false throughout (the
-     * self-reference contract in the comment above). */
+     * Each cell passed on the way is forwarded to the cell its thunk returned
+     * (as Clojure's LazySeq.sval leaves it), so the head links to nothing
+     * until the end: the cells behind the walk are garbage unless someone
+     * else holds them (it used to link them all, and one rooted head kept a
+     * 3M-element walk live). A thunk is dropped once called, as LazySeq
+     * drops its fn. l itself stays undone throughout, with `cached` at the
+     * walk's current cell, so a self-referential seq that re-enters its own
+     * force (chunk-map* walking the tail) still sees it as unrealized. */
     Clove *cur = l, *r;
-    for (;;) {
+    for (uint32_t steps = 1;; steps++) {
+        /* every thunk runs at the same depth, and a spill slot only the
+         * first few wrote can hold the head's env for the whole walk */
+        if (steps <= 4 || (steps & 255) == 0) stack_scrub_small();
         Clove *th = cur->as.lazy.thunk;
         r = th->tag == CLOVE_VECTOR ? vec_seq_from(th, cur->as.lazy.vidx)
           : th->tag == CLOVE_TNODE ? sorted_iter_chunk(th, cur->as.lazy.state)
           : apply(gc_root_envs[0], th, NULL, 0);
+        if (cur != l) {
+            cur->as.lazy.cached = r;
+            cur->as.lazy.done = true;
+        }
+        cur->as.lazy.thunk = NIL;   /* called: its closure may go */
+        cur->as.lazy.state = NULL;
         if (r == NULL || r == NIL || r->tag != CLOVE_LAZY) break;
-        if (r->as.lazy.done) { r = r->as.lazy.cached; break; }
-        cur->as.lazy.cached = r;   /* provisional next-link, not a result */
+        if (r->as.lazy.done) { r = lazy_force(r); break; }
+        l->as.lazy.cached = r;      /* in progress: where the walk is */
         cur = r;
     }
-    /* Phase 2: back-patch every visited cell with the realized result —
-     * exactly what the recursive unwind used to do. */
-    Clove *p = l;
-    for (;;) {
-        Clove *next = (p == cur) ? NULL : p->as.lazy.cached;
-        p->as.lazy.cached = r;
-        p->as.lazy.done = true;
-        p->as.lazy.thunk = NIL;
-        p->as.lazy.state = NULL;
-        if (!next) break;
-        p = next;
-    }
+    l->as.lazy.cached = r;
+    l->as.lazy.done = true;
+    l->as.lazy.thunk = NIL;
+    l->as.lazy.state = NULL;
     return r;
 }
 
@@ -12210,7 +12496,7 @@ static Clove *prim_chunk_map(CloveEnv *env, Clove **argv, int nargs) {
         t = &(*t)->as.cons.tail;
         Clove *tail = s->as.cons.tail;
         if (tail != NIL && tail->tag == CLOVE_LAZY &&
-            !tail->as.lazy.done) { s = tail; break; }
+            lazy_unrealized(tail)) { s = tail; break; }
         s = seq1(tail);
     }
     Clove *pair[2] = {out, s};
@@ -12229,7 +12515,7 @@ static Clove *prim_chunk_filter(CloveEnv *env, Clove **argv, int nargs) {
         }
         Clove *tail = s->as.cons.tail;
         if (tail != NIL && tail->tag == CLOVE_LAZY &&
-            !tail->as.lazy.done) { s = tail; break; }
+            lazy_unrealized(tail)) { s = tail; break; }
         s = seq1(tail);
     }
     Clove *pair[2] = {out, s};
@@ -15625,7 +15911,6 @@ static const char *PRELUDE =
     "                       (list form x))]\n"
     "        (recur threaded (rest forms))))))\n"
     /* seq utilities */
-    "(defn next [coll] (seq (rest coll)))\n"
     "(defn mapcat [f coll] (apply concat (map f coll)))\n"
     "(defn remove [pred coll] (filter (complement pred) coll))\n"
     "(defn keep [f coll] (filter some? (map f coll)))\n"
@@ -15688,32 +15973,10 @@ static const char *PRELUDE =
     "   (sort (fn [a b] (let [r (cmp (f a) (f b))]\n"
     "                     (if (number? r) (neg? r) r))) coll)))\n"
     /* associative utilities */
-    "(defn update\n"
-    "  ([m k f] (assoc m k (f (get m k))))\n"
-    "  ([m k f x] (assoc m k (f (get m k) x)))\n"
-    "  ([m k f x y] (assoc m k (f (get m k) x y)))\n"
-    "  ([m k f x y z] (assoc m k (f (get m k) x y z)))\n"
-    "  ([m k f x y z & more] (assoc m k (apply f (get m k) x y z more))))\n"
     "(defn get-in\n"
     "  ([m ks] (reduce get m ks))\n"
     "  ([m ks d] (let [r (reduce (fn [acc k] (if (nil? acc) nil (get acc k))) m ks)]\n"
     "              (if (nil? r) d r))))\n"
-    "(defn assoc-in [m ks v]\n"
-    "  (let [k (first ks) r (next ks)]\n"
-    "    (if r\n"
-    "      (assoc m k (assoc-in (get m k) r v))\n"
-    "      (assoc m k v))))\n"
-    "(defn update-in\n"
-    "  ([m ks f]\n"
-    "   (let [k (first ks) r (next ks)]\n"
-    "     (if r\n"
-    "       (assoc m k (update-in (get m k) r f))\n"
-    "       (assoc m k (f (get m k))))))\n"
-    "  ([m ks f & args]\n"
-    "   (let [k (first ks) r (next ks)]\n"
-    "     (if r\n"
-    "       (assoc m k (apply update-in (get m k) r f args))\n"
-    "       (assoc m k (apply f (get m k) args))))))\n"
     "(defn select-keys [m ks]\n"
     "  (reduce (fn [acc k] (if (contains? m k) (assoc acc k (get m k)) acc)) {} ks))\n"
     /* string helpers */
@@ -17155,6 +17418,10 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "first",   prim_first);
     clove_define_native(e, "second",  prim_second);
     clove_define_native(e, "rest",    prim_rest);
+    clove_define_native(e, "next",    prim_next);
+    clove_define_native(e, "update",    prim_update);
+    clove_define_native(e, "update-in", prim_update_in);
+    clove_define_native(e, "assoc-in",  prim_assoc_in);
     clove_define_native(e, "cons",    prim_cons);
     clove_define_native(e, "conj",    prim_conj);
     clove_define_native(e, "count",   prim_count);
