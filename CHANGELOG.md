@@ -13,6 +13,14 @@
 - The esoteric-language interpreter example is now `examples/tape.clj`
   ("Tape Machine").
 
+### Fixed
+- A later `let` binding of a name no longer changes what an earlier closure
+  or lazy seq in the same `let` sees: `(let [x 1 f (fn [] x) x 2] (f))` is 1.
+  `letfn` is now a special form (`letfn*`) instead of relying on that leak.
+- `recur` in a variadic fn binds the rest param to the value given, as
+  Clojure does; it used to wrap it in another list, so loops over `& more`
+  nested, errored or never ended.
+
 ## v0.9.0 — 2026-11-02
 
 ### Changed

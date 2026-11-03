@@ -4041,5 +4041,15 @@
 (assert= [true "dflt"] [(string? (System/getProperty "user.dir")) (System/getProperty "nope.prop" "dflt")])
 (assert= true (str/starts-with? (with-out-str (time 1)) "\"Elapsed time: "))
 
+;; ── workstream B: evaluator, special forms, prelude ──
+;; a later let binding of the same name must not change what earlier closures see
+(assert= [1 [11 21] 1] [(let [x 1 f (fn [] x) x 2] (f)) (let [n 1 xs (map #(+ n %) [10 20]) n 100] (vec xs)) (let [[n] [1] g (fn [] n) [n] [2]] (g))])
+(defn clove-b1 [] [(let [x 1 f (fn [] x) x 2 g (fn [] x) x 3] [(f) (g) x]) (let [n 1 xs (map #(+ n %) [10 20]) n 100] (vec xs))])
+(assert= [[1 2 3] [11 21]] (do (clove-b1) (clove-b1)))
+;; recur in a variadic arity binds the rest param directly
+(defn clove-b2a [n & xs] (if (zero? n) xs (recur (dec n) (cons n xs))))
+(defn clove-b2b [acc & more] (if more (recur (+ acc (first more)) (next more)) acc))
+(assert= ['(1 2 3) 6 :done] [(clove-b2a 3) (clove-b2b 0 1 2 3) ((fn [& xs] (if (seq xs) (recur (next xs)) :done)) 1 2 3)])
+
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

@@ -4270,6 +4270,17 @@ static void vmc_bind(VmC *c, Clove *pat) {
     }
 }
 
+/* Did code emitted since `from` possibly capture the current env frame
+ * (a closure, a lazy thunk, or a tree-walked form)? */
+static bool vmc_may_capture(VmC *c, uint32_t from) {
+    if (!c->ok) return false;
+    for (uint32_t i = from; i < c->ncode; i++) {
+        uint8_t op = c->code[i] & 0xff;
+        if (op == VOP_CLOSURE || op == VOP_LAZY || op == VOP_EVAL) return true;
+    }
+    return false;
+}
+
 /* Enter/leave a runtime env frame (one VOP_NEWENV / VOP_POPENV). */
 static void vmc_frame_enter(VmC *c) {
     c->frame++;
@@ -4284,16 +4295,16 @@ static bool vm_special_name(const char *s) {
     /* must stay in sync with eval_inner's special forms (no shared
      * list); the first 11 are handled explicitly in vmc_form before
      * this is consulted — listed anyway as drift insurance */
-    static const char *names[24];
+    static const char *names[25];
     if (!names[0]) {
-        static const char *txt[24] = {
+        static const char *txt[25] = {
             "quote", "if", "do", "def", "let", "fn", "loop", "recur",
             "and", "or", "when", "cond", "defn", "defmacro", "quasiquote",
             "try", "catch", "finally", "ns", "use", "import", "binding",
-            "with-redefs", "**reader-splice**"};
-        for (int i = 0; i < 24; i++) names[i] = intern(txt[i], strlen(txt[i]));
+            "with-redefs", "**reader-splice**", "letfn*"};
+        for (int i = 0; i < 25; i++) names[i] = intern(txt[i], strlen(txt[i]));
     }
-    for (int i = 0; i < 24; i++)
+    for (int i = 0; i < 25; i++)
         if (s == names[i]) return true;
     return false;
 }
@@ -4550,9 +4561,20 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
             c->loop_depth++;
             vmc_emit(c, VOP_NEWENV, 0);
             vmc_frame_enter(c);
+            int extra = 0;                /* frames opened after a capture */
+            uint32_t frame_pc = c->ncode;
             for (size_t i = 0; i < vec_len(bv); i += 2) {
                 Clove *pat = vec_nth(bv, i);
                 vmc_form(c, cenv, vec_nth(bv, i + 1), false);
+                if (vmc_may_capture(c, frame_pc)) {
+                    /* a closure may hold this frame: later bindings go in a
+                     * child so (let [x 1 f (fn [] x) x 2] (f)) stays 1 */
+                    vmc_emit(c, VOP_NEWENV, 0);
+                    vmc_frame_enter(c);
+                    c->loop_depth++;
+                    extra++;
+                    frame_pc = c->ncode;
+                }
                 if (pat != NIL && pat->tag == CLOVE_SYMBOL)
                     vmc_emit(c, VOP_BIND, vmc_const(c, pat));
                 else
@@ -4560,9 +4582,11 @@ static void vmc_form(VmC *c, CloveEnv *cenv, Clove *form, bool tail) {
                 vmc_bind(c, pat);
             }
             vmc_body(c, cenv, rest->as.cons.tail, tail);
-            vmc_emit(c, VOP_POPENV, 0);
-            vmc_frame_leave(c);
-            c->loop_depth--;
+            for (int x = 0; x <= extra; x++) {
+                vmc_emit(c, VOP_POPENV, 0);
+                vmc_frame_leave(c);
+                c->loop_depth--;
+            }
             c->nlocals = save_locals;
             return;
         }
@@ -5054,11 +5078,30 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
         Clove * volatile recur_keep = NIL;
         (void)recur_keep;
         int tc_frame = -1;   /* trace-frame slot successive tail calls replace */
+        Clove *recur_arity = NULL;   /* variadic arity a self-recur re-enters */
         for (;;) {
             if (!fn->as.fn.fc_ready) fastcall_init(fn);  /* fn can change via a tail call */
             Clove *chosen;
             CloveEnv *call;
-            if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
+            if (recur_arity) {
+                /* recur in a variadic arity passes the rest param as one
+                 * value, already a seq: bind it as-is, same arity */
+                chosen = recur_arity;
+                recur_arity = NULL;
+                call = env_new(fn->as.fn.env);
+                int i = 0;
+                for (Clove *p = chosen->as.cons.head; p && p->tag == CLOVE_LIST; p = p->as.cons.tail) {
+                    Clove *pat = p->as.cons.head;
+                    if (pat->tag == CLOVE_SYMBOL && pat->as.sym == sym_amp()) {
+                        if (nargs != i + 1)
+                            clove_error("recur: expected %d args, got %d", i + 1, nargs);
+                        destructure(call, p->as.cons.tail->as.cons.head, argv[i]);
+                        break;
+                    }
+                    if (i >= nargs) clove_error("recur: too few args (%d)", nargs);
+                    destructure(call, pat, argv[i++]);
+                }
+            } else if (fn->as.fn.fc_arity && (size_t)nargs == fn->as.fn.fc_n) {
                 /* fast path: fill the frame's slots straight from argv, no
                  * arity_info walk and no bind_params/destructure calls. */
                 chosen = fn->as.fn.fc_arity;
@@ -5144,6 +5187,11 @@ static Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
             argv = result->as.recur.spill
                 ? (Clove **)result->as.recur.iv[0] : result->as.recur.iv;
             nargs = (int)result->as.recur.n;
+            if (!result->meta && chosen != fn->as.fn.fc_arity) {
+                size_t fx; bool va;
+                arity_info(chosen->as.cons.head, &fx, &va);
+                if (va) recur_arity = chosen;
+            }
             if (result->meta) {    /* tail call to ANOTHER fn (meta = target) */
                 Clove *newfn = result->meta;
                 if (newfn->tag == CLOVE_FN) fn = newfn;         /* loop, replacing this frame */
@@ -6220,7 +6268,27 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     CloveEnv *scope = env_new(env);
                     for (size_t i = 0; i < vec_len(binds_vec); i += 2) {
                         Clove *val = eval(scope, vec_nth(binds_vec, i + 1));
+                        /* a closure holds this frame: bind into a child so
+                         * a later same-name binding doesn't leak into it */
+                        if (scope->captured) scope = env_new(scope);
                         destructure(scope, vec_nth(binds_vec, i), val);
+                    }
+                    return eval_body(scope, rest->as.cons.tail);
+                }
+                static const char *SYM_LETFN;
+                if (!SYM_LETFN) SYM_LETFN = intern("letfn*", 6);
+                if (s == SYM_LETFN) {
+                    /* (letfn* [f (fn ..) g (fn ..)] body) — every fn closes
+                     * over one frame holding all the names */
+                    Clove *bv = rest->as.cons.head;
+                    if (bv == NIL || bv->tag != CLOVE_VECTOR || vec_len(bv) % 2 != 0)
+                        clove_error("letfn needs an even-sized binding vector");
+                    CloveEnv *scope = env_new(env);
+                    for (size_t i = 0; i < vec_len(bv); i += 2)
+                        env_define(scope, sym_name(vec_nth(bv, i), "letfn"), NIL);
+                    for (size_t i = 0; i < vec_len(bv); i += 2) {
+                        Clove *f = eval(scope, vec_nth(bv, i + 1));
+                        *env_local_find(scope, vec_nth(bv, i)->as.sym) = f;
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }
@@ -15065,7 +15133,7 @@ static const char *PRELUDE =
     "              forms)\n"
     "       ~g)))\n"
     "(defmacro letfn [fnspecs & body]\n"
-    "  `(let [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
+    "  `(letfn* [~@(mapcat (fn [spec] (list (first spec) (cons 'fn (rest spec))))\n"
     "                   fnspecs)]\n"
     "     ~@body))\n"
     "(defmacro condp [pred expr & clauses]\n"
