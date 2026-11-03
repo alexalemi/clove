@@ -4076,6 +4076,13 @@
          [(subseq (sorted-set 1 2 3 4 5) > 2) (subseq (sorted-set 1 2 3 4 5) >= 2 < 4)
           (rsubseq (sorted-set 1 2 3 4 5) < 4) (rsubseq (sorted-set 1 2 3 4 5) > 1 <= 4)
           (subseq (sorted-map 1 :a 2 :b 3 :c) <= 2) (rseq (sorted-set 3 1 2)) (rseq (sorted-set))])
+;; the heap shrinks after a big structure is dropped (Linux: read VmRSS)
+(when (and (= :linux (clove/os*)) (not (System/getenv "CLOVE_GC_STRESS")))
+  (let [rss (fn [] (parse-long (second (re-find #"VmRSS:\s+(\d+)" (slurp "/proc/self/status")))))
+        big (atom (vec (range 2000000)))
+        before (rss)]
+    (reset! big nil) (gc) (gc)
+    (assert= true (< (rss) (- before 20000)))))
 (when clove-test-coro?
   ;; deep = inside a coroutine stops with StackOverflowError instead of corrupting the heap
   (let [v (reduce (fn [a _] [a]) [] (range 100000))

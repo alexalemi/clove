@@ -12,6 +12,34 @@
 ### Changed
 - The esoteric-language interpreter example is now `examples/tape.clj`
   ("Tape Machine").
+- `subvec` is an O(1) slice sharing the vector's structure (it copied).
+  `seq`, `first` and `rest` of a vector no longer copy it into a list:
+  `(first v)` on a million-element vector took 26 ms.
+- `seq`, `rseq`, `subseq` and `rsubseq` of a sorted collection walk the tree
+  lazily, and `subseq`/`rsubseq` seek to their start key in O(log n) and
+  stop at the end bound. `(first (subseq s >= k))` on 100k elements took
+  12 ms.
+- The fiber scheduler's ready queue pops in O(1): 8,000 futures took 25 s
+  and 50,000 ran out of memory.
+- Symbol and keyword intern tables grow; 200,000 distinct keywords took 10 s.
+- The heap shrinks: the collector returns empty cell blocks and surplus
+  recycled arrays to the OS instead of keeping its peak size forever.
+- A finished coroutine frees its 1 MiB stack at once rather than at the next
+  collection (200,000 short coroutines peaked at 2 GB).
+- Hashing or comparing a map or set no longer builds an entry list.
+
+### Fixed
+- Strings containing NUL bytes compared, hashed and interned (as keywords
+  and symbols) only up to the first NUL: `(= "" (str (char 0)))` was true.
+- Hashing a double no longer has undefined behavior for NaN, infinities and
+  values beyond the long range.
+- `=` and `hash` on deeply nested data inside a coroutine (go block, future)
+  throw StackOverflowError instead of overrunning the coroutine's stack and
+  corrupting memory. Coroutine stacks now have a guard page.
+- A list ending in a lazy tail, such as `(cons 1 (lazy-seq [2]))`, hashes
+  like the equal vector.
+- `subseq` and `rsubseq` return `()` rather than nil where Clojure does.
+- `CLOVE_GC_LOG` counts every cell type in its histogram.
 
 ## v0.9.0 — 2026-11-02
 

@@ -75,6 +75,9 @@
 #include <errno.h>
 #include <limits.h>   /* INT_MAX — clamping the length delta in str_compare */
 #include <setjmp.h>
+#ifdef __GLIBC__
+#include <malloc.h>      /* malloc_trim — hand freed heap back after a big drop */
+#endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>        /* scan_registers + exports (clove notebook -S) */
 #include <emscripten/stack.h>
@@ -138,8 +141,9 @@ static int clove_wsa_init(void) {   /* idempotent winsock startup */
 #include <dlfcn.h>          /* dlopen — FFI module loading */
 #ifndef __EMSCRIPTEN__      /* no ucontext in wasm: notebooks run without coroutines */
 #include <ucontext.h>       /* makecontext/swapcontext — coroutine primitive */
-#include <sys/mman.h>       /* mmap — coroutine stacks with a guard page */
+#include <sys/mman.h>       /* mmap — coroutine stacks, GC cell blocks */
 #define CLOVE_HAVE_CORO 1
+#define CLOVE_HAVE_MMAP 1
 #endif
 #define sock_close close
 #define clove_wsa_init() 0
@@ -1411,6 +1415,29 @@ static CloveEnv *env_root(CloveEnv *e) {
 typedef struct CellBlock { struct CellBlock *next; size_t used; Clove cells[CELL_BLOCK_N]; } CellBlock;
 static CellBlock *cell_blocks;
 static Clove *cell_freelist;        /* linked through as.cons.head */
+static size_t cell_nblocks;
+
+/* Blocks are mmap'd where we can: the sweep hands empty ones back, and a
+ * malloc'd block that size can stay in the C heap after free. */
+static CellBlock *cell_block_new(void) {
+#ifdef CLOVE_HAVE_MMAP
+    void *p = mmap(NULL, sizeof(CellBlock), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    CellBlock *b = p == MAP_FAILED ? NULL : p;
+#else
+    CellBlock *b = malloc(sizeof *b);
+#endif
+    if (b) cell_nblocks++;
+    return b;
+}
+static void cell_block_free(CellBlock *b) {
+    cell_nblocks--;
+#ifdef CLOVE_HAVE_MMAP
+    munmap(b, sizeof(CellBlock));
+#else
+    free(b);
+#endif
+}
 
 #define ENV_BLOCK_N 1024
 typedef struct EnvBlock { struct EnvBlock *next; size_t used; CloveEnv envs[ENV_BLOCK_N]; } EnvBlock;
@@ -1442,6 +1469,8 @@ static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
 
 static void gc_mark_env(CloveEnv *e);
+static void chunk_pools_trim(void);
+static size_t pool_trimmed;   /* bytes freed by the trims of this sweep */
 
 /* Marking uses an explicit worklist, not C-stack recursion: a 10k-deep
  * closure/env chain (long reduce over lazy pipelines) overflowed the C
@@ -1708,13 +1737,20 @@ static void gc_collect(void) {
     }
     gc_scan_range(&regs, (char *)&regs + sizeof regs);
 
-    /* Sweep cells: free owned arrays once, rebuild the free list. */
-    size_t live = 0, freed = 0;
+    /* Sweep cells: free owned arrays once, rebuild the free list. Blocks
+     * left with no live cell move to `empty`; after the new threshold is
+     * known, enough of them to feed the next cycle rejoin the pool and the
+     * rest go back to the OS (the heap used to only ever grow). */
+    size_t live = 0, freed = 0, spare = 0;
+    CellBlock *empty = NULL;
     cell_freelist = NULL;
-    for (CellBlock *b = cell_blocks; b; b = b->next) {
+    for (CellBlock **pb = &cell_blocks; *pb; ) {
+        CellBlock *b = *pb;
+        size_t blive = 0;
+        Clove *bhead = NULL, *btail = NULL;
         for (size_t i = 0; i < b->used; i++) {
             Clove *c = &b->cells[i];
-            if (c->gcmark) { c->gcmark = 0; live++; continue; }
+            if (c->gcmark) { c->gcmark = 0; live++; blive++; continue; }
             if (c->tag != CLOVE_FREE) {
                 switch (c->tag) {
                     case CLOVE_STRING: free(c->as.str); break;
@@ -1747,9 +1783,19 @@ static void gc_collect(void) {
                 freed++;
             }
             memset(&c->as, 0, sizeof c->as);
-            c->as.cons.head = cell_freelist;
-            cell_freelist = c;
+            c->as.cons.head = bhead;
+            bhead = c;
+            if (!btail) btail = c;
         }
+        if (blive == 0) {                  /* unlink; decided below */
+            *pb = b->next;
+            b->next = empty;
+            empty = b;
+            continue;
+        }
+        if (bhead) { btail->as.cons.head = cell_freelist; cell_freelist = bhead; }
+        spare += CELL_BLOCK_N - blive;     /* includes a fresh block's unbumped tail */
+        pb = &b->next;
     }
 
     /* Sweep envs: free owned binding chains, rebuild the free list. */
@@ -1804,6 +1850,38 @@ static void gc_collect(void) {
         churn_floor /= 2;                 /* >50% live: tighten, save memory */
     size_t floor = churn_floor;
     gc_threshold = live * 4 > floor ? live * 4 : floor;
+
+    /* Keep empty blocks until the pool can absorb the next cycle's
+     * allocations without growing; unmap the rest. A kept block rejoins
+     * fully free (used = N), at the tail of the list so bump allocation
+     * in the head block is unaffected. */
+    size_t blocks_freed = 0;
+    CellBlock **tailp = &cell_blocks;
+    while (*tailp) tailp = &(*tailp)->next;
+    while (empty) {
+        CellBlock *b = empty;
+        empty = b->next;
+        if (spare >= gc_threshold) { cell_block_free(b); blocks_freed++; continue; }
+        for (size_t i = 0; i < b->used; i++) {
+            Clove *c = &b->cells[i];
+            c->as.cons.head = cell_freelist;
+            cell_freelist = c;
+        }
+        spare += b->used;
+        b->next = NULL;
+        *tailp = b;
+        tailp = &b->next;
+    }
+    pool_trimmed = 0;
+    chunk_pools_trim();
+    /* the mark worklist grows to the deepest mark ever seen (8 bytes per
+     * queued cell: ~100 MB after a 5M-element vector); drop it if large */
+    if (mark_cap > (1u << 20)) { free(mark_stack); mark_stack = NULL; mark_cap = 0; }
+#ifdef __GLIBC__
+    /* glibc keeps freed small chunks in its heap; after a big release
+     * (whole blocks, or MBs of arrays) ask it to return the pages */
+    if (blocks_freed || pool_trimmed > (8u << 20)) malloc_trim(0);
+#endif
 }
 
 #define GC_BYTES_CAP (256u << 20)   /* string-churn slack ceiling: 256MB */
@@ -1920,11 +1998,13 @@ static unsigned popcnt32(uint32_t x) {
  * nodes — both die young, so a free list beats malloc/free churn. The
  * next-chunk pointer reuses the first slot. */
 static Clove **chunk32_freelist;
+static size_t chunk32_nfree, chunk32_low;   /* low: fewest free since last GC */
 
 static Clove **chunk32_alloc(void) {
     if (chunk32_freelist) {
         Clove **p = chunk32_freelist;
         chunk32_freelist = (Clove **)p[0];
+        if (--chunk32_nfree < chunk32_low) chunk32_low = chunk32_nfree;
         return p;
     }
     return xmalloc(sizeof(Clove *) * 32);
@@ -1933,12 +2013,14 @@ static Clove **chunk32_alloc(void) {
 static void chunk32_free(Clove **p) {
     p[0] = (Clove *)chunk32_freelist;
     chunk32_freelist = p;
+    chunk32_nfree++;
 }
 
 /* Size-classed free lists for vector tails (1..32 pointers). Tail sizes
  * repeat heavily under conj churn, so exact-size recycling avoids both
  * malloc traffic and the memory inflation of always-32 chunks. */
 static Clove **tail_freelist[33];
+static size_t tail_nfree[33], tail_low[33];
 
 static Clove **tail_alloc(uint8_t n) {
     if (n == 0) n = 1;
@@ -1946,6 +2028,7 @@ static Clove **tail_alloc(uint8_t n) {
     if (tail_freelist[n]) {
         Clove **p = tail_freelist[n];
         tail_freelist[n] = (Clove **)p[0];
+        if (--tail_nfree[n] < tail_low[n]) tail_low[n] = tail_nfree[n];
         return p;
     }
     return xmalloc(sizeof(Clove *) * n);
@@ -1955,6 +2038,27 @@ static void tail_free(Clove **p, uint8_t n) {
     if (n == 0) n = 1;
     p[0] = (Clove *)tail_freelist[n];
     tail_freelist[n] = p;
+    tail_nfree[n]++;
+}
+
+/* After a sweep: free the arrays a pool held unused through the whole last
+ * cycle (its low-water mark), so dropping a big vector or map gives its node
+ * arrays back, while steady churn, which drains the pool, keeps recycling. */
+static void pool_trim(Clove ***list, size_t *nfree, size_t *low, size_t width) {
+    size_t k = *low < *nfree ? *low : *nfree;
+    pool_trimmed += k * width * sizeof(Clove *);
+    for (; k; k--) {
+        Clove **p = *list;
+        *list = (Clove **)p[0];
+        (*nfree)--;
+        free(p);
+    }
+    *low = *nfree;
+}
+static void chunk_pools_trim(void) {
+    pool_trim(&chunk32_freelist, &chunk32_nfree, &chunk32_low, 32);
+    for (int n = 1; n <= 32; n++)
+        pool_trim(&tail_freelist[n], &tail_nfree[n], &tail_low[n], (size_t)n);
 }
 
 /* Allocate a node with zeroed kid slots. Callers fill the slots immediately
@@ -2245,7 +2349,7 @@ static Clove *map_assoc(Clove *m, Clove *k, Clove *v) {
     Clove *kv[2 * MAP_SMALL + 2];
     if (n) memcpy(kv, o->as.vec.tail, sizeof(Clove *) * n);
     if (map_small_find(m, k, &at)) {
-        if (kv[at + 1] == v) return m;
+        if (o->as.vec.tail[at + 1] == v) return m;   /* found => o is set */
         kv[at + 1] = v;                       /* keeps the original key */
         return map_small_cell(m, kv, n);
     }
@@ -2828,7 +2932,7 @@ static Clove *cell_alloc(bool zero) {
         cell_freelist = c->as.cons.head;
     } else {
         if (!cell_blocks || cell_blocks->used == CELL_BLOCK_N) {
-            CellBlock *b = malloc(sizeof *b);
+            CellBlock *b = cell_block_new();
             if (!b) clove_error("out of memory");
             b->used = 0;
             b->next = cell_blocks;
@@ -11202,11 +11306,6 @@ static Clove *mk_sorted(Clove *cmp, bool is_map) {
     return s;
 }
 
-/* the comparison key of an iteration entry: a set's element is its own key; a
- * map entry is a [k v] vector keyed by element 0. */
-static Clove *sorted_entry_key(Clove *coll, Clove *entry) {
-    return coll->as.sorted.is_map ? vec_nth(entry, 0) : entry;
-}
 
 static int sorted_cmp_call(CloveEnv *env, Clove *coll, Clove *a, Clove *b) {
     Clove *cmp = coll->as.sorted.cmp;
@@ -11599,11 +11698,25 @@ static Clove *prim_sort(CloveEnv *env, Clove **argv, int nargs) {
 
 static Clove *prim_vec(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    Clove *s = to_seq(argv[0]);
-    Clove *v = mk_empty_vec();
-    for (Clove *l = s; l && l->tag == CLOVE_LIST; l = l->as.cons.tail)
-        v = vec_conj1(v, l->as.cons.head);
-    return v;
+    Clove *a[2] = { mk_empty_vec(), NULL };
+    Clove *t = prim_transient(NULL, a, 1);
+    int tag = argv[0] == NIL ? CLOVE_NIL : argv[0]->tag;
+    if (tag == CLOVE_LIST || tag == CLOVE_LAZY) {
+        /* walk advancing the root slot: a lazy source is collected behind
+         * the cursor instead of being realized whole first (to_seq) */
+        for (Clove *l = seq1_slot(&argv[0]); l != NIL; l = seq1_slot(&argv[0])) {
+            a[0] = t; a[1] = l->as.cons.head;
+            prim_conj_bang(NULL, a, 2);
+            argv[0] = l->as.cons.tail;
+        }
+    } else {
+        for (Clove *l = to_seq(argv[0]); l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
+            a[0] = t; a[1] = l->as.cons.head;
+            prim_conj_bang(NULL, a, 2);
+        }
+    }
+    a[0] = t;
+    return prim_persistent_bang(NULL, a, 1);
 }
 
 static const char *as_named(Clove *v, const char *what) {
