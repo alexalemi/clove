@@ -912,8 +912,16 @@ static const char *stack_floor(void) {
     return main_stack_floor;
 }
 
+/* Stack scrubbing has to reach every word: under ASan, the scrub's own
+ * buffer would otherwise get redzones, which it never writes. */
+#if defined(__GNUC__) || defined(__clang__)
+#define CLOVE_NO_ASAN __attribute__((no_sanitize_address))
+#else
+#define CLOVE_NO_ASAN
+#endif
+
 /* The deepest stack address the evaluator has reached since the last
- * stack_scrub_dirty: everything between it and a caller's frame is what
+ * stack_scrub_to: everything between it and a caller's frame is what
  * calls that returned left behind. */
 static uintptr_t stack_low;   /* an address, not a pointer: never a root */
 
@@ -925,22 +933,29 @@ static inline void stack_note(const char *sp) {
 /* Zero the stack below the caller down to stack_low. A later frame that
  * reserves a slot and never writes it would show the conservative scan
  * whatever an earlier call left there (a vector built in a `loop` and
- * since dropped) for as long as that frame lives. Only the part dirtied
- * since the last scrub is cleared, so a cheap form costs little. */
-static __attribute__((noinline)) void stack_scrub_dirty(void) {
+ * since dropped, the coll a returned call bound in its frame) for as long
+ * as that frame lives. Only the part dirtied since the last scrub is
+ * cleared, plus a margin for natives, which don't note their depth.
+ * `at` is an address in the caller's frame: after this, stack_low sits
+ * there, so the same caller scrubs again only once something it calls
+ * has run deeper. */
+static __attribute__((noinline)) CLOVE_NO_ASAN void stack_scrub_to(uintptr_t at) {
     char probe;
     uintptr_t here = (uintptr_t)&probe, low = stack_low, floor = (uintptr_t)stack_floor();
-    stack_low = here;   /* the frames above us are left behind next */
+    stack_low = at;
     if (!low || low > here) low = here;
     if (floor && low < floor) low = floor;
-    /* the notes come from evaluator frames; the natives they called ran a
-     * little deeper, so clear a margin past the mark */
     size_t n = (size_t)(here - low) + 1024;
     if (n > 65536) n = 65536;
     char *buf = __builtin_alloca(n);
     memset(buf, 0, n);
     __asm__ __volatile__("" : : "r"(buf) : "memory");   /* keep the stores */
 }
+
+/* Scrub if anything ran below `at` since the last scrub. */
+#define STACK_SCRUB_HERE() do { char sp_probe_; uintptr_t at_ = (uintptr_t)&sp_probe_; \
+        __asm__ __volatile__("" : : "r"(&sp_probe_) : "memory"); \
+        if (stack_low < at_) stack_scrub_to(at_); } while (0)
 
 static void clove_check_stack(void) {
     char probe;
@@ -1790,7 +1805,19 @@ static Clove *g_var_meta;   /* var metadata side table (see "Var metadata") */
  * 128-byte saved signal mask unwritten. The collector runs below it. */
 static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp);
 
-static void gc_collect(void) {
+static __attribute__((noinline)) void gc_collect_regs(void);
+static __attribute__((noinline)) CLOVE_NO_ASAN void stack_scrub(void);
+
+/* The collector's own frames land on stack whatever ran there last left
+ * behind (persistent!'s frames held the transient a moment ago), and any
+ * slot they reserve but never write would be scanned as a root. Zero that
+ * stretch first: everything below this frame is dead. */
+static __attribute__((noinline)) void gc_collect(void) {
+    stack_scrub();
+    gc_collect_regs();
+}
+
+static __attribute__((noinline)) void gc_collect_regs(void) {
     /* Flush callee-saved registers onto the stack so the scan sees them.
      * glibc's setjmp mangles rbp (pointer guard), so a root the caller keeps
      * in rbp is not visible in `regs`; __builtin_unwind_init makes this
@@ -4738,7 +4765,7 @@ static Clove *read_form(const char **p) {
 static Clove *eval_body(CloveEnv *env, Clove *body) {
     Clove *r = NIL;
     for (Clove *first = body; body && body->tag == CLOVE_LIST; body = body->as.cons.tail) {
-        if (body != first) stack_scrub_dirty();
+        if (body != first) STACK_SCRUB_HERE();
         r = eval(env, body->as.cons.head);
     }
     return r;
@@ -5857,6 +5884,14 @@ static __attribute__((noinline)) CloveEnv *vm_frame_to_heap(CloveEnv *se) {
     return e;
 }
 
+/* Out of line: the slot pointer would otherwise sit in vm_run's frame
+ * (unoptimized builds give it a slot of its own) and keep the loop's last
+ * frame, and everything bound in it, alive for the rest of the body. */
+static __attribute__((noinline)) void env_set_local(CloveEnv *e, const char *name, Clove *v) {
+    Clove **p = env_local_find(e, name);
+    if (p) *p = v;
+}
+
 static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
     uint32_t *code = chunk->as.chunk.code;
     Clove **K = chunk->as.chunk.consts;
@@ -5918,14 +5953,16 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
             VM_CASE(VOP_BIND)
                 env_define(env, K[a]->as.sym, vstack[vsp - 1]);
                 vsp--;
+                STACK_SCRUB_HERE();   /* as between tree-walked let bindings */
                 VM_NEXT();
             VM_CASE(VOP_DESTRUCT)
                 destructure(env, K[a], vstack[vsp - 1]);
                 vsp--;
+                STACK_SCRUB_HERE();
                 VM_NEXT();
             VM_CASE(VOP_NEWENV) env = env_new(env); env_keep = env; VM_NEXT();
             VM_CASE(VOP_POPENV) env = env->parent; env_keep = env; VM_NEXT();
-            VM_CASE(VOP_POP)    vsp--; VM_NEXT();
+            VM_CASE(VOP_POP)    vsp--; STACK_SCRUB_HERE(); VM_NEXT();   /* between body forms */
             VM_CASE(VOP_CALL) {
                 uint32_t n = a & 0xff;
                 Clove *f = vstack[vsp - n - 1];
@@ -5997,10 +6034,8 @@ static Clove *vm_run(CloveEnv *env_in, Clove *chunk) {
                         env_define(env, nm->as.cons.head->as.sym, vals[i]);
                 } else {
                     uint32_t i = 0;
-                    for (Clove *nm = K[k]; nm && nm->tag == CLOVE_LIST; nm = nm->as.cons.tail, i++) {
-                        Clove **p = env_local_find(env, nm->as.cons.head->as.sym);
-                        if (p) *p = vals[i];
-                    }
+                    for (Clove *nm = K[k]; nm && nm->tag == CLOVE_LIST; nm = nm->as.cons.tail, i++)
+                        env_set_local(env, nm->as.cons.head->as.sym, vals[i]);
                 }
                 env_keep = env;
                 vsp -= n;
@@ -6360,13 +6395,13 @@ static Clove *apply_other(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
  * leaves the first call's env and arguments in words that later frames at
  * that depth may never overwrite; the conservative scan would keep them
  * (a lazy seq's head, and with it everything realized since) alive. */
-static __attribute__((noinline)) void stack_scrub(void) {
+static __attribute__((noinline)) CLOVE_NO_ASAN void stack_scrub(void) {
     char buf[8192];
     memset(buf, 0, sizeof buf);
     __asm__ __volatile__("" : : "r"(buf) : "memory");   /* keep the stores */
 }
 /* The same for the few frames a thunk call uses (see lazy_force). */
-static __attribute__((noinline)) void stack_scrub_small(void) {
+static __attribute__((noinline)) CLOVE_NO_ASAN void stack_scrub_small(void) {
     char buf[1024];
     memset(buf, 0, sizeof buf);
     __asm__ __volatile__("" : : "r"(buf) : "memory");
@@ -6396,8 +6431,11 @@ static Clove *apply_fn(CloveEnv *env, Clove *fn, Clove **argv, int nargs);
  * whatever an earlier call left in them stays visible to the conservative
  * scan for as long as the native runs ((first (filter p (iterate ..)))
  * kept the whole walk live that way under clang). */
-static inline Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
-    if (fn->tag == CLOVE_NATIVE) return fn->as.native(env, argv, nargs);
+static inline __attribute__((always_inline)) Clove *apply(CloveEnv *env, Clove *fn, Clove **argv, int nargs) {
+    if (fn->tag == CLOVE_NATIVE) {
+        STACK_SCRUB_HERE();
+        return fn->as.native(env, argv, nargs);
+    }
     return apply_fn(env, fn, argv, nargs);
 }
 
@@ -7838,7 +7876,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                          * a later same-name binding doesn't leak into it */
                         if (scope->captured) scope = env_new(scope);
                         destructure(scope, vec_nth(binds_vec, i), val);
-                        stack_scrub_dirty();
+                        STACK_SCRUB_HERE();
                     }
                     return eval_body(scope, rest->as.cons.tail);
                 }

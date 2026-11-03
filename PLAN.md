@@ -201,15 +201,20 @@ Things the history log leaves unresolved, roughly by value:
   stack env; `vm_compile` and `lazy_force` scrub the stack below them;
   `lazy_force` forwards each realized step to the end of the chain, so one
   stale word on an early lazy cell no longer pins the whole tail; `apply`
-  calls natives with no frame of its own in between (clang's `apply` frame
-  held the iterate head under `(first (filter ..))` in a slot it never
-  wrote); `eval_body` and `let` zero the stack the last form dirtied
-  (`stack_scrub_dirty`: eval/apply_fn/gc_drain note the deepest address,
-  plus a 1 KB margin for natives), so a frame's unwritten slot no longer
-  shows the previous form's values (the `loop` vector under -O0), and
-  `main` keeps no big arrays in its frame (mingw scanned 32 KB of
-  never-written slots there, CRT leftovers included). Compiled bodies (vm_run) don't scrub between statements, and
-  which dead words survive there is still up to the compiler; only
+  calls natives with no frame of its own (it is always_inline). Frames
+  that reserve a slot and never write it still see what earlier calls
+  left there, so the stack is zeroed where that matters: `stack_note`
+  (in eval, apply_fn's stack check, gc_drain) records the deepest address
+  reached, and `STACK_SCRUB_HERE` clears down to it before a native call,
+  between body forms and after let bindings (tree-walked and VM), plus a
+  1 KB margin for natives' own frames; each collection zeroes the stack
+  below it first, and recur's rebind and `main` keep no stray pointers in
+  their frames. Cost: up to ~10% on call-heavy loops (fib, a loop calling
+  a small fn), nothing measurable on collection builders. The fn-body and
+  top-level tests pass on gcc/clang/mingw at -O2 and -O0 and on gcc ASan.
+  Not covered: clang+ASan builds (not shipped, not in CI) still pin the
+  `iterate` walk through a vm_run frame slot, and natives that run long
+  without calling back into the evaluator are not scrubbed under. Only
   precise roots would close this for good; (2) Binding
   structs and the malloc arena (`malloc_trim` only on glibc) are not
   returned. `clove/heap-bytes*` measures (1) without RSS

@@ -96,8 +96,12 @@
   element before the match (1.1 GB at 3M elements, now 26 MB). Realizing a
   long chain of lazy seqs forwards each step instead of keeping it. Natives
   are called without an `apply` frame in between, so clang builds (macOS)
-  release the `iterate` case too, and between top-level forms and `let`
-  bindings the stack the last form dirtied is zeroed.
+  release the `iterate` case too. The stack a call dirtied is zeroed
+  before the next native call, between body forms and after `let`
+  bindings (in compiled fn bodies too), and before each collection, so
+  dropped data is freed on every platform, Windows included (`main` no
+  longer keeps a 32 KB never-written array in its frame). Call-heavy
+  loops pay up to ~10%.
 
 ### Fixed (host IO, processes, batteries)
 - `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`

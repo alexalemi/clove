@@ -4626,6 +4626,22 @@
                           "                       (iterate inc 0)))]"
                           "  (prn [x @h]))"))]
       (assert= 3000000 x)
+      (assert= true (< (or h Long/MAX_VALUE) (* 100 1024 1024))))
+    ;; the same inside a compiled fn body: a returned call's frame (filter's
+    ;; leaf frame binding the iterate head) under `first`, and recur's slot
+    ;; pointer into the loop's last frame
+    (assert= true (< 3000000 (or (run (str "(defn f [] (let [big (atom (loop [v (transient []) i 0]"
+                                           "  (if (< i 3000000) (recur (conj! v i) (inc i)) (persistent! v))))]"
+                                           "  (gc) (reset! big nil) (gc)))"
+                                           "(prn (f))"))
+                                 0)))
+    (let [[x h] (run (str "(defn f [] (let [h (atom nil)"
+                          "      x (first (filter #(do (when (= % 3000000) (gc) (reset! h (clove/heap-bytes*)))"
+                          "                            (= % 3000000))"
+                          "                       (iterate inc 0)))]"
+                          "  [x @h]))"
+                          "(prn (f))"))]
+      (assert= 3000000 x)
       (assert= true (< (or h Long/MAX_VALUE) (* 100 1024 1024))))))
 ;; ── workstream I: idle collection, map/set builders ──
 ;; A program that churns and then blocks gives its heap back without (gc):
