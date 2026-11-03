@@ -1885,6 +1885,8 @@ static void gc_collect(void) {
     /* glibc keeps freed small chunks in its heap; after a big release
      * (whole blocks, or MBs of arrays) ask it to return the pages */
     if ((blocks_freed && !gc_stress) || pool_trimmed > (8u << 20)) malloc_trim(0);
+#else
+    (void)blocks_freed;
 #endif
 }
 
