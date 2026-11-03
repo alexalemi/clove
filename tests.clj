@@ -4054,7 +4054,28 @@
   ;; a child killed by a signal exits 128+sig, not 0
   (assert= 137 (:exit (sh "kill -9 $$")))
   (assert= 143 (clove/sh-lines* "kill -TERM $$" identity))
-  (assert= 137 (:exit (sh "sh" "-c" "kill -9 $$"))))
+  (assert= 137 (:exit (sh "sh" "-c" "kill -9 $$")))
+  ;; C nREPL server: a bencode length past 2^64 or 64 MB closes the session
+  ;; (it wrapped to malloc(0) and overflowed, or tried to read 4 GB); the
+  ;; server keeps serving the next client
+  (let [T (str (System/getProperty "java.io.tmpdir") "/clove-nrepl-c1")
+        exe (str (clove/exe-dir*) "/clove")
+        _ (clove/file-op* :mkdirs T)
+        pid (str/trim (:out (sh (str "cd '" T "' && env -u CLOVE_GC_STRESS timeout 60 " exe
+                                     " nrepl 8095 >/dev/null 2>&1 & echo $!"))))
+        conn (fn [] (loop [i 0]
+                      (or (try (tcp/connect "127.0.0.1" 8095) (catch Exception e nil))
+                          (when (< i 100) (Thread/sleep 50) (recur (inc i))))))
+        ask (fn [msg] (let [fd (conn)]
+                        (when fd
+                          (tcp/send fd msg)
+                          (let [r (tcp/recv fd)] (tcp/close fd) r))))]
+    (assert= nil (ask "d18446744073709551615:abcd"))
+    (assert= nil (ask "d2:op4000000000:xyz"))
+    (assert= nil (ask "d2:op1x:y"))
+    (assert= true (str/includes? (str (ask "d2:op5:clonee")) "new-session"))
+    (sh (str "kill " pid))
+    (sh (str "rm -rf '" T "'"))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

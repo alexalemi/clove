@@ -19881,10 +19881,17 @@ static void bw_kv(FILE *f, const char *k, const char *v) { bw_cstr(f, k); bw_cst
 /* ── bencode reading: pull out the string fields we care about ── */
 typedef struct { char *op, *code, *id, *session, *file, *prefix, *sym; } NreplMsg;
 
+#define NREPL_MAX_STR ((size_t)64 << 20)   /* one string field, 64 MB */
+
+/* A length prefix that isn't all digits or exceeds the cap ends the session. */
 static char *br_string(FILE *f, int first) {
     size_t n = (size_t)(first - '0');
     int c;
-    while ((c = fgetc(f)) != ':' && c != EOF) n = n * 10 + (size_t)(c - '0');
+    while ((c = fgetc(f)) != ':') {
+        if (c < '0' || c > '9') return NULL;
+        n = n * 10 + (size_t)(c - '0');
+        if (n > NREPL_MAX_STR) return NULL;
+    }
     char *s = malloc(n + 1);
     if (!s || fread(s, 1, n, f) != n) { free(s); return NULL; }
     s[n] = '\0';
@@ -19905,7 +19912,7 @@ static bool br_skip_body(FILE *f) {  /* skip until matching 'e' (list/dict) */
 static bool br_skip(FILE *f, int c) {
     if (c == 'i') { while ((c = fgetc(f)) != 'e') if (c == EOF) return false; return true; }
     if (c == 'l' || c == 'd') return br_skip_body(f);
-    if (c >= '0' && c <= '9') { char *s = br_string(f, c); free(s); return s != NULL; }
+    if (c >= '0' && c <= '9') { char *s = br_string(f, c); bool ok = s != NULL; free(s); return ok; }
     return false;
 }
 

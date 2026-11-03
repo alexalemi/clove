@@ -22,6 +22,9 @@
   (`(sh "kill -9 $$")` gave exit 0).
 - `~/.clove_history` is created with mode 0600, and an existing one is
   tightened to it.
+- The nREPL server (`clove nrepl`) rejects a bencode string length that is
+  not all digits or exceeds 64 MB. A length past 2^64 wrapped around and
+  overflowed a heap buffer.
 - `clove/proc*` no longer leaks pipe descriptors when `pipe` or `fork` fails.
 
 ## v0.9.0 — 2026-11-02
