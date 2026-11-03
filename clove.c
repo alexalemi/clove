@@ -1424,8 +1424,20 @@ static size_t cell_nblocks;
  * malloc'd block that size can stay in the C heap after free. */
 static CellBlock *cell_block_new(void) {
 #ifdef CLOVE_HAVE_MMAP
-    void *p = mmap(NULL, sizeof(CellBlock), PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *p;
+    for (;;) {
+        p = mmap(NULL, sizeof(CellBlock), PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED || sizeof(void *) < 8) break;
+        /* A 32-bit int stored into a stack slot that held a pointer leaves
+         * (old high half << 32 | small int): a word that points just past a
+         * 4 GB boundary. A block covering such addresses got cells pinned by
+         * those words in ~1 run in 6 (a dropped 5M-element vector survived
+         * (gc)). Leave such a mapping reserved and untouched (no RSS) so the
+         * next mmap lands elsewhere. */
+        uint64_t lo = (uint64_t)(uintptr_t)p, hi = lo + sizeof(CellBlock);
+        if ((lo >> 32) == (hi >> 32) && (lo & 0xffffffffu) >= (1u << 20)) break;
+    }
     CellBlock *b = p == MAP_FAILED ? NULL : p;
 #else
     CellBlock *b = malloc(sizeof *b);
@@ -1467,6 +1479,7 @@ static size_t gc_freed_last;
  * out from under the user, so it unwinds with an error there instead. */
 static bool clove_interactive;
 static bool gc_stress;             /* CLOVE_GC_STRESS=1: collect every 512 allocs */
+static bool gc_explicit;           /* this collection is a (gc) call: give memory back */
 static void *gc_stack_base;
 static CloveEnv *gc_root_envs[8];
 static int gc_n_root_envs;
@@ -1684,14 +1697,31 @@ static void gc_scan_range(void *lo_, void *hi_) {
 static bool method_noted(const char *dotted);   /* user-implemented .method names */
 static Clove *g_var_meta;   /* var metadata side table (see "Var metadata") */
 
+/* The stack scan starts at `regs`, so whatever lies above it in this frame is
+ * scanned too. Uninitialized words there are stale stack contents that pin
+ * dead data (a dropped 5M-element vector survived every explicit (gc)), so
+ * the frame holds only `regs`, zeroed first because setjmp leaves glibc's
+ * 128-byte saved signal mask unwritten. The collector runs below it. */
+static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp);
+
 static void gc_collect(void) {
+    /* Flush callee-saved registers onto the stack so the scan sees them.
+     * glibc's setjmp mangles rbp (pointer guard), so a root the caller keeps
+     * in rbp is not visible in `regs`; __builtin_unwind_init makes this
+     * frame save every callee-saved register, above `regs`. */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(__EMSCRIPTEN__)
+    __builtin_unwind_init();
+#endif
+    jmp_buf regs;
+    memset(&regs, 0, sizeof regs);
+    setjmp(regs);
+    gc_collect_from(&regs);
+}
+
+static __attribute__((noinline)) void gc_collect_from(jmp_buf *regsp) {
     gc_allocs = 0;
     gc_extra_bytes = 0;
     gc_refresh_bounds();   /* O(1) reject range for the conservative scan */
-
-    /* Flush callee-saved registers onto the stack so the scan sees them. */
-    jmp_buf regs;
-    setjmp(regs);
 #ifdef __EMSCRIPTEN__
     /* wasm locals live outside linear memory, invisible to the stack scan
      * below (which only sees the shadow stack). Under ASYNCIFY this unwinds
@@ -1733,23 +1763,24 @@ static void gc_collect(void) {
     }
 #endif
     if (active_top) {
-        void *sp = &regs;
+        void *sp = regsp;
         void *lo = sp < active_top ? sp : active_top;
         void *hi = sp < active_top ? active_top : sp;
         gc_scan_range(lo, hi);
     }
-    gc_scan_range(&regs, (char *)&regs + sizeof regs);
+    gc_scan_range(regsp, (char *)regsp + sizeof *regsp);
 
     /* Sweep cells: free owned arrays once, rebuild the free list. Blocks
-     * left with no live cell move to `empty`; after the new threshold is
-     * known, enough of them to feed the next cycle rejoin the pool and the
-     * rest go back to the OS (the heap used to only ever grow). */
+     * left with no live cell move to `empty` (or `idle`, when nothing was
+     * allocated in them all cycle); after the new threshold is known, some
+     * rejoin the pool and the rest go back to the OS. */
     size_t live = 0, freed = 0, spare = 0;
-    CellBlock *empty = NULL;
+    CellBlock *empty = NULL, *idle = NULL;
+    Clove *fl_tail = NULL;              /* last cell of the free list */
     cell_freelist = NULL;
     for (CellBlock **pb = &cell_blocks; *pb; ) {
         CellBlock *b = *pb;
-        size_t blive = 0;
+        size_t blive = 0, freed0 = freed;
         Clove *bhead = NULL, *btail = NULL;
         for (size_t i = 0; i < b->used; i++) {
             Clove *c = &b->cells[i];
@@ -1792,22 +1823,37 @@ static void gc_collect(void) {
         }
         if (blive == 0) {                  /* unlink; decided below */
             *pb = b->next;
-            b->next = empty;
-            empty = b;
+            if (freed == freed0) { b->next = idle; idle = b; }
+            else { b->next = empty; empty = b; }
             continue;
         }
-        if (bhead) { btail->as.cons.head = cell_freelist; cell_freelist = bhead; }
+        if (bhead) {
+            if (!cell_freelist) fl_tail = btail;
+            btail->as.cons.head = cell_freelist;
+            cell_freelist = bhead;
+        }
         spare += CELL_BLOCK_N - blive;     /* includes a fresh block's unbumped tail */
         pb = &b->next;
     }
 
-    /* Sweep envs: free owned binding chains, rebuild the free list. */
+    /* Sweep envs: free owned binding chains, rebuild the free list. An env
+     * block left with no live env is freed when nothing was allocated in it
+     * all cycle (a lazy pipeline can hold a million closures' envs at its
+     * peak); (gc) also frees the empty ones beyond 3x the live envs. */
     env_freelist = NULL;
-    for (EnvBlock *b = env_blocks; b; b = b->next) {
+    CloveEnv *env_fl_tail = NULL;
+    size_t env_live = 0, env_spare = 0;
+    EnvBlock *env_empty = NULL;
+    for (EnvBlock **pb = &env_blocks; *pb; ) {
+        EnvBlock *b = *pb;
+        size_t blive = 0;
+        bool touched = false;
+        CloveEnv *bhead = NULL, *btail = NULL;
         for (size_t i = 0; i < b->used; i++) {
             CloveEnv *e = &b->envs[i];
-            if (e->gcmark) { e->gcmark = 0; live++; continue; }
+            if (e->gcmark) { e->gcmark = 0; live++; blive++; continue; }
             if (!e->gcfree) {
+                touched = true;
                 for (Binding *bn = e->bindings; bn; ) {
                     Binding *next = bn->next;
                     bn->next = binding_freelist;
@@ -1818,9 +1864,44 @@ static void gc_collect(void) {
             }
             e->bindings = NULL;
             e->nslots = 0;
-            e->parent = env_freelist;
-            env_freelist = e;
+            e->parent = bhead;
+            bhead = e;
+            if (!btail) btail = e;
         }
+        if (blive == 0 && b->used == ENV_BLOCK_N &&      /* the bump block stays */
+            (!touched || gc_stress || gc_explicit)) {    /* decided below */
+            *pb = b->next;
+            b->next = env_empty;
+            env_empty = b;
+            continue;
+        }
+        if (bhead) {
+            if (!env_freelist) env_fl_tail = btail;
+            btail->parent = env_freelist;
+            env_freelist = bhead;
+        }
+        env_live += blive;
+        env_spare += ENV_BLOCK_N - blive;
+        pb = &b->next;
+    }
+    size_t env_keep = env_live * 3 > 64u * ENV_BLOCK_N ? env_live * 3 : 64u * ENV_BLOCK_N;
+    size_t env_blocks_freed = 0;
+    EnvBlock **etail = &env_blocks;
+    while (*etail) etail = &(*etail)->next;
+    while (env_empty) {
+        EnvBlock *b = env_empty;
+        env_empty = b->next;
+        if (!gc_explicit || env_spare >= env_keep) { free(b); env_blocks_freed++; continue; }
+        for (size_t i = 0; i < ENV_BLOCK_N; i++) {   /* append to the free list */
+            CloveEnv *e = &b->envs[i];
+            e->parent = NULL;
+            if (env_fl_tail) env_fl_tail->parent = e; else env_freelist = e;
+            env_fl_tail = e;
+        }
+        env_spare += ENV_BLOCK_N;
+        b->next = NULL;
+        *etail = b;
+        etail = &b->next;
     }
 
     gc_freed_last = freed;
@@ -1833,9 +1914,16 @@ static void gc_collect(void) {
         fprintf(stderr, "[gc] live=%zu freed=%zu", live, freed);
         for (int t = 0; t <= CLOVE_TNODE; t++)
             if (tagn[t] > 100000) fprintf(stderr, " tag%d=%zu", t, tagn[t]);
-        fprintf(stderr, "\n");
+        size_t nb = 0, ne = 0;
+        for (CellBlock *b = cell_blocks; b; b = b->next) nb++;
+        for (CellBlock *b = empty; b; b = b->next) ne++;
+        for (CellBlock *b = idle; b; b = b->next) ne++;
+        size_t nenv = 0;
+        for (EnvBlock *b = env_blocks; b; b = b->next) nenv++;
+        fprintf(stderr, " blocks=%zu empty=%zu envblocks=%zu floor=%zu\n", nb, ne, nenv, churn_floor);
     }
-    /* 4x headroom: GC was ~60% of runtime on allocation-heavy workloads
+    /* 4x headroom (heap = 4x live at the next collection, capped below for
+     * big live sets): GC was ~60% of runtime on allocation-heavy workloads
      * at 2x (AoC profile, 2026-06). Mark cost scales with live data, so
      * collecting half as often nearly halves GC time for 2x peak waste.
      *
@@ -1847,29 +1935,45 @@ static void gc_collect(void) {
      * often; when much survives (retentive), shrink it back to cap memory.
      * Bounded by GC_CHURN_CAP (peak ≈ that many cells of garbage). */
     size_t total = live + freed;
-    if (live * 8 < total && churn_floor < GC_CHURN_CAP)
+    if (gc_explicit)
+        churn_floor = GC_MIN_THRESHOLD;   /* (gc): start over from the floor */
+    else if (live * 8 < total && churn_floor < GC_CHURN_CAP)
         churn_floor *= 2;                 /* <12.5% live: amortize fixed cost */
     else if (live * 2 > total && churn_floor > GC_MIN_THRESHOLD)
         churn_floor /= 2;                 /* >50% live: tighten, save memory */
+    /* ...but never more than 16x live: the floor pays off when live data is
+     * pinned in bulk, not for a tiny live set, where it only made the heap
+     * big (03-loop: 52k live cells, 8M floor, 530 MB RSS, 22% system time
+     * faulting it in; at 16x live: 72 MB and 3%, same user time) */
+    while (churn_floor > GC_MIN_THRESHOLD && churn_floor > live * 16) churn_floor /= 2;
     size_t floor = churn_floor;
-    gc_threshold = live * 4 > floor ? live * 4 : floor;
+    /* headroom is 3x live, but at most GC_CHURN_CAP cells: a 14M-cell live
+     * set used to wait for 56M more allocations, ~3.5 GB of garbage */
+    size_t room = live * 3 < GC_CHURN_CAP ? live * 3 : GC_CHURN_CAP;
+    gc_threshold = live + room > floor ? live + room : floor;
 
     /* Keep empty blocks until the pool can absorb the next cycle's
-     * allocations without growing; unmap the rest. A kept block rejoins
-     * fully free (used = N), at the tail of the list so bump allocation
-     * in the head block is unaffected. */
-    size_t blocks_freed = 0;
+     * allocations without growing; unmap the rest. A block nothing was
+     * allocated in for a whole cycle goes regardless: the free list hands
+     * out the holes in partly-live blocks first and kept blocks last, so a
+     * block the last cycle never reached is one the workload doesn't need.
+     * An explicit (gc) keeps only a margin. Stress mode unmaps every empty
+     * block, to exercise this path. Kept blocks go at the tail of the block
+     * list so bump allocation in the head block is unaffected. */
+    size_t keep = gc_threshold;
+    if (gc_explicit) keep = live * 2 > GC_MIN_THRESHOLD ? live * 2 : GC_MIN_THRESHOLD;
+    for (CellBlock *b; (b = idle); ) { idle = b->next; cell_block_free(b); }
     CellBlock **tailp = &cell_blocks;
     while (*tailp) tailp = &(*tailp)->next;
     while (empty) {
         CellBlock *b = empty;
         empty = b->next;
-        /* stress mode unmaps every empty block, to exercise this path */
-        if (gc_stress || spare >= gc_threshold) { cell_block_free(b); blocks_freed++; continue; }
-        for (size_t i = 0; i < b->used; i++) {
+        if (gc_stress || spare >= keep) { cell_block_free(b); continue; }
+        for (size_t i = 0; i < b->used; i++) {     /* append to the free list */
             Clove *c = &b->cells[i];
-            c->as.cons.head = cell_freelist;
-            cell_freelist = c;
+            c->as.cons.head = NULL;
+            if (fl_tail) fl_tail->as.cons.head = c; else cell_freelist = c;
+            fl_tail = c;
         }
         spare += b->used;
         b->next = NULL;
@@ -1882,10 +1986,12 @@ static void gc_collect(void) {
      * queued cell: ~100 MB after a 5M-element vector); drop it if large */
     if (mark_cap > (1u << 20)) { free(mark_stack); mark_stack = NULL; mark_cap = 0; }
 #ifdef __GLIBC__
-    /* glibc keeps freed small chunks in its heap; after a big release
-     * (whole blocks, or MBs of arrays) ask it to return the pages */
-    if ((blocks_freed && !gc_stress) || pool_trimmed > (8u << 20)) malloc_trim(0);
+    /* glibc keeps freed small chunks in its heap; after a big release ask it
+     * to return the pages (cell blocks are mmap'd and need no trim) */
+    if (pool_trimmed + env_blocks_freed * sizeof(EnvBlock) > (8u << 20) || gc_explicit)
+        malloc_trim(0);
 #endif
+    (void)env_blocks_freed;   /* read only under glibc */
 }
 
 #define GC_BYTES_CAP (256u << 20)   /* string-churn slack ceiling: 256MB */
@@ -2049,7 +2155,7 @@ static void tail_free(Clove **p, uint8_t n) {
  * cycle (its low-water mark), so dropping a big vector or map gives its node
  * arrays back, while steady churn, which drains the pool, keeps recycling. */
 static void pool_trim(Clove ***list, size_t *nfree, size_t *low, size_t width) {
-    size_t k = *low < *nfree ? *low : *nfree;
+    size_t k = gc_explicit || *low > *nfree ? *nfree : *low;
     pool_trimmed += k * width * sizeof(Clove *);
     for (; k; k--) {
         Clove **p = *list;
@@ -11697,8 +11803,17 @@ static Clove *prim_onto(CloveEnv *env, Clove **argv, int nargs) {
 
 static Clove *prim_gc(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)argv; (void)nargs;
+    gc_explicit = true;
     gc_collect();
+    gc_explicit = false;
     return mk_int((int64_t)gc_freed_last);  /* cells freed by this collection */
+}
+
+/* (clove/heap-bytes*) -> bytes held in cell blocks: what the collector
+ * itself has mapped, independent of how the OS counts RSS */
+static Clove *prim_heap_bytes(CloveEnv *env, Clove **argv, int nargs) {
+    (void)env; (void)argv; (void)nargs;
+    return mk_int((int64_t)(cell_nblocks * sizeof(CellBlock)));
 }
 
 /* ── Exceptions ── */
@@ -15536,6 +15651,7 @@ static const char *PRELUDE =
     /* java.lang.System statics */
     "(defn System/getenv ([] {}) ([k] (clove/env* k)))\n"
     "(defn System/exit ([] (clove/exit* 0)) ([n] (clove/exit* n)))\n"
+    "(defn System/gc [] (gc) nil)\n"
     "(defn System/currentTimeMillis [] (quot (clove/now-us*) 1000))\n"
     /* Apache Commons Math integer gcd, used by Emmy's rational-function simplifier */
     "(defn ArithmeticUtils/gcd [a b]\n"
@@ -16744,6 +16860,7 @@ CloveEnv *clove_new_env(void) {
     clove_define_native(e, "concat",  prim_concat);
     clove_define_native(e, "gensym",  prim_gensym);
     clove_define_native(e, "gc",      prim_gc);
+    clove_define_native(e, "clove/heap-bytes*", prim_heap_bytes);
     clove_define_native(e, "throw",      prim_throw);
     clove_define_native(e, "ex-info",    prim_ex_info);
     clove_define_native(e, "clove/ex-isa?*",   prim_ex_isa);

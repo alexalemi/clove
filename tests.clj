@@ -4342,6 +4342,40 @@
   (let [order (atom [])]
     (run! deref (doall (for [i (range 5)] (future (swap! order conj i)))))
     (assert= [0 1 2 3 4] @order)))
+;; ── workstream G: heap retention ──
+(assert= nil (System/gc))
+;; Fresh processes, so the collector state does not depend on the suite.
+;; clove/heap-bytes* is what the collector has mapped; RSS bounds are looser
+;; (Linux only, not under ASan, whose quarantine holds freed memory).
+(when-not (System/getenv "CLOVE_GC_STRESS")
+  (let [run (fn [src] (read-string (:out (sh (str (clove/exe-dir*) "/clove") "-e" src))))
+        rss? (and (= :linux (clove/os*)) (not (System/getenv "ASAN_OPTIONS")))
+        rss "(fn [] (if (= :linux (clove/os*)) (parse-long (second (re-find #\"VmRSS:\\s+(\\d+)\" (slurp \"/proc/self/status\")))) 0))"]
+    ;; one (gc) after dropping a 5M-element vector gives its blocks back
+    ;; (stale words in the collector's own frame used to pin it)
+    (let [[h0 h1 r0 r1] (run (str "(let [rss " rss " big (atom (vec (range 5000000)))"
+                                  "      h0 (clove/heap-bytes*) r0 (rss)]"
+                                  "  (reset! big nil) (gc)"
+                                  "  (prn [h0 (clove/heap-bytes*) r0 (rss)]))"))]
+      (assert= true (< h1 (quot h0 4)))
+      (when rss? (assert= true (< r1 (quot r0 2)))))
+    ;; after a churn-heavy phase, light allocation shrinks the heap on its
+    ;; own, closures' env blocks included (no explicit gc). The churn runs
+    ;; deep in the stack so no stale word in the shallow frames pins a list.
+    (let [[h0 h1 r1] (run (str "(let [rss " rss
+                               "      deep (fn deep [n f] (if (zero? n) (f) (let [r (deep (dec n) f)] r)))"
+                               "      h0 (deep 20 (fn [] (dotimes [_ 40] (count (doall (map inc (range 300000)))))"
+                               "                        (clove/heap-bytes*)))]"
+                               "  (dotimes [i 3000000] (vector i))"
+                               "  (prn [h0 (clove/heap-bytes*) (rss)]))"))]
+      (assert= true (< h1 (quot h0 2)))
+      (assert= true (< h1 (* 100 1024 1024)))
+      (when rss? (assert= true (< r1 (* 200 1024)))))
+    ;; a loop with a tiny live set keeps a small heap (it grew to ~500 MB)
+    (let [[r h] (run (str "(let [r (loop [i 0 acc 0] (if (< i 5000000) (recur (inc i) (+ acc i)) acc))]"
+                          "  (prn [r (clove/heap-bytes*)]))"))]
+      (assert= 12499997500000 r)
+      (assert= true (< h (* 100 1024 1024))))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))
