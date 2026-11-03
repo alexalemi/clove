@@ -229,6 +229,7 @@ typedef enum {
                      * balanced tree (CLOVE_TNODE root) + the comparator (NIL =
                      * default). Key identity is "cmp == 0", not =, so custom
                      * comparators collapse cmp-equal keys. O(log n) everything. */
+    CLOVE_THASH,     /* transient map or set (as.map; is_set tells which) */
     CLOVE_TNODE,     /* internal: a node of a sorted collection's weight-balanced
                      * tree (Adams' tree). Holds key, val (set: val==key; map: the
                      * value), left/right subtrees, and subtree size. Not user-
@@ -256,6 +257,7 @@ struct Clove {
                  bool plain; } symc;  /* plain: an unqualified, non-special, non-dot
                                        * call head — skip the dispatch cascade */
         const char *kw;
+        struct { const char *name; uint32_t hash; } kwc;   /* kw + its cached clove_hash */
         char *str;
         /* aliases .str — nbytes: buffer length from mk_str; ncp: cached
          * codepoint count (STR_NCP_UNKNOWN until first asked for) */
@@ -286,17 +288,21 @@ struct Clove {
          * original (k1 v1 k2 v2 ...) form list, kept so eval can evaluate
          * entries in source order (a HAMT has none). NULL on every map built
          * at runtime -- map_assoc allocates a fresh zeroed cell. */
-        /* order (maps only, NULL for sets/empty): a persistent vector of
-         * entry cells in insertion order; the HAMT maps key -> the same
-         * entry cell (a CLOVE_TNODE: key, val, size = its slot in order).
-         * dissoc leaves a NULL slot (dead counts them) until compaction. */
-        struct { Clove *root; size_t count; Clove *lit_order; Clove *order; uint32_t dead; } map;
+        /* order: a small map's k0 v0 k1 v1 ... vector (root NULL). A big
+         * map (root set) maps key -> an entry cell (a CLOVE_TNODE: key, val,
+         * size = insertion stamp, 0 .. count+dead-1); dissoc leaves a gap in
+         * the stamps (dead counts them) until compaction.
+         * CLOVE_THASH (a transient map or set) uses the same fields: edit_id
+         * marks the nodes and entries it owns, alive flips off at persistent!. */
+        struct { Clove *root; Clove *lit_order; Clove *order; uint32_t count; uint32_t dead;
+                 uint32_t edit_id; bool alive; bool is_set; } map;
         /* sorted set/map: root of a weight-balanced tree (NIL when empty); cmp is
          * the comparator fn (NIL = default cmp_values). */
         struct { Clove *root; Clove *cmp; bool is_map; } sorted;
         /* a weight-balanced tree node: left/right subtrees, the comparison key,
-         * its value (set: == key; map: the value), and subtree node count. */
-        struct { Clove *left; Clove *right; Clove *key; Clove *val; uint32_t size; } tnode;
+         * its value (set: == key; map: the value), and subtree node count.
+         * Also a hash map's entry cell; edit is the transient that owns it. */
+        struct { Clove *left; Clove *right; Clove *key; Clove *val; uint32_t size; uint32_t edit; } tnode;
         /* HAMT node. kids interleaves [k1,v1,k2,v2...]; k==NULL → v is a
          * subnode. Collision nodes hold same-hash entries linearly. */
         struct { Clove **kids; uint32_t bitmap; uint32_t chash; uint16_t nkids;
@@ -774,6 +780,7 @@ static const char *val_type_name(Clove *v) {
         case CLOVE_LAZY:    return "a lazy seq";
         case CLOVE_VECTOR:  return "a vector";
         case CLOVE_TVEC:    return "a transient vector";
+        case CLOVE_THASH:   return v->as.map.is_set ? "a transient set" : "a transient map";
         case CLOVE_MAP:     return "a map";
         case CLOVE_SET:     return "a set";
         case CLOVE_SORTED:  return v->as.sorted.is_map ? "a sorted map" : "a sorted set";
@@ -958,6 +965,7 @@ static size_t kw_slot(const char *s, size_t cap) {
     return (size_t)x & (cap - 1);
 }
 
+static uint32_t fnv1a(const char *s, size_t n);
 static Clove *mk_kw(const char *s) {   /* s is already interned */
     if (kw_table)
         for (KwNode *n = kw_table[kw_slot(s, kw_cap)]; n; n = n->next)
@@ -980,6 +988,7 @@ static Clove *mk_kw(const char *s) {   /* s is already interned */
     v->tag = CLOVE_KEYWORD;
     v->gcmark = 1;
     v->as.kw = s;
+    v->as.kwc.hash = fnv1a(s, strlen(s)) ^ 0x517cc1b7u;
     KwNode *n = xmalloc(sizeof *n);
     size_t h = kw_slot(s, kw_cap);
     n->name = s; n->cell = v; n->next = kw_table[h];
@@ -1525,6 +1534,7 @@ static void gc_drain(void) {
                 break;
             case CLOVE_MAP:
             case CLOVE_SET:
+            case CLOVE_THASH:
                 mark_push(v->as.map.root);          /* NULL-safe */
                 mark_push(v->as.map.lit_order);     /* map literals only; NULL otherwise */
                 mark_push(v->as.map.order);         /* maps only; NULL-safe */
@@ -1945,7 +1955,7 @@ static uint32_t clove_hash(Clove *v) {
         }
         case CLOVE_STRING:  return fnv1a(v->as.str, v->as.strx.nbytes);
         case CLOVE_CHAR:    return mix64((uint64_t)(uint32_t)v->as.chr) ^ 0x9b3d6f2au;
-        case CLOVE_KEYWORD: return fnv1a(v->as.kw, strlen(v->as.kw)) ^ 0x517cc1b7u;
+        case CLOVE_KEYWORD: return v->as.kwc.hash;
         case CLOVE_SYMBOL:  return fnv1a(v->as.sym, strlen(v->as.sym)) ^ 0x2545f491u;
         case CLOVE_LAZY:
             return clove_hash(to_seq(v));
@@ -2274,8 +2284,9 @@ static Clove *mk_map(void) {
 /* Two representations, told apart by root:
  *   small (root NULL): order is a vector of k0 v0 k1 v1 ... (≤ MAP_SMALL
  *     entries, no holes) — PersistentArrayMap: linear scan, no hashing;
- *   big (root set): the HAMT maps key -> an entry cell that also sits in
- *     the order vector at its insertion slot.
+ *   big (root set): the HAMT maps key -> an entry cell carrying the value
+ *     and an insertion stamp. Replacing a value keeps the stamp, so only
+ *     the HAMT path is copied; iteration sorts entries by stamp.
  * Both iterate in insertion order. */
 #define MAP_SMALL 8
 
@@ -2304,35 +2315,29 @@ static bool map_find(Clove *m, Clove *key, Clove **out) {
     return true;
 }
 
-/* An entry cell: the key, its value, and its slot in the order vector. */
-static Clove *mk_mentry(Clove *k, Clove *v, uint32_t idx) {
+/* An entry cell: the key, its value, and its insertion stamp. */
+static Clove *mk_mentry(Clove *k, Clove *v, uint32_t stamp) {
     Clove *e = alloc(CLOVE_TNODE);
     e->as.tnode.key = k;
     e->as.tnode.val = v;
-    e->as.tnode.size = idx;
+    e->as.tnode.size = stamp;
     return e;
 }
 
 static Clove *map_assoc_big(Clove *m, Clove *k, Clove *v) {
     uint32_t h = clove_hash(k);
-    Clove *old = NULL;
-    Clove *order = m->as.map.order;
-    Clove *ent, *norder;
+    Clove *old = NULL, *ent;
     bool added = false;
     if (m->as.map.root && hamt_find(m->as.map.root, 0, h, k, &old)) {
         if (old->as.tnode.val == v) return m;          /* identical: no change */
         ent = mk_mentry(old->as.tnode.key, v, old->as.tnode.size);
-        norder = vec_assoc_idx(order, old->as.tnode.size, ent);
     } else {
-        if (!order) order = mk_empty_vec();
-        ent = mk_mentry(k, v, order->as.vec.count);
-        norder = vec_conj1(order, ent);
+        ent = mk_mentry(k, v, m->as.map.count + m->as.map.dead);
     }
     Clove *root = hamt_assoc(m->as.map.root, 0, h, k, ent, &added);
-    Clove *nm = alloc(CLOVE_MAP);  /* root/norder are stack-rooted here */
+    Clove *nm = alloc(CLOVE_MAP);  /* root is stack-rooted here */
     nm->as.map.root = root;
     nm->as.map.count = m->as.map.count + (added ? 1 : 0);
-    nm->as.map.order = norder;
     nm->as.map.dead = m->as.map.dead;
     nm->meta = m->meta;
     return nm;
@@ -2341,7 +2346,7 @@ static Clove *map_assoc_big(Clove *m, Clove *k, Clove *v) {
 static Clove *map_small_cell(Clove *m, Clove **kv, size_t n) {
     Clove *nm = alloc(CLOVE_MAP);
     nm->meta = m->meta;
-    nm->as.map.count = n / 2;
+    nm->as.map.count = (uint32_t)(n / 2);
     if (n) nm->as.map.order = vec_cell(NULL, 0, (uint32_t)n, kv, (uint8_t)n, NULL);
     return nm;
 }
@@ -2369,15 +2374,77 @@ static Clove *map_assoc(Clove *m, Clove *k, Clove *v) {
     return big;
 }
 
-/* Rebuild without tombstones (renumbers every entry). */
+/* Put a big map's entries in stamp order: a[stamp] = entry, gaps NULL. */
+static void hamt_scatter(Clove *node, Clove **a) {
+    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
+        Clove *k = node->as.hnode.kids[i];
+        if (k == NULL && !node->as.hnode.collision) hamt_scatter(node->as.hnode.kids[i + 1], a);
+        else { Clove *e = node->as.hnode.kids[i + 1]; a[e->as.tnode.size] = e; }
+    }
+}
+
+/* Scratch space for a big map's entries in insertion order: buf when it
+ * fits, else a GC-owned int array (*hold), so an error thrown mid-walk
+ * leaks nothing. The caller keeps the map and *hold reachable while it
+ * reads the array; the entries are reachable through the map. */
+#define MAP_ORDER_BUF 64
+static Clove *mk_iarray_of(uint32_t n, bool dbl);
+static Clove **map_order(Clove *m, Clove **buf, Clove **hold, uint32_t *n) {
+    uint32_t cap = m->as.map.count + m->as.map.dead;
+    Clove **a = buf;
+    *hold = NULL;
+    if (cap > MAP_ORDER_BUF) {
+        *hold = mk_iarray_of((uint32_t)(((uint64_t)cap * sizeof(Clove *) + 7) / 8), false);
+        a = (Clove **)(*hold)->as.iarr.data;
+    }
+    memset(a, 0, sizeof(Clove *) * cap);
+    hamt_scatter(m->as.map.root, a);
+    *n = cap;
+    return a;
+}
+
+/* Visit every entry without allocating: maps in insertion order (k, v), sets
+ * in HAMT order (x, x). Stops early when f returns false; returns false then. */
+static bool hamt_each(Clove *node, EntryFn f, void *ctx) {
+    if (!node) return true;
+    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
+        Clove *k = node->as.hnode.kids[i];
+        if (k == NULL && !node->as.hnode.collision) {
+            if (!hamt_each(node->as.hnode.kids[i + 1], f, ctx)) return false;
+        } else if (!f(k, node->as.hnode.kids[i + 1], ctx)) return false;
+    }
+    return true;
+}
+static bool map_each(Clove *m, EntryFn f, void *ctx) {
+    if (m->tag == CLOVE_SET || (m->tag == CLOVE_THASH && m->as.map.is_set))
+        return hamt_each(m->as.map.root, f, ctx);
+    if (!m->as.map.count) return true;
+    if (!m->as.map.root) {
+        Clove *order = m->as.map.order;
+        for (uint32_t i = 0; i < order->as.vec.count; i += 2)
+            if (!f(order->as.vec.tail[i], order->as.vec.tail[i + 1], ctx)) return false;
+        return true;
+    }
+    Clove *buf[MAP_ORDER_BUF], *hold;
+    Clove *volatile keep_m = m;            /* f may collect: keep both alive */
+    uint32_t n;
+    Clove **a = map_order(m, buf, &hold, &n);
+    Clove *volatile keep_hold = hold;
+    bool ok = true;
+    for (uint32_t i = 0; i < n && ok; i++)
+        if (a[i]) ok = f(a[i]->as.tnode.key, a[i]->as.tnode.val, ctx);
+    (void)keep_m; (void)keep_hold;
+    return ok;
+}
+
+/* Rebuild without tombstones (restamps every entry). */
+static bool compact_add(Clove *k, Clove *v, void *ctx) {
+    *(Clove **)ctx = map_assoc_big(*(Clove **)ctx, k, v);
+    return true;
+}
 static Clove *map_compact(Clove *m) {
     Clove *nm = mk_map();
-    Clove *order = m->as.map.order;
-    uint32_t n = order ? order->as.vec.count : 0;
-    for (uint32_t i = 0; i < n; i++) {
-        Clove *e = vec_nth(order, i);
-        if (e) nm = map_assoc_big(nm, e->as.tnode.key, e->as.tnode.val);
-    }
+    map_each(m, compact_add, &nm);
     nm->meta = m->meta;
     return nm;
 }
@@ -2396,25 +2463,16 @@ static Clove *map_dissoc_one(Clove *m, Clove *k) {
     bool removed = false;
     Clove *old = NULL;
     uint32_t h = clove_hash(k);
-    if (!m->as.map.root || !hamt_find(m->as.map.root, 0, h, k, &old)) return m;
+    if (!hamt_find(m->as.map.root, 0, h, k, &old)) return m;
     Clove *root = hamt_dissoc(m->as.map.root, 0, h, k, &removed);
     Clove *nm = alloc(CLOVE_MAP);
     nm->meta = m->meta;
     nm->as.map.count = m->as.map.count - 1;
-    if (nm->as.map.count == 0) return nm;            /* empty: no order */
+    if (nm->as.map.count == 0) return nm;            /* empty: no root */
     nm->as.map.root = root;
-    Clove *order = m->as.map.order;
-    uint32_t idx = old->as.tnode.size;
-    if (idx + 1 == order->as.vec.count && m->as.map.dead == 0 && order->as.vec.count <= 32) {
-        /* last slot of a small map: shrink instead of leaving a hole */
-        Clove *tmp[32];
-        for (uint32_t i = 0; i < idx; i++) tmp[i] = vec_nth(order, i);
-        nm->as.map.order = vec_cell(NULL, 0, idx, tmp, (uint8_t)idx, NULL);
-        nm->as.map.dead = 0;
-        return nm;
-    }
-    nm->as.map.order = vec_assoc_idx(order, idx, NULL);
-    nm->as.map.dead = m->as.map.dead + 1;
+    /* the newest entry leaves no gap: the next insert reuses its stamp */
+    bool last = old->as.tnode.size + 1 == m->as.map.count + m->as.map.dead;
+    nm->as.map.dead = m->as.map.dead + (last ? 0 : 1);
     if (nm->as.map.dead > 8 && nm->as.map.dead > nm->as.map.count) return map_compact(nm);
     return nm;
 }
@@ -2433,55 +2491,30 @@ static void hamt_entries(Clove *node, Clove ***t) {
     }
 }
 
-/* Visit every entry without allocating: maps in insertion order (k, v), sets
- * in HAMT order (x, x). Stops early when f returns false; returns false then. */
-static bool hamt_each(Clove *node, EntryFn f, void *ctx) {
-    if (!node) return true;
-    for (size_t i = 0; i < node->as.hnode.nkids; i += 2) {
-        Clove *k = node->as.hnode.kids[i];
-        if (k == NULL && !node->as.hnode.collision) {
-            if (!hamt_each(node->as.hnode.kids[i + 1], f, ctx)) return false;
-        } else if (!f(k, node->as.hnode.kids[i + 1], ctx)) return false;
-    }
-    return true;
-}
-static bool map_each(Clove *m, EntryFn f, void *ctx) {
-    if (m->tag == CLOVE_SET) return hamt_each(m->as.map.root, f, ctx);
-    Clove *order = m->as.map.order;
-    if (!order || !m->as.map.count) return true;
-    uint32_t n = order->as.vec.count;
-    if (!m->as.map.root) {
-        for (uint32_t i = 0; i < n; i += 2)
-            if (!f(order->as.vec.tail[i], order->as.vec.tail[i + 1], ctx)) return false;
-        return true;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        Clove *e = vec_nth(order, i);
-        if (e && !f(e->as.tnode.key, e->as.tnode.val, ctx)) return false;
-    }
-    return true;
-}
-
-/* Maps iterate in insertion order (the order vector); sets in HAMT order. */
+/* Maps iterate in insertion order; sets in HAMT order. */
 static Clove *map_entry_list(Clove *m) {
     Clove *out = NIL, **t = &out;
     if (m->tag == CLOVE_SET) { hamt_entries(m->as.map.root, &t); return out; }
-    Clove *order = m->as.map.order;
-    if (!order || !m->as.map.count) return NIL;
-    uint32_t n = order->as.vec.count;
+    if (!m->as.map.count) return NIL;
     if (!m->as.map.root) {
-        for (uint32_t i = 0; i < n; i += 2) {
+        Clove *order = m->as.map.order;
+        for (uint32_t i = 0; i < order->as.vec.count; i += 2) {
             *t = mk_cons(mk_cons(order->as.vec.tail[i], order->as.vec.tail[i + 1]), NIL);
             t = &(*t)->as.cons.tail;
         }
         return out;
     }
+    Clove *buf[MAP_ORDER_BUF], *hold;
+    Clove *volatile keep_m = m;
+    uint32_t n;
+    Clove **a = map_order(m, buf, &hold, &n);
+    Clove *volatile keep_hold = hold;
     for (uint32_t i = 0; i < n; i++) {
-        Clove *e = vec_nth(order, i);
-        if (!e) continue;
-        *t = mk_cons(mk_cons(e->as.tnode.key, e->as.tnode.val), NIL);
+        if (!a[i]) continue;
+        *t = mk_cons(mk_cons(a[i]->as.tnode.key, a[i]->as.tnode.val), NIL);
         t = &(*t)->as.cons.tail;
     }
+    (void)keep_m; (void)keep_hold;
     return out;
 }
 
@@ -5308,9 +5341,26 @@ static Clove *prim_note_method(CloveEnv *env, Clove **argv, int nargs) {
     return NIL;
 }
 
+/* Could any type implement mname? Callers pass a handful of literal names,
+ * so their interned ".mname" is memoized by pointer. Past the note table's
+ * cap nothing more is recorded, so the answer is then always maybe. */
+static bool method_maybe(const char *mname) {
+    static const char *lit[32], *dot[32];
+    static int nlit;
+    if (n_method_notes >= METHOD_NOTE_CAP / 2) return true;
+    for (int i = 0; i < nlit; i++) if (lit[i] == mname) return method_noted(dot[i]);
+    char buf[256];
+    int n = snprintf(buf, sizeof buf, ".%s", mname);
+    if (n <= 1 || n >= (int)sizeof buf) return true;
+    const char *d = intern(buf, (size_t)n);
+    if (nlit < 32) { lit[nlit] = mname; dot[nlit] = d; nlit++; }
+    return method_noted(d);
+}
+
 static bool dispatch_deftype_method(CloveEnv *env, Clove *inst, const char *mname,
                                     Clove **argv, int nargs, Clove **out) {
     if (inst == NIL || inst->tag != CLOVE_MAP) return false;
+    if (!method_maybe(mname)) return false;   /* skips a key lookup per assoc/get */
     /* cache the :clove/type keyword: this runs on every count/get-miss/assoc/nth,
      * so re-interning + re-allocating the keyword each time is pure waste. */
     static Clove *KW_CLOVE_TYPE;
@@ -6037,6 +6087,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
         case CLOVE_INT: case CLOVE_DOUBLE: case CLOVE_BOOL: case CLOVE_NIL: case CLOVE_EMPTY:
         case CLOVE_BIGINT: case CLOVE_RATIO: case CLOVE_BIGDEC: case CLOVE_VAR:
         case CLOVE_STRING: case CLOVE_CHAR: case CLOVE_KEYWORD: case CLOVE_FN: case CLOVE_NATIVE:
+        case CLOVE_THASH:
         case CLOVE_ATOM: case CLOVE_TVEC: case CLOVE_CORO: case CLOVE_IARRAY:
         case CLOVE_SORTED:  /* a constructed sorted coll has no reader literal */
         case CLOVE_TNODE:   /* internal sorted-tree node; self-evaluates if it leaks */
@@ -7304,6 +7355,7 @@ static void print_to(SBuf *sb, Clove *v, bool readably) {
             break;
         }
         case CLOVE_TVEC:  sb_puts(sb, "#<transient-vector>"); break;
+        case CLOVE_THASH: sb_puts(sb, v->as.map.is_set ? "#<transient-set>" : "#<transient-map>"); break;
         case CLOVE_HNODE: sb_puts(sb, "#<hamt-node>"); break;  /* never user-visible */
         case CLOVE_TNODE: sb_puts(sb, "#<tree-node>"); break;  /* never user-visible */
         case CLOVE_FN: {   /* #<fn name [params] ...> when known — REPL/error clarity */
@@ -8510,6 +8562,7 @@ static bool is_jcoll(Clove *v);
 static bool clove_eq(Clove *a, Clove *b) {
     if (a == b) return true;
     if (a == NULL || b == NULL) return false;
+    if (a->tag == CLOVE_INT && b->tag == CLOVE_INT) return a->as.i == b->as.i;
     if (a->tag == CLOVE_ATOM && is_jcoll(a)) return clove_eq(a->as.atom.value, b);
     if (b->tag == CLOVE_ATOM && is_jcoll(b)) return clove_eq(a, b->as.atom.value);
     bool a_seq = a->tag == CLOVE_LIST || a->tag == CLOVE_VECTOR || a->tag == CLOVE_LAZY || a->tag == CLOVE_EMPTY;
@@ -11629,6 +11682,7 @@ static Clove *prim_type(CloveEnv *env, Clove **argv, int nargs) {
         case CLOVE_SORTED: n = v->as.sorted.is_map ? "sorted-map" : "sorted-set"; break;
         case CLOVE_IARRAY: n = v->as.iarr.dbl ? "double-array" : v->as.iarr.bytes ? "byte-array" : "int-array"; break;
         case CLOVE_TVEC: n = "transient-vector"; break;
+        case CLOVE_THASH: n = v->as.map.is_set ? "transient-set" : "transient-map"; break;
         case CLOVE_ATOM: n = "atom"; break;
         case CLOVE_FN: case CLOVE_NATIVE: n = "fn"; break;
         case CLOVE_CORO: n = "coroutine"; break;
