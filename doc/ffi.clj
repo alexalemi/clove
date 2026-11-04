@@ -57,7 +57,7 @@
 ;;
 ;; (time (fib 32))      ; "Elapsed time: 780 msecs"
 ;; (jit/compile! 'fib)
-;; (time (fib 32))      ; "Elapsed time: 5.2 msecs"
+;; (time (fib 32))      ; "Elapsed time: 12 msecs"
 ;; ```
 ;;
 ;; Numbers are `long long` unless you hint `^double`, on parameters or on the

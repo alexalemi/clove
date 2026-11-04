@@ -9402,6 +9402,21 @@ static Clove *arith(ArithOp op, Clove **argv, int nargs, ArithMode mode) {
         if (op == OP_MUL) return mk_int(1);
         clove_error("wrong number of args (0)");
     }
+    /* Mixed kinds fold left, as Clojure's (+ a b c) is (+ (+ a b) c): the
+     * long steps before a double still overflow, and ratios before a double
+     * stay exact. Uniform argument lists take the fast paths below. */
+    if (n > 2 && (is_float || is_big || is_ratio || is_dec)) {
+        bool mixed = false;
+        for (size_t i = 1; i < n && !mixed; i++) mixed = argv[i]->tag != argv[0]->tag;
+        if (mixed) {
+            Clove *pair[2] = { argv[0], NULL };
+            for (size_t i = 1; i < n; i++) {
+                pair[1] = argv[i];
+                pair[0] = arith(op, pair, 2, mode);
+            }
+            return pair[0];
+        }
+    }
     if (is_float) goto float_path;
     /* a BigDecimal anywhere makes the result a BigDecimal (doubles aside) */
     if (is_dec) goto dec_path;
@@ -16147,6 +16162,10 @@ typedef struct {
      * vector (args). Append-only — never reorder the slots above. */
     void *(*mk_vec)(void **items, int n);
     void *(*nth_elem)(void *vec, int i);
+    /* Appended for the JIT: booleans as values, and errors of a JVM class
+     * (ArithmeticException for overflow and division by zero). */
+    void *(*mk_bool)(int b);
+    void (*error_cls)(const char *cls, const char *msg);
 } CloveFfiApi;
 
 static void *fa_mk_int(long long i) { return mk_int((int64_t)i); }
@@ -16173,11 +16192,13 @@ static void fa_def_native(void *env, const char *name, void *(*fn)(void *, void 
 static void fa_error(const char *msg) { clove_error("%s", msg); }
 static void *fa_mk_vec(void **items, int n) { return mk_vector((Clove **)items, (size_t)n); }
 static void *fa_nth_elem(void *vec, int i) { return vec_nth((Clove *)vec, (size_t)i); }
+static void *fa_mk_bool(int b) { return b ? TRUE : FALSE; }
+static void fa_error_cls(const char *cls, const char *msg) { clove_error_cls(cls, "%s", msg); }
 
 static CloveFfiApi ffi_api = {
     fa_mk_int, fa_mk_double, fa_mk_str, fa_nil,
     fa_as_int, fa_as_double, fa_as_str, fa_nth_arg, fa_def_native, fa_error,
-    fa_mk_vec, fa_nth_elem,
+    fa_mk_vec, fa_nth_elem, fa_mk_bool, fa_error_cls,
 };
 
 static Clove *prim_ffi_load(CloveEnv *env, Clove **argv, int nargs) {
@@ -19721,6 +19742,7 @@ CloveEnv *clove_new_env(void) {
         "       \" void(*def_native)(void*,const char*,void*(*)(void*,void*,int));\"\n"
         "       \" void(*error)(const char*);\"\n"
         "       \" void*(*mk_vec)(void**,int); void*(*nth_elem)(void*,int);\"\n"
+        "       \" void*(*mk_bool)(int); void(*error_cls)(const char*,const char*);\"\n"
         "       \" } CloveFfiApi;\\n\"\n"
         "       \"static CloveFfiApi *api;\\n\"))\n"
         /* A private 0700 scratch dir per user. The FFI cache below is dlopen'd,

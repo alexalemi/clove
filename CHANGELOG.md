@@ -103,6 +103,23 @@
   longer keeps a 32 KB never-written array in its frame). Call-heavy
   loops pay up to ~10%.
 
+### Fixed (JIT)
+- `jit/compile!` no longer changes what a function returns. A `let` that
+  shadows a name read the uninitialized new variable; comparisons returned
+  `1`/`0` instead of `true`/`false`; `0` counted as false; `(= 1 1.0)` was
+  true; `min`/`max` ignored all but two arguments; long arithmetic wrapped
+  on overflow instead of throwing; `quot`/`rem`/`mod` by zero killed the
+  process with SIGFPE; `##Inf`/`##NaN` literals failed to compile; `(+)`
+  and `(*)` were rejected. Loop bindings now see the ones before them, and
+  self-calls work inside a `loop`. Forms whose compiled answer could not
+  match (mixed long/double `if` branches or `min`/`max`, `if` without
+  else, a `recur` changing a loop variable's type, a `^long` return hint
+  on a double body) are rejected instead. Overflow checks make fib(32)
+  ~12 ms instead of ~4 ms.
+- Variadic arithmetic over mixed number kinds folds left as Clojure does:
+  `(+ Long/MAX_VALUE 1 1.0)` throws "long overflow" instead of returning
+  a double.
+
 ### Fixed (host IO, processes, batteries)
 - `spit` and `slurp` report IO errors like the JVM: `(spit "/dev/full" "x")`
   throws `IOException` "No space left on device" (it returned nil), and

@@ -1222,9 +1222,8 @@
 (def jit-geo-interp (jit-geo 0.5 10))               ; inference through self-recursion
 (jit/compile! 'jit-geo)
 (assert= jit-geo-interp (jit-geo 0.5 10))
-(jit/defn ^long jit-truncr [^double x] (+ x 1))     ; explicit ^long ret truncates
-(jit/compile! 'jit-truncr)
-(assert= 3 (jit-truncr 2.5))
+(jit/defn ^long jit-truncr [^double x] (+ x 1))     ; ^long ret on a double body: rejected
+(assert= :badret (try (jit/compile! 'jit-truncr) (catch Exception e :badret)))
 (jit/defn jit-negl [^double x] (long (- x)))        ; casts + unary minus
 (jit/compile! 'jit-negl)
 (assert= -3 (jit-negl 3.7))
@@ -1234,6 +1233,49 @@
 (assert= :intdiv (try (jit/compile! 'jit-idiv) (catch Exception e :intdiv)))
 (jit/defn jit-drem [^double a] (rem a 2))           ; rem/quot/mod stay integer-only
 (assert= :drem (try (jit/compile! 'jit-drem) (catch Exception e :drem)))
+; compiled code answers exactly as the interpreted fn does, errors included
+(defn jit-run [f & args]
+  (try (pr-str (apply f args))
+       (catch Exception e [(.getSimpleName (class e)) (ex-message e)])))
+(defmacro jit-same [nm params body & arg-lists]
+  `(do (jit/defn ~nm ~params ~body)
+       (let [before# (mapv (fn [a#] (apply jit-run ~nm a#)) [~@arg-lists])]
+         (jit/compile! '~nm)
+         (assert= before# (mapv (fn [a#] (apply jit-run ~nm a#)) [~@arg-lists])))))
+(jit-same jit-shadow [x] (let [x (inc x)] x) [5])          ; read the new x's init, not itself
+(jit-same jit-lt [x] (< x 3) [1] [5])                       ; booleans, not 1/0
+(jit-same jit-truthy [x] (if (rem x 2) 10 20) [4])          ; 0 is truthy
+(jit-same jit-eqmix [x] (if (= x 1.0) 1 2) [1])             ; (= 1 1.0) is false
+(jit-same jit-eqd [^double x] (= x 1.0) [1.0])
+(jit-same jit-max3 [a b c] (max a b c) [1 2 9] [9 2 1])     ; every argument counts
+(jit-same jit-maxnan [^double x ^double y] (max x y) [1.0 ##NaN] [##NaN 1.0])
+(jit-same jit-sq [x] (* x x) [3] [4000000000])              ; overflow throws
+(jit-same jit-inc [x] (inc x) [1] [Long/MAX_VALUE])
+(jit-same jit-neg [x] (- x) [1] [Long/MIN_VALUE])
+(jit-same jit-mixadd [a ^double b c] (+ a c b) [Long/MAX_VALUE 1.0 1] [1 1.0 1])
+(jit-same jit-quot [a b] (quot a b) [7 2] [7 0] [Long/MIN_VALUE -1])  ; no SIGFPE
+(jit-same jit-rem [a b] (rem a b) [7 0] [Long/MIN_VALUE -1])
+(jit-same jit-mod [a b] (mod a b) [-7 2] [7 0])
+(jit-same jit-long [^double x] (long x) [-2.9] [##NaN])
+(jit-same jit-inf [^double x] (+ x ##Inf) [1.0])             ; ##Inf/##NaN literals compile
+(jit-same jit-noargs [] (+ (+) (*)) [])
+(jit-same jit-names [a-b a_b] (- a-b a_b) [5 3])
+(jit-same jit-loopseq [n] (loop [i 0 j (+ i 1) acc 0] (if (< i n) (recur (inc i) (inc j) (+ acc j)) acc)) [5])
+(jit-same jit-inloop [n] (if (< n 2) n (loop [i 0 s 0] (if (< i 2) (recur (inc i) (+ s (jit-inloop (- n 1 i)))) s))) [10])
+(jit-same jit-pred [n] (if (zero? n) true (if (= n 1) false (jit-pred (- n 2)))) [10] [7])
+(jit-same jit-not [a] (not (zero? a)) [0] [3])
+(assert= [(first (jit-run (fn [x] (long x)) 1e30)) true]    ; out-of-range cast throws too
+         (let [r (jit-run jit-long 1e30)] [(first r) (str/starts-with? (second r) "Value out of range for long")]))
+; forms whose compiled answer could not match: rejected, the interpreted fn stays
+(jit/defn jit-ifmix [x] (if (< x 0) 0 (Math/sqrt x)))       ; long or double by value
+(assert= :ifmix (try (jit/compile! 'jit-ifmix) (catch Exception e :ifmix)))
+(jit/defn jit-noelse [x] (if (< x 0) 1))                    ; nil when false
+(assert= :noelse (try (jit/compile! 'jit-noelse) (catch Exception e :noelse)))
+(jit/defn jit-minmix [a ^double b] (min a b))
+(assert= :minmix (try (jit/compile! 'jit-minmix) (catch Exception e :minmix)))
+(jit/defn jit-recurd [x] (loop [y 0] (if (< y 3) (recur (+ y 0.5)) y)))
+(assert= :recurd (try (jit/compile! 'jit-recurd) (catch Exception e :recurd)))
+(assert= 3.0 (jit-recurd 1))
 ) ; end when-unix
 
 ; ── vendor: deps.edn resolution against local fixtures (no network) ──

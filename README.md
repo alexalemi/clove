@@ -258,16 +258,16 @@ set).
 (load-file "jit.clj")
 (jit/defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 (jit/compile! 'fib)    ; generate C → cc → dlopen → swap the binding, live
-(fib 32)               ; ~0.7 s interpreted → 5 ms native (faster than bb/JVM)
+(fib 32)               ; ~0.7 s interpreted → ~12 ms native (faster than bb/JVM)
 ```
 
-`jit.clj` (~300 lines of clove) compiles a numeric subset — `if`, `let`,
-`loop`/`recur`, self-recursion, arithmetic/comparisons, `Math/sqrt`, casts —
-to unboxed C through the same generate→`cc`→`dlopen`→rebind pipeline as the
-FFI. Types default to `long long`; JVM-style `^long`/`^double` hints on
-params (and optionally the fn name, for the return type — otherwise it's
-inferred from the body) pick unboxed `double`, and types flow through
-arithmetic like C promotion:
+`jit.clj` (~400 lines of clove) compiles a numeric subset — `if`, `let`,
+`loop`/`recur`, self-recursion, arithmetic/comparisons, `not`, `min`/`max`,
+`Math/sqrt`, casts — to unboxed C through the same generate→`cc`→`dlopen`→rebind
+pipeline as the FFI. Types default to `long long`; JVM-style `^long`/`^double`
+hints on params (and optionally the fn name, for the return type — otherwise
+it's inferred from the body) pick unboxed `double`, and a double operand makes
+an arithmetic step double, as in Clojure:
 
 ```clojure
 (jit/defn ^double dist [^double x ^double y]
@@ -275,9 +275,16 @@ arithmetic like C promotion:
 (jit/compile! 'dist)   ; unboxed double machine ops throughout
 ```
 
+The compiled function answers as the interpreted one does: comparisons
+return booleans, every number is truthy, `(= 1 1.0)` is false, long
+arithmetic throws on overflow and `quot`/`rem`/`mod` on a zero divisor.
+Code whose answer's type would depend on the values (an `if` with a long
+branch and a double one, an `if` with no else, a `recur` that turns a long
+loop variable into a double) is rejected at compile time.
+
 Compiled modules are content-cached, so warm compiles are a `dlopen`.
 Outside the subset, `jit/compile!` errors cleanly and the interpreted
-version stays. fib(32): **5 ms** vs babashka's 520 ms and JVM Clojure's
+version stays. fib(32): **~12 ms** vs babashka's 520 ms and JVM Clojure's
 610 ms — it's real machine code.
 
 ## FFI: call C from Clojure
