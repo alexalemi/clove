@@ -27,12 +27,13 @@
 
 (keys (zipmap (range 10) (repeat 0)))
 
-;; Syntax quote doesn't qualify symbols. On the JVM, `` `map `` reads as
-;; `clojure.core/map`; here it stays `map`. This matters only to macros that
-;; inspect their own expansion.
+;; Syntax quote qualifies symbols as on the JVM, but clove's own core macros
+;; expand to bare symbols: `(macroexpand '(when-let [x y] x))` shows `when`,
+;; `let` and a literal `t#` where the JVM shows `clojure.core/when` and a
+;; gensym. This matters only to code that inspects those expansions.
 ;; %%
 
-`(map inc xs)
+[`(map inc xs) (macroexpand '(when-let [x y] x))]
 
 ;; Floating-point division by zero gives infinity or NaN, as compiled Clojure
 ;; does with primitive doubles. Boxed JVM math, and babashka, throw instead.
@@ -63,7 +64,6 @@
 ;;   any `catch` except `ExceptionInfo`, `AssertionError` and `Error`.
 ;; - Seqs realize in chunks of 32, as on the JVM, but `chunked-seq?` is
 ;;   always false.
-;; - Nested syntax quote doesn't work. Auto-gensym (`x#`) does.
 ;; - Tagged literals stop at `#inst` and `#uuid`; `*data-readers*` isn't
 ;;   consulted.
 ;; - `tap>` calls taps on the spot instead of queuing them for a background

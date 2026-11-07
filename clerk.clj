@@ -146,7 +146,9 @@
   (let [val (atom nil)
         err (atom nil)
         out (with-out-str
-              (try (reset! val (eval (read-string (str "(do " text "\n)"))))
+              ;; a def cell shows (and caches) the value, as Clerk does
+              (try (reset! val (let [v (eval (read-string (str "(do " text "\n)")))]
+                                 (if (var? v) @v v)))
                    (catch Throwable e (reset! err (ex-message e)))))]
     {:value @val :error @err :out out}))
 

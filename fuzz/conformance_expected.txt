@@ -596,3 +596,11 @@ nil
 [1000 5000 4499500 true]
 [1333 false true 1332667 true 0]
 [:overflow :overflow 9.223372036854776E18 1.0 9.0 9.0 2.5 6.0]
+(clojure.core/map clojure.string/join user/cq-undefined if let* recur & .method java.lang.String :k "s" 1 nil)
+[true false nil]
+[5 1]
+{:a 2, user/b [user/c 1 2]}
+[(let* [x 1] x) (fn* ([x] x)) (loop* [i 0] i) (let* [x 1] x)]
+["#'user/cq-v" "#'user/cq-f" nil "#'clojure.core/map" 1]
+:cnf
+[{:k 1} #{:s} ()]

@@ -532,9 +532,12 @@ embeddability matter; use bb or the JVM where throughput does.
   insertion order past that. A replaced key keeps its slot, and a dissoc'd and
   re-added key moves to the end. Sets still iterate in hash order. Code that
   needs an order should still say so (`sorted-map`, `array-map`)
-- Quasiquote auto-gensym (`x#`) works; nested quasiquote levels do not.
-  Syntax quote leaves symbols unqualified: `` `map `` reads as `map`, where
-  the JVM gives `clojure.core/map`
+- Syntax quote resolves symbols as the JVM does in your code and in
+  libraries (`` `map `` is `clojure.core/map`, `` `foo `` is `user/foo`,
+  `x#` is a fresh gensym, nesting works). clove's own core macros are the
+  exception: their expansions keep bare symbols and a literal `x#`. An
+  unresolved Capitalized name stays bare (the JVM would qualify it to
+  `java.lang`)
 - `()` is the empty list (not `nil`), but seq fns treat an exhausted seq as
   `nil`, as in Clojure
 - Namespaces are a flat global with per-namespace aliases (not separate var

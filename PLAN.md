@@ -118,18 +118,24 @@ Things the history log leaves unresolved, roughly by value:
   faults) and ~1,300 top-level forms. Measure with hyperfine and put a
   warm-up run first: the first command in a hyperfine run reads ~4 ms slow.
   Prefaulting cell blocks with MAP_POPULATE saved only ~0.2 ms.
-- **`clojure.data.priority-map`**: `conj`/`into` on one bypass its deftype
-  `cons` (they treat it as a plain map), and it prints its internals.
-  `assoc`/`peek`/`pop` work.
-- **Small REPL rough edges** seen while writing docs: `printn` suggests
-  `print` rather than `println`; `defn` returns the fn rather than the var
-  (`#'user/f` on the JVM).
-- **meander `m/rewrite`** — blocked on syntax-quote: JVM qualifies an
-  unresolvable bare symbol to the current ns (`with` →
-  `meander.syntax.epsilon/with`); clove leaves it bare, so meander's parser
-  registry misses. Fix is to qualify inside library loads, held back until a
-  prelude/battery audit confirms nothing relies on clove's bare-symbol
-  (non-hygienic) templates. Details: HISTORY.md, specter/meander entries.
+- **`clojure.data.priority-map`**: no `subseq`/`rsubseq`, and a
+  `priority-map-by` comparator is not carried into `empty`.
+- **Small REPL rough edge**: `printn` suggests `print` rather than `println`.
+- **Syntax-quote (2026-11-04)** resolves as the JVM reader does
+  (`qq_symbol`): library and user templates qualify core names to
+  `clojure.core/`, ns defs and refers to their ns, unresolved names to the
+  template's ns; `x#` gensyms per syntax-quote; a nested syntax-quote is
+  rewritten to seq/concat code first (`qq_code`). Symbols it qualifies are
+  re-homed to the expanding ns so a nested macro call expands under the
+  caller's `*ns*`. Prelude templates (home_ns NULL) stay bare with a literal
+  `x#`: clove's core macros share one `x#` across separate templates. That
+  unblocked meander `m/rewrite`, `m/with`, `m/re` and strategies (battery
+  matches bb). Library `defmulti` tables are now ns-qualified (protocol
+  methods keep the bare key deftypes register under).
+- **test.check** fails at load: `clojure.test.check.random` sets
+  `*unchecked-math*` and relies on wrapping `+`, which clove ignores, so
+  `split` throws "long overflow". Needs `*unchecked-math*` honored (per
+  file) or an `unchecked-add` rewrite in the vendored copy.
 - **BigInt leftovers.** No separate BigInteger type (`biginteger` prints
   `3N`); a ratio's `numerator`/`denominator` are longs when they fit (JVM:
   BigInteger). Natives that take an integer through `int_value`/`as_int`
@@ -140,9 +146,9 @@ Things the history log leaves unresolved, roughly by value:
   class go through `clove_error_cls` (arithmetic, index bounds, number
   parsing, nil/non-number arguments, stack overflow). Everything else is
   untyped and matches any `catch` clause but ExceptionInfo/AssertionError/
-  Error. Classify more sites as ported code turns out to dispatch on them —
-  wrong-arity (ArityException) and "not a function" (ClassCastException) are
-  the likely next ones. `type` of an exception is still its representation
+  Error. Classify more sites as ported code turns out to dispatch on them
+  (wrong-arity and "not a function" already throw ArityException and
+  ClassCastException). `type` of an exception is still its representation
   (`:map`/`:string`); only `class` and `instance?` see the recorded class.
 - **Data readers**: only `#inst`/`#uuid`; `*data-readers*` and
   `data_readers.clj` are not consulted, so other tags are read errors (inside
@@ -249,7 +255,7 @@ Things the history log leaves unresolved, roughly by value:
 - Namespaces: flat global + per-ns aliases behind a symbol-based namespace
   layer; top-level `user` defs are bare, hence visible from other
   namespaces; no remove-ns/ns-unmap (root Bindings are append-only)
-- Quasiquote: auto-gensym `x#` works; nested quasiquote levels do not
+- Syntax-quote in prelude macros keeps bare symbols (see README)
 - Conservative GC may retain garbage pointed at by stale stack slots
 
 ## Testing conventions

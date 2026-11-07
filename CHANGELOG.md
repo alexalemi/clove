@@ -74,6 +74,31 @@
   (was 3,000) and 6,000 through `try` (was 670) on an 8 MB stack.
 
 ### Fixed
+- Syntax quote resolves symbols as the JVM reader does, in your code and in
+  libraries: `` `map `` is `clojure.core/map`, `` `helper `` is
+  `my.ns/helper`, `x#` is a fresh gensym per syntax quote, and nested
+  syntax quote works (`` `(a `(b ~~x)) ``). It left symbols bare, so
+  meander's `m/rewrite` could not find its own operators; `m/rewrite`,
+  `m/with`, `m/re` and `meander.strategy.epsilon` now give babashka's
+  results. clove's own core macros still expand to bare symbols.
+- `(macroexpand '(let [x 1] x))` looped forever (`let*` expanded back to
+  `let`), which also hung `(require 'clojure.core.match)`. It returns
+  `(let* [x 1] x)`; `loop` and `fn` stop at `loop*` and `fn*`.
+- `def`, `defn` and `defmacro` return the var (`#'user/f`), and `defonce`
+  returns nil when the name is already bound. A var of a `user` or core def
+  prints qualified (`#'user/x`, `#'clojure.core/map`).
+- `clojure.data.priority-map`: `conj` and `into` keep its indexes (they
+  added plain entries), `dissoc` removes the key, `keys`, `vals`,
+  `contains?`, `empty`, calling it as a fn and `=` work, and it prints as
+  a map in priority order instead of showing its internals.
+- Two libraries' `defmulti`s with the same name no longer share one method
+  table.
+- `satisfies?` is true for a protocol extended to an interface such as
+  `clojure.lang.ISeq`.
+- `(Class/forName "x.Y")` of a class clove does not model throws
+  `ClassNotFoundException` (it returned nil, so feature probes took the
+  wrong branch).
+- `keys` and `vals` accept a vector of map entries.
 - The collector no longer keeps dead data alive through its own stack
   frame (uninitialized words, and the unwritten signal-mask part of the
   `jmp_buf`) or through words that hold the high half of an old heap

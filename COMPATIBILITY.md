@@ -9,7 +9,6 @@ does not, so vendor its dependencies too (listed where needed).
 
 | Library | Verified |
 |---|---|
-| org.clojure/test.check | `quick-check` runs properties end-to-end |
 | org.clojure/tools.cli | `parse-opts` with `:parse-fn` |
 | org.clojure/data.csv | `read-csv` |
 | org.clojure/math.combinatorics | `combinations`, `permutations` |
@@ -34,7 +33,7 @@ borkdude/deflet.
 |---|---|
 | org.clojure/core.match | wildcards, multi-column, nested vectors, maps, seq patterns, `:or`, `:guard`, `:as`, rest patterns, clause ordering (13/13 battery) |
 | markdown-clj | `md-to-html-string`: headings, emphasis, lists, links, code blocks, tables, YAML front-matter metadata |
-| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). `m/rewrite` not yet: meander registers its `with`/`$` parsers under syntax-quoted bare symbols, which clove's syntax-quote leaves unqualified (documented divergence) while lookups use the qualified name |
+| meander/epsilon | `match`/`search`/`find`: logic + memory vars, maps (nested/multi-key), `scan`, `pred`, `or`, `app` (9/9 battery). Since 2026-11-04 also `rewrite`/`rewrites`, `with`, `re`, `symbol`, `cata`, and `meander.strategy.epsilon` (`rewrite`, `attempt`, `bottom-up`, `all`), matching babashka |
 
 ## Works — verified functionally (bring-up round, 2026-08-27)
 
@@ -46,8 +45,8 @@ borkdude/deflet.
 
 | Library | Status |
 |---|---|
-| meander `m/rewrite` | not yet: see the meander row above. match/search/find are fine |
-| clojure.data.priority-map | `priority-map`, `assoc`, `peek`, `pop` work; `conj`/`into` bypass its `cons` and printing shows the internals |
+| clojure.data.priority-map | `priority-map`, `conj`, `into`, `assoc`, `dissoc`, `peek`, `pop`, `keys`/`vals`, `=`, printing; no `subseq`/`rsubseq` |
+| org.clojure/test.check | fails at load since `+` throws on overflow: its splittable RNG relies on `*unchecked-math*`, which clove ignores |
 
 ## Won't work (JVM-native by design)
 
