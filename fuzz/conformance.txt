@@ -632,3 +632,12 @@
 (let [s (reduce disj (set (range 2000)) (range 0 2000 3)) t (persistent! (reduce disj! (transient (set (range 2000))) (range 0 2000 3)))] [(count s) (contains? s 3) (contains? s 4) (reduce + s) (= s t) (count (apply disj s (range 2000)))])
 ;; mixed-kind variadic arithmetic folds left: long steps before a double still overflow
 [(try (+ 9223372036854775807 1 1.0) (catch ArithmeticException e :overflow)) (try (* 4611686018427387904 2 1.0) (catch ArithmeticException e :overflow)) (+' 9223372036854775807 1 1.0) (+ 1/3 2/3 0.0) (- 10 1/2 0.5) (* 2 3N 1.5) (+ 1M 1 0.5) (+ 1 2.0 3)]
+;; syntax-quote resolves symbols like the JVM reader: core, current ns, specials, x#
+`(map clojure.string/join cq-undefined if let* recur & .method java.lang.String :k "s" 1 nil)
+(let [[a b] `[x# x#]] [(= a b) (= `y# `y#) (namespace a)])
+(let [x 1] (eval `(let [y# 5] `[~y# ~~x])))
+`{:a ~(+ 1 1) b [c ~@[1 2]]}
+[(macroexpand '(let [x 1] x)) (macroexpand '(fn [x] x)) (macroexpand '(loop [i 0] i)) (macroexpand-1 '(let* [x 1] x))]
+[(pr-str (def cq-v 1)) (pr-str (defn cq-f [] 1)) (defonce cq-v 2) (pr-str (var map)) (cq-f)]
+(try (Class/forName "no.such.Klass") (catch ClassNotFoundException _ :cnf))
+(let [x 1] (eval `[`{:k ~~x} `#{:s} `()]))

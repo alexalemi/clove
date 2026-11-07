@@ -50,8 +50,14 @@
 (clove/reg-method! 'seq    :PriorityMap (fn [this] (seq (pm-seq this))))
 (clove/reg-method! 'peek   :PriorityMap pm-peek)
 (clove/reg-method! 'pop    :PriorityMap pm-pop)
-(clove/reg-method! 'dissoc :PriorityMap pm-dissoc)
+(clove/reg-method! 'without :PriorityMap pm-dissoc)
 (clove/reg-method! 'containsKey :PriorityMap (fn [this k] (contains? (:k->p this) k)))
+(clove/reg-method! 'invoke :PriorityMap (fn ([this k] (get (:k->p this) k))
+                                          ([this k nf] (get (:k->p this) k nf))))
+(clove/reg-method! 'equiv :PriorityMap (fn [this o] (= (:k->p this) (if (= :PriorityMap (type o)) (:k->p o) o))))
+(clove/reg-method! 'empty :PriorityMap (fn [this] (pm-cell (empty (:p->ks this)) {})))
+;; prints (and str's) as a map in priority order, like the JVM's
+(clove/reg-method! 'clove/as-map :PriorityMap (fn [this] (into {} (pm-seq this))))
 
 (defn priority-map [& kvs]
   (reduce (fn [m [k v]] (pm-assoc m k v))

@@ -3345,7 +3345,7 @@
   QQP
   (qq-emit [this] `(let [~@bindings] :body))
   (qq-quote [this] 'bindings))
-(assert= '(let [q 5] :body) (qq-emit (QQR. '(q 5))))
+(assert= '(clojure.core/let [q 5] :body) (qq-emit (QQR. '(q 5))))
 (assert= 'bindings (qq-quote (QQR. :whatever)))
 ;; keys/vals accept sequences of map entries (Clojure parity; meander needs it)
 (assert= [1 2] (vec (sort (vals (sort-by key {:a 1 :b 2})))))
@@ -3433,7 +3433,7 @@
 (def s50-m2 (var s50-m1))
 (alter-meta! (var s50-m2) merge {:macro true})
 (assert= 4 (s50-m2 3))
-(assert= '(inc 3) (macroexpand-1 '(s50-m2 3)))
+(assert= '(clojure.core/inc 3) (macroexpand-1 '(s50-m2 3)))
 (defn s50-in-fn [] (s50-m2 10))          ; VM-compiled body path
 (assert= 11 (s50-in-fn))
 ;; :bb reader-conditional feature: priority clove > bb > default > clj
@@ -4251,7 +4251,7 @@
 (def ^:dynamic *clove-b3* 1)
 (assert= [2 2 10 5 1]
          [(let [f (binding [*clove-b3* 2] (bound-fn [] *clove-b3*))] (f))
-          (binding [*clove-b3* 2] (some (fn [[k v]] (when (= (str k) "#'*clove-b3*") v)) (get-thread-bindings)))
+          (binding [*clove-b3* 2] (some (fn [[k v]] (when (= (str k) "#'user/*clove-b3*") v)) (get-thread-bindings)))
           (with-bindings {(var *clove-b3*) 10} *clove-b3*)
           (do (push-thread-bindings {(var *clove-b3*) 5}) (let [v *clove-b3*] (pop-thread-bindings) v))
           *clove-b3*])
@@ -4747,6 +4747,71 @@
 (let [m (reduce (fn [m i] (assoc (dissoc m i) (+ i 1000) i)) (zipmap (range 1000) (range 1000)) (range 9000))]
   (assert= (range 9000 10000) (keys m))
   (assert= true (= m (zipmap (range 9000 10000) (range 8000 9000)))))
+
+;; syntax-quote resolves symbols as the JVM reader does: core names to
+;; clojure.core, the rest to the current ns; specials, dotted and .method
+;; names stay bare; x# is one gensym per syntax-quote
+(defn sqj-local [] 1)
+(assert= '(clojure.core/map user/sqj-local user/sqj-nope if let* recur .m java.lang.String :k)
+         `(map sqj-local sqj-nope if let* recur .m java.lang.String :k))
+(assert= [true false false] (let [[a b] `[x# x#]] [(= a b) (= a 'x#) (= `y# `y#)]))
+(assert= 1 (user/sqj-local))
+;; nested syntax-quote: the inner one becomes seq/concat code, ~~x reaches out
+(assert= '(user/a 1 (clojure.core/seq (clojure.core/concat (clojure.core/list (quote user/b)) (clojure.core/list 1))))
+         (let [x 1] `(a ~x `(b ~~x))))
+(assert= [5 1] (let [x 1] (eval `(let [y# 5] `[~y# ~~x]))))
+(assert= {:a 2 'user/b ['user/c 1 2]} `{:a ~(+ 1 1) b [c ~@[1 2]]})
+(assert= [{:k 1} #{:s} ()] (let [x 1] (eval `[`{:k ~~x} `#{:s} `()])))
+;; in a library: own defs, refers and aliases qualify; an ns-local name
+;; shadowing a core special (meander's `and`) wins; nested macro calls
+;; expand under the caller's ns, so its aliases resolve
+(clove/eval-forms* "(ns sqj.lib) (defn helper [] :h) (defn and [& xs] :lib-and)
+(defmacro call-helper [] `(helper))
+(defmacro emit [] `[and when fresh x#])
+(defmacro wrap [x] `(sqj.lib/unwrap ~x))
+(defmacro unwrap [x] (if (= 'sqj.lib (ns-name *ns*)) :lib-ns :caller-ns))" "sqjtest")
+(in-ns 'user)
+(assert= :h (eval '(sqj.lib/call-helper)))
+(let [[a w f g] (macroexpand-1 '(sqj.lib/emit))]
+  (assert= '[sqj.lib/and clojure.core/when sqj.lib/fresh] [a w f])
+  (assert= true (str/ends-with? (str g) "__auto__")))
+(assert= :caller-ns (eval '(sqj.lib/wrap 1)))
+;; macroexpand stops at let*/loop*/fn* instead of looping back to let
+(assert= '(let* [x 1] x) (macroexpand '(let [x 1] x)))
+(assert= '(loop* [i 0] i) (macroexpand '(loop [i 0] i)))
+;; same-named multimethods in two namespaces keep separate tables
+(clove/eval-forms* "(ns sqj.mm1) (defmulti op identity) (defmethod op :a [_] :one)
+(ns sqj.mm2) (defmulti op (fn [x y] x)) (defmethod op :a [_ _] :two)" "sqjmm")
+(in-ns 'user)
+(assert= [:one :two] [(sqj.mm1/op :a) (sqj.mm2/op :a :b)])
+;; satisfies? sees protocols extended to host interfaces
+(defprotocol SqjP (sqjf [x]))
+(extend-protocol SqjP clojure.lang.ISeq (sqjf [x] :seq))
+(assert= [true false] [(satisfies? SqjP '(1)) (satisfies? SqjP 1)])
+;; Class/forName of a class clove does not model is ClassNotFoundException
+(assert= :cnf (try (Class/forName "no.such.Klass") (catch ClassNotFoundException _ :cnf)))
+;; keys/vals take a vector of entries ((group-by f a-map) values)
+(assert= ['(1 2) '(:a :b)] [(vals [[:a 1] [:b 2]]) (keys [[:a 1] [:b 2]])])
+;; def, defn and defmacro return the var; defonce on a bound name is nil
+(assert= "#'user/sqj-dv" (pr-str (def sqj-dv 1)))
+(assert= "#'user/sqj-df" (pr-str (defn sqj-df [] 1)))
+(assert= "#'user/sqj-dm" (pr-str (defmacro sqj-dm [] 1)))
+(assert= nil (defonce sqj-dv 2))
+(assert= "#'clojure.core/map" (pr-str (var map)))
+;; priority-map: conj/into keep its indexes, it prints and compares as a map
+(require (quote [clojure.data.priority-map :as pmq]))
+(let [p (pmq/priority-map :a 3 :b 1 :c 2)]
+  (assert= "{:b 1, :c 2, :a 3}" (pr-str p))
+  (assert= "{:b 1, :c 2, :a 3}" (str p))
+  (assert= [:d 0] (peek (conj p [:d 0])))
+  (assert= [:e -1] (peek (into p {:e -1 :a 9})))
+  (assert= "{:e -1, :b 1, :c 2, :a 9}" (pr-str (into p {:e -1 :a 9})))
+  (assert= [:c 2] (peek (dissoc p :b)))
+  (assert= [3 true false] [(p :a) (contains? p :b) (contains? p :z)])
+  (assert= ['(:b :c :a) '(1 2 3)] [(keys p) (vals p)])
+  (assert= [true true] [(= p {:a 3 :b 1 :c 2}) (= {:a 3 :b 1 :c 2} p)])
+  (assert= "{}" (pr-str (empty p)))
+  (assert= [:y 1] (peek (into (pmq/priority-map) [[:x 2] [:y 1]]))))
 
 (println (str "tests complete: " @clove-test-passed " passed, " @clove-test-failed " failed"))
 (when (pos? @clove-test-failed) (System/exit 1))

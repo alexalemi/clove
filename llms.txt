@@ -39,8 +39,10 @@ embedding a scripting language in C, and small standalone binaries.
   classes. Don't reach for arbitrary Java libraries; there aren't any.
 - Strings index by codepoint, not UTF-16 unit: `(count "𝄞")` is 1.
 - Hash maps keep insertion order at every size. Sets don't.
-- Syntax quote leaves symbols unqualified: `` `map `` is `map`, not
-  `clojure.core/map`. Nested syntax quote doesn't work.
+- Syntax quote qualifies symbols as the JVM does (`` `map `` is
+  `clojure.core/map`), except in clove's own core macros, whose expansions
+  stay bare (`(macroexpand '(when-let ..))` shows `let`, not
+  `clojure.core/let`).
 - Float division by zero gives `##Inf`/`##NaN` instead of throwing.
 - Namespaces are a flat global with per-namespace aliases. Defs in `user` are
   visible from every namespace. A namespace is its symbol.

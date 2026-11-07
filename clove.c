@@ -5044,7 +5044,8 @@ static Binding *root_find(CloveEnv *root, const char *name, const char *home_ns,
             size_t plen = (size_t)(slash - name);
             if ((plen == 12 && !memcmp(name, "clojure.core", 12)) ||
                 (plen == 9  && !memcmp(name, "cljs.core", 9)) ||
-                (plen == 12 && !memcmp(name, "clojure.lang", 12))) {
+                (plen == 12 && !memcmp(name, "clojure.lang", 12)) ||
+                (plen == 4  && !memcmp(name, "user", 4))) {   /* user defs are bare */
                 const char *bare = intern(slash + 1, strlen(slash + 1));
                 { Binding *b = root_binding(root, bare); if (b) return b; }
             }
@@ -6830,12 +6831,100 @@ static Clove *eval_form_meta(CloveEnv *env, Clove *form) {
     return m;
 }
 
-/* Quasiquote template expansion: copy structure, evaluating ~x holes and
- * splicing ~@xs. Nested quasiquotes are not given Clojure's full treatment
- * (no level counting, no auto-gensym #-suffixes, no namespace resolution). */
-static Clove *qq_expand_1(CloveEnv *env, Clove *form);
-static Clove *qq_expand(CloveEnv *env, Clove *form) {
-    Clove *r = qq_expand_1(env, form);
+/* Syntax-quote, as Clojure's reader does it but at eval time: copy the
+ * template, evaluating ~x holes and splicing ~@xs. Symbols resolve the way
+ * the JVM resolves them (qq_symbol); x# names a gensym shared by one
+ * syntax-quote (*gs, a map from x# to its gensym). A nested `form is first
+ * rewritten into the seq/concat/list code the JVM reader would produce
+ * (qq_code), and that code is then the outer template. */
+static int gensym_counter;
+static const char **core_key;   /* root names defined by the prelude (core_seal) */
+static size_t core_cap;
+static void core_seal(void) {
+    free(core_key);
+    core_key = malloc(ridx_cap * sizeof *core_key);
+    if (!core_key) { fputs("out of memory\n", stderr); exit(1); }
+    memcpy(core_key, ridx_key, ridx_cap * sizeof *core_key);
+    core_cap = ridx_cap;
+}
+static Clove *mk_var_cell(Binding *b);
+static bool core_name(const char *name) {
+    if (!core_cap) return false;
+    for (size_t j = ridx_slot(name, core_cap); core_key[j]; j = (j + 1) & (core_cap - 1))
+        if (core_key[j] == name) return true;
+    return false;
+}
+static bool name_in(const char *s, const char *const *names) {
+    for (; *names; names++) if (!strcmp(s, *names)) return true;
+    return false;
+}
+static Clove *qq_symbol(CloveEnv *env, Clove *form, Clove **gs) {
+    static const char *const jvm_special[] = {
+        "def", "loop*", "recur", "if", "case*", "let*", "letfn*", "do", "fn*",
+        "quote", "var", "import*", ".", "set!", "deftype*", "reify*", "try",
+        "throw", "monitor-enter", "monitor-exit", "catch", "finally", "new",
+        "&", NULL};
+    /* clove's own special forms that are clojure.core macros on the JVM */
+    static const char *const core_special[] = {
+        "and", "or", "when", "cond", "let", "fn", "loop", "defn", "defmacro",
+        "binding", "with-redefs", "lazy-seq", "ns", "require", "use", "import",
+        NULL};
+    const char *name = form->as.symc.name;
+    const char *home = form->as.symc.home_ns;
+    /* prelude templates stay bare and keep x# literal: clove's core macros
+     * rely on both (one x# shared across separate templates) */
+    if (!home) return form;
+    size_t n = strlen(name);
+    if (n > 1 && name[n - 1] == '#' && !strchr(name, '/')) {
+        Clove *g;
+        if (*gs && map_find(*gs, form, &g)) return g;
+        SBuf sb = {0};
+        sb_printf(&sb, "%.*s__%d__auto__", (int)(n - 1), name, gensym_counter++);
+        g = mk_sym(intern(sb.data, sb.len));
+        free(sb.data);
+        *gs = map_assoc(*gs ? *gs : mk_map(), form, g);
+        return g;
+    }
+    const char *slash = strchr(name, '/');
+    if (slash && slash != name && slash[1]) {
+        /* `r.syntax/x under (:require [meander.syntax.epsilon :as r.syntax]) */
+        size_t plen = (size_t)(slash - name);
+        const char *pre = intern(name, plen), *full = NULL;
+        /* user aliases only: the prelude's own (clojure.string -> str) are
+         * clove internals, and `clojure.string/join must stay as written */
+        for (int i = 0; i < n_aliases && !full; i++)
+            if (alias_table[i] == pre && alias_owner[i] == home) full = alias_ns[i];
+        for (int i = 0; i < n_aliases && !full; i++)
+            if (alias_table[i] == pre && alias_owner[i]) full = alias_ns[i];
+        if (full && strncmp(full, name, plen) != 0)
+            return mk_sym(intern_qual(full, slash + 1));
+        /* re-homed to the expansion's ns, like every symbol qualified here:
+         * a nested macro call then expands under the caller's *ns* */
+        return home == cur_reader_ns ? form : mk_sym(name);
+    }
+    if (slash || name[0] == '.' || name[n - 1] == '.' || strchr(name, '.') ||
+        name_in(name, jvm_special))
+        return form;
+    CloveEnv *root = env_root(env);
+    const char *qual = intern_qual(home, name);
+    if (root_binding(root, qual)) return mk_sym(qual);
+    for (int i = 0; i < n_refers; i++)
+        if (refer_from[i] == qual) return mk_sym(refer_to[i]);
+    if (name_in(name, core_special)) return mk_sym(intern_qual("clojure.core", name));
+    if (root_binding(root, name)) {
+        if (core_name(name)) return mk_sym(intern_qual("clojure.core", name));
+        return strcmp(home, "user") ? form : mk_sym(qual);
+    }
+    /* shortcut: an unresolved Capitalized name is taken for a Java class and
+     * left bare (the JVM would write java.lang.String); qualify it if a
+     * library ever compares those */
+    if (name[0] >= 'A' && name[0] <= 'Z') return form;
+    return mk_sym(qual);
+}
+
+static Clove *qq_expand_1(CloveEnv *env, Clove *form, Clove **gs);
+static Clove *qq_expand(CloveEnv *env, Clove *form, Clove **gs) {
+    Clove *r = qq_expand_1(env, form, gs);
     /* metadata rides along, itself syntax-quoted, as in Clojure; an
      * unquoted form's own metadata is dropped */
     if (form == NULL || form == NIL || !form_has_user_meta(form)) return r;
@@ -6846,9 +6935,55 @@ static Clove *qq_expand(CloveEnv *env, Clove *form) {
     for (Clove *e = map_entry_list(form->meta); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
         if (!meta_loc_key(e->as.cons.head->as.cons.head))
             m = map_assoc(m, e->as.cons.head->as.cons.head, e->as.cons.head->as.cons.tail);
-    return with_meta_of(r, qq_expand_1(env, m));
+    return with_meta_of(r, qq_expand_1(env, m, gs));
 }
-static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
+
+static Clove *core_sym(const char *name) { return mk_sym(intern_qual("clojure.core", name)); }
+static Clove *list2(Clove *a, Clove *b) { return mk_cons(a, mk_cons(b, NIL)); }
+static bool is_unquote(Clove *f, const char *which) {
+    return f != NIL && f->tag == CLOVE_LIST && f->as.cons.head->tag == CLOVE_SYMBOL &&
+           f->as.cons.head->as.sym == which;
+}
+/* The code the JVM reader writes for `form: (seq (concat (list 'a) [x] xs)),
+ * (apply vector ...), (quote sym). Used for a syntax-quote nested in another. */
+static Clove *qq_code(CloveEnv *env, Clove *form, Clove **gs) {
+    const char *UQ = intern("clojure.core/unquote", 20);
+    const char *UQS = intern("clojure.core/unquote-splicing", 29);
+    if (form == NULL || form == NIL) return NIL;
+    if (form->tag == CLOVE_SYMBOL)
+        return list2(mk_sym(intern("quote", 5)), qq_symbol(env, form, gs));
+    if (form->tag == CLOVE_LIST && form->as.cons.head->tag == CLOVE_SYMBOL &&
+        form->as.cons.head->as.sym == intern("quasiquote", 10)) {
+        Clove *inner_gs = NULL;
+        return qq_code(env, qq_code(env, form->as.cons.tail->as.cons.head, &inner_gs), gs);
+    }
+    if (is_unquote(form, UQ)) return form->as.cons.tail->as.cons.head;
+    if (is_unquote(form, UQS)) clove_error("splice not in list");
+    if (form->tag == CLOVE_EMPTY) return mk_cons(core_sym("list"), NIL);
+    Clove *items;
+    if (form->tag == CLOVE_LIST) items = form;
+    else if (form->tag == CLOVE_VECTOR || form->tag == CLOVE_SET) items = to_seq(form);
+    else if (form->tag == CLOVE_MAP) {
+        items = NIL;
+        for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
+            items = mk_cons(e->as.cons.head->as.cons.head, mk_cons(e->as.cons.head->as.cons.tail, items));
+    } else return form;
+    Clove *parts = NIL, **t = &parts;
+    for (Clove *l = items; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
+        Clove *el = l->as.cons.head;
+        Clove *p = is_unquote(el, UQS) ? el->as.cons.tail->as.cons.head
+                 : list2(core_sym("list"), is_unquote(el, UQ) ? el->as.cons.tail->as.cons.head
+                                                              : qq_code(env, el, gs));
+        *t = mk_cons(p, NIL);
+        t = &(*t)->as.cons.tail;
+    }
+    Clove *seq = list2(core_sym("seq"), mk_cons(core_sym("concat"), parts));
+    if (form->tag == CLOVE_LIST) return seq;
+    const char *ctor = form->tag == CLOVE_VECTOR ? "vector" : form->tag == CLOVE_SET ? "hash-set" : "hash-map";
+    return mk_cons(core_sym("apply"), list2(core_sym(ctor), seq));
+}
+
+static Clove *qq_expand_1(CloveEnv *env, Clove *form, Clove **gs) {
     static const char *SYM_UQ, *SYM_UQS;
     if (!SYM_UQ) { SYM_UQ = intern("clojure.core/unquote", 20); SYM_UQS = intern("clojure.core/unquote-splicing", 29); }
 
@@ -6858,6 +6993,10 @@ static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
         Clove *head = form->as.cons.head;
         if (head->tag == CLOVE_SYMBOL && head->as.sym == SYM_UQ)
             return eval(env, form->as.cons.tail->as.cons.head);
+        if (head->tag == CLOVE_SYMBOL && head->as.sym == intern("quasiquote", 10)) {
+            Clove *inner_gs = NULL;
+            return qq_expand_1(env, qq_code(env, form->as.cons.tail->as.cons.head, &inner_gs), gs);
+        }
         Clove *out = NIL, **t = &out;
         for (Clove *l = form; l && l->tag == CLOVE_LIST; l = l->as.cons.tail) {
             Clove *el = l->as.cons.head;
@@ -6870,7 +7009,7 @@ static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
                     t = &(*t)->as.cons.tail;
                 }
             } else {
-                *t = mk_cons(qq_expand(env, el), NIL);
+                *t = mk_cons(qq_expand(env, el, gs), NIL);
                 t = &(*t)->as.cons.tail;
             }
         }
@@ -6890,7 +7029,7 @@ static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
                     t = &(*t)->as.cons.tail;
                 }
             } else {
-                *t = mk_cons(qq_expand(env, el), NIL);
+                *t = mk_cons(qq_expand(env, el, gs), NIL);
                 t = &(*t)->as.cons.tail;
             }
         }
@@ -6902,8 +7041,8 @@ static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
     if (form->tag == CLOVE_MAP) {
         Clove *m = mk_map();
         for (Clove *e = map_entry_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail) {
-            Clove *k = qq_expand(env, e->as.cons.head->as.cons.head);
-            Clove *val = qq_expand(env, e->as.cons.head->as.cons.tail);
+            Clove *k = qq_expand(env, e->as.cons.head->as.cons.head, gs);
+            Clove *val = qq_expand(env, e->as.cons.head->as.cons.tail, gs);
             m = map_assoc(m, k, val);
         }
         return m;
@@ -6911,36 +7050,10 @@ static Clove *qq_expand_1(CloveEnv *env, Clove *form) {
     if (form->tag == CLOVE_SET) {
         Clove *s = mk_set();
         for (Clove *e = set_element_list(form); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-            s = set_conj(s, qq_expand(env, e->as.cons.head));
+            s = set_conj(s, qq_expand(env, e->as.cons.head, gs));
         return s;
     }
-    /* Alias resolution in templates, like Clojure's syntax-quote: `r.syntax/x
-     * written under (:require [meander.syntax.epsilon :as r.syntax]) expands
-     * to the FULL ns-qualified symbol, so the emitted code is resolvable in
-     * namespaces that don't share the alias (meander's defsyntax operators
-     * were emitted alias-qualified and unresolvable at the use site). */
-    if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns) {
-        const char *slash = strchr(form->as.symc.name, '/');
-        if (slash && slash != form->as.symc.name && slash[1]) {
-            size_t plen = (size_t)(slash - form->as.symc.name);
-            if (plen < 128) {
-                const char *full = alias_lookup(intern(form->as.symc.name, plen),
-                                                form->as.symc.home_ns);
-                if (full && strncmp(full, form->as.symc.name, plen) != 0) {
-                    return mk_sym(intern_qual(full, slash + 1));
-                }
-            }
-        }
-    }
-    /* Syntax-quote qualification (Clojure-faithful-ish): a bare template
-     * symbol whose home ns defines it expands to the qualified symbol, so
-     * `(move ~a) inside (ns p21 ...) yields p21/move — matching the case
-     * constants real Clojure code writes against syntax-quoted forms. */
-    if (form->tag == CLOVE_SYMBOL && form->as.symc.home_ns &&
-        !strchr(form->as.symc.name, '/')) {
-        const char *qual = intern_qual(form->as.symc.home_ns, form->as.symc.name);
-        if (root_binding(env_root(env), qual)) return mk_sym(qual);
-    }
+    if (form->tag == CLOVE_SYMBOL) return qq_symbol(env, form, gs);
     /* Atoms are template literals. */
     return form;
 }
@@ -7383,8 +7496,8 @@ static __attribute__((noinline)) Clove *eval_defmacro(CloveEnv *env, Clove *rest
         const char *st = env_define_root(env_root(env), name, m);
         if (strchr(st, '/')) mark_private_def(st, mac_private);
         if (mac_doc != NIL) doc_put(st, mac_doc->as.str, NULL);
+        return mk_var_cell(root_binding(env_root(env), st));
     }
-    return m;
 }
 
 static __attribute__((noinline)) Clove *eval_defn(CloveEnv *env, Clove *rest) {
@@ -7452,7 +7565,7 @@ static __attribute__((noinline)) Clove *eval_def(CloveEnv *env, Clove *rest) {
         const char *st = env_define_root(env_root(env), name, NIL);
         if (strchr(st, '/')) mark_private_def(st, def_private);
         var_meta_on_def(st, dm);
-        return NIL;
+        return mk_var_cell(root_binding(env_root(env), st));
     }
     /* (def name "docstring" value): docstring → doc registry */
     if (valf->as.cons.tail != NIL &&
@@ -7463,10 +7576,11 @@ static __attribute__((noinline)) Clove *eval_def(CloveEnv *env, Clove *rest) {
         valf = valf->as.cons.tail;
     }
     Clove *val = eval(env, valf->as.cons.head);
+    const char *st;
     /* def is always global; a redef without ^:private clears
      * the mark (Clojure resets var meta on redef) */
     {
-        const char *st = env_define_root(env_root(env), name, val);
+        st = env_define_root(env_root(env), name, val);
         if (strchr(st, '/')) mark_private_def(st, def_private);
         if (def_doc != NIL) doc_put(st, def_doc->as.str, NULL);
         var_meta_on_def(st, dm);
@@ -7488,7 +7602,7 @@ static __attribute__((noinline)) Clove *eval_def(CloveEnv *env, Clove *rest) {
                                   mk_sym(intern(bare, strlen(bare))));
         }
     }
-    return val;
+    return mk_var_cell(root_binding(env_root(env), st));   /* (def x 1) => #'user/x */
 }
 
 static __attribute__((noinline)) Clove *eval_set(CloveEnv *env, Clove *rest) {
@@ -7849,7 +7963,7 @@ static Clove *eval_inner(CloveEnv *env, Clove *form) {
                     }
                     if (s == SYM_BINDING || s == SYM_WITH_REDEFS) return eval_binding(env, s == SYM_BINDING, rest);
                 }
-                if (s == SYM_QUASIQUOTE) return qq_expand(env, rest->as.cons.head);
+                if (s == SYM_QUASIQUOTE) { Clove *gs = NULL; return qq_expand(env, rest->as.cons.head, &gs); }
                 if (s == SYM_DEFMACRO) return eval_defmacro(env, rest);
                 if (s == SYM_DEFN) return eval_defn(env, rest);
                 if (s == SYM_QUOTE) return rest->as.cons.head;
@@ -8190,7 +8304,11 @@ static void print_to(SBuf *sb, Clove *v, bool readably) {
         case CLOVE_RATIO: { char *a = big_to_decimal(v->as.ratio.num), *b = big_to_decimal(v->as.ratio.den);
             sb_puts(sb, a); sb_putc(sb, '/'); sb_puts(sb, b); free(a); free(b); } break;
         case CLOVE_BIGDEC: bd_print(sb, v); sb_putc(sb, 'M'); break;
-        case CLOVE_VAR: sb_puts(sb, "#'"); sb_puts(sb, v->as.var.name); break;
+        case CLOVE_VAR:   /* a bare root name is a core or user-ns def */
+            sb_puts(sb, "#'");
+            if (!strchr(v->as.var.name, '/')) sb_puts(sb, core_name(v->as.var.name) ? "clojure.core/" : "user/");
+            sb_puts(sb, v->as.var.name);
+            break;
         case CLOVE_DOUBLE: format_double(sb, v->as.d); break;
         case CLOVE_SYMBOL: sb_puts(sb, v->as.sym); break;
         case CLOVE_KEYWORD: sb_putc(sb, ':'); sb_puts(sb, v->as.kw); break;
@@ -8323,6 +8441,15 @@ static void print_to(SBuf *sb, Clove *v, bool readably) {
                              (long long)y, m, d, (int)(rem / 3600000), (int)(rem / 60000 % 60),
                              (int)(rem / 1000 % 60), (int)(rem % 1000));
                     sb_puts(sb, buf);
+                    break;
+                }
+            }
+            /* a map-like deftype (priority-map) prints as the map it stands for */
+            if (ty != NULL) {
+                Clove *as;
+                if (dispatch_deftype_method(gc_root_envs[0], v, "clove/as-map", NULL, 0, &as) &&
+                    as != v) {
+                    print_to(sb, as, readably);
                     break;
                 }
             }
@@ -9679,6 +9806,11 @@ static bool clove_eq(Clove *a, Clove *b) {
                       dispatch_deftype_method(gc_root_envs[0], a, "equals", barg, 1, &out))
                       return is_truthy(out);
               }
+              if (map_find(b, mk_kw(KW_CT), &ty)) {   /* (= {:a 1} a-priority-map) */
+                  Clove *aarg[1] = { a }, *out;
+                  if (dispatch_deftype_method(gc_root_envs[0], b, "equiv", aarg, 1, &out))
+                      return is_truthy(out);
+              }
             }
             if (a->as.map.count != b->as.map.count) return false;
             clove_check_stack();
@@ -9928,6 +10060,13 @@ static Clove *prim_nth(CloveEnv *env, Clove **argv, int nargs) {
     return NIL;
 }
 
+/* conj onto a map goes through a deftype's own assoc, as APersistentMap.cons
+ * does (clojure.data.priority-map keeps its indexes that way) */
+static Clove *conj_assoc(CloveEnv *env, Clove *m, Clove *k, Clove *v) {
+    Clove *out, *kv[2] = { k, v };
+    if (dispatch_deftype_method(env, m, "assoc", kv, 2, &out)) return out;
+    return map_assoc(m, k, v);
+}
 static Clove *prim_conj(CloveEnv *env, Clove **argv, int nargs) {
     if (nargs == 0) return mk_empty_vec();   /* (conj) => [] */
     Clove *r = argv[0];  /* nil works: conj onto nil yields a list */
@@ -9964,15 +10103,15 @@ static Clove *prim_conj(CloveEnv *env, Clove **argv, int nargs) {
              * a no-op, and a 2-element seq is accepted like a vector entry. */
             if (x == NIL) { /* no-op */ }
             else if (x->tag == CLOVE_VECTOR && vec_len(x) == 2) {
-                r = map_assoc(r, vec_nth(x, 0), vec_nth(x, 1));
+                r = conj_assoc(env, r, vec_nth(x, 0), vec_nth(x, 1));
             } else if (x->tag == CLOVE_MAP) {
                 for (Clove *e = map_entry_list(x); e && e->tag == CLOVE_LIST; e = e->as.cons.tail)
-                    r = map_assoc(r, e->as.cons.head->as.cons.head,
+                    r = conj_assoc(env, r, e->as.cons.head->as.cons.head,
                                   e->as.cons.head->as.cons.tail);
             } else if (x->tag == CLOVE_LIST || x->tag == CLOVE_LAZY) {
                 Clove *s = to_seq(x);
                 if (s != NIL && s->as.cons.tail != NIL)
-                    r = map_assoc(r, s->as.cons.head, s->as.cons.tail->as.cons.head);
+                    r = conj_assoc(env, r, s->as.cons.head, s->as.cons.tail->as.cons.head);
                 else clove_error("conj on map: expected a [k v] entry or a map");
             } else clove_error("conj on map: expected a [k v] entry or a map");
         } else clove_error("conj: can't add to %s", val_desc(r));
@@ -10389,8 +10528,10 @@ static Clove *prim_dissoc(CloveEnv *env, Clove **argv, int nargs) {
         return m;
     }
     if (m->tag != CLOVE_MAP) clove_error("dissoc: expected a map, got %s", val_desc(m));
-    for (int i = 1; i < nargs; i++)
-        m = map_dissoc_one(m, argv[i]);
+    for (int i = 1; i < nargs; i++) {
+        Clove *out;   /* a deftype's own dissoc: IPersistentMap.without */
+        m = dispatch_deftype_method(env, m, "without", &argv[i], 1, &out) ? out : map_dissoc_one(m, argv[i]);
+    }
     return m;
 }
 
@@ -10436,9 +10577,10 @@ static Clove *prim_keys(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     Clove *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY)
+    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY || m->tag == CLOVE_VECTOR)
         return entry_side_list(m, 0, "keys");
     if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("keys: expected a map, got %s", val_desc(m));
+    { Clove *sq; if (dispatch_deftype_method(env, m, "seq", NULL, 0, &sq)) return entry_side_list(sq, 0, "keys"); }
     return map_kv_list(m, 0);
 }
 
@@ -10446,9 +10588,10 @@ static Clove *prim_vals(CloveEnv *env, Clove **argv, int nargs) {
     (void)env; (void)nargs;
     Clove *m = argv[0];
     if (m == NIL) return NIL;
-    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY)
+    if (m->tag == CLOVE_LIST || m->tag == CLOVE_LAZY || m->tag == CLOVE_EMPTY || m->tag == CLOVE_VECTOR)
         return entry_side_list(m, 1, "vals");
     if (m->tag != CLOVE_MAP && m->tag != CLOVE_SORTED) clove_error("vals: expected a map, got %s", val_desc(m));
+    { Clove *sq; if (dispatch_deftype_method(env, m, "seq", NULL, 0, &sq)) return entry_side_list(sq, 1, "vals"); }
     return map_kv_list(m, 1);
 }
 
@@ -10457,7 +10600,11 @@ static Clove *prim_contains_p(CloveEnv *env, Clove **argv, int nargs) {
     Clove *coll = argv[0];
     Clove *k = argv[1];
     if (coll == NIL) return FALSE;
-    if (coll->tag == CLOVE_MAP) return mk_bool(map_find(coll, k, NULL));
+    if (coll->tag == CLOVE_MAP) {
+        Clove *out;
+        if (dispatch_deftype_method(env, coll, "containsKey", &argv[1], 1, &out)) return mk_bool(is_truthy(out));
+        return mk_bool(map_find(coll, k, NULL));
+    }
     if (coll->tag == CLOVE_SET) return mk_bool(set_contains(coll, k, NULL));
     if (as_thash(coll, "contains?"))
         return mk_bool(coll->as.map.is_set ? set_contains(coll, k, NULL) : map_find(coll, k, NULL));
@@ -11078,12 +11225,11 @@ static Clove *prim_concat(CloveEnv *env, Clove **argv, int nargs) {
 
 static Clove *prim_gensym(CloveEnv *env, Clove **argv, int nargs) {
     (void)env;
-    static int counter = 0;
     const char *prefix = "G__";
     if (nargs > 0 && argv[0]->tag == CLOVE_STRING)
         prefix = argv[0]->as.str;
     SBuf sb = {0};
-    sb_printf(&sb, "%s%d", prefix, counter++);
+    sb_printf(&sb, "%s%d", prefix, gensym_counter++);
     const char *nm = intern(sb.data, sb.len);
     free(sb.data);
     return mk_sym(nm);
@@ -15834,13 +15980,16 @@ static Clove *prim_pop(CloveEnv *env, Clove **argv, int nargs) {
 }
 
 static Clove *prim_empty(CloveEnv *env, Clove **argv, int nargs) {
-    (void)env;
     Clove *v = argv[0];
     if (v == NIL) return NIL;
     switch (v->tag) {
         case CLOVE_LIST: case CLOVE_LAZY: case CLOVE_EMPTY: return EMPTY;  /* (empty '(1 2)) => () */
         case CLOVE_VECTOR: return mk_empty_vec();
-        case CLOVE_MAP:    return mk_map();
+        case CLOVE_MAP: {
+            Clove *out;
+            if (dispatch_deftype_method(env, v, "empty", NULL, 0, &out)) return out;
+            return mk_map();
+        }
         case CLOVE_SET:    return mk_set();
         case CLOVE_SORTED: return mk_sorted(v->as.sorted.cmp, v->as.sorted.is_map);
         default:          return NIL;
@@ -16642,7 +16791,7 @@ static const char *PRELUDE =
     "    (if (meta m) (with-meta r (meta m)) r)))\n"
     /* defonce: evaluating a bare unbound symbol throws — catch it and def.
      * Keeps atoms etc. alive across re-evaluation (notebook saves, reloads). */
-    "(defmacro defonce [n e] `(try ~n (catch Exception ex# (def ~n ~e))))\n"
+    "(defmacro defonce [n e] `(try ~n nil (catch Exception ex# (def ~n ~e))))\n"
     "(defmacro time [expr]\n"
     "  `(let [t0# (clove/now-ms*) v# ~expr]\n"
     "     (println (str \"Elapsed time: \" (- (clove/now-ms*) t0#) \" msecs\"))\n"
@@ -16818,6 +16967,7 @@ static const char *PRELUDE =
        serialization buffers + query_v3). clove's (pkg.Class. ..) resolves to the
        short ctor name. */
     "(defn .toArray [c] (object-array (deref c)))\n"
+    "(defn .disjoin [s x] (disj s x))\n"
     "(defn .isArray [_] false)\n"   /* clove arrays are vectors, not host array classes */
     /* java.io char readers over a string, for libs like clojure.data.csv: a
        reader is {:clove/type <class-kw> :rdr (atom {:s :pos :pb})}; .read returns
@@ -16844,7 +16994,12 @@ static const char *PRELUDE =
      * the StringReader collapses to (read-string (str "\"" *in*)). */
     "(def ^:dynamic *in* nil)\n"
     /* java reflection: clove has no classes — inert */
-    "(defn Class/forName [& _] nil)\n"
+    /* a class clove does not model is ClassNotFoundException, so the usual
+       (try (Class/forName "x.Y") ... (catch ClassNotFoundException _ ..))
+       feature probe takes the fallback; java.* and clojure.* stay nil */
+    "(defn Class/forName [n & _]\n"
+    "  (if (re-find #\"^(java|javax|clojure)\\.\" (str n)) nil\n"
+    "    (throw (clove/ex-typed* :ClassNotFoundException (ex-info (str n) {})))))\n"
     "(defn .getName [x] (if (and (map? x) (:nm x)) (:nm x) (str x)))\n"   /* :nm = synthetic Method */
     "(defn .getSimpleName [x] (str x))\n"
     /* threads: clove is single-threaded, so one stable identity/id */
@@ -19140,7 +19295,10 @@ CloveEnv *clove_new_env(void) {
            & options). Skip a leading docstring/attr-map; the next form is the
            dispatch fn; remaining key-vals are options (we honour :default). */
         "(defmacro defmulti [name & args]\n"
-        "  (let [key (clove/mmk name)\n"
+        /* a library's table key is ns-qualified: meander's match IR and
+           substitute namespaces each (defmulti compile* ...). Protocol methods
+           keep the bare name, which deftype/extend register under. */
+        "  (let [key (if (or (namespace name) (:clove/protocol (meta name)) (#{\"\" \"user\"} (str *ns*))) (clove/mmk name) (symbol (str *ns*) (str name)))\n"
         "        args (if (string? (first args)) (rest args) args)\n"
         "        args (if (map? (first args)) (rest args) args)\n"
         "        dispatch (first args)\n"
@@ -19211,7 +19369,7 @@ CloveEnv *clove_new_env(void) {
         "  (let [sigs (filter list? sigs)]\n"
         "  `(do ~@(map (fn [sig]\n"
         "                (let [m (first sig)]\n"
-        "                  `(defmulti ~m (fn [& args#] (type (first args#))))))\n"
+        "                  `(defmulti ~(vary-meta m assoc :clove/protocol true) (fn [& args#] (type (first args#))))))\n"
         "              sigs)\n"
         "       (def ~pname '~(mapv first sigs)))))\n"
         /* definterface: clove has no host interfaces — bind the name to a type
@@ -19270,7 +19428,9 @@ CloveEnv *clove_new_env(void) {
            the protocol's methods — a reify/extend may legally omit some (they'd
            throw only if called), and `every?` would wrongly reject it. */
         "(defn satisfies? [proto x]\n"
-        "  (boolean (some (fn [m] (contains? (get @clove/multi-tables (clove/mmk m)) (type x))) proto)))\n"
+        "  (boolean (some (fn [m] (let [t (get @clove/multi-tables (clove/mmk m))]\n"
+        "                          (or (contains? t (type x)) (some? (clove/multi-find t (type x))))))\n"
+        "                proto)))\n"
         /* records: maps tagged with :clove/type */
         /* defrecord: like deftype but immutable (fields are direct values, no
            atoms) and with both ->R (positional) and map->R (from a map) ctors.
@@ -20357,7 +20517,7 @@ CloveEnv *clove_new_env(void) {
         "      form)))\n"
         "(let [native-mx1 macroexpand-1]\n"
         "  (defn macroexpand-1 [form]\n"
-        "    (let [r (native-mx1 form)]\n"
+        "    (let [r (if (and (seq? form) (contains? '#{let* loop* fn*} (first form))) form (native-mx1 form))]\n"
         "      (if (and (identical? r form) (seq? form))\n"
         "        (clove/expand-native form)\n"
         "        r))))\n"
@@ -20648,6 +20808,7 @@ CloveEnv *clove_new_env(void) {
         "  ([k d] (or (System/getProperty k) d)))\n"
         "(defn System/getProperties [] (into {} (map (fn [k] [k (System/getProperty k)]) [\"user.dir\" \"user.home\" \"user.name\" \"java.io.tmpdir\" \"line.separator\" \"file.separator\" \"path.separator\" \"os.name\"])))\n");
     register_ns(intern("clojure.core", 12));   /* core is native; make it findable */
+    if (env_root(e) == ridx_env) core_seal();
     set_cur_ns(env_root(e), intern("user", 4));
     return e;
 }
